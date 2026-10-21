@@ -1,0 +1,6 @@
+repository = "https://github.com/GalactechsLLC/dg_xch_utils"
+revision = "ca437be562cec5f0514f6edd4c794adfe382dd8a"
+crate = "dg_xch_timelord"
+upstream_license = "Apache-2.0"
+reviewed_date = "2026-10-20"
+integration_state = "linked_native_adapter_fixture_validated"

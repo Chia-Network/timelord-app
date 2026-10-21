@@ -1,0 +1,261 @@
+import Foundation
+import XCTest
+@testable import TimelordPresentation
+
+final class PresentationTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_000_000)
+
+    func testAutomaticTuningKeepsLiveProofMetricsAndClearsStaleLearningState() throws {
+        let status=try operationalStatus()
+        let object: [String:Any] = ["api_version":1,"service_pid":42,"service_state":"ready","timelord_state":"running","message":"Producing verified proofs.","production_enabled":true,"started_unix":999000,"timestamp_unix":1000000,"latest_proof_unix":1000000,"proofs_delivered":7,"tuning_paused":false,
+            "full_node":["host":"localhost","port":8444,"network":"mainnet","state":"ready"],
+            "boards":[["id":"a","name":"A","client_port":18110,"assigned_chains":["challenge","reward","infused_challenge"],"connected_clients":3,"hardware_state":"connected","temperature_c":42.5,"temperature_limit_c":55,"frequency_mhz":1450,"voltage_v":1,"profile":"Automatic","latest_proof_unix":1000000,"automatic":["state":"testing","message":"Testing a 10 MHz increase","active_seconds":90,"cooldown_seconds":0]]],"connected_client_count":3,"delivered_ips":1000000]
+        let decoder=JSONDecoder();decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let automatic=try decoder.decode(ServiceStatus.self,from:JSONSerialization.data(withJSONObject:object))
+        let view=LivePresentation.snapshot(status:automatic,history:try operationalHistory(),now:now)
+        XCTAssertEqual(view.phase,.running);XCTAssertEqual(view.headlineSpeed,"700K");XCTAssertEqual(view.proofsToday,status.proofsDelivered)
+        XCTAssertEqual(view.runningTitle,"Running · Optimizing");XCTAssertTrue(view.boards[0].isAutomatic);XCTAssertEqual(view.boards[0].automaticTitle,"Testing settings")
+        var paused=object;paused["tuning_paused"]=true
+        let pausedStatus=try decoder.decode(ServiceStatus.self,from:JSONSerialization.data(withJSONObject:paused))
+        XCTAssertEqual(LivePresentation.snapshot(status:pausedStatus,now:now).runningTitle,"Running")
+        let stale=LivePresentation.snapshot(status:automatic,now:now.addingTimeInterval(20));XCTAssertFalse(stale.serviceAvailable);XCTAssertFalse(stale.automaticActive)
+    }
+
+    func testNodeSyncIsIndependentOfTimelordAndExpires() throws {
+        func node(_ synced: Bool, _ syncing: Bool, _ timestamp: Double) throws -> NodeSyncStatus {
+            let json = "{\"synced\":\(synced),\"syncing\":\(syncing),\"height\":9500241,\"target_height\":9501000,\"timestamp_unix\":\(timestamp)}"
+            let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+            return try decoder.decode(NodeSyncStatus.self, from: Data(json.utf8))
+        }
+        let synced = try node(true, false, now.timeIntervalSince1970)
+        let stopped = LivePresentation.snapshot(status: nil, nodeSync: synced, paused: true, now: now)
+        XCTAssertEqual(stopped.node.detail, "Synced")
+        XCTAssertEqual(stopped.node.height, 9_500_241)
+        XCTAssertEqual(stopped.phase, .paused)
+        let syncing = LivePresentation.snapshot(status: nil, nodeSync: try node(false, true, now.timeIntervalSince1970), now: now)
+        XCTAssertEqual(syncing.node.detail, "Syncing")
+        let stale = LivePresentation.snapshot(status: nil, nodeSync: synced, now: now.addingTimeInterval(31))
+        XCTAssertEqual(stale.node.detail, "Sync status unavailable")
+        XCTAssertNil(stale.node.height)
+        let future = LivePresentation.snapshot(status: nil, nodeSync: synced, now: now.addingTimeInterval(-10))
+        XCTAssertNil(future.node.height)
+        XCTAssertEqual(LivePresentation.snapshot(status: nil).node.detail, "Sync status unavailable")
+    }
+
+    func testRecoveryRetainsObservedSlowProofsInAverage() {
+        let window = DateInterval(start: now.addingTimeInterval(-100), end: now)
+        let history = ChainHistory(chain: .challenge,
+            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 1_000_000), ProofObservation(date: now.addingTimeInterval(-50), ips: 400_000), ProofObservation(date: now, ips: 1_000_000)],
+            captureIntervals: [window], events: [HistoryEvent(date: now.addingTimeInterval(-50), end: nil, kind: .recovery)])
+        let stats = history.statistics(in: window)
+        XCTAssertEqual(stats.average, 800_000)
+        XCTAssertEqual(stats.minimum, 400_000)
+        XCTAssertEqual(stats.coverage, 1)
+        XCTAssertEqual(Set(history.plotPoints(in: window).map(\.segment)).count, 1)
+    }
+
+    func testMissingCaptureBreaksLineAndHasSeparateCoverage() {
+        let window = DateInterval(start: now.addingTimeInterval(-100), end: now)
+        let history = ChainHistory(chain: .reward,
+            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 900_000), ProofObservation(date: now.addingTimeInterval(-10), ips: 950_000)],
+            captureIntervals: [DateInterval(start: window.start, duration: 40), DateInterval(start: now.addingTimeInterval(-40), end: now)], events: [])
+        XCTAssertEqual(history.statistics(in: window).coverage, 0.8, accuracy: 0.0001)
+        XCTAssertEqual(history.statistics(in: window).average, 925_000)
+        XCTAssertEqual(history.plotPoints(in: window).map(\.segment), [0, 1])
+    }
+
+    func testKnownWorkOutageDoesNotBecomeMissingTelemetry() {
+        let window = DateInterval(start: now.addingTimeInterval(-100), end: now)
+        let history = ChainHistory(chain: .reward,
+            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 900_000), ProofObservation(date: now.addingTimeInterval(-10), ips: 950_000)],
+            captureIntervals: [window], events: [HistoryEvent(date: now.addingTimeInterval(-60), end: now.addingTimeInterval(-30), kind: .nodeUnavailable)])
+        XCTAssertEqual(history.statistics(in: window).coverage, 1)
+        XCTAssertEqual(history.plotPoints(in: window).map(\.segment), [0, 1])
+        XCTAssertEqual(history.statistics(in: window).observations, 2)
+    }
+
+    func testOverlappingCaptureIsNotCountedTwice() {
+        let window = DateInterval(start: now.addingTimeInterval(-100), end: now)
+        let history = ChainHistory(chain: .challenge, samples: [], captureIntervals: [window, window, DateInterval(start: now.addingTimeInterval(-200), end: now)], events: [])
+        XCTAssertEqual(history.statistics(in: window).coverage, 1)
+    }
+
+    func testAdjacentCaptureDoesNotCreateArtificialLineBreaks() {
+        let window = DateInterval(start: now.addingTimeInterval(-100), end: now)
+        let history = ChainHistory(chain: .challenge,
+            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 900_000), ProofObservation(date: now.addingTimeInterval(-10), ips: 950_000)],
+            captureIntervals: [DateInterval(start: window.start, duration: 60), DateInterval(start: now.addingTimeInterval(-60), end: now)], events: [])
+        XCTAssertEqual(history.statistics(in: window).coverage, 1)
+        XCTAssertEqual(history.plotPoints(in: window).map(\.segment), [0, 0])
+    }
+
+    func testHoverOverUnknownDataDoesNotShowANearbyHealthyValue() {
+        let window = DateInterval(start: now.addingTimeInterval(-100), end: now)
+        let history = ChainHistory(chain: .challenge,
+            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 900_000), ProofObservation(date: now.addingTimeInterval(-10), ips: 950_000)],
+            captureIntervals: [DateInterval(start: window.start, duration: 40), DateInterval(start: now.addingTimeInterval(-40), end: now)], events: [])
+        XCTAssertNil(history.observation(near: now.addingTimeInterval(-50), in: window))
+        XCTAssertEqual(history.observation(near: now.addingTimeInterval(-10), in: window)?.ips, 950_000)
+    }
+
+    func testInvalidAndOutsideWindowObservationsAreNotPlotted() {
+        let window = HistoryRange.hour.interval(endingAt: now)
+        let history = ChainHistory(chain: .challenge,
+            samples: [ProofObservation(date: now, ips: .nan), ProofObservation(date: now, ips: -.infinity), ProofObservation(date: now, ips: -1), ProofObservation(date: window.start.addingTimeInterval(-1), ips: 2_000_000), ProofObservation(date: now, ips: 0)], captureIntervals: [window], events: [])
+        XCTAssertEqual(history.statistics(in: window).observations, 1)
+        XCTAssertEqual(history.statistics(in: window).average, 0)
+    }
+
+    func testEmptyHistoryNeverLooksLikeZeroSpeed() {
+        let history = ChainHistory.empty(.infusedChallenge)
+        let stats = history.statistics(in: HistoryRange.hour.interval(endingAt: now))
+        XCTAssertNil(stats.average)
+        XCTAssertEqual(stats.coverage, 0)
+        XCTAssertEqual(DisplayFormat.ips(stats.average), "—")
+    }
+
+    func testFixtureLayoutsCoverEachChainOnceWithoutSummingIPS() {
+        for scenario in [PresentationScenario.runningOneBoard, .runningThreeBoards] {
+            let snapshot = scenario.snapshot(now: now)
+            let chains = snapshot.boards.flatMap(\.histories).map(\.chain)
+            XCTAssertEqual(Set(chains), Set(Chain.allCases))
+            XCTAssertEqual(chains.count, 3)
+            XCTAssertFalse(snapshot.serviceAvailable)
+            XCTAssertLessThan(snapshot.headlineHistory!.statistics(in: HistoryRange.hour.interval(endingAt: now)).average!, 1_100_000)
+        }
+        XCTAssertEqual(PresentationScenario.runningOneBoard.snapshot(now: now).boards.count, 1)
+        XCTAssertEqual(PresentationScenario.runningThreeBoards.snapshot(now: now).boards.count, 3)
+    }
+
+    func testFailureScenariosKeepTheirOwnStates() {
+        XCTAssertEqual(PresentationScenario.waitingForNode.snapshot(now: now).phase, .waitingForNode)
+        XCTAssertNil(PresentationScenario.waitingForNode.snapshot(now: now).headlineHistory?.statistics(in: HistoryRange.hour.interval(endingAt: now)).average)
+        XCTAssertEqual(PresentationScenario.nodeUnreachable.snapshot(now: now).phase, .nodeUnreachable)
+        XCTAssertEqual(PresentationScenario.boardDisconnected.snapshot(now: now).boards[2].state, .disconnected)
+        XCTAssertEqual(PresentationScenario.temperatureLimit.snapshot(now: now).boards[1].state, .thermalStop)
+        XCTAssertEqual(PresentationScenario.runningThreeBoards.snapshot(now: now, paused: true).phase, .paused)
+    }
+
+    func testFixtureDoesNotDiscardRecoveryObservations() {
+        let history = PresentationScenario.runningOneBoard.snapshot(now: now).headlineHistory!
+        let window = HistoryRange.hour.interval(endingAt: now)
+        XCTAssertLessThan(history.statistics(in: window).minimum!, 700_000)
+        XCTAssertLessThan(history.statistics(in: window).coverage, 1)
+    }
+
+    func testHelperReadyIsNotProductiveAndStaleStatusIsUnavailable() throws {
+        let json = """
+        {"api_version":1,"service_pid":42,"service_state":"ready","timelord_state":"running","message":"fixture","production_enabled":false,
+         "started_unix":999000,"timestamp_unix":1000000,"latest_proof_unix":1000000,"proofs_delivered":0,"tuning_paused":false,
+         "full_node":{"host":"localhost","port":8444,"network":"mainnet","state":"connected"},
+         "boards":[{"id":"a","name":"A","client_port":18110,"assigned_chains":["challenge","reward","infused_challenge"],"connected_clients":3,"hardware_state":"not_inspected","profile":"Manual"}],"connected_client_count":3,"delivered_ips":1000000}
+        """
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let status = try decoder.decode(ServiceStatus.self, from: Data(json.utf8))
+        let view = LivePresentation.snapshot(status: status, now: now)
+        XCTAssertEqual(view.phase, .setupRequired)
+        XCTAssertEqual(view.headlineSpeed, "—")
+        XCTAssertNil(view.latestProof)
+        XCTAssertEqual(view.boards[0].state, .uninspected)
+        let stale = LivePresentation.snapshot(status: status, now: now.addingTimeInterval(20))
+        XCTAssertFalse(stale.serviceAvailable)
+        XCTAssertTrue(stale.boards.isEmpty)
+    }
+}
+
+extension PresentationTests {
+    func testStoppedConfiguredAutomaticBoardExplainsHowToStart() {
+        var config = AppConfiguration()
+        config.service.startAutomatically = false
+        config.node.certificate = "/fixture/cert"; config.node.privateKey = "/fixture/key"; config.node.caCertificate = "/fixture/ca"
+        config.hardware.clientBinary = "/fixture/client"
+        let device = DiscoveredDevice(name: "Fixture", location: 1, serial: "fixture-only")
+        config.hardware = BoardDiscovery.reconcile([device], hardware: config.hardware)
+        let ready = LivePresentation.snapshot(status: nil, configuration: config, detectedDevices: [device], now: now)
+        XCTAssertEqual(ready.runningTitle, "Ready to run")
+        XCTAssertTrue(ready.explanation.contains("Press Run"))
+        XCTAssertTrue(ready.explanation.contains("Automatic tuning"))
+        config.service.startAutomatically = true
+        let automaticStart = LivePresentation.snapshot(status: nil, configuration: config, detectedDevices: [device], now: now)
+        XCTAssertTrue(automaticStart.explanation.contains("starts automatically"))
+        XCTAssertNil(ready.proofsToday)
+        let paused = LivePresentation.snapshot(status: nil, configuration: config, detectedDevices: [device], paused: true, now: now)
+        XCTAssertEqual(paused.runningTitle, "Paused")
+        let disconnected = LivePresentation.snapshot(status: nil, configuration: config, detectedDevices: [], now: now)
+        XCTAssertFalse(disconnected.readyToRun)
+        config.node.certificate = nil
+        let incomplete = LivePresentation.snapshot(status: nil, configuration: config, detectedDevices: [device], now: now)
+        XCTAssertFalse(incomplete.readyToRun)
+    }
+    func testDetectedBoardsUseAutomaticSeedAndRememberProfilesAcrossUsbPorts() {
+        var hardware=HardwareConfiguration()
+        hardware=BoardDiscovery.reconcile([DiscoveredDevice(name:"Chia VDF A",location:4113,serial:"one")],hardware:hardware)
+        let first=hardware.boards[0]
+        XCTAssertEqual(first.profileName,"Automatic")
+        XCTAssertEqual(first.frequencyMhz,1450);XCTAssertEqual(first.voltageV,1.0)
+        hardware.boards[0].profile="manual";hardware.boards[0].frequencyMhz=1540
+        hardware=BoardDiscovery.reconcile([],hardware:hardware)
+        XCTAssertTrue(hardware.boards.isEmpty);XCTAssertEqual(hardware.rememberedBoards.count,1)
+        hardware=BoardDiscovery.reconcile([DiscoveredDevice(name:"Chia VDF A",location:9001,serial:"one")],hardware:hardware)
+        XCTAssertEqual(hardware.boards[0].id,first.id)
+        XCTAssertEqual(hardware.boards[0].profileName,"Manual")
+        XCTAssertEqual(hardware.boards[0].frequencyMhz,1540)
+        XCTAssertEqual(hardware.boards[0].deviceLocation,9001)
+        hardware=BoardDiscovery.reconcile([DiscoveredDevice(name:"Chia VDF A",location:9001,serial:"replacement")],hardware:hardware)
+        XCTAssertEqual(hardware.boards[0].profileName,"Automatic")
+        XCTAssertNotEqual(hardware.boards[0].id,first.id)
+    }
+    func testAutomaticEngineAssignmentsAndNoConfiguredGhostCards() {
+        var config=AppConfiguration()
+        let devices=(0..<3).map {DiscoveredDevice(name:"ASIC",location:4113+$0,serial:"serial-\($0)")}
+        for (count,expected) in [(1,[3]),(2,[2,1]),(3,[1,1,1])] {
+            config.hardware=BoardDiscovery.reconcile(Array(devices.prefix(count)),hardware:config.hardware)
+            XCTAssertEqual(BoardTopology.counts(config.hardware.boards),expected)
+            let snapshot=LivePresentation.snapshot(status:nil,configuration:config,detectedDevices:Array(devices.prefix(count)),now:now)
+            XCTAssertEqual(snapshot.boards.count,count)
+            XCTAssertEqual(snapshot.boards.map { $0.histories.count },expected)
+            XCTAssertEqual(Set(snapshot.boards.flatMap(\.histories).map(\.chain)),Set(Chain.allCases))
+        }
+        let unplugged=LivePresentation.snapshot(status:nil,configuration:config,detectedDevices:[],now:now)
+        XCTAssertTrue(unplugged.boards.isEmpty)
+    }
+    private func operationalStatus(production: Bool = true, latest: Double = 1_000_000) throws -> ServiceStatus {
+        let object: [String: Any] = ["api_version":1,"service_pid":42,"service_state":"ready","timelord_state":"running","message":"Producing verified proofs.","production_enabled":production,"started_unix":999000,"timestamp_unix":1000000,"latest_proof_unix":latest,"proofs_delivered":7,"tuning_paused":false,
+            "full_node":["host":"localhost","port":8444,"network":"mainnet","state":"ready"],
+            "boards":[["id":"a","name":"A","client_port":18110,"assigned_chains":["challenge","reward","infused_challenge"],"connected_clients":3,"hardware_state":"connected","temperature_c":42.5,"temperature_limit_c":55,"frequency_mhz":1540,"voltage_v":1,"recoveries":2,"latest_proof_unix":latest,"profile":"Manual"]],"connected_client_count":3,"delivered_ips":1000000]
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode(ServiceStatus.self, from: JSONSerialization.data(withJSONObject: object))
+    }
+    private func operationalHistory(pid: Int = 42) throws -> HistoryPayload {
+        let object: [String: Any] = ["api_version":1,"service_pid":pid,"timestamp_unix":1000000,"capture_start_unix":996400,
+            "observations":[["id":1,"chain":"challenge","timestamp_unix":999900,"ips":400000],["id":2,"chain":"challenge","timestamp_unix":1000000,"ips":1000000]],
+            "events":[["id":1,"timestamp_unix":999900,"board_id":"a","kind":"recovery"],["id":2,"timestamp_unix":999910,"board_id":NSNull(),"kind":"node_unavailable","end_unix":999920]]]
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode(HistoryPayload.self, from: JSONSerialization.data(withJSONObject: object))
+    }
+    func testDistinctProofsAtTheSameTimestampKeepSeparateChartIdentities() {
+        let history = ChainHistory(chain: .challenge, samples: [ProofObservation(date: now, ips: 900000, id: "proof-1"), ProofObservation(date: now, ips: 900000, id: "proof-2")], captureIntervals: [HistoryRange.hour.interval(endingAt: now)], events: [])
+        XCTAssertEqual(Set(history.plotPoints(in: HistoryRange.hour.interval(endingAt: now)).map(\.id)).count, 2)
+        XCTAssertEqual(history.statistics(in: HistoryRange.hour.interval(endingAt: now)).observations, 2)
+    }
+    func testOperationalStatusAndHistoryUseVerifiedSentProofsWithoutSummingChains() throws {
+        let snapshot = LivePresentation.snapshot(status: try operationalStatus(), history: try operationalHistory(), now: now)
+        XCTAssertEqual(snapshot.phase, .running)
+        XCTAssertEqual(snapshot.headlineSpeed, "700K")
+        XCTAssertEqual(snapshot.proofsToday, 7)
+        XCTAssertEqual(snapshot.boards.first?.temperatureC, 42.5)
+        XCTAssertEqual(snapshot.boards.first?.state, .active)
+        XCTAssertEqual(snapshot.headlineHistory?.plotPoints(in: HistoryRange.hour.interval(endingAt: now)).map(\.segment), [0, 1])
+    }
+    func testStaleProofAndAnotherServiceHistoryCannotLookProductive() throws {
+        let staleProof = LivePresentation.snapshot(status: try operationalStatus(latest: 999800), history: try operationalHistory(pid: 43), now: now)
+        XCTAssertEqual(staleProof.phase, .waitingForProofs)
+        XCTAssertEqual(staleProof.headlineSpeed, "—")
+        XCTAssertNotEqual(staleProof.boards.first?.state, .active)
+        let incapable = LivePresentation.snapshot(status: try operationalStatus(production: false), history: try operationalHistory(), now: now)
+        XCTAssertEqual(incapable.headlineSpeed, "—")
+        XCTAssertNil(incapable.latestProof)
+        XCTAssertNil(incapable.proofsToday)
+    }
+
+}

@@ -1,0 +1,24 @@
+# Development endpoints intentionally differ from Chia's 8000/18000 ports.
+# Without node credentials this sample waits without sending work. Choose a native
+# client and explicit USB location before enabling managed hardware.
+schema_version = 1
+
+[node]
+host = "localhost"
+port = 8444
+network = "mainnet"
+# server_name = "node.example.com"
+# certificate = "/path/to/dedicated-timelord.crt"
+# private_key = "/path/to/dedicated-timelord.key"
+# ca_certificate = "/path/to/node-ca.crt"
+
+[service]
+status_listen = "127.0.0.1:9257"
+
+[hardware]
+
+[[hardware.boards]]
+id = "development-board"
+name = "Development board"
+client_port = 18110
+# device_location = 12305

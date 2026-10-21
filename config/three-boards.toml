@@ -1,0 +1,26 @@
+schema_version = 1
+
+[node]
+host = "localhost"
+port = 8444
+network = "mainnet"
+
+[service]
+status_listen = "127.0.0.1:9257"
+
+[hardware]
+
+[[hardware.boards]]
+id = "board-a"
+name = "Board A"
+client_port = 18110
+
+[[hardware.boards]]
+id = "board-b"
+name = "Board B"
+client_port = 18111
+
+[[hardware.boards]]
+id = "board-c"
+name = "Board C"
+client_port = 18112

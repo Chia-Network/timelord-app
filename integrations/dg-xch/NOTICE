@@ -1,0 +1,10 @@
+Timelord Mac links dg_xch_utils crates from GalactechsLLC, revision
+ca437be562cec5f0514f6edd4c794adfe382dd8a, under the Apache License 2.0.
+https://github.com/GalactechsLLC/dg_xch_utils
+
+The regular scheduler, protocol/consensus types, authenticated transport helpers
+and VDF verification are used as dependencies. The native-client adapter and
+application lifecycle are maintained in this repository. No upstream source files
+are vendored or modified. See LICENSE and Cargo.lock for provenance.
+
+ICC seed translation follows Scheduler.set_peak/finish at the pinned revision.

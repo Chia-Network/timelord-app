@@ -1,0 +1,12 @@
+Timelord uses chiavdf from Chia-Network under the Apache License 2.0.
+https://github.com/Chia-Network/chiavdf
+The small native control integration is applied only to build staging.
+
+The developer app bundles FT4222/D2XX libraries from Future Technology Devices
+International Ltd. (FTDI). These vendor libraries retain their own license terms.
+https://ftdichip.com/products/ft4222h/
+
+The native client dynamically links GNU MP (GMP); when bundled, its license texts
+are included alongside this notice. GMP is a separate third-party library and is
+not licensed under the application's Apache-2.0 license.
+https://gmplib.org/
