@@ -79,6 +79,22 @@ control fixtures. Tests use generated identities and disposable local peers and
 processes. They never use a live node or USB board. Dashboard sample data exists
 only in the test target; it is not part of the app.
 
+## Continuous integration
+
+Pull requests and pushes to `main` run macOS formatting, lint, native fixtures,
+Rust/Swift tests, and an independent Apple Silicon developer app build. The build
+uploads a zipped, ad-hoc-signed app, its SHA256 and native source provenance for
+14 days. It is not a notarized release. CI never connects to a live node or ASIC.
+
+Security checks run CodeQL and a Cargo vulnerability audit on pull requests,
+`main`, and weekly. Dependabot proposes weekly Cargo and GitHub Actions updates.
+The audit currently reports the existing upstream `rsa` dependency advisory
+[RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071/), for which no
+fixed version is available. This check reports the finding without suppressing it.
+Require **macOS checks** and **Apple Silicon app bundle** in the repository's
+branch rules when CI is verified. Signing/notarized releases and hardware
+benchmarks are separate from these workflows.
+
 ## Development status
 
 Initial hardware/node smoke tests have verified real proofs across all three
