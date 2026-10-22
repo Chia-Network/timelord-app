@@ -55,7 +55,24 @@ for binary in "$APP/Contents/Frameworks/"*.dylib "$APP/Contents/Helpers/hw_vdf_c
   if [[ "$binary" == "$APP/Contents/Frameworks/"* ]]; then install_name_tool -id "@rpath/$(basename "$binary")" "$binary"; fi
   codesign --force --sign - "$binary"
 done
-cp apps/macos/AppIcon/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+# The layered icon needs Xcode 26's actool: Assets.car carries the macOS 26 appearances and
+# actool also writes a fallback AppIcon.icns. With only the command line tools, ship the flat icon.
+if xcrun --find actool >/dev/null 2>&1; then
+  ICON_LOG="$(mktemp)"
+  # actool resolves relative input paths against the output folder, so pass absolute paths.
+  if ! xcrun actool "$PROJECT_ROOT/apps/macos/AppIcon/AppIcon.icon" --compile "$APP/Contents/Resources" \
+      --platform macosx --minimum-deployment-target "$MACOSX_DEPLOYMENT_TARGET" --app-icon AppIcon \
+      --output-partial-info-plist "$ICON_LOG.plist" --output-format human-readable-text --errors --warnings >"$ICON_LOG" 2>&1 \
+    || [[ ! -f "$APP/Contents/Resources/Assets.car" || ! -f "$APP/Contents/Resources/AppIcon.icns" ]]; then
+    cat "$ICON_LOG" >&2
+    echo 'Could not compile apps/macos/AppIcon/AppIcon.icon (requires Xcode 26 or newer).' >&2
+    exit 1
+  fi
+  rm -f "$ICON_LOG" "$ICON_LOG.plist"
+else
+  echo 'actool not found (it ships with Xcode, not the command line tools); bundling the flat AppIcon.icns.' >&2
+  cp apps/macos/AppIcon/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+fi
 cp LICENSE "$APP/Contents/Resources/LICENSE"
 cp integrations/dg-xch/LICENSE "$APP/Contents/Resources/ThirdParty/dg-xch-LICENSE"
 cp integrations/chiavdf/LICENSE "$APP/Contents/Resources/ThirdParty/chiavdf-LICENSE"
@@ -70,6 +87,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>Timelord</string>
   <key>CFBundleDisplayName</key><string>Timelord</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleIconName</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>CFBundleVersion</key><string>1</string>

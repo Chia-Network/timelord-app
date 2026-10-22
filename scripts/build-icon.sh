@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Regenerate apps/macos/AppIcon/AppIcon.icns from its SVG sources. Only needed after
-# editing the artwork; the app bundle uses the committed .icns. Requires rsvg-convert.
+# Regenerate the flat apps/macos/AppIcon/AppIcon.icns from its SVG sources. The bundle uses it only
+# when Xcode's actool is unavailable; otherwise it ships the layered AppIcon.icon. Requires rsvg-convert.
 set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ICON_DIR="$PROJECT_ROOT/apps/macos/AppIcon"
