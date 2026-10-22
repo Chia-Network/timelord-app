@@ -24,7 +24,8 @@ setting while proofs continue; **Pause** stops proof production.
 Done saves settings. Changes to a running service use **Save & Restart**. Settings
 includes **Run Timelord when the app opens**, enabled by default. Pause holds until
 Run is selected or the app is reopened. Closing the window keeps the menu bar and
-service running; Stop and Quit stops the app's owned processes. An externally
+service running. Quit from the app, menu bar, Dock, or system logout waits for the
+app’s owned service to stop its ASIC clients and save chart history. An externally
 started service is observed without taking ownership.
 
 While its owned service runs, the app prevents idle system sleep and App Nap;

@@ -4,7 +4,12 @@ import TimelordPresentation
 
 @main
 struct TimelordMacApp: App {
-    @StateObject private var model = TimelordModel()
+    @NSApplicationDelegateAdaptor(ApplicationDelegate.self) private var delegate
+    var body: some Scene { TimelordScenes(model: delegate.model) }
+}
+
+private struct TimelordScenes: Scene {
+    @ObservedObject var model: TimelordModel
     var body: some Scene {
         WindowGroup("Timelord", id: "main") { Overview(model: model) }
             .defaultSize(width: 1180, height: 820)

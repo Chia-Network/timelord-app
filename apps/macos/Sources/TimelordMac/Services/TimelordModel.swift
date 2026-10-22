@@ -32,6 +32,7 @@ final class TimelordModel: ObservableObject {
     private var lastHistoryFetch = Date.distantPast
     private var pausedByUser = false
     private var automaticStartPending = true
+    private var quitting = false
     private var monitoring: Task<Void, Never>?
     private let monitoringEnabled: Bool
 
@@ -40,7 +41,7 @@ final class TimelordModel: ObservableObject {
     var logsURL: URL { controller.logsURL }
     var statusURL: URL { liveClient.endpoint }
     var quitLabel: String { liveStatus != nil && !ownsService ? "Quit interface" : "Stop and Quit" }
-    var canStartService: Bool { !ownsService && liveStatus == nil && !starting }
+    var canStartService: Bool { !quitting && !ownsService && liveStatus == nil && !starting }
     var canInspectConnections: Bool { !ownsService && liveStatus == nil && !starting }
 
     init(controller suppliedController: ServiceController? = nil, initialConfiguration: AppConfiguration? = nil, monitoringEnabled: Bool = true) {
@@ -73,6 +74,7 @@ final class TimelordModel: ObservableObject {
         snapshot = LivePresentation.snapshot(status: liveStatus, history: history, configuration: configurationLoaded ? savedConfiguration : nil, detectedDevices: discoveredDevices, nodeSync: nodeSync, paused: pausedByUser, starting: starting, error: controller.errorMessage)
     }
     func refresh() async {
+        guard !quitting else { return }
         if !configurationLoaded {
             do {
                 try controller.prepareConfig(); configuration = try await configurationClient.load(); savedConfiguration = configuration; configurationLoaded = true
@@ -106,7 +108,7 @@ final class TimelordModel: ObservableObject {
 
     /// One startup attempt per app launch, once setup and hardware discovery are ready.
     func considerAutomaticStart(serviceAbsent: Bool) {
-        guard automaticStartPending, savedConfiguration.service.startAutomatically,
+        guard !quitting, automaticStartPending, savedConfiguration.service.startAutomatically,
               serviceAbsent, configurationLoaded, !pausedByUser, canStartService,
               !operationInProgress, sheet == nil, !hasUnsavedSettings,
               savedConfiguration.node.hasIdentity,
@@ -181,9 +183,12 @@ final class TimelordModel: ObservableObject {
         guard canStartService else { return }; automaticStartPending = false; starting = true; pausedByUser = false; errorMessage = nil
         Task {
             await refreshDevices()
+            defer { starting = false }
+            guard !quitting else { return }
             do {
                 guard !discoveredDevices.isEmpty else { throw ConfigurationError.message("Connect an ASIC board to start.") }
                 try await configurationClient.save(savedConfiguration)
+                guard !quitting else { return }
                 useSavedStatusEndpoint()
                 try controller.start(); configurationNeedsRestart = false
             } catch {errorMessage=error.localizedDescription}
@@ -316,12 +321,16 @@ final class TimelordModel: ObservableObject {
         let lines = ["Timelord local status", "State: \(snapshot.phase.title)", "Boards shown: \(snapshot.boards.count)", snapshot.proofFreshness]
         NSPasteboard.general.clearContents(); NSPasteboard.general.setString(lines.joined(separator: "\n"), forType: .string)
     }
-    func stopAndQuit() {
+    func stopAndQuit() { NSApplication.shared.terminate(nil) }
+
+    func prepareForTermination() async {
+        quitting = true
         automaticStartPending = false
-        controller.stop()
-        Task { @MainActor in
-            while controller.ownsService { try? await Task.sleep(nanoseconds: 100_000_000) }
-            monitoring?.cancel(); NSApplication.shared.terminate(nil)
-        }
+        monitoring?.cancel(); monitoring = nil
+        controller.onChange = nil
+        await controller.stopAndWait()
+        // A startup awaiting USB discovery or a config write must observe quitting
+        // before it can launch a helper, even if termination arrived mid-start.
+        while starting { try? await Task.sleep(nanoseconds: 100_000_000) }
     }
 }

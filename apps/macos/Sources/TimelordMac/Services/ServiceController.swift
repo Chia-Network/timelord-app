@@ -93,4 +93,16 @@ final class ServiceController {
     }
 
     func stop() { if let process, process.isRunning { process.terminate() } }
+
+    /// The helper exits only after its native clients and final history flush finish.
+    func stopAndWait() async {
+        guard let child = process else { return }
+        if child.isRunning { child.terminate() }
+        while child.isRunning { try? await Task.sleep(nanoseconds: 100_000_000) }
+        // The termination callback may still be queued on the main actor.
+        guard process === child else { return }
+        releaseActivity()
+        process = nil
+        try? logHandle?.close(); logHandle = nil
+    }
 }
