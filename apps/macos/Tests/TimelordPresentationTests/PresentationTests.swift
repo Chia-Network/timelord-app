@@ -5,6 +5,24 @@ import XCTest
 final class PresentationTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_000_000)
 
+    func testRestoredChartKeepsLowSamplesAndDoesNotBridgeRestartDowntime() throws {
+        let object: [String: Any] = ["api_version":2,"service_pid":42,"timestamp_unix":1000000,
+            "capture_intervals":[["start_unix":999880,"end_unix":999910],["start_unix":999970,"end_unix":1000000]],
+            "observations":[["id":1,"chain":"challenge","timestamp_unix":999900,"ips":400000],["id":2,"chain":"challenge","timestamp_unix":999990,"ips":1000000]],
+            "events":[["id":1,"timestamp_unix":999910,"kind":"telemetry_gap","end_unix":999970]]]
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let history = try decoder.decode(HistoryPayload.self, from: JSONSerialization.data(withJSONObject: object))
+        let view = LivePresentation.snapshot(status: try operationalStatus(), history: history, now: now)
+        let chain = try XCTUnwrap(view.headlineHistory)
+        let window = HistoryRange.quarterHour.interval(endingAt: now)
+        let points = chain.plotPoints(in: window)
+        XCTAssertEqual(points.count, 2)
+        XCTAssertNotEqual(points[0].segment, points[1].segment)
+        XCTAssertEqual(chain.statistics(in: window).average, 700000)
+        XCTAssertEqual(chain.statistics(in: window).coverage, 60.0 / 900.0, accuracy: 0.0001)
+        XCTAssertNil(chain.observation(near: Date(timeIntervalSince1970: 999940), in: window))
+    }
+
     func testAutomaticTuningKeepsLiveProofMetricsAndClearsStaleLearningState() throws {
         let status=try operationalStatus()
         let object: [String:Any] = ["api_version":1,"service_pid":42,"service_state":"ready","timelord_state":"running","message":"Producing verified proofs.","production_enabled":true,"started_unix":999000,"timestamp_unix":1000000,"latest_proof_unix":1000000,"proofs_delivered":7,"tuning_paused":false,
@@ -227,7 +245,7 @@ extension PresentationTests {
         return try decoder.decode(ServiceStatus.self, from: JSONSerialization.data(withJSONObject: object))
     }
     private func operationalHistory(pid: Int = 42) throws -> HistoryPayload {
-        let object: [String: Any] = ["api_version":1,"service_pid":pid,"timestamp_unix":1000000,"capture_start_unix":996400,
+        let object: [String: Any] = ["api_version":2,"service_pid":pid,"timestamp_unix":1000000,"capture_intervals":[["start_unix":996400,"end_unix":1000000]],
             "observations":[["id":1,"chain":"challenge","timestamp_unix":999900,"ips":400000],["id":2,"chain":"challenge","timestamp_unix":1000000,"ips":1000000]],
             "events":[["id":1,"timestamp_unix":999900,"board_id":"a","kind":"recovery"],["id":2,"timestamp_unix":999910,"board_id":NSNull(),"kind":"node_unavailable","end_unix":999920]]]
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase

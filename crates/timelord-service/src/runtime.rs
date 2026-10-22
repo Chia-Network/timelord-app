@@ -15,7 +15,7 @@ use dg_xch_servers::transport::{
 };
 use dg_xch_timelord::scheduler::{Output, Scheduler, WorkPlan, WorkResult};
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -29,7 +29,7 @@ use tokio_tungstenite::{
 };
 
 pub type Socket = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Observation {
     pub id: u64,
     pub chain: Chain,
@@ -37,7 +37,7 @@ pub struct Observation {
     pub work_started_unix: u64,
     pub ips: f64,
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Event {
     pub id: u64,
     pub timestamp_unix: u64,
@@ -64,7 +64,9 @@ pub struct RuntimeState {
     pub proofs_delivered: u64,
     pub failed_proofs: u64,
     pub tuning_paused: bool,
-    events_created: u64,
+    pub(crate) events_created: u64,
+    pub(crate) observations_created: u64,
+    pub(crate) archive: Option<crate::history_store::Snapshot>,
     pub boards: std::collections::HashMap<String, HardwareState>,
 }
 impl Default for RuntimeState {
@@ -79,6 +81,8 @@ impl Default for RuntimeState {
             failed_proofs: 0,
             tuning_paused: false,
             events_created: 0,
+            observations_created: 0,
+            archive: None,
             boards: Default::default(),
         }
     }
@@ -117,8 +121,9 @@ impl RuntimeState {
     fn delivered(&mut self, speeds: Vec<(Chain, ProofTiming)>) {
         for (chain, timing) in speeds {
             let ips = timing.delivered_ips();
+            self.observations_created += 1;
             self.observations.push(Observation {
-                id: self.proofs_delivered + 1,
+                id: self.observations_created,
                 chain,
                 ips,
                 timestamp_unix: unix_now(),

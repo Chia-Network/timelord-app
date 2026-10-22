@@ -162,7 +162,7 @@ public enum LivePresentation {
         else if live?.productionEnabled == true { phase = nodeReady ? .waitingForProofs : .waitingForNode }
         else { phase = .setupRequired }
         let proofCapable = live?.productionEnabled == true
-        let validHistory = history.flatMap { proofCapable && $0.servicePid == live?.servicePid && $0.apiVersion == 1 ? $0 : nil }
+        let validHistory = history.flatMap { proofCapable && $0.servicePid == live?.servicePid && $0.apiVersion == 2 ? $0 : nil }
         var boards: [BoardSnapshot]
         if let live {
             boards = live.boards.filter { board in
@@ -178,14 +178,18 @@ public enum LivePresentation {
                 let histories = board.assignedChains.compactMap(Chain.init(rawValue:)).map { chain -> ChainHistory in
                     guard let validHistory else { return .empty(chain) }
                     let end = min(now, Date(timeIntervalSince1970: validHistory.timestampUnix))
-                    let start = min(end, Date(timeIntervalSince1970: validHistory.captureStartUnix))
+                    let captures = validHistory.captureIntervals.compactMap { capture -> DateInterval? in
+                        let start = Date(timeIntervalSince1970: capture.startUnix)
+                        let finish = min(end, Date(timeIntervalSince1970: capture.endUnix))
+                        return finish > start ? DateInterval(start: start, end: finish) : nil
+                    }
                     let samples = validHistory.observations.filter { $0.chain == chain }.map { ProofObservation(date: Date(timeIntervalSince1970: $0.timestampUnix), ips: $0.ips, id: "proof-\($0.id)") }
                     let events = validHistory.events.filter { $0.boardId == nil || $0.boardId == board.id }.compactMap { event -> HistoryEvent? in
                         guard let kind = HistoryEventKind(rawValue: event.kind) else { return nil }
                         let date = Date(timeIntervalSince1970: event.timestampUnix)
                         return HistoryEvent(date: date, end: kind.interruptsWork ? event.endUnix.map(Date.init(timeIntervalSince1970:)) ?? end : nil, kind: kind, id: "event-\(event.id)")
                     }
-                    return ChainHistory(chain: chain, samples: samples, captureIntervals: end > start ? [DateInterval(start: start, end: end)] : [], events: events)
+                    return ChainHistory(chain: chain, samples: samples, captureIntervals: captures, events: events)
                 }
                 return BoardSnapshot(id: board.id, name: board.name, state: state, temperatureC: board.temperatureC, temperatureLimitC: board.temperatureLimitC, profile: board.profile, frequencyMHz: board.frequencyMhz, voltageV: board.voltageV, histories: histories, lastProof: last, automatic: board.automatic)
             }

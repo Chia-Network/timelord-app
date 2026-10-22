@@ -104,6 +104,29 @@ trial, then holds the previous observed setting while production continues.
 
 ## CLI and endpoints
 
+### Saved chart history
+
+The service saves verified sent-proof observations, recovery/profile events and
+capture intervals beside its config: `config.toml` uses `config.history.json`.
+No credentials or proof contents are stored. The owner-only JSON checkpoint is
+replaced atomically every five seconds and flushed after a clean shutdown. A
+crash can lose data since the last successful checkpoint (normally up to five
+seconds); previously saved history survives. Retention is 24 hours, bounded to
+86,400 observations and events.
+
+Restarting restores chart data with a gap between capture sessions. It does not
+restore current proof counters, uptime, hardware state or current IPS. Changing
+the node address/network or board-to-chain assignments starts a new history
+context to avoid misattribution; frequency/profile and app updates retain history.
+Unreadable or corrupt checkpoints are left untouched and persistence is disabled
+with a warning in `service.log`; proof production can continue. Back up or remove
+that checkpoint while the service is stopped to start a fresh history file.
+
+Status remains `/v1/status`; chart history uses `/v2/history` with explicit capture
+intervals so the app never draws a continuous line across restart downtime.
+
+### Commands
+
 ```sh
 # build/rust/debug/timelord-service or the app's Contents/Helpers/timelord-service
 timelord-service init --config FILE

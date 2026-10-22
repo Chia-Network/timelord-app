@@ -21,12 +21,19 @@ impl Drop for Fixture {
 }
 
 fn status(port: u16) -> Option<serde_json::Value> {
+    get_json(port, "/v1/status")
+}
+
+fn get_json(port: u16, path: &str) -> Option<serde_json::Value> {
     let mut socket =
         TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_millis(200))
             .ok()?;
     socket.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
     socket
-        .write_all(b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
         .ok()?;
     let mut response = String::new();
     socket.read_to_string(&mut response).ok()?;
@@ -145,4 +152,65 @@ fn helper_reports_real_socket_state_without_claiming_productivity() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    let checkpoint = config.with_extension("history.json");
+    assert!(
+        checkpoint.is_file(),
+        "Graceful shutdown must flush chart history"
+    );
+    // Seed only the fixture's historical chart file, not a live proof stream.
+    // The restarted helper must expose it without claiming current productivity.
+    let configured: timelord_core::Config =
+        toml::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    let scope = serde_json::to_vec(&(
+        configured.node.network,
+        &configured.node.host,
+        configured.node.port,
+        configured.assignments().unwrap(),
+    ))
+    .unwrap();
+    let scope: String = dg_xch_core::utils::hash_256(scope)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let saved = serde_json::json!({"schema_version":1,"scope":scope,
+        "capture_intervals":[{"start_unix":now-100,"end_unix":now-30}],
+        "observations":[{"id":50,"chain":"challenge","timestamp_unix":now-60,"work_started_unix":now-61,"ips":425000}],
+        "events":[{"id":22,"timestamp_unix":now-60,"board_id":"fixture","kind":"recovery","end_unix":null}]});
+    std::fs::write(&checkpoint, serde_json::to_vec(&saved).unwrap()).unwrap();
+    fixture.child = Command::new(env!("CARGO_BIN_EXE_timelord-service"))
+        .args(["serve", "--config"])
+        .arg(&config)
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let restarted = wait_for(status_port, 0);
+    assert!(restarted["latest_proof_unix"].is_null());
+    assert!(restarted["delivered_ips"].is_null());
+    assert_eq!(restarted["proofs_delivered"], 0);
+    let history = get_json(status_port, "/v2/history").unwrap();
+    assert_eq!(history["api_version"], 2);
+    assert_eq!(history["service_pid"], fixture.child.id());
+    assert_eq!(history["observations"][0]["ips"], 425000.0);
+    assert_eq!(history["events"][0]["kind"], "recovery");
+    assert_eq!(history["events"][1]["kind"], "telemetry_gap");
+    assert_eq!(history["events"][1]["timestamp_unix"], now - 30);
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-TERM", &fixture.child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while fixture.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "Restarted fixture did not stop");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let flushed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(checkpoint).unwrap()).unwrap();
+    assert_eq!(flushed["observations"][0]["id"], 50);
 }

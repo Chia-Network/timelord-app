@@ -3,6 +3,7 @@ mod automatic;
 mod connection;
 mod diagnostics;
 mod hardware;
+mod history_store;
 mod inventory;
 mod node_status;
 mod private_control;
@@ -296,7 +297,7 @@ async fn main() -> Result<()> {
                     .unwrap_or(Path::new("."))
                     .join("automatic-profiles.json"),
             );
-            serve(value).await?;
+            serve(value, config.with_extension("history.json")).await?;
         }
         Command::Tuning { config, paused } => {
             let value = load(&config)?;
@@ -484,12 +485,15 @@ async fn status(State(shared): State<Arc<Shared>>) -> Json<Status> {
 
 async fn history(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
     let runtime = shared.runtime.lock().expect("runtime");
+    let store =
+        history_store::Store::new(PathBuf::new(), &shared.config).expect("validated history scope");
+    let saved = store.snapshot(&runtime, shared.started_unix, unix_now());
     Json(
-        serde_json::json!({"api_version":1,"service_pid":std::process::id(),"timestamp_unix":unix_now(),"capture_start_unix":shared.started_unix.max(unix_now().saturating_sub(86400)).max(if runtime.observations.len() >= 86400 { runtime.observations.first().map(|o| o.timestamp_unix).unwrap_or(0) } else { 0 }),"observations":runtime.observations,"events":runtime.events}),
+        serde_json::json!({"api_version":2,"service_pid":std::process::id(),"timestamp_unix":unix_now(),"capture_intervals":saved.capture_intervals,"observations":saved.observations,"events":saved.events}),
     )
 }
 
-async fn serve(config: Config) -> Result<()> {
+async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
     let config = inventory::connected_configuration(config).await?;
     hardware::validate_automatic(&config).await?;
     let assignments = config.assignments().map_err(anyhow::Error::msg)?;
@@ -518,15 +522,34 @@ async fn serve(config: Config) -> Result<()> {
     let backend = Arc::new(backend);
     let active = config.node.certificate.is_some();
     let tuning_paused = config.service.tuning_paused;
+    let started_unix = unix_now();
+    let store = Arc::new(history_store::Store::new(history_path, &config)?);
+    let mut runtime = runtime::RuntimeState::with_tuning_paused(tuning_paused);
+    // Leave unreadable/corrupt checkpoints untouched and keep proof production
+    // available. A bad history file must not silently be replaced with empty data.
+    let history_enabled = match store.restore(&mut runtime, started_unix) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, "Saved history unavailable; persistence disabled to preserve checkpoint");
+            false
+        }
+    };
     let shared = Arc::new(Shared {
         config,
         assignments,
         clients: Arc::new(Mutex::new(BTreeSet::new())),
-        runtime: Mutex::new(runtime::RuntimeState::with_tuning_paused(tuning_paused)),
-        started_unix: unix_now(),
+        runtime: Mutex::new(runtime),
+        started_unix,
     });
     let (shutdown, receiver) = watch::channel(false);
     let mut tasks = JoinSet::new();
+    if history_enabled {
+        tasks.spawn(history_store::record(
+            shared.clone(),
+            store.clone(),
+            receiver.clone(),
+        ));
+    }
     for (id, capacity, listener) in listeners {
         tasks.spawn(client_listener(
             listener,
@@ -568,7 +591,7 @@ async fn serve(config: Config) -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/status", get(status))
-        .route("/v1/history", get(history))
+        .route("/v2/history", get(history))
         .with_state(shared.clone());
     tracing::info!(address=%shared.config.service.status_listen,"Service ready");
     let result = axum::serve(http, app)
@@ -579,6 +602,16 @@ async fn serve(config: Config) -> Result<()> {
         .await;
     while let Some(task) = tasks.join_next().await {
         task.context("Client listener stopped unexpectedly")??;
+    }
+    if history_enabled {
+        let saved = store.snapshot(
+            &shared.runtime.lock().expect("runtime"),
+            shared.started_unix,
+            unix_now(),
+        );
+        if let Err(error) = tokio::task::spawn_blocking(move || store.save(&saved)).await? {
+            tracing::warn!(%error, "Final chart history checkpoint could not be saved");
+        }
     }
     result.context("Status server failed")
 }

@@ -80,8 +80,11 @@ tuning; it cannot change operating points or control arbitrary processes.
 Proof timings include native session startup, verification, scheduler gating and
 node send. The UI plots verified sent-proof events by independent chain, with
 recovery observations retained and capture gaps explicit. A send is not proof of
-node acceptance. History is bounded to 24 hours/86,400 observations and never
-crosses service owners. A stale gauge is not current productivity.
+node acceptance. History is bounded to 24 hours/86,400 observations, checkpointed
+atomically beside the config, and restored with explicit capture gaps. API
+responses still match the current service owner; restored records never populate
+current health, proof counters or hardware state. Node/network/chain-assignment
+changes reset the history context. A stale gauge is not current productivity.
 
 Tests use canonical C++ proof fixtures, generated TLS identities, local peers and
 owned fake processes. Presentation scenarios compile only in the test target.
