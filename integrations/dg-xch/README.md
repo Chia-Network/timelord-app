@@ -51,3 +51,22 @@ measurements are in `six-worker-trial.json`. The trial service is separate from
 the default reproducible build until an upstream revision can be pinned. The
 upstream repository currently provides read access to this account, so publishing
 the proposal requires a writable fork or help from an upstream maintainer.
+
+## Completed-proof path measurement
+
+`proof-path-trial.json` records the October 22 six-minute diagnostic capture with
+three boards, one engine per board, at the existing 1600 MHz / 1.0 V operating
+points. All 100 regular chain proofs were matched from native target observation
+through adapter verification; 44 node messages were matched separately. The
+normal six-worker overlap app and original configuration were restored afterward.
+No diagnostic instrumentation is included in the product source.
+
+The request median after target observation was 248 ms, but the 26 requests at
+the 61-checkpoint limit averaged 3.76 seconds, mostly queued behind checkpoint
+construction. The native planner searches queued checkpoints for reuse; completed
+checkpoints have already left that queue. The capture found 240 identical
+checkpoint segments recomputed after prior completion in the same native session.
+Completed-checkpoint reuse and a bounded checkpoint layout merit controlled tests
+before further startup micro-optimization. This is a latency profile, not a
+controlled IPS gain or long-term stability result; three node-state resyncs are
+recorded separately from zero ASIC recoveries and zero invalid proofs.
