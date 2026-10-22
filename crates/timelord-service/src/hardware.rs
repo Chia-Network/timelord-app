@@ -151,6 +151,13 @@ impl AutomaticOwner {
                 if line.len() > 512 {
                     bail!("Native control response too large");
                 }
+                if line.starts_with("TLERR ") {
+                    let parts: Vec<_> = line.trim_end().splitn(4, ' ').collect();
+                    if parts.len() != 4 || parts[1] != "1" || parts[2].parse::<u64>()? != sequence {
+                        bail!("Native control rejection does not match request");
+                    }
+                    bail!("Native control rejected request {sequence}: {}", parts[3]);
+                }
                 if !line.starts_with("TLACK ") {
                     continue;
                 }
@@ -250,7 +257,11 @@ impl AutomaticOwner {
             )?,
             Some(Action::Set(point, reason)) => {
                 let persist = !self.policy.in_trial();
-                let actual = self.change(point, 5).await?;
+                tracing::info!(board=%board.name, frequency_mhz=point.frequency_mhz, voltage_v=point.voltage_v, %reason, "Applying automatic setting");
+                let actual = self
+                    .change(point, 5)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{}: {error}", board.name))?;
                 self.policy.applied(actual, crate::unix_now(), reason);
                 // Save rollback limits/cooldown, never an outstanding experiment.
                 // Zero clean seconds keeps the resumed point explicitly provisional.
@@ -464,7 +475,7 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("tl-ack-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let binary = directory.join("fake-client");
-        std::fs::write(&binary,"#!/bin/sh\nwhile read command version id frequency voltage; do\n  if [ \"$id\" = 4 ]; then printf '%0600d' 0; continue; fi\n  if [ \"$id\" = 3 ]; then id=999; fi\n  printf 'TLACK 1 %s %s %s\\n' \"$id\" \"$frequency\" \"$voltage\"\ndone\n").unwrap();
+        std::fs::write(&binary,"#!/bin/sh\nwhile read command version id frequency voltage; do\n  if [ \"$id\" = 4 ]; then printf '%0600d\\n' 0; continue; fi\n  if [ \"$id\" = 3 ]; then id=999; fi\n  if [ \"$id\" = 5 ]; then printf 'TLERR 1 5 readback frequency=0.000000\\n'; continue; fi\n  printf 'TLACK 1 %s %s %s\\n' \"$id\" \"$frequency\" \"$voltage\"\ndone\n").unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut config:Config=toml::from_str("[[hardware.boards]]\nid='a'\nname='A'\nclient_port=18110\ndevice_location=4113\nserial='a'\nprofile='automatic'").unwrap();
         config.hardware.client_binary = Some(binary.clone());
@@ -544,6 +555,20 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("too large")
+        );
+        assert!(
+            owner
+                .change(
+                    Point {
+                        frequency_mhz: 1490.,
+                        voltage_v: 1.
+                    },
+                    1
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("readback frequency=0.000000")
         );
         terminate(&mut child).await;
         std::fs::remove_dir_all(directory).unwrap();

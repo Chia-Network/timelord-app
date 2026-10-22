@@ -23,7 +23,7 @@ template<class Read, class Voltage, class Frequency, class Pause>
 Point apply(Point target, Read read, Voltage voltage, Frequency frequency, Pause pause) {
     if (!valid(target)) throw std::runtime_error("limits");
     Point old = read();
-    if (!valid(old)) throw std::runtime_error("initial_readback");
+    if (!valid(old)) throw std::runtime_error("initial_readback frequency=" + std::to_string(old.frequency) + " voltage=" + std::to_string(old.voltage));
     pause(false);
     if (target.voltage > old.voltage) voltage(target.voltage);
     frequency(target.frequency);
@@ -31,7 +31,7 @@ Point apply(Point target, Read read, Voltage voltage, Frequency frequency, Pause
     const Point actual = read();
     if (!valid(actual) || std::abs(actual.frequency - target.frequency) > 1.
         || std::abs(actual.voltage - target.voltage) > .0063)
-        throw std::runtime_error("readback");
+        throw std::runtime_error("readback frequency=" + std::to_string(actual.frequency) + " voltage=" + std::to_string(actual.voltage) + " requested_frequency=" + std::to_string(target.frequency) + " requested_voltage=" + std::to_string(target.voltage));
     pause(true);
     return actual;
 }
@@ -78,6 +78,15 @@ public:
             char response[128];
             const int size = snprintf(response,sizeof(response),"TLACK 1 %llu %.6f %.6f\n",id,actual.frequency,actual.voltage);
             return size > 0 && write(output,response,static_cast<size_t>(size)) == size;
+        } catch (const std::exception &error) {
+            // Carry the operation failure over the control pipe before closing it.
+            // The coordinator may be awaiting this reply and unable to drain stderr.
+            char response[512];
+            const int size = snprintf(response,sizeof(response),"TLERR 1 %llu %.400s\n",id,error.what());
+            if (size > 0 && static_cast<size_t>(size) < sizeof(response))
+                (void)write(output,response,static_cast<size_t>(size));
+            fprintf(stderr,"Live control rejected request %llu: %s\n",id,error.what());
+            return false;
         } catch (...) { return false; }
     }
 };

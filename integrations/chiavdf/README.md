@@ -20,7 +20,10 @@ patch/header hashes, native binary hash and staged source hashes. The final
 The integration adds an inherited-pipe command channel to the existing native
 client. `TLSET 1 ID MHz V\n` is applied on its USB owner thread, quiescing active
 engines, ordering voltage/clock writes, checking readback and resuming those
-engines. `TLACK 1 ID MHz V\n` confirms actual settings. IDs increase and frames
+engines. `TLACK 1 ID MHz V\n` confirms actual settings.
+A rejected hardware operation returns bounded `TLERR 1 ID reason\n` before the
+client stops, preserving the native failure even while the coordinator awaits
+its control reply. IDs increase and frames
 are bounded. Live commands accept 200–1600 MHz / requested 0.7–1.0 V. A 55°C
 pre-write guard supplements the coordinator's sampled guard. Failed commands,
 readback mismatch or controller EOF quiesce engines and terminate the child.

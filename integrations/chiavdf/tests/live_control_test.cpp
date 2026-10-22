@@ -54,5 +54,12 @@ int main() {
     const char* request="TLSET 1 1 1450 1\n";assert(write(in[1],request,strlen(request))>0);
     assert(!lost.poll([](Point p){return p;}));
     for(int fd:{in[0],in[1],out[1]})close(fd);
+    // Preserve the native failure while still rejecting the command and stopping.
+    assert(!pipe(in)&&!pipe(out));Channel rejected(in[0],out[1]);assert(rejected.start());
+    assert(write(in[1],request,strlen(request))>0);
+    assert(!rejected.poll([](Point)->Point{throw std::runtime_error("pll_write");}));
+    char reason[128]{};const auto size=::read(out[0],reason,sizeof(reason)-1);assert(size>0);
+    assert(std::string(reason,static_cast<size_t>(size))=="TLERR 1 1 pll_write\n");
+    for(int fd:{in[0],in[1],out[0],out[1]})close(fd);
     puts("native live-control fixtures passed (no USB)");
 }
