@@ -1,0 +1,76 @@
+{
+  "upstream_base": "ca437be562cec5f0514f6edd4c794adfe382dd8a",
+  "patch": "six-worker-discriminant.patch",
+  "worker_count": 6,
+  "shared_across_chains": true,
+  "normal_build_applies_patch": false,
+  "sha_backend": "RustCrypto sha2/asm, aarch64 only, existing fallback",
+  "replay": {
+    "serial_us": {
+      "median_ms": 8.8665,
+      "mean_ms": 11.9123125
+    },
+    "parallel_us": {
+      "median_ms": 3.0915,
+      "mean_ms": 3.7890143229166666
+    },
+    "samples": 768,
+    "mismatches": 0
+  },
+  "tests": {
+    "out_of_order_earlier_winner": "passed",
+    "sizes_seed_widths_counter_carry": "passed",
+    "app_workspace": "passed",
+    "upstream_clippy": "passed"
+  },
+  "trial_service_sha256": "d05986510515f10e97a1e41ad8f400990861e686a0c825e4dc4ee0a87f4ea146",
+  "raw_evidence_local": "/private/tmp/timelord-six-worker-prime-20261022",
+  "raw_evidence_remote": "/Users/cameron/timelord-six-worker-prime-20261022",
+  "live_initial": {
+    "elapsed_seconds": 129.31778407096863,
+    "service_pid": 98306,
+    "state": "running",
+    "proofs": 30,
+    "failed_proofs": 0,
+    "searches": {
+      "Challenge": {
+        "n": 8,
+        "median_ms": 0.017,
+        "max_ms": 19.893
+      },
+      "Reward": {
+        "n": 8,
+        "median_ms": 3.5265,
+        "max_ms": 7.752
+      },
+      "InfusedChallenge": {
+        "n": 8,
+        "median_ms": 0.0175,
+        "max_ms": 2.463
+      }
+    },
+    "boards": [
+      {
+        "name": "ASIC 1",
+        "recoveries": 0,
+        "temperature_c": 42.12,
+        "frequency_mhz": 1600.0
+      },
+      {
+        "name": "ASIC 2",
+        "recoveries": 0,
+        "temperature_c": 41.02,
+        "frequency_mhz": 1600.0
+      },
+      {
+        "name": "ASIC 3",
+        "recoveries": 0,
+        "temperature_c": 38.79,
+        "frequency_mhz": 1580.0
+      }
+    ]
+  },
+  "production_trial_active": true,
+  "automatic_tuning_enabled": true,
+  "comparison_limit": "Initial live samples are different challenges from the earlier baseline; no controlled live IPS improvement is claimed."
+}

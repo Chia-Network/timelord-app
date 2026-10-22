@@ -1,0 +1,139 @@
+--- a/vdf/Cargo.toml
++++ b/vdf/Cargo.toml
+@@ -18,6 +18,10 @@
+ # builds unless `force-cross` is set. Feature-only, inert natively.
+ gmp-mpfr-sys = { version = "1.7.1", default-features = false, features = ["force-cross"] }
+ sha2 = "0.10.9"
++rayon = "1.11"
++
++[target.'cfg(target_arch = "aarch64")'.dependencies]
++sha2 = { version = "0.10.9", features = ["asm"] }
+ 
+ [dev-dependencies]
+ hex = "0.4.3"
+--- a/vdf/src/discriminant.rs
++++ b/vdf/src/discriminant.rs
+@@ -46,9 +46,76 @@
+     }
+ 
+     let prime = discriminant_memo().get_or_init((seed.to_vec(), size_bits), || {
+-        hash_prime(seed, size_bits, &[0, 1, 2, size_bits - 1])
++        parallel_discriminant_prime(seed, size_bits)
+     });
+     Ok(-prime.get().expect("discriminant initialized"))
++}
++
++// One shared pool bounds CPU use across concurrent challenge searches. The memo above
++// still coalesces identical challenges; proof-form (264-bit) searches remain serial.
++pub(crate) fn parallel_discriminant_prime(seed: &[u8], size_bits: usize) -> BigInt {
++    use std::sync::OnceLock;
++    const WORKERS: usize = 6;
++    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
++    let pool = POOL.get_or_init(|| {
++        rayon::ThreadPoolBuilder::new()
++            .num_threads(WORKERS)
++            .thread_name(|n| format!("discriminant-{n}"))
++            .build()
++            .expect("create discriminant worker pool")
++    });
++    let chunks = (size_bits / 8).div_ceil(32);
++    first_passing_in_order(pool, |index| {
++        // Add modulo the seed width, exactly matching repeated byte increments.
++        let mut sprout = seed.to_vec();
++        let mut carry = u128::from(index) * chunks as u128;
++        for byte in sprout.iter_mut().rev() {
++            carry += u128::from(*byte);
++            *byte = carry as u8;
++            carry >>= 8;
++        }
++        let mut bytes = Vec::with_capacity(size_bits / 8);
++        for _ in 0..chunks {
++            increment_big_endian(&mut sprout);
++            let hash = Sha256::digest(&sprout);
++            let count = (size_bits / 8 - bytes.len()).min(hash.len());
++            bytes.extend_from_slice(&hash[..count]);
++        }
++        let mut n = BigUint::from_bytes_be(&bytes);
++        for bit in [0, 1, 2, size_bits - 1] {
++            n.set_bit(bit as u64, true);
++        }
++        is_probable_prime(&n).then(|| BigInt::from_biguint(Sign::Plus, n))
++    })
++}
++
++fn first_passing_in_order<T: Send>(
++    pool: &rayon::ThreadPool,
++    test: impl Fn(u64) -> Option<T> + Sync,
++) -> T {
++    use rayon::prelude::*;
++    use std::sync::atomic::{AtomicU64, Ordering};
++    let next = AtomicU64::new(0);
++    let best = AtomicU64::new(u64::MAX);
++    pool.install(|| {
++        (0..pool.current_num_threads())
++            .into_par_iter()
++            .filter_map(|_| {
++                loop {
++                    let index = next.fetch_add(1, Ordering::Relaxed);
++                    if index >= best.load(Ordering::Relaxed) {
++                        return None;
++                    }
++                    if let Some(value) = test(index) {
++                        best.fetch_min(index, Ordering::Relaxed);
++                        return Some((index, value));
++                    }
++                }
++            })
++            .min_by_key(|(index, _)| *index)
++            .expect("passing discriminant candidate")
++            .1
++    })
+ }
+ 
+ pub(crate) fn hash_prime(seed: &[u8], size_bits: usize, bitmask: &[usize]) -> BigInt {
+@@ -443,3 +510,45 @@
+ #[cfg(test)]
+ #[path = "../tests/unit/discriminant/cache_tests.rs"]
+ mod cache_tests;
++
++#[cfg(test)]
++mod parallel_search_tests {
++    use super::*;
++
++    #[test]
++    fn slower_earlier_winner_beats_fast_later_winner() {
++        let pool = rayon::ThreadPoolBuilder::new()
++            .num_threads(6)
++            .build()
++            .unwrap();
++        for _ in 0..16 {
++            let found = first_passing_in_order(&pool, |index| {
++                if index == 1 {
++                    std::thread::sleep(std::time::Duration::from_millis(10));
++                }
++                (index == 1 || index == 4).then_some(index)
++            });
++            assert_eq!(found, 1);
++        }
++    }
++
++    #[test]
++    fn parallel_matches_serial_for_sizes_seed_widths_and_counter_carry() {
++        let mut seeds = vec![vec![0], vec![255], vec![255; 32], vec![0; 32]];
++        for i in 0u64..64 {
++            seeds.push(Sha256::digest(i.to_be_bytes()).to_vec());
++        }
++        for bits in [16, 264, 512, 1024] {
++            for seed in &seeds {
++                if seed.len() == 1 && bits > 16 {
++                    continue;
++                }
++                assert_eq!(
++                    parallel_discriminant_prime(seed, bits),
++                    hash_prime(seed, bits, &[0, 1, 2, bits - 1]),
++                    "bits={bits} seed={seed:?}"
++                );
++            }
++        }
++    }
++}
