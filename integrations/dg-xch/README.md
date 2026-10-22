@@ -83,3 +83,9 @@ objects and accounts for available proof-worker parallelism when choosing a
 prefix. The app's normal native pin and integration patch are unchanged. The
 original app/configuration were restored after both live captures; sustained
 paired IPS measurement and long-chain coarsening remain follow-up work.
+
+The subsequent user-requested deployment is recorded in `pr450-deployment.json`.
+The M6 now runs the clean PR #450 native client with the unchanged startup service
+(hardware SHA, six workers and preparation/retirement overlap), retained GMP/FTDI
+libraries and the existing 1600 MHz / 1.0 V board points. This is an explicit
+runtime development build; the normal repository dependency pin is unchanged.
