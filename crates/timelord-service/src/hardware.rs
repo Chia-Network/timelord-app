@@ -91,7 +91,12 @@ impl AutomaticOwner {
         let host = automatic::host();
         let point = automatic::initial(&shared.config, board, engines, &hash, &host)?;
         let mut owner = Self {
-            policy: Policy::new(board.automatic.clone(), point, crate::unix_now()),
+            policy: Policy::new(
+                board.automatic.clone(),
+                point,
+                crate::unix_now(),
+                supported_frequencies(&shared.config).await?,
+            ),
             input: child.stdin.take().context("Native control input missing")?,
             output: BufReader::new(
                 child
@@ -368,6 +373,39 @@ async fn supervise(
     }
     result
 }
+async fn supported_frequencies(config: &Config) -> Result<Vec<f64>> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(3),
+        Command::new(
+            config
+                .hardware
+                .client_binary
+                .as_ref()
+                .context("Choose a native client")?,
+        )
+        .arg("--control-frequencies")
+        .kill_on_drop(true)
+        .output(),
+    )
+    .await
+    .context("Native frequency capability check timed out")??;
+    if !output.status.success() || output.stdout.len() > 2048 {
+        bail!("Native client could not report supported Automatic frequencies");
+    }
+    let frequencies: Vec<f64> = serde_json::from_slice(&output.stdout)
+        .context("Native client needs the bundled supported-frequency capability")?;
+    if frequencies.is_empty()
+        || frequencies.len() > 141
+        || frequencies
+            .iter()
+            .any(|f| !f.is_finite() || !(200. ..=1600.).contains(f))
+        || frequencies.windows(2).any(|f| f[0] >= f[1])
+    {
+        bail!("Native client reported invalid supported frequencies");
+    }
+    Ok(frequencies)
+}
+
 pub async fn validate_automatic(config: &Config) -> Result<()> {
     if !config
         .hardware
@@ -396,6 +434,7 @@ pub async fn validate_automatic(config: &Config) -> Result<()> {
             "Automatic mode needs the bundled live-control native client. Select it in board settings, or use Manual settings."
         );
     }
+    let frequencies = supported_frequencies(config).await?;
     let hash = automatic::fingerprint(config)?;
     let host = automatic::host();
     for board in &config.hardware.boards {
@@ -406,7 +445,7 @@ pub async fn validate_automatic(config: &Config) -> Result<()> {
                     board.name
                 );
             }
-            automatic::initial(
+            let point = automatic::initial(
                 config,
                 board,
                 config
@@ -418,6 +457,16 @@ pub async fn validate_automatic(config: &Config) -> Result<()> {
                 &hash,
                 &host,
             )?;
+            if !frequencies
+                .iter()
+                .any(|f| (*f - point.frequency_mhz).abs() <= 1.)
+            {
+                bail!(
+                    "{}: Initial Automatic frequency {} MHz is not supported by this native client",
+                    board.name,
+                    point.frequency_mhz
+                );
+            }
         }
     }
     Ok(())
@@ -475,7 +524,7 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("tl-ack-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let binary = directory.join("fake-client");
-        std::fs::write(&binary,"#!/bin/sh\nwhile read command version id frequency voltage; do\n  if [ \"$id\" = 4 ]; then printf '%0600d\\n' 0; continue; fi\n  if [ \"$id\" = 3 ]; then id=999; fi\n  if [ \"$id\" = 5 ]; then printf 'TLERR 1 5 readback frequency=0.000000\\n'; continue; fi\n  printf 'TLACK 1 %s %s %s\\n' \"$id\" \"$frequency\" \"$voltage\"\ndone\n").unwrap();
+        std::fs::write(&binary,"#!/bin/sh\nif [ \"$1\" = --control-frequencies ]; then echo '[1450,1460,1470,1480,1490]'; exit 0; fi\nwhile read command version id frequency voltage; do\n  if [ \"$id\" = 4 ]; then printf '%0600d\\n' 0; continue; fi\n  if [ \"$id\" = 3 ]; then id=999; fi\n  if [ \"$id\" = 5 ]; then printf 'TLERR 1 5 readback frequency=0.000000\\n'; continue; fi\n  printf 'TLACK 1 %s %s %s\\n' \"$id\" \"$frequency\" \"$voltage\"\ndone\n").unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut config:Config=toml::from_str("[[hardware.boards]]\nid='a'\nname='A'\nclient_port=18110\ndevice_location=4113\nserial='a'\nprofile='automatic'").unwrap();
         config.hardware.client_binary = Some(binary.clone());

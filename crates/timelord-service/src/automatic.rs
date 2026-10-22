@@ -75,9 +75,10 @@ pub struct Policy {
     ceiling: f64,
     voltage_rejected: bool,
     was_paused: bool,
+    frequencies: Vec<f64>,
 }
 impl Policy {
-    pub fn new(settings: AutomaticConfig, point: Point, now: u64) -> Self {
+    pub fn new(settings: AutomaticConfig, point: Point, now: u64, frequencies: Vec<f64>) -> Self {
         Self {
             ceiling: settings.max_frequency_mhz,
             settings,
@@ -91,6 +92,7 @@ impl Policy {
             frequency_active: 0,
             voltage_rejected: false,
             was_paused: false,
+            frequencies,
             status: Status {
                 state: "learning".into(),
                 message: "Observing verified live proofs".into(),
@@ -185,8 +187,25 @@ impl Policy {
             } else {
                 self.ceiling = self.point.frequency_mhz - 10.;
                 Point {
-                    frequency_mhz: (self.point.frequency_mhz - 20.)
-                        .max(self.settings.min_frequency_mhz),
+                    frequency_mhz: self
+                        .frequencies
+                        .iter()
+                        .copied()
+                        .rev()
+                        .find(|&f| {
+                            f <= self.point.frequency_mhz - 20.
+                                && f >= self.settings.min_frequency_mhz
+                        })
+                        .unwrap_or_else(|| {
+                            self.frequencies
+                                .iter()
+                                .copied()
+                                .find(|&f| {
+                                    f >= self.settings.min_frequency_mhz
+                                        && f < self.point.frequency_mhz
+                                })
+                                .unwrap_or(self.point.frequency_mhz)
+                        }),
                     voltage_v: self.point.voltage_v,
                 }
             };
@@ -269,16 +288,21 @@ impl Policy {
             self.status.state = "monitoring".into();
             return None;
         }
-        if self.point.frequency_mhz + 10. <= self.ceiling {
+        if let Some(frequency_mhz) = self
+            .frequencies
+            .iter()
+            .copied()
+            .find(|&f| f >= self.point.frequency_mhz + 10. - 0.000001 && f <= self.ceiling)
+        {
             self.baseline = Some(score);
             self.best = self.point;
             self.trial = Some(Trial::Frequency);
             return Some(Action::Set(
                 Point {
-                    frequency_mhz: self.point.frequency_mhz + 10.,
+                    frequency_mhz,
                     ..self.point
                 },
-                "Testing a 10 MHz increase".into(),
+                format!("Testing supported frequency {frequency_mhz:.0} MHz"),
             ));
         }
         self.status.state = "monitoring".into();
@@ -464,6 +488,9 @@ pub fn socket_path(config_path: &Path, config: &Config) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn frequencies() -> Vec<f64> {
+        (20..=160).map(|i| f64::from(i) * 10.).collect()
+    }
     fn settings() -> AutomaticConfig {
         AutomaticConfig {
             healthy_seconds: 30,
@@ -490,8 +517,59 @@ mod tests {
                 voltage_v: 1.,
             },
             0,
+            frequencies(),
         )
     }
+    #[test]
+    fn sparse_pll_steps_skip_unsupported_requests_and_respect_soft_ceiling() {
+        let point = Point {
+            frequency_mhz: 1500.,
+            voltage_v: 1.,
+        };
+        let supported = vec![1480., 1490., 1500., 1520., 1540.];
+        let mut p = Policy::new(settings(), point, 0, supported.clone());
+        let mut next = None;
+        for now in 1..=40 {
+            if let Some(Action::Set(target, _)) = p.observe(now, input()) {
+                next = Some(target);
+                break;
+            }
+        }
+        assert_eq!(next.unwrap().frequency_mhz, 1520.);
+        p.applied(next.unwrap(), 41, "trial".into());
+        let mut recovery = input();
+        recovery.recoveries = 1;
+        let Some(Action::Set(rollback, _)) = p.observe(42, recovery) else {
+            panic!("missing rollback")
+        };
+        assert_eq!(rollback.frequency_mhz, 1500.);
+        let mut config = settings();
+        config.max_frequency_mhz = 1510.;
+        config.voltage_after_seconds = 1000;
+        let mut limited = Policy::new(config, point, 0, supported.clone());
+        for now in 1..=100 {
+            assert!(!matches!(
+                limited.observe(now, input()),
+                Some(Action::Set(..))
+            ));
+        }
+        let mut backoff = Policy::new(
+            settings(),
+            Point {
+                frequency_mhz: 1540.,
+                voltage_v: 1.,
+            },
+            0,
+            supported,
+        );
+        let mut recovery = input();
+        recovery.recoveries = 1;
+        let Some(Action::Set(target, _)) = backoff.observe(1, recovery) else {
+            panic!("missing backoff")
+        };
+        assert_eq!(target.frequency_mhz, 1520.);
+    }
+
     #[test]
     fn idle_and_unattributed_proofs_cannot_promote_a_setting() {
         let mut p = policy();
@@ -558,6 +636,7 @@ mod tests {
                 voltage_v: 0.95,
             },
             0,
+            frequencies(),
         );
         let mut failure = input();
         failure.recoveries = 1;
@@ -614,7 +693,7 @@ mod tests {
     fn voltage_trials_restore_voltage_and_pause_discards_trial_evidence() {
         let mut s = settings();
         s.max_frequency_mhz = 1450.;
-        let mut p = Policy::new(s, policy().point, 0);
+        let mut p = Policy::new(s, policy().point, 0, frequencies());
         for now in (5..=60).step_by(5) {
             if let Some(Action::Set(point, reason)) = p.observe(now, input()) {
                 assert_eq!(point.voltage_v, 0.99375);
@@ -754,7 +833,7 @@ mod tests {
             1520.
         );
         let entry = learned(&config, &board, 3, "hash", "mac").unwrap().unwrap();
-        let mut restored = Policy::new(board.automatic.clone(), entry.point, 0);
+        let mut restored = Policy::new(board.automatic.clone(), entry.point, 0, frequencies());
         restored.restore(&entry);
         assert_eq!(restored.learned_limits(), (1520., 30, true));
         for (engines, hash, host) in [

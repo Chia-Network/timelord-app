@@ -4,6 +4,12 @@
 #include <vector>
 using namespace timelord_control;
 int main() {
+    // Sparse high-clock PLL entries must not be advertised as exact 10 MHz steps.
+    struct Entry { double freq; };
+    const Entry pll[]={{1490.},{1500.},{1511.111111},{1520.},{1525.},{1533.333333},{1540.},{1560.},{1566.666667},{1571.428571},{1580.},{1600.}};
+    assert(pll[frequency_index(1510.,pll,12)].freq==1500.);
+    for(double f:{1510.,1530.,1570.,1590.}) assert(!supported_frequency(f,pll,12));
+    for(double f:{1500.,1520.,1540.,1560.,1580.,1600.}) assert(supported_frequency(f,pll,12));
     // An idle infused-chain board must keep reporting temperature even when
     // its iteration counter never reaches the usual active polling interval.
     using Poll = timelord_telemetry::Poll;

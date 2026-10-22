@@ -27,6 +27,10 @@ its control reply. IDs increase and frames
 are bounded. Live commands accept 200–1600 MHz / requested 0.7–1.0 V. A 55°C
 pre-write guard supplements the coordinator's sampled guard. Failed commands,
 readback mismatch or controller EOF quiesce engines and terminate the child.
+`--control-frequencies` reports eligible 10 MHz-grid requests directly from the
+pinned PLL table, before USB initialization. Automatic tuning chooses from that
+list for trials and backoff; unsupported gaps such as 1510 MHz are skipped.
+Readback tolerance remains 1 MHz and configured ceilings still apply.
 This mode excludes the upstream client's independent auto-frequency loop.
 
 Temperature sampling continues when no engine has work, including idle infused

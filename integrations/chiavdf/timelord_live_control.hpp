@@ -18,6 +18,27 @@ inline bool valid(Point p) {
     return std::isfinite(p.frequency) && std::isfinite(p.voltage)
         && p.frequency >= 200 && p.frequency <= 1600 && p.voltage >= .7 && p.voltage <= 1.;
 }
+// Return the same floor entry used for live PLL writes.
+template<class Entry>
+size_t frequency_index(double target, const Entry *entries, size_t count) {
+    size_t index = 0;
+    while (index + 1 < count && entries[index + 1].freq <= target) ++index;
+    return index;
+}
+template<class Entry>
+bool supported_frequency(double target, const Entry *entries, size_t count) {
+    return count && std::abs(entries[frequency_index(target,entries,count)].freq - target) <= 1.;
+}
+template<class Entry>
+void print_frequencies(const Entry *entries, size_t count) {
+    bool first = true;
+    fputs("[",stdout);
+    for (int f = 200; f <= 1600; f += 10) {
+        if (!supported_frequency(f,entries,count)) continue;
+        printf("%s%d",first?"":",",f); first = false;
+    }
+    puts("]");
+}
 // The caller must leave engines paused on any exception and terminate the client.
 template<class Read, class Voltage, class Frequency, class Pause>
 Point apply(Point target, Read read, Voltage voltage, Frequency frequency, Pause pause) {
