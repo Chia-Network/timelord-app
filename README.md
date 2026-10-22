@@ -89,9 +89,9 @@ are smoke-tested without a node or USB board. It is not a notarized release. CI 
 
 Security checks run CodeQL and a Cargo vulnerability audit on pull requests,
 `main`, and weekly. Dependabot proposes weekly Cargo and GitHub Actions updates.
-The audit currently reports the existing upstream `rsa` dependency advisory
-[RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071/), for which no
-fixed version is available. This check reports the finding without suppressing it.
+The audit has one reviewed exception for the upstream `rsa` dependency advisory
+[RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071/): the app does
+not use its affected operations. The rationale is recorded in `.cargo/audit.toml`.
 Require **macOS checks** and **Apple Silicon app bundle** in the repository's
 branch rules when CI is verified. CodeQL needs `actions: read` to inspect workflow
 runs in this private repository. Hardware benchmarks remain separate.

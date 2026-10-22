@@ -19,9 +19,7 @@ Hardware acceptance and testing on the oldest supported macOS remain separate.
 
 ## One-time repository setup
 
-Create a GitHub Actions environment named `release`. Restrict deployments to
-release tags (`v*`), and configure its required reviewers according to the team's
-release policy. Configure these environment secrets, using the same names as
+Grant this repository access to the following organization secrets, using the same names as
 [chia-blockchain's macOS workflow](https://github.com/Chia-Network/chia-blockchain/blob/main/.github/workflows/build-macos-installers.yml):
 
 | Secret | Value |
@@ -32,8 +30,9 @@ release policy. Configure these environment secrets, using the same names as
 | `APPLE_NOTARIZE_USERNAME` | Apple account used for notarization |
 | `APPLE_NOTARIZE_PASSWORD` | Its app-specific password |
 
-An organization secret can be used instead if this repository has access. Do not
-commit certificates, private keys or account passwords. The pinned Apple signing
+No GitHub Actions environment or environment approval is required. Repository
+secrets can also supply these values. Do not commit certificates, private keys
+or account passwords. The pinned Apple signing
 action imports the certificate into a temporary keychain and removes it in its
 post-job cleanup. Exactly one imported Developer ID Application identity must
 match the team. Standard jobs have read-only repository permissions; only the
@@ -55,7 +54,7 @@ the certificate must permit Developer ID distribution and notarization.
    version, branch ref, unsupported suffix or malformed tag is rejected before
    signing. To rerun manually, dispatch **Release** against that existing tag:
    `gh workflow run release.yml --ref v0.1.0`.
-4. After CI succeeds, approve the `release` environment if it requires approval.
+4. After CI succeeds, signing and notarization run automatically and create a draft.
 5. Review and publish the resulting draft in GitHub Releases. Beta/RC tags create
    prerelease drafts. The workflow never publishes a release automatically.
 
@@ -90,9 +89,9 @@ The draft contains:
 A retry can replace assets on an existing draft. It refuses to modify a published
 release. Move no existing release tags; use a new version for different source.
 Notarization failures retain their submission JSON in a diagnostic Actions
-artifact, and do not create a draft release. Cargo audit remains a separate Security check and continues to report the
-existing upstream advisory. Successful signing does not resolve that finding;
-release reviewers must consider its current status.
+artifact, and do not create a draft release. Cargo audit remains a separate
+Security check. Its reviewed upstream RSA advisory exception is documented in
+`.cargo/audit.toml`; signing does not remove that dependency.
 
 ## Local packaging check
 

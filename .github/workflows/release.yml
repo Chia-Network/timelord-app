@@ -42,7 +42,6 @@ jobs:
     needs: [version, checks]
     runs-on: macos-26
     timeout-minutes: 60
-    environment: release
     permissions:
       contents: read
       actions: read
@@ -61,7 +60,7 @@ jobs:
           APPLE_DEV_ID_APP: ${{ secrets.APPLE_DEV_ID_APP }}
           APPLE_DEV_ID_APP_PASS: ${{ secrets.APPLE_DEV_ID_APP_PASS }}
         run: |
-          : "${APPLE_DEV_ID_APP:?Configure APPLE_DEV_ID_APP in the release environment}"
+          : "${APPLE_DEV_ID_APP:?Grant this repository access to APPLE_DEV_ID_APP}"
           : "${APPLE_DEV_ID_APP_PASS:?Configure APPLE_DEV_ID_APP_PASS}"
           : "${APPLE_TEAM_ID:?Configure APPLE_TEAM_ID}"
           : "${APPLE_NOTARIZE_USERNAME:?Configure APPLE_NOTARIZE_USERNAME}"
