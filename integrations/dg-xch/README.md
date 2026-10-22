@@ -70,3 +70,16 @@ Completed-checkpoint reuse and a bounded checkpoint layout merit controlled test
 before further startup micro-optimization. This is a latency profile, not a
 controlled IPS gain or long-term stability result; three node-state resyncs are
 recorded separately from zero ASIC recoveries and zero invalid proofs.
+
+`optimization-status.json` keeps startup and completed-proof work as separate
+tracks. Hardware SHA, the six-worker discriminant trial and preparation/retirement
+overlap remain retained. Startup measurements remain open; live challenge sets
+vary, so changes in their medians require a controlled replay before attribution.
+
+The checkpoint-reuse proposal is isolated in
+[chiavdf PR #450](https://github.com/Chia-Network/chiavdf/pull/450), with controlled
+M6 and live validation in `checkpoint-reuse-trial.json`. It reuses owned checkpoint
+objects and accounts for available proof-worker parallelism when choosing a
+prefix. The app's normal native pin and integration patch are unchanged. The
+original app/configuration were restored after both live captures; sustained
+paired IPS measurement and long-chain coarsening remain follow-up work.
