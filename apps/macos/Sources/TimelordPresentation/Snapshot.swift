@@ -86,6 +86,12 @@ public struct AppSnapshot: Sendable {
               history.hasFreshValue(at: now) else { return "—" }
         return DisplayFormat.ips(history.statistics(in: HistoryRange.hour.interval(endingAt: now)).average)
     }
+    /// Board tiles respond to tuning changes while smoothing individual proof variation.
+    /// Use the same 30-second gauge samples as the headline, over a shorter window.
+    public func recentSpeed(for history: ChainHistory) -> String {
+        guard phase == .running, history.hasFreshValue(at: now) else { return "—" }
+        return DisplayFormat.ips(history.statistics(in: DateInterval(start: now.addingTimeInterval(-300), end: now)).average)
+    }
     public var latestProof: Date? { boards.compactMap(\.lastProof).max() }
     public var proofFreshness: String {
         guard let latestProof else { return "Waiting for the first verified proof" }

@@ -41,8 +41,8 @@ Automatic tuning status. The headline IPS is the last-hour arithmetic mean of
 `chia_timelord_estimated_ips` gauge semantics. Each output uses cumulative iterations
 divided by elapsed time from client assignment to proof receipt (before verification
 and node submission), truncated to one decimal place. Only validated proofs update
-the gauge; internal one-iteration primers do not. Board charts use the same samples
-for their individual chains. Independent chain speeds are never added together.
+the gauge; internal one-iteration primers do not. Board tiles show five-minute means for their individual chains, alongside one-hour
+charts using the same samples. Independent chain speeds are never added together.
 
 Slow recovery samples remain included. Values at least 90 seconds old, known work
 interruptions and missing capture are omitted rather than held as current speed or
@@ -51,6 +51,8 @@ scrape alignment and availability for exact comparisons. A successful send does 
 establish that the node used the proof. Existing delivery-timing history is retained
 on disk but is not mixed into the new IPS charts. Automatic tuning continues using
 its separate delivered-proof timings, including verification and submission delays.
+The native clients retain recent ASIC values for off-grid proof endpoints
+(`--retain-asic-values`), matching the optimized benchmark configuration.
 
 ## Build
 

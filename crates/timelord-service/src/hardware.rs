@@ -32,6 +32,7 @@ pub fn arguments(board: &BoardConfig, engines: usize) -> Result<Vec<String>> {
         "4".into(),
         "--proof-threads".into(),
         "3".into(),
+        "--retain-asic-values".into(),
         "--checkpoint-threshold".into(),
         "250000".into(),
         "--freq".into(),
@@ -629,11 +630,13 @@ mod tests {
             toml::from_str("id='a'\nname='A'\nclient_port=18110\ndevice_location=1").unwrap();
         let automatic = arguments(&board, 3).unwrap();
         assert!(automatic.contains(&"--live-control".into()));
+        assert!(automatic.contains(&"--retain-asic-values".into()));
         assert!(automatic.windows(2).any(|w| w == ["--freq", "1450"]));
         board.profile = ProfileMode::Manual;
         board.frequency_mhz = 1540.;
         let manual = arguments(&board, 1).unwrap();
         assert!(!manual.contains(&"--live-control".into()));
+        assert!(manual.contains(&"--retain-asic-values".into()));
         assert!(manual.windows(2).any(|w| w == ["--freq", "1540"]));
         assert!(
             manual

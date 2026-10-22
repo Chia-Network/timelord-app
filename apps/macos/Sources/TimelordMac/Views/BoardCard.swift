@@ -19,19 +19,20 @@ struct BoardCard: View {
                         }
                         Text(board.state.title).font(.caption).foregroundStyle(.secondary)
                     }
+                    if !board.histories.isEmpty { Text("IPS · 5-minute averages").font(.caption2).foregroundStyle(.secondary) }
                     ForEach(board.histories) { history in
                         VStack(alignment: .leading, spacing: 6) {
                             HStack {
                                 Label(history.chain.title, systemImage: "circle.fill").font(.subheadline).foregroundStyle(history.chain.color)
                                 Spacer()
-                                Text(DisplayFormat.ips(history.hasFreshValue(at: snapshot.now) && snapshot.phase == .running ? history.statistics(in: HistoryRange.hour.interval(endingAt: snapshot.now)).average : nil)).font(.headline).monospacedDigit()
+                                Text(snapshot.recentSpeed(for: history)).font(.headline).monospacedDigit()
                             }
                             IPSHistoryChart(history: history, range: .hour, now: snapshot.now, upperBound: snapshot.chartUpperBound, compact: true)
                                 .frame(minHeight: 42, maxHeight: .infinity)
                         }
                     }
                     if board.histories.isEmpty { Text("No chains assigned").font(.callout).foregroundStyle(.secondary).frame(maxHeight: .infinity) }
-                    HStack { Text("1 hour ago"); Spacer(); Text("Last-hour averages · now") }.font(.caption2).foregroundStyle(.secondary)
+                    HStack { Text("1 hour ago"); Spacer(); Text("Now") }.font(.caption2).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }.buttonStyle(.plain)
                 .accessibilityHint("Show \(board.name) history, temperature and profile")

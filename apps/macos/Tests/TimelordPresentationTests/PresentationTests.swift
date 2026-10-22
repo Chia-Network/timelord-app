@@ -56,6 +56,23 @@ final class PresentationTests: XCTestCase {
         XCTAssertEqual(sameTime.sampledObservations(in: window).last?.ips, 400_000)
     }
 
+    func testBoardTileShowsRecentMeanWhileHeadlineKeepsHourlyMean() {
+        let end = Date(timeIntervalSince1970: 900_000)
+        let window = HistoryRange.hour.interval(endingAt: end)
+        let samples = (0...60).map { minute in
+            ProofObservation(date: window.start.addingTimeInterval(Double(minute) * 60), ips: minute < 55 ? 400_000 : 1_000_000)
+        }
+        let history = ChainHistory(chain: .challenge, samples: samples, captureIntervals: [window], events: [])
+        let board = BoardSnapshot(id: "a", name: "A", state: .active, temperatureC: nil, temperatureLimitC: 55, profile: "Manual", frequencyMHz: nil, voltageV: nil, histories: [history], lastProof: end)
+        func snapshot(_ now: Date, phase: AppPhase = .running) -> AppSnapshot {
+            AppSnapshot(phase: phase, explanation: "", node: ConnectionSnapshot(title: "", detail: "", tone: .positive), timelord: ConnectionSnapshot(title: "", detail: "", tone: .positive), boards: [board], proofsToday: 61, uptimeSeconds: 3600, now: now, serviceAvailable: true)
+        }
+        XCTAssertEqual(snapshot(end).recentSpeed(for: history), "1.000M")
+        XCTAssertEqual(snapshot(end).headlineSpeed, "455K")
+        XCTAssertEqual(snapshot(end.addingTimeInterval(90)).recentSpeed(for: history), "—")
+        XCTAssertEqual(snapshot(end, phase: .paused).recentSpeed(for: history), "—")
+    }
+
     func testNativeClientFaultShowsReasonWithoutClaimingServiceReady() throws {
         let view = LivePresentation.snapshot(status: try operationalStatus(state: "fault", message: "Native control closed before acknowledgement"), now: now)
         XCTAssertEqual(view.phase, .serviceUnavailable)
