@@ -84,23 +84,51 @@ max_frequency_mhz = 1600
 min_voltage_v = 0.9
 healthy_seconds = 120
 cooldown_seconds = 900
-voltage_after_seconds = 3600
+recovery_window_seconds = 300
+recovery_loss_percent = 5.0
+recovery_bad_windows = 2
 minimum_proofs_per_chain = 3
 ```
 
-The policy uses active verified work and fresh temperature readings, rather than
-elapsed idle time. It tests 10 MHz increases, retaining measured improvements;
-recoveries restore the previous observed trial setting or reduce the baseline by
-20 MHz. At lower voltage, a recovery can first restore requested 1.0 V. Frequency
-exploration respects thermal headroom and cooldown. Once frequency settles, it can
-test 6.25 mV reductions after an hour of active work. These are live heuristics,
-not a benchmark or a guarantee of long-term stability.
+The objective is delivered proof performance. Automatic never reduces voltage
+because a board is stable. It explores supported PLL settings within the configured
+frequency ceiling, holds otherwise stable trials even without a small measured
+IPS gain, and permits recoveries while their delivered IPS cost stays acceptable.
+There is no fixed recoveries-per-hour rejection limit.
+
+After at least `healthy_seconds` of active verified work and three qualifying
+proofs per assigned chain (configurable above), a setting can be retained. Idle
+time and stale telemetry do not advance that active-work timer. Recovery-related
+backoff requires delivered IPS more than `recovery_loss_percent` below the
+accepted baseline in `recovery_bad_windows` consecutive windows of
+`recovery_window_seconds` each. Every bad window must contain recoveries and
+sufficient fresh proof observations; slow recovery observations remain in the
+score. One good complete window resets the consecutive count. These defaults
+(two five-minute windows and a 5% drop) are provisional heuristics, not limits
+established by the earlier hardware experiments. Workload changes can affect IPS
+comparisons, so a correlated decline does not prove recoveries caused it.
+
+A qualifying recovery problem first raises lower voltage toward requested 1.0 V,
+or restores the previous trial frequency / backs off to a supported lower step.
+Protective backoff starts the configured cooldown before upward exploration
+resumes. Temperature within 1°C of the configured stop triggers frequency backoff;
+upward exploration pauses within 3°C. The hard temperature/missing-telemetry stops,
+failed-readback handling, and invalid-proof fault behavior remain enforced. At a
+performance floor the policy holds and reports the problem rather than repeatedly
+writing the same setting. Normal recoveries alone never stop proof production.
+
+The old `voltage_after_seconds` config key is accepted when reading existing
+configs, ignored, and omitted from newly saved configs. Voltage optimization has
+been removed from the policy and app settings model.
 
 Learned settings are bound to serial, engine count, Mac model and native binary
 SHA256. `automatic-profiles.json` is stored next to the config; override it with
-`hardware.automatic_state`. Confirmed rollback settings are saved with zero clean
-seconds; experimental increases are not saved. Pause tuning rolls back an ongoing
-trial, then holds the previous observed setting while production continues.
+`hardware.automatic_state`. Cache schema 2 removes voltage-search state. Existing
+schema-1 observed frequencies are retained; old zero-recovery ceilings/cooldowns
+are discarded and previously reduced voltage is raised to at least the configured
+starting voltage. Saves remain atomic and owner-only. Unconfirmed trial settings
+are not saved. Pause tuning holds the current operating point while production
+continues; resume starts a fresh observation period.
 
 ## CLI and endpoints
 

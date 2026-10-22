@@ -19,7 +19,10 @@ New boards use **Automatic** tuning, starting at 1450 MHz / requested 1.0 V or a
 learned setting for that board, engine count, Mac model and native client. Manual
 frequency and voltage settings remain available. Requested voltage is limited to
 1.0 V and the temperature stop to at most 55°C. **Pause tuning** holds the observed
-setting while proofs continue; **Pause** stops proof production.
+setting while proofs continue; **Pause** stops proof production. Automatic permits
+recoveries while delivered performance remains acceptable, holds stable voltage,
+and backs off for sustained recovery-related IPS loss or thermal pressure. The
+recovery evaluation thresholds are configurable in the [configuration guide](docs/configuration.md).
 
 Done saves settings. Changes to a running service use **Save & Restart**. Settings
 includes **Run Timelord when the app opens**, enabled by default. Pause holds until

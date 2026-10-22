@@ -69,7 +69,9 @@ public struct AutomaticConfiguration: Codable, Sendable, Equatable {
     public var minVoltageV = 0.9
     public var healthySeconds = 120
     public var cooldownSeconds = 900
-    public var voltageAfterSeconds = 3600
+    public var recoveryWindowSeconds = 300
+    public var recoveryLossPercent = 5.0
+    public var recoveryBadWindows = 2
     public var minimumProofsPerChain = 3
     public init() {}
 }

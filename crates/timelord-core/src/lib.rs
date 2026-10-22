@@ -147,7 +147,12 @@ pub struct AutomaticConfig {
     pub min_voltage_v: f64,
     pub healthy_seconds: u64,
     pub cooldown_seconds: u64,
+    /// Read existing configs without reviving the removed voltage search.
+    #[serde(skip_serializing)]
     pub voltage_after_seconds: u64,
+    pub recovery_window_seconds: u64,
+    pub recovery_loss_percent: f64,
+    pub recovery_bad_windows: u32,
     pub minimum_proofs_per_chain: usize,
 }
 impl Default for AutomaticConfig {
@@ -161,6 +166,9 @@ impl Default for AutomaticConfig {
             healthy_seconds: 120,
             cooldown_seconds: 900,
             voltage_after_seconds: 3600,
+            recovery_window_seconds: 300,
+            recovery_loss_percent: 5.,
+            recovery_bad_windows: 2,
             minimum_proofs_per_chain: 3,
         }
     }
@@ -179,7 +187,11 @@ impl AutomaticConfig {
             && self.contains(self.start_frequency_mhz, self.start_voltage_v)
             && self.healthy_seconds >= 30
             && self.cooldown_seconds >= self.healthy_seconds
-            && self.voltage_after_seconds >= self.cooldown_seconds
+            && self.recovery_window_seconds >= self.healthy_seconds
+            && self.recovery_window_seconds <= 3600
+            && self.recovery_loss_percent.is_finite()
+            && (0.1..=50.).contains(&self.recovery_loss_percent)
+            && (2..=12).contains(&self.recovery_bad_windows)
             && self.minimum_proofs_per_chain >= 3
     }
 }
@@ -364,6 +376,26 @@ mod tests {
             temperature_limit_c: default_temperature_limit(),
         }
     }
+    #[test]
+    fn old_voltage_search_key_is_read_only_and_recovery_limits_are_validated() {
+        let value: AutomaticConfig = toml::from_str("voltage_after_seconds=3600").unwrap();
+        assert!(value.validate());
+        assert!(
+            !toml::to_string(&value)
+                .unwrap()
+                .contains("voltage_after_seconds")
+        );
+        let mut invalid = value.clone();
+        invalid.recovery_loss_percent = f64::NAN;
+        assert!(!invalid.validate());
+        invalid = value.clone();
+        invalid.recovery_bad_windows = 1;
+        assert!(!invalid.validate());
+        invalid = value;
+        invalid.recovery_window_seconds = 30;
+        assert!(!invalid.validate());
+    }
+
     #[test]
     fn profiles_are_automatic_by_default_and_manual_is_explicit() {
         let mut b: BoardConfig = toml::from_str("id='a'\nname='A'\nclient_port=18110").unwrap();

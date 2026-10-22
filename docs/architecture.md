@@ -63,6 +63,10 @@ iteration checkpoints. Automatic policy decisions use proof observations whose
 work started after the new setting epoch and settling allowance. Every assigned
 chain must have enough observations; the score is the minimum independent-chain
 mean. Idle time, old in-flight work and missing temperature do not justify a raise.
+Recoveries are permitted. Only a sustained, configured loss of delivered IPS in
+consecutive recovery-containing windows triggers recovery backoff. The policy
+holds stable settings and performs no downward voltage search. The independent
+hard verification and hardware guards remain authoritative.
 
 The native client remains the sole USB owner. Its event loop applies bounded,
 sequenced commands through inherited pipes, pauses active engines, orders voltage

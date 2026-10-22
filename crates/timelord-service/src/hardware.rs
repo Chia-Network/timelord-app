@@ -209,7 +209,6 @@ impl AutomaticOwner {
                 updated_unix: crate::unix_now(),
                 ceiling_mhz: self.policy.learned_limits().0,
                 cooldown_seconds: self.policy.learned_limits().1,
-                voltage_rejected: self.policy.learned_limits().2,
             },
         )
     }
@@ -236,7 +235,9 @@ impl AutomaticOwner {
             let score = automatic::phase_score(
                 &state.observations,
                 &chains,
-                self.policy.epoch,
+                self.policy
+                    .epoch
+                    .max(now.saturating_sub(self.policy.settings.recovery_window_seconds)),
                 self.policy.settings.minimum_proofs_per_chain,
             );
             automatic::Input {
@@ -252,7 +253,6 @@ impl AutomaticOwner {
             }
         };
         match self.policy.observe(now, input) {
-            Some(Action::Stop(reason)) => bail!(reason),
             Some(Action::Save) => self.record(
                 shared,
                 self.policy
