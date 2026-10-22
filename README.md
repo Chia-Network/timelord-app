@@ -83,8 +83,9 @@ only in the test target; it is not part of the app.
 
 Pull requests and pushes to `main` run macOS formatting, lint, native fixtures,
 Rust/Swift tests, and an independent Apple Silicon developer app build. The build
-uploads a zipped, ad-hoc-signed app, its SHA256 and native source provenance for
-14 days. It is not a notarized release. CI never connects to a live node or ASIC.
+uploads a zipped, ad-hoc-signed app, a drag-to-Applications DMG, checksums and
+native source provenance for 14 days. The DMG is mounted and its bundled helpers
+are smoke-tested without a node or USB board. It is not a notarized release. CI never connects to a live node or ASIC.
 
 Security checks run CodeQL and a Cargo vulnerability audit on pull requests,
 `main`, and weekly. Dependabot proposes weekly Cargo and GitHub Actions updates.
@@ -92,8 +93,16 @@ The audit currently reports the existing upstream `rsa` dependency advisory
 [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071/), for which no
 fixed version is available. This check reports the finding without suppressing it.
 Require **macOS checks** and **Apple Silicon app bundle** in the repository's
-branch rules when CI is verified. Signing/notarized releases and hardware
-benchmarks are separate from these workflows.
+branch rules when CI is verified. CodeQL needs `actions: read` to inspect workflow
+runs in this private repository. Hardware benchmarks remain separate.
+
+## Releases
+
+Version tags run the same CI jobs, then sign and notarize an Apple Silicon DMG
+and upload it to a **draft** GitHub release. No release credentials are used in
+pull requests. Releases fail if credentials or notarization are missing; they
+never fall back to developer signing. See [the release guide](docs/releases.md)
+for Apple credentials, version tags, download artifacts, and publishing.
 
 ## Development status
 

@@ -1,0 +1,163 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Validate release tag
+    if: github.repository == 'Chia-Network/timelord-app'
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require a matching version tag
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          test "$REF_TYPE" = tag
+          version="$(bash scripts/release-version.sh "$TAG")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  checks:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  sign:
+    name: Sign and notarize Apple Silicon DMG
+    needs: [version, checks]
+    runs-on: macos-26
+    timeout-minutes: 60
+    environment: release
+    permissions:
+      contents: read
+      actions: read
+    env:
+      RELEASE_VERSION: ${{ needs.version.outputs.version }}
+      SOURCE_REVISION: ${{ github.sha }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_NOTARIZE_USERNAME: ${{ secrets.APPLE_NOTARIZE_USERNAME }}
+      APPLE_NOTARIZE_PASSWORD: ${{ secrets.APPLE_NOTARIZE_PASSWORD }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require signing and notarization credentials
+        env:
+          APPLE_DEV_ID_APP: ${{ secrets.APPLE_DEV_ID_APP }}
+          APPLE_DEV_ID_APP_PASS: ${{ secrets.APPLE_DEV_ID_APP_PASS }}
+        run: |
+          : "${APPLE_DEV_ID_APP:?Configure APPLE_DEV_ID_APP in the release environment}"
+          : "${APPLE_DEV_ID_APP_PASS:?Configure APPLE_DEV_ID_APP_PASS}"
+          : "${APPLE_TEAM_ID:?Configure APPLE_TEAM_ID}"
+          : "${APPLE_NOTARIZE_USERNAME:?Configure APPLE_NOTARIZE_USERNAME}"
+          : "${APPLE_NOTARIZE_PASSWORD:?Configure APPLE_NOTARIZE_PASSWORD}"
+      - name: Download app built by this run's CI jobs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: Timelord-macos-arm64
+          path: build/input
+      - name: Verify and unpack app
+        run: |
+          cd build/input
+          # CI's checksum may include the build/ prefix; validate by basename.
+          expected="$(awk '{print $1}' Timelord-macos-arm64.zip.sha256)"
+          actual="$(shasum -a 256 Timelord-macos-arm64.zip | awk '{print $1}')"
+          test "$expected" = "$actual"
+          ditto -x -k Timelord-macos-arm64.zip ..
+      - name: Import Developer ID Application certificate
+        id: certificate
+        uses: Apple-Actions/import-codesign-certs@ecbd19dea13f98382982b6b0267f77080d1cfea3 # v7
+        with:
+          p12-file-base64: ${{ secrets.APPLE_DEV_ID_APP }}
+          p12-password: ${{ secrets.APPLE_DEV_ID_APP_PASS }}
+      - name: Sign app and build DMG
+        env:
+          IDENTITIES: ${{ steps.certificate.outputs.identities }}
+        run: |
+          SIGNING_IDENTITY="$(jq -er --arg team "($APPLE_TEAM_ID)" '
+            [.[] | select(.name | startswith("Developer ID Application:")) | select(.name | endswith($team))]
+            | if length == 1 then .[0].hash else error("Expected exactly one Developer ID Application identity for this team") end' <<< "$IDENTITIES")"
+          export SIGNING_IDENTITY
+          bash scripts/sign-macos.sh build/Timelord.app
+          bash scripts/package-macos.sh build/Timelord.app "build/Timelord-$RELEASE_VERSION-macos-arm64.dmg" "$RELEASE_VERSION"
+          codesign --sign "$SIGNING_IDENTITY" --timestamp "build/Timelord-$RELEASE_VERSION-macos-arm64.dmg"
+      - name: Notarize, staple, and assess disk image
+        run: |
+          dmg="build/Timelord-$RELEASE_VERSION-macos-arm64.dmg"
+          xcrun notarytool submit "$dmg" --wait --timeout 30m --output-format json \
+            --apple-id "$APPLE_NOTARIZE_USERNAME" --password "$APPLE_NOTARIZE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" > build/notarization.json
+          jq -e '.status == "Accepted"' build/notarization.json
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
+      - name: Record release provenance and checksum
+        run: |
+          mkdir -p build/release
+          mv "build/Timelord-$RELEASE_VERSION-macos-arm64.dmg" build/release/
+          cp build/input/controlled-native/provenance.txt build/release/native-provenance.txt
+          cp build/notarization.json build/release/notarization.json
+          jq -n --arg version "$RELEASE_VERSION" --arg commit "$SOURCE_REVISION" \
+            --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{version:$version, source_commit:$commit, workflow_run:$run, architecture:"arm64", minimum_macos:"14.0"}' \
+            > build/release/release-manifest.json
+          (cd build/release && shasum -a 256 *.dmg > SHA256SUMS)
+      - name: Upload signed release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Timelord-signed-macos-arm64
+          path: build/release/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Preserve notarization diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: notarization-diagnostics
+          path: build/notarization.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  draft:
+    name: Create draft GitHub release
+    needs: [version, sign]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: Timelord-signed-macos-arm64
+          path: release
+      - name: Verify assets and create or update draft
+        run: |
+          (cd release && shasum -a 256 -c SHA256SUMS)
+          if gh release view "$TAG" --json isDraft > existing-release.json 2>/dev/null; then
+            jq -e '.isDraft == true' existing-release.json
+          else
+            args=(--draft --verify-tag --title "Timelord $VERSION" --generate-notes)
+            if [[ "$VERSION" == *-* ]]; then args+=(--prerelease); fi
+            gh release create "$TAG" "${args[@]}"
+          fi
+          gh release upload "$TAG" release/* --clobber
