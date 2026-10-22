@@ -17,7 +17,13 @@ struct TimelordMacApp: App {
                     Button("Settings…") { model.sheet = .settings }.keyboardShortcut(",")
                 }
             }
-        MenuBarExtra("Timelord", systemImage: "clock.arrow.circlepath") { MenuStatus(model: model) }
+        MenuBarExtra {
+            MenuStatus(model: model)
+        } label: {
+            Image(nsImage: MenuBarIcon.image(for: MenuBarGlyph(phase: model.snapshot.phase)))
+                .renderingMode(.template)
+                .accessibilityLabel("Timelord, \(model.snapshot.phase.title)")
+        }
             .menuBarExtraStyle(.window)
     }
 }
