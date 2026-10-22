@@ -47,6 +47,10 @@ boards determines chain assignments; there is no separate layout override.
 A topology change requires restarting the service. Manual settings accept
 200–2200 MHz and requested 0.7–1.0 V; Automatic exploration stays within its bounds.
 
+A fresh app installation needs no USB driver paths in its config. Discovery finds
+the packaged D2XX library relative to the helper inside the app bundle. Explicit
+`driver_library` or `client_binary` paths remain administrator overrides.
+
 ## Node identities
 
 Select a local Chia root in the app, or run `local-node --chia-root FOLDER`. This
@@ -56,7 +60,9 @@ configuration nor imports CA signing keys. Peer connectivity does not establish
 sync status. RPC is polled every 15 seconds; stale observations show no height.
 
 For a remote node, provide a folder containing `connection.toml`, a dedicated
-client certificate/key and the node CA certificate. The manifest has
+client certificate/key and the node CA certificate. See
+[Create and import a connection bundle](connection-bundles.md) for commands,
+the complete manifest, and optional RPC through SSH. The manifest has
 `schema_version = 1` and the `[node]` section above. Credential paths must be
 relative, remain inside the bundle, and not escape through symlinks. Private keys
 must have mode 0600; CA certificates cannot act as client identities. An optional

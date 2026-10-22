@@ -73,6 +73,8 @@ Configuration is human-editable TOML at
 `~/Library/Application Support/Timelord/config.toml`. Relative paths resolve from
 the configuration directory. See [configuration](docs/configuration.md) for node
 identities, remote bundles, board settings, tuning and CLI commands.
+For a node on another computer, follow
+[Create and import a connection bundle](docs/connection-bundles.md).
 
 Run `bash scripts/check.sh` for formatting, clippy, Rust/Swift tests and the native
 control fixtures. Tests use generated identities and disposable local peers and
