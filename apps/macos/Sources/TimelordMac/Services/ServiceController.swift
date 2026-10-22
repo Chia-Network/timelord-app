@@ -12,6 +12,13 @@ final class ServiceController {
     private(set) var errorMessage: String?
     private var process: Process?
     private var logHandle: FileHandle?
+    private var activity: NSObjectProtocol?
+    var preventsIdleSleep: Bool { activity != nil }
+
+    private func releaseActivity() {
+        if let activity { ProcessInfo.processInfo.endActivity(activity) }
+        activity = nil
+    }
     var ownsService: Bool { process?.isRunning == true }
     var processID: Int32? { process?.processIdentifier }
 
@@ -49,6 +56,7 @@ final class ServiceController {
         // A child can have exited before its main-actor cleanup callback runs.
         // Retire its handle now; that callback must not clear a replacement child.
         if process != nil {
+            releaseActivity()
             process = nil; try? logHandle?.close(); logHandle = nil
         }
         let helper = helperURL
@@ -68,6 +76,7 @@ final class ServiceController {
         child.terminationHandler = { [weak self] child in
             Task { @MainActor in
                 guard let self, self.process === child else { return }
+                self.releaseActivity()
                 self.process = nil
                 try? self.logHandle?.close()
                 self.logHandle = nil
@@ -77,6 +86,7 @@ final class ServiceController {
         }
         do { try child.run() } catch { try? handle.close(); throw error }
         process = child
+        activity = ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: "Producing Chia timelord proofs")
         logHandle = handle
         errorMessage = nil
         onChange?()

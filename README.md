@@ -27,6 +27,10 @@ Run is selected or the app is reopened. Closing the window keeps the menu bar an
 service running; Stop and Quit stops the app's owned processes. An externally
 started service is observed without taking ownership.
 
+While its owned service runs, the app prevents idle system sleep and App Nap;
+the display can still sleep and the screen can lock. Pause/exit releases the
+activity after the service exits. Explicit system sleep is not prevented.
+
 The dashboard shows node sync/height, per-chain proof history, temperature and
 Automatic tuning status. IPS measures verified proofs sent to the node, including
 slow recovery observations. Independent chain speeds are never added together.

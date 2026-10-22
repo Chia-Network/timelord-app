@@ -108,6 +108,7 @@ final class ConfigurationClientTests: XCTestCase {
         let model = TimelordModel(controller: controller, initialConfiguration: saved, monitoringEnabled: false)
         try controller.start()
         defer { controller.stop() }
+        XCTAssertTrue(controller.preventsIdleSleep)
         let oldPid = try XCTUnwrap(controller.processID)
         XCTAssertEqual(model.settingsDoneTitle, "Done")
         model.configuration.hardware.boards[0].profile = "automatic"
@@ -139,6 +140,7 @@ final class ConfigurationClientTests: XCTestCase {
         controller.stop()
         while controller.ownsService && Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
         XCTAssertFalse(controller.ownsService)
+        XCTAssertFalse(controller.preventsIdleSleep)
     }
 
     @MainActor

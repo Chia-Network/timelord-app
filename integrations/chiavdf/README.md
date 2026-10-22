@@ -26,6 +26,12 @@ pre-write guard supplements the coordinator's sampled guard. Failed commands,
 readback mismatch or controller EOF quiesce engines and terminate the child.
 This mode excludes the upstream client's independent auto-frequency loop.
 
+Temperature sampling continues when no engine has work, including idle infused
+chains. A monotonic five-second deadline supplements the existing active polling
+cadence. Temperature-only reads do not start engines or deserialize proof values.
+The coordinator's 60-second missing-telemetry stop and configured temperature
+limit remain enforced.
+
 Native fixtures use fake registers and anonymous pipes. Rust fixtures also test
 child-process acknowledgements and owner-only control IPC. Physical PLL/voltage
 settling and proof continuity during live changes still require hardware testing.

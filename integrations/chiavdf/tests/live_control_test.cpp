@@ -1,8 +1,22 @@
 #include "../timelord_live_control.hpp"
+#include "../timelord_telemetry.hpp"
 #include <cassert>
 #include <vector>
 using namespace timelord_control;
 int main() {
+    // An idle infused-chain board must keep reporting temperature even when
+    // its iteration counter never reaches the usual active polling interval.
+    using Poll = timelord_telemetry::Poll;
+    const auto start = Poll::Clock::time_point{};
+    Poll telemetry(start);
+    int samples = 0;
+    for (int second = 0; second <= 180; ++second) {
+        if (telemetry.due(false, start + std::chrono::seconds(second))) ++samples;
+        assert(samples == second / 5);
+    }
+    assert(telemetry.due(true, start + std::chrono::seconds(181)));
+    assert(!telemetry.due(false, start + std::chrono::seconds(185)));
+    assert(telemetry.due(false, start + std::chrono::seconds(186)));
     Point current{1450.,.95};std::vector<std::string> actions;
     auto read=[&](){return current;};
     auto voltage=[&](double v){actions.push_back("voltage");current.voltage=v;};
