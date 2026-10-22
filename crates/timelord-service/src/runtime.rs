@@ -60,6 +60,7 @@ pub struct RuntimeState {
     pub node: String,
     pub message: String,
     pub observations: Vec<Observation>,
+    pub estimated_observations: Vec<Observation>,
     pub events: Vec<Event>,
     pub proofs_delivered: u64,
     pub failed_proofs: u64,
@@ -76,6 +77,7 @@ impl Default for RuntimeState {
             node: "not_configured".into(),
             message: "Connect a full node to get started.".into(),
             observations: vec![],
+            estimated_observations: vec![],
             events: vec![],
             proofs_delivered: 0,
             failed_proofs: 0,
@@ -117,6 +119,20 @@ impl RuntimeState {
                 event.end_unix = Some(unix_now());
             }
         }
+    }
+    pub fn estimated(&mut self, chain: Chain, ips: f64, work_started_unix: u64) {
+        self.observations_created += 1;
+        self.estimated_observations.push(Observation {
+            id: self.observations_created,
+            chain,
+            ips,
+            timestamp_unix: unix_now(),
+            work_started_unix,
+        });
+        self.estimated_observations
+            .retain(|o| o.timestamp_unix >= unix_now().saturating_sub(86400));
+        let excess = self.estimated_observations.len().saturating_sub(86400);
+        self.estimated_observations.drain(..excess);
     }
     fn delivered(&mut self, speeds: Vec<(Chain, ProofTiming)>) {
         for (chain, timing) in speeds {
@@ -320,7 +336,7 @@ fn prime_infused(
     primers.abort_all();
     primers.spawn(async move {
         if let Some(work) = work {
-            backend.prove(Chain::InfusedChallenge, work).await?;
+            backend.prime(work).await?;
         } else {
             backend.stop_chain(Chain::InfusedChallenge).await;
         }

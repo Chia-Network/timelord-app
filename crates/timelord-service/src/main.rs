@@ -341,7 +341,7 @@ struct Shared {
     assignments: Vec<Assignment>,
     // These are socket slots, not authenticated board/engine identities.
     clients: Arc<Mutex<BTreeSet<(String, u8)>>>,
-    runtime: Mutex<runtime::RuntimeState>,
+    runtime: Arc<Mutex<runtime::RuntimeState>>,
     started_unix: u64,
 }
 
@@ -489,7 +489,7 @@ async fn history(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
         history_store::Store::new(PathBuf::new(), &shared.config).expect("validated history scope");
     let saved = store.snapshot(&runtime, shared.started_unix, unix_now());
     Json(
-        serde_json::json!({"api_version":2,"service_pid":std::process::id(),"timestamp_unix":unix_now(),"capture_intervals":saved.capture_intervals,"observations":saved.observations,"events":saved.events}),
+        serde_json::json!({"api_version":3,"service_pid":std::process::id(),"timestamp_unix":unix_now(),"capture_intervals":saved.capture_intervals,"estimated_observations":saved.estimated_observations,"events":saved.events}),
     )
 }
 
@@ -518,8 +518,6 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
             .with_context(|| format!("Binding client listener for {}", b.id))?;
         listeners.push((b.id.clone(), capacity, listener));
     }
-    let (backend, offers) = asic::AsicBackend::new(&config)?;
-    let backend = Arc::new(backend);
     let active = config.node.certificate.is_some();
     let tuning_paused = config.service.tuning_paused;
     let started_unix = unix_now();
@@ -534,11 +532,14 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
             false
         }
     };
+    let runtime = Arc::new(Mutex::new(runtime));
+    let (backend, offers) = asic::AsicBackend::new(&config, runtime.clone())?;
+    let backend = Arc::new(backend);
     let shared = Arc::new(Shared {
         config,
         assignments,
         clients: Arc::new(Mutex::new(BTreeSet::new())),
-        runtime: Mutex::new(runtime),
+        runtime,
         started_unix,
     });
     let (shutdown, receiver) = watch::channel(false);
@@ -591,7 +592,7 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/status", get(status))
-        .route("/v2/history", get(history))
+        .route("/v3/history", get(history))
         .with_state(shared.clone());
     tracing::info!(address=%shared.config.service.status_listen,"Service ready");
     let result = axum::serve(http, app)
@@ -691,7 +692,7 @@ mod tests {
             config: Config::default(),
             assignments: vec![],
             clients: Arc::new(Mutex::new(BTreeSet::new())),
-            runtime: Mutex::new(runtime::RuntimeState::default()),
+            runtime: Default::default(),
             started_unix: unix_now(),
         });
         let (stop, rx) = watch::channel(false);

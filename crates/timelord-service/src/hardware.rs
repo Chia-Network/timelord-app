@@ -663,7 +663,7 @@ mod tests {
             assignments: config.assignments().unwrap(),
             config,
             clients: Arc::new(std::sync::Mutex::new(Default::default())),
-            runtime: std::sync::Mutex::new(Default::default()),
+            runtime: Default::default(),
             started_unix: crate::unix_now(),
         });
         let (_stop, receiver) = watch::channel(false);

@@ -124,7 +124,7 @@ public struct HistoryPayload: Decodable, Sendable {
     public let servicePid: Int
     public let timestampUnix: Double
     public let captureIntervals: [RecordedCapture]
-    public let observations: [RecordedProof]
+    public let estimatedObservations: [RecordedProof]
     public let events: [RecordedEvent]
 }
 public struct RecordedCapture: Decodable, Sendable {

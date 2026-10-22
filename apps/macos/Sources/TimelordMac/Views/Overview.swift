@@ -34,7 +34,7 @@ struct Overview: View {
                         .font(.caption).foregroundStyle(.secondary).lineLimit(2)
                 }.frame(maxWidth: .infinity, alignment: .leading)
                 HStack(alignment: .top, spacing: 18) {
-                    MetricTile(title: "Delivered speed", value: model.snapshot.headlineSpeed, caption: "Challenge chain · last-hour average")
+                    MetricTile(title: "IPS", value: model.snapshot.headlineSpeed, caption: "Last-hour average")
                     Divider()
                     MetricTile(title: "Proofs delivered", value: model.snapshot.proofsToday.map { $0.formatted() } ?? "—", caption: "Verified proofs sent to your node this run")
                     Divider()

@@ -191,10 +191,16 @@ fn helper_reports_real_socket_state_without_claiming_productivity() {
     assert!(restarted["latest_proof_unix"].is_null());
     assert!(restarted["delivered_ips"].is_null());
     assert_eq!(restarted["proofs_delivered"], 0);
-    let history = get_json(status_port, "/v2/history").unwrap();
-    assert_eq!(history["api_version"], 2);
+    let history = get_json(status_port, "/v3/history").unwrap();
+    assert_eq!(history["api_version"], 3);
     assert_eq!(history["service_pid"], fixture.child.id());
-    assert_eq!(history["observations"][0]["ips"], 425000.0);
+    assert!(
+        history["estimated_observations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    // Old delivery measurements remain on disk, never masquerading as new IPS.
     assert_eq!(history["events"][0]["kind"], "recovery");
     assert_eq!(history["events"][1]["kind"], "telemetry_gap");
     assert_eq!(history["events"][1]["timestamp_unix"], now - 30);

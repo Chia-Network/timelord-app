@@ -21,13 +21,13 @@ actor LiveStatusClient {
         return status
     }
     func history(expectedPID: Int) async throws -> HistoryPayload {
-        let url = endpoint.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("v2/history")
+        let url = endpoint.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("v3/history")
         var request = URLRequest(url: url); request.timeoutInterval = 5; request.cachePolicy = .reloadIgnoringLocalCacheData
         let (data, response) = try await URLSession.shared.data(for: request)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw StatusError.invalidResponse }
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
         let history = try decoder.decode(HistoryPayload.self, from: data)
-        guard history.apiVersion == 2 else { throw StatusError.unsupportedVersion }
+        guard history.apiVersion == 3 else { throw StatusError.unsupportedVersion }
         guard history.servicePid == expectedPID else { throw StatusError.differentOwner }
         return history
     }

@@ -5,6 +5,57 @@ import XCTest
 final class PresentationTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_000_000)
 
+    func testScrapeMeanWeightsTimeInsteadOfProofCountAndKeepsLowRecoveryValues() {
+        // A burst of three fast outputs must not outweigh three scrapes held at 400K.
+        let start = Date(timeIntervalSince1970: 900_000)
+        let window = DateInterval(start: start, duration: 120)
+        let history = ChainHistory(chain: .challenge, samples: [
+            ProofObservation(date: start, ips: 400_000),
+            ProofObservation(date: start.addingTimeInterval(89), ips: 400_000),
+            ProofObservation(date: start.addingTimeInterval(91), ips: 1_000_000),
+            ProofObservation(date: start.addingTimeInterval(92), ips: 1_000_000),
+            ProofObservation(date: start.addingTimeInterval(93), ips: 1_000_000)],
+            captureIntervals: [window], events: [HistoryEvent(date: start, end: nil, kind: .recovery)])
+        XCTAssertEqual(history.sampledObservations(in: window).map(\.ips), [400_000,400_000,400_000,1_000_000])
+        XCTAssertEqual(history.statistics(in: window).average, 550_000)
+    }
+
+    func testNormalHistoryFetchLagDoesNotMakeFreshIPSUnavailable() {
+        let start = Date(timeIntervalSince1970: 900_000)
+        let history = ChainHistory(chain: .challenge, samples: [ProofObservation(date: start.addingTimeInterval(25), ips: 900_000)], captureIntervals: [DateInterval(start: start, duration: 30)], events: [])
+        XCTAssertTrue(history.hasFreshValue(at: start.addingTimeInterval(45)))
+        XCTAssertFalse(history.hasFreshValue(at: start.addingTimeInterval(60)))
+    }
+
+    func testStaleGaugeCreatesGapWithoutInventingZerosOrBridgingTheChart() {
+        let start = Date(timeIntervalSince1970: 900_000)
+        let window = DateInterval(start: start, duration: 180)
+        let history = ChainHistory(chain: .challenge, samples: [
+            ProofObservation(date: start, ips: 900_000),
+            ProofObservation(date: start.addingTimeInterval(150), ips: 1_000_000)],
+            captureIntervals: [window], events: [])
+        XCTAssertFalse(history.hasFreshValue(at: start.addingTimeInterval(90)))
+        XCTAssertEqual(history.sampledObservations(in: window).map(\.ips), [900_000,900_000,1_000_000,1_000_000])
+        XCTAssertEqual(history.plotPoints(in: window).map(\.segment), [0,0,1,1])
+        XCTAssertEqual(history.statistics(in: window).coverage, 1)
+    }
+
+    func testHeadlineUsesLatestOutputFromAnyChainAndExpiresEvenWithHistory() {
+        let end = Date(timeIntervalSince1970: 900_120)
+        let window = DateInterval(start: end.addingTimeInterval(-120), end: end)
+        let cc = ChainHistory(chain: .challenge, samples: [ProofObservation(date: window.start, ips: 400_000, sequence: 1)], captureIntervals: [window], events: [])
+        let rc = ChainHistory(chain: .reward, samples: [ProofObservation(date: window.start.addingTimeInterval(60), ips: 1_000_000, sequence: 2)], captureIntervals: [window], events: [])
+        let board = BoardSnapshot(id: "a", name: "A", state: .active, temperatureC: nil, temperatureLimitC: 55, profile: "Manual", frequencyMHz: nil, voltageV: nil, histories: [rc,cc], lastProof: end)
+        func snapshot(_ now: Date, phase: AppPhase = .running) -> AppSnapshot {
+            AppSnapshot(phase: phase, explanation: "", node: ConnectionSnapshot(title: "", detail: "", tone: .positive), timelord: ConnectionSnapshot(title: "", detail: "", tone: .positive), boards: [board], proofsToday: 2, uptimeSeconds: 120, now: now, serviceAvailable: true)
+        }
+        XCTAssertEqual(snapshot(end).headlineSpeed, "760K")
+        XCTAssertEqual(snapshot(end.addingTimeInterval(30)).headlineSpeed, "—")
+        XCTAssertEqual(snapshot(end, phase: .paused).headlineSpeed, "—")
+        let sameTime = ChainHistory(chain: .challenge, samples: [ProofObservation(date: end, ips: 400_000, sequence: 10), ProofObservation(date: end, ips: 1_000_000, sequence: 2)], captureIntervals: [window], events: [])
+        XCTAssertEqual(sameTime.sampledObservations(in: window).last?.ips, 400_000)
+    }
+
     func testNativeClientFaultShowsReasonWithoutClaimingServiceReady() throws {
         let view = LivePresentation.snapshot(status: try operationalStatus(state: "fault", message: "Native control closed before acknowledgement"), now: now)
         XCTAssertEqual(view.phase, .serviceUnavailable)
@@ -18,9 +69,9 @@ final class PresentationTests: XCTestCase {
     }
 
     func testRestoredChartKeepsLowSamplesAndDoesNotBridgeRestartDowntime() throws {
-        let object: [String: Any] = ["api_version":2,"service_pid":42,"timestamp_unix":1000000,
+        let object: [String: Any] = ["api_version":3,"service_pid":42,"timestamp_unix":1000000,
             "capture_intervals":[["start_unix":999880,"end_unix":999910],["start_unix":999970,"end_unix":1000000]],
-            "observations":[["id":1,"chain":"challenge","timestamp_unix":999900,"ips":400000],["id":2,"chain":"challenge","timestamp_unix":999990,"ips":1000000]],
+            "estimated_observations":[["id":1,"chain":"challenge","timestamp_unix":999900,"ips":400000],["id":2,"chain":"challenge","timestamp_unix":999990,"ips":1000000]],
             "events":[["id":1,"timestamp_unix":999910,"kind":"telemetry_gap","end_unix":999970]]]
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
         let history = try decoder.decode(HistoryPayload.self, from: JSONSerialization.data(withJSONObject: object))
@@ -75,7 +126,7 @@ final class PresentationTests: XCTestCase {
     func testRecoveryRetainsObservedSlowProofsInAverage() {
         let window = DateInterval(start: now.addingTimeInterval(-100), end: now)
         let history = ChainHistory(chain: .challenge,
-            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 1_000_000), ProofObservation(date: now.addingTimeInterval(-50), ips: 400_000), ProofObservation(date: now, ips: 1_000_000)],
+            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 1_000_000), ProofObservation(date: now.addingTimeInterval(-50), ips: 400_000), ProofObservation(date: now.addingTimeInterval(-20), ips: 1_000_000)],
             captureIntervals: [window], events: [HistoryEvent(date: now.addingTimeInterval(-50), end: nil, kind: .recovery)])
         let stats = history.statistics(in: window)
         XCTAssertEqual(stats.average, 800_000)
@@ -87,7 +138,7 @@ final class PresentationTests: XCTestCase {
     func testMissingCaptureBreaksLineAndHasSeparateCoverage() {
         let window = DateInterval(start: now.addingTimeInterval(-100), end: now)
         let history = ChainHistory(chain: .reward,
-            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 900_000), ProofObservation(date: now.addingTimeInterval(-10), ips: 950_000)],
+            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 900_000), ProofObservation(date: now.addingTimeInterval(-20), ips: 950_000)],
             captureIntervals: [DateInterval(start: window.start, duration: 40), DateInterval(start: now.addingTimeInterval(-40), end: now)], events: [])
         XCTAssertEqual(history.statistics(in: window).coverage, 0.8, accuracy: 0.0001)
         XCTAssertEqual(history.statistics(in: window).average, 925_000)
@@ -97,7 +148,7 @@ final class PresentationTests: XCTestCase {
     func testKnownWorkOutageDoesNotBecomeMissingTelemetry() {
         let window = DateInterval(start: now.addingTimeInterval(-100), end: now)
         let history = ChainHistory(chain: .reward,
-            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 900_000), ProofObservation(date: now.addingTimeInterval(-10), ips: 950_000)],
+            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 900_000), ProofObservation(date: now.addingTimeInterval(-20), ips: 950_000)],
             captureIntervals: [window], events: [HistoryEvent(date: now.addingTimeInterval(-60), end: now.addingTimeInterval(-30), kind: .nodeUnavailable)])
         XCTAssertEqual(history.statistics(in: window).coverage, 1)
         XCTAssertEqual(history.plotPoints(in: window).map(\.segment), [0, 1])
@@ -113,16 +164,16 @@ final class PresentationTests: XCTestCase {
     func testAdjacentCaptureDoesNotCreateArtificialLineBreaks() {
         let window = DateInterval(start: now.addingTimeInterval(-100), end: now)
         let history = ChainHistory(chain: .challenge,
-            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 900_000), ProofObservation(date: now.addingTimeInterval(-10), ips: 950_000)],
+            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 900_000), ProofObservation(date: now.addingTimeInterval(-20), ips: 950_000)],
             captureIntervals: [DateInterval(start: window.start, duration: 60), DateInterval(start: now.addingTimeInterval(-60), end: now)], events: [])
         XCTAssertEqual(history.statistics(in: window).coverage, 1)
-        XCTAssertEqual(history.plotPoints(in: window).map(\.segment), [0, 0])
+        XCTAssertEqual(history.plotPoints(in: window).map(\.segment), [0, 0, 0])
     }
 
     func testHoverOverUnknownDataDoesNotShowANearbyHealthyValue() {
         let window = DateInterval(start: now.addingTimeInterval(-100), end: now)
         let history = ChainHistory(chain: .challenge,
-            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 900_000), ProofObservation(date: now.addingTimeInterval(-10), ips: 950_000)],
+            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 900_000), ProofObservation(date: now.addingTimeInterval(-20), ips: 950_000)],
             captureIntervals: [DateInterval(start: window.start, duration: 40), DateInterval(start: now.addingTimeInterval(-40), end: now)], events: [])
         XCTAssertNil(history.observation(near: now.addingTimeInterval(-50), in: window))
         XCTAssertEqual(history.observation(near: now.addingTimeInterval(-10), in: window)?.ips, 950_000)
@@ -131,7 +182,7 @@ final class PresentationTests: XCTestCase {
     func testInvalidAndOutsideWindowObservationsAreNotPlotted() {
         let window = HistoryRange.hour.interval(endingAt: now)
         let history = ChainHistory(chain: .challenge,
-            samples: [ProofObservation(date: now, ips: .nan), ProofObservation(date: now, ips: -.infinity), ProofObservation(date: now, ips: -1), ProofObservation(date: window.start.addingTimeInterval(-1), ips: 2_000_000), ProofObservation(date: now, ips: 0)], captureIntervals: [window], events: [])
+            samples: [ProofObservation(date: now, ips: .nan), ProofObservation(date: now, ips: -.infinity), ProofObservation(date: now, ips: -1), ProofObservation(date: window.start.addingTimeInterval(-1), ips: 2_000_000), ProofObservation(date: now.addingTimeInterval(-10), ips: 0)], captureIntervals: [window], events: [])
         XCTAssertEqual(history.statistics(in: window).observations, 1)
         XCTAssertEqual(history.statistics(in: window).average, 0)
     }
@@ -257,18 +308,18 @@ extension PresentationTests {
         return try decoder.decode(ServiceStatus.self, from: JSONSerialization.data(withJSONObject: object))
     }
     private func operationalHistory(pid: Int = 42) throws -> HistoryPayload {
-        let object: [String: Any] = ["api_version":2,"service_pid":pid,"timestamp_unix":1000000,"capture_intervals":[["start_unix":996400,"end_unix":1000000]],
-            "observations":[["id":1,"chain":"challenge","timestamp_unix":999900,"ips":400000],["id":2,"chain":"challenge","timestamp_unix":1000000,"ips":1000000]],
+        let object: [String: Any] = ["api_version":3,"service_pid":pid,"timestamp_unix":1000000,"capture_intervals":[["start_unix":996400,"end_unix":1000000]],
+            "estimated_observations":[["id":1,"chain":"challenge","timestamp_unix":999900,"ips":400000],["id":2,"chain":"challenge","timestamp_unix":999970,"ips":1000000]],
             "events":[["id":1,"timestamp_unix":999900,"board_id":"a","kind":"recovery"],["id":2,"timestamp_unix":999910,"board_id":NSNull(),"kind":"node_unavailable","end_unix":999920]]]
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
         return try decoder.decode(HistoryPayload.self, from: JSONSerialization.data(withJSONObject: object))
     }
     func testDistinctProofsAtTheSameTimestampKeepSeparateChartIdentities() {
-        let history = ChainHistory(chain: .challenge, samples: [ProofObservation(date: now, ips: 900000, id: "proof-1"), ProofObservation(date: now, ips: 900000, id: "proof-2")], captureIntervals: [HistoryRange.hour.interval(endingAt: now)], events: [])
-        XCTAssertEqual(Set(history.plotPoints(in: HistoryRange.hour.interval(endingAt: now)).map(\.id)).count, 2)
-        XCTAssertEqual(history.statistics(in: HistoryRange.hour.interval(endingAt: now)).observations, 2)
+        let history = ChainHistory(chain: .challenge, samples: [ProofObservation(date: now.addingTimeInterval(-10), ips: 900000, id: "proof-1"), ProofObservation(date: now.addingTimeInterval(-10), ips: 900000, id: "proof-2")], captureIntervals: [HistoryRange.hour.interval(endingAt: now)], events: [])
+        XCTAssertEqual(Set(history.observations(in: HistoryRange.hour.interval(endingAt: now)).map(\.id)).count, 2)
+        XCTAssertEqual(history.statistics(in: HistoryRange.hour.interval(endingAt: now)).observations, 1)
     }
-    func testOperationalStatusAndHistoryUseVerifiedSentProofsWithoutSummingChains() throws {
+    func testOperationalStatusAndHistoryUseSampledVerifiedOutputsWithoutSummingChains() throws {
         let snapshot = LivePresentation.snapshot(status: try operationalStatus(), history: try operationalHistory(), now: now)
         XCTAssertEqual(snapshot.phase, .running)
         XCTAssertEqual(snapshot.headlineSpeed, "700K")

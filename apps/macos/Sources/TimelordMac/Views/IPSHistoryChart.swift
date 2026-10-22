@@ -47,7 +47,7 @@ struct IPSHistoryChart: View {
                                 }
                         }
                     }
-                Text(hovered.map { "\($0.date.formatted(date: .omitted, time: .shortened)) · \(DisplayFormat.ips($0.ips)) IPS" } ?? "Move over the chart to inspect a recorded proof.")
+                Text(hovered.map { "\($0.date.formatted(date: .omitted, time: .shortened)) · \(DisplayFormat.ips($0.ips)) IPS" } ?? "Move over the chart to inspect a speed sample.")
                     .font(.caption).foregroundStyle(.secondary).monospacedDigit().frame(height: 18)
             }
         }
@@ -58,7 +58,7 @@ struct IPSHistoryChart: View {
             }
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(history.chain.title) delivered IPS over \(range.title)")
+        .accessibilityLabel("\(history.chain.title) IPS over \(range.title)")
         .accessibilityValue("Average \(DisplayFormat.ips(history.statistics(in: window).average)); \(Int(history.statistics(in: window).coverage * 100)) percent telemetry coverage")
     }
 
@@ -74,7 +74,7 @@ struct IPSHistoryChart: View {
                 LineMark(x: .value("Time", point.date), y: .value("IPS", point.ips), series: .value("Segment", point.segment))
                     .foregroundStyle(history.chain.color)
                     .lineStyle(StrokeStyle(lineWidth: compact ? 1.6 : 2))
-                    .interpolationMethod(.linear)
+                    .interpolationMethod(.stepEnd)
             }
             if !compact {
                 ForEach(history.events(in: window).filter { $0.kind == .recovery || $0.kind == .profileChange }) { event in

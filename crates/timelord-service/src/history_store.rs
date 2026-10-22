@@ -30,6 +30,10 @@ pub struct Snapshot {
     schema_version: u32,
     scope: String,
     pub observations: Vec<Observation>,
+    // Older checkpoints contain delivery timings only; never reinterpret them
+    // as exporter-compatible measurements.
+    #[serde(default)]
+    pub estimated_observations: Vec<Observation>,
     pub events: Vec<Event>,
     pub capture_intervals: Vec<Capture>,
 }
@@ -77,7 +81,13 @@ impl Store {
             return Ok(());
         }
         saved.prune(started);
-        state.observations_created = saved.observations.iter().map(|o| o.id).max().unwrap_or(0);
+        state.observations_created = saved
+            .observations
+            .iter()
+            .chain(&saved.estimated_observations)
+            .map(|o| o.id)
+            .max()
+            .unwrap_or(0);
         state.events_created = saved.events.iter().map(|e| e.id).max().unwrap_or(0);
         if let Some(end) = saved.capture_intervals.last().map(|c| c.end_unix) {
             for event in &mut saved.events {
@@ -101,12 +111,16 @@ impl Store {
             schema_version: 1,
             scope: self.scope.clone(),
             observations: vec![],
+            estimated_observations: vec![],
             events: vec![],
             capture_intervals: vec![],
         });
         saved
             .observations
             .extend(state.observations.iter().cloned());
+        saved
+            .estimated_observations
+            .extend(state.estimated_observations.iter().cloned());
         saved.events.extend(state.events.iter().cloned());
         if now > started {
             saved.capture_intervals.push(Capture {
@@ -153,13 +167,16 @@ impl Store {
 impl Snapshot {
     fn prune(&mut self, now: u64) {
         let cutoff = now.saturating_sub(DAY);
-        self.observations.retain(|o| {
-            o.timestamp_unix >= cutoff
-                && o.timestamp_unix <= now
-                && o.work_started_unix <= o.timestamp_unix
-                && o.ips.is_finite()
-                && o.ips >= 0.
-        });
+        for observations in [&mut self.observations, &mut self.estimated_observations] {
+            observations.retain(|o| {
+                o.timestamp_unix >= cutoff
+                    && o.timestamp_unix <= now
+                    && o.work_started_unix <= o.timestamp_unix
+                    && o.ips.is_finite()
+                    && o.ips >= 0.
+            });
+            observations.drain(..observations.len().saturating_sub(MAX_RECORDS));
+        }
         self.events.retain_mut(|e| {
             let instant = ["recovery", "profile_change"].contains(&e.kind.as_str());
             let end = if instant {
@@ -174,8 +191,6 @@ impl Snapshot {
             e.end_unix = e.end_unix.map(|end| end.min(now));
             true
         });
-        self.observations
-            .drain(..self.observations.len().saturating_sub(MAX_RECORDS));
         let capture_cutoff = if self.observations.len() == MAX_RECORDS {
             cutoff.max(
                 self.observations
@@ -255,6 +270,7 @@ mod tests {
         let (directory, store) = fixture();
         let mut first = RuntimeState {
             observations: vec![proof(1, 1002, 1_000_000.), proof(2, 1045, 400_000.)],
+            estimated_observations: vec![proof(3, 1045, 425_000.)],
             ..Default::default()
         };
         first.events.push(Event {
@@ -279,7 +295,8 @@ mod tests {
         assert_eq!(second.failed_proofs, 0);
         assert_eq!(second.phase, "setup_required");
         assert!(second.boards.is_empty());
-        assert_eq!(second.observations_created, 2);
+        assert_eq!(second.observations_created, 3);
+        assert!(second.estimated_observations.is_empty());
         assert_eq!(second.events_created, 7);
         assert_eq!(second.events[0].kind, "telemetry_gap");
         assert_eq!(second.events[0].timestamp_unix, 1050);
@@ -290,9 +307,10 @@ mod tests {
         let saved = store.snapshot(&second, 1100, 1120);
         assert_eq!(
             saved.observations.iter().map(|o| o.id).collect::<Vec<_>>(),
-            vec![1, 2, 3]
+            vec![1, 2, 4]
         );
         assert_eq!(saved.observations[1].ips, 400_000.);
+        assert_eq!(saved.estimated_observations[0].ips, 425_000.);
         assert_eq!(saved.events[1].end_unix, Some(1050));
         assert_eq!(saved.capture_intervals.len(), 2);
         assert_eq!(saved.capture_intervals[0].end_unix, 1050);

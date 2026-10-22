@@ -30,7 +30,7 @@ struct BoardDetailSheet: View {
                     StatusBadge(title: board.state.title, tone: board.state.tone)
                     VStack(alignment: .leading, spacing: 18) {
                         HStack {
-                            Text("Delivered speed").font(.headline)
+                            Text("IPS").font(.headline)
                             Spacer()
                             Picker("Time range", selection: $range) { ForEach(HistoryRange.allCases) { Text($0.title).tag($0) } }
                                 .labelsHidden().frame(width: 145)
@@ -42,7 +42,7 @@ struct BoardDetailSheet: View {
                         IPSHistoryChart(history: history, range: range, now: snapshot.now, upperBound: snapshot.chartUpperBound)
                             .frame(height: 220)
                         statistics
-                        Text("Verified proof observations for this chain. Slow proofs around recoveries remain included. Gaps and work interruptions break the line; telemetry coverage is reported separately.")
+                        Text("Latest verified proof speed sampled every 30 seconds. Slow recovery samples remain included. Gaps, interruptions and stale values are excluded; telemetry coverage is reported separately.")
                             .font(.caption).foregroundStyle(.secondary)
                     }.timelordCard()
                     HStack(alignment: .top, spacing: 18) {
@@ -97,9 +97,9 @@ struct BoardDetailSheet: View {
     private var statistics: some View {
         let stats = history.statistics(in: range.interval(endingAt: snapshot.now))
         return HStack(alignment: .top, spacing: 16) {
-            MetricTile(title: "Average", value: DisplayFormat.ips(stats.average), caption: "\(stats.observations) observations")
-            MetricTile(title: "Lowest", value: DisplayFormat.ips(stats.minimum), caption: "Recorded proof IPS")
-            MetricTile(title: "Highest", value: DisplayFormat.ips(stats.maximum), caption: "Recorded proof IPS")
+            MetricTile(title: "Average", value: DisplayFormat.ips(stats.average), caption: "\(stats.observations) speed samples")
+            MetricTile(title: "Lowest", value: DisplayFormat.ips(stats.minimum), caption: "Sampled IPS")
+            MetricTile(title: "Highest", value: DisplayFormat.ips(stats.maximum), caption: "Sampled IPS")
             MetricTile(title: "Coverage", value: String(format: "%.1f%%", stats.coverage * 100), caption: "Telemetry available")
         }
     }

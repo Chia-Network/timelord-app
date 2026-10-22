@@ -36,9 +36,21 @@ the display can still sleep and the screen can lock. Pause/exit releases the
 activity after the service exits. Explicit system sleep is not prevented.
 
 The dashboard shows node sync/height, per-chain proof history, temperature and
-Automatic tuning status. IPS measures verified proofs sent to the node, including
-slow recovery observations. Independent chain speeds are never added together.
-A successful send does not establish that the node used the proof.
+Automatic tuning status. The headline IPS is the last-hour arithmetic mean of
+30-second samples of the latest verified output from any chain, matching the
+`chia_timelord_estimated_ips` gauge semantics. Each output uses cumulative iterations
+divided by elapsed time from client assignment to proof receipt (before verification
+and node submission), truncated to one decimal place. Only validated proofs update
+the gauge; internal one-iteration primers do not. Board charts use the same samples
+for their individual chains. Independent chain speeds are never added together.
+
+Slow recovery samples remain included. Values at least 90 seconds old, known work
+interruptions and missing capture are omitted rather than held as current speed or
+filled with zeros. Grafana may hold stale gauges longer; compare the same windows,
+scrape alignment and availability for exact comparisons. A successful send does not
+establish that the node used the proof. Existing delivery-timing history is retained
+on disk but is not mixed into the new IPS charts. Automatic tuning continues using
+its separate delivered-proof timings, including verification and submission delays.
 
 ## Build
 

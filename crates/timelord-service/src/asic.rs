@@ -72,10 +72,15 @@ impl ProofTiming {
         self.iterations as f64 / self.started.elapsed().as_secs_f64()
     }
 }
+fn estimated_ips(iterations: u64, elapsed: Duration) -> f64 {
+    (iterations as f64 / elapsed.as_secs_f64() * 10.).floor() / 10.
+}
+
 struct Active {
     lease: Lease,
     key: ProofRequest,
     started: Instant,
+    estimated_started: Instant,
 }
 struct Lane {
     board: String,
@@ -96,9 +101,13 @@ impl std::error::Error for AsicFailure {}
 pub struct AsicBackend {
     lanes: Vec<(Chain, Lane)>,
     pools: HashMap<String, Mutex<mpsc::Receiver<Lease>>>,
+    runtime: Arc<SyncMutex<crate::runtime::RuntimeState>>,
 }
 impl AsicBackend {
-    pub fn new(config: &Config) -> Result<(Self, HashMap<String, mpsc::Sender<Lease>>)> {
+    pub fn new(
+        config: &Config,
+        runtime: Arc<SyncMutex<crate::runtime::RuntimeState>>,
+    ) -> Result<(Self, HashMap<String, mpsc::Sender<Lease>>)> {
         let assignments = config.assignments().map_err(anyhow::Error::msg)?;
         let mut pools = HashMap::new();
         let mut offers = HashMap::new();
@@ -119,14 +128,21 @@ impl AsicBackend {
                 )
             })
             .collect();
-        Ok((Self { lanes, pools }, offers))
+        Ok((
+            Self {
+                lanes,
+                pools,
+                runtime,
+            },
+            offers,
+        ))
     }
     pub async fn prove(
         &self,
         chain: Chain,
         work: ProofRequest,
     ) -> Result<(ProofResult, ProofTiming)> {
-        self.prove_inner(chain, work).await.map_err(|error| {
+        self.prove_inner(chain, work, true).await.map_err(|error| {
             if error.is::<AsicFailure>() {
                 error
             } else {
@@ -144,10 +160,17 @@ impl AsicBackend {
             }
         })
     }
+    pub async fn prime(&self, work: ProofRequest) -> Result<()> {
+        // A one-iteration primer keeps ICC ready; it is not a scheduled VDF output.
+        self.prove_inner(Chain::InfusedChallenge, work, false)
+            .await?;
+        Ok(())
+    }
     async fn prove_inner(
         &self,
         chain: Chain,
         work: ProofRequest,
+        record_metric: bool,
     ) -> Result<(ProofResult, ProofTiming)> {
         work.validate_regular()?;
         if work.iterations > MAX_REQUEST_ITERATIONS {
@@ -183,6 +206,9 @@ impl AsicBackend {
                     .await
                     .context("Waiting for ASIC client timed out")?
                     .context("ASIC listener stopped")?;
+                // Match Python timelord: start when assigning the client, before
+                // discriminant construction and the initial handshake.
+                let estimated_started = Instant::now();
                 let seed = work.challenge.const_bytes().to_vec();
                 let bits = work.discriminant_bits;
                 let magnitude =
@@ -207,6 +233,7 @@ impl AsicBackend {
                     lease,
                     key: work.clone(),
                     started,
+                    estimated_started,
                 }
             }
         };
@@ -220,6 +247,9 @@ impl AsicBackend {
             acknowledge_stop(&mut active.lease.socket).await?;
             bail!("ASIC stopped before returning its proof");
         };
+        // Freeze IPS on receipt, before verification or scheduler/send delays.
+        // Publish only after the proof has passed verification.
+        let ips = estimated_ips(work.iterations, active.estimated_started.elapsed());
         let checked = work.clone();
         let result = tokio::task::spawn_blocking(move || verify(&checked, *proof))
             .await?
@@ -232,6 +262,13 @@ impl AsicBackend {
             iterations: work.iterations,
             started: active.started,
         };
+        if record_metric {
+            self.runtime.lock().expect("runtime").estimated(
+                chain,
+                ips,
+                crate::unix_now().saturating_sub(active.estimated_started.elapsed().as_secs()),
+            );
+        }
         *owner = Some(active);
         Ok((result, timing))
     }
@@ -373,7 +410,7 @@ mod tests {
     ) {
         let config: Config =
             toml::from_str("[[hardware.boards]]\nid='a'\nname='A'\nclient_port=18110\n").unwrap();
-        let (backend, offers) = AsicBackend::new(&config).unwrap();
+        let (backend, offers) = AsicBackend::new(&config, Default::default()).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap())
             .await
@@ -447,7 +484,17 @@ mod tests {
             socket.read_exact(&mut ack).await.unwrap();
             assert_eq!(&ack, b"ACK");
         });
-        for n in [1, 20] {
+        // ICC priming must never become the global speed gauge.
+        backend.prime(work(1, 64)).await.unwrap();
+        assert!(
+            backend
+                .runtime
+                .lock()
+                .unwrap()
+                .estimated_observations
+                .is_empty()
+        );
+        for n in [20] {
             assert_eq!(
                 backend
                     .prove(Chain::InfusedChallenge, work(n, 64))
@@ -459,10 +506,63 @@ mod tests {
                 n
             );
         }
+        {
+            let state = backend.runtime.lock().unwrap();
+            assert_eq!(state.estimated_observations.len(), 1);
+            assert_eq!(
+                state.estimated_observations[0].chain,
+                Chain::InfusedChallenge
+            );
+            assert!(state.observations.is_empty());
+            assert_eq!(state.proofs_delivered, 0);
+        }
         backend.stop_all().await;
         fixture.await.unwrap();
         assert!(clients.lock().unwrap().is_empty());
     }
+    #[test]
+    fn exporter_ips_is_cumulative_receipt_speed_truncated_to_tenths() {
+        assert_eq!(estimated_ips(1_000_000, Duration::from_secs(3)), 333_333.3);
+        assert_eq!(
+            estimated_ips(20_000_000, Duration::from_secs(20)),
+            1_000_000.
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_proof_does_not_update_the_speed_gauge() {
+        let (backend, mut socket, _) = setup().await;
+        let fixture = tokio::spawn(async move {
+            handshake(&mut socket).await;
+            requested(&mut socket).await;
+            // A structurally valid but mathematically invalid class-group output.
+            let mut raw = 20_u64.to_be_bytes().to_vec();
+            raw.extend(100_u64.to_be_bytes());
+            raw.extend([0; 100]);
+            raw.push(0);
+            raw.extend([0; 100]);
+            let hex: Vec<_> = raw
+                .iter()
+                .flat_map(|b| format!("{b:02x}").into_bytes())
+                .collect();
+            socket
+                .write_all(&(hex.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
+            socket.write_all(&hex).await.unwrap();
+        });
+        assert!(backend.prove(Chain::Challenge, work(20, 64)).await.is_err());
+        fixture.await.unwrap();
+        assert!(
+            backend
+                .runtime
+                .lock()
+                .unwrap()
+                .estimated_observations
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn cancelled_proof_closes_its_partial_frame_and_releases_the_slot() {
         let (backend, mut socket, clients) = setup().await;

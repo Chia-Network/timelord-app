@@ -50,13 +50,14 @@ pub async fn check(mut config: Config) -> Result<Vec<CheckedProof>> {
             listeners.push((board.id.clone(), capacity, listener));
         }
     }
-    let (backend, offers) = AsicBackend::new(&config)?;
+    let runtime = Arc::new(Mutex::new(RuntimeState::default()));
+    let (backend, offers) = AsicBackend::new(&config, runtime.clone())?;
     let backend = Arc::new(backend);
     let shared = Arc::new(Shared {
         config,
         assignments,
         clients: Arc::new(Mutex::new(BTreeSet::new())),
-        runtime: Mutex::new(RuntimeState::default()),
+        runtime,
         started_unix: unix_now(),
     });
     let (stop, shutdown) = watch::channel(false);

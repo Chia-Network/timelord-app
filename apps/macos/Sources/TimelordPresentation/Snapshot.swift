@@ -74,8 +74,18 @@ public struct AppSnapshot: Sendable {
     public var readyToRun = false
     public var runningTitle: String { phase == .serviceUnavailable && serviceAvailable ? "Proof service stopped" : readyToRun ? "Ready to run" : phase == .running && !tuningPaused && boards.contains(where: { ["learning","testing"].contains($0.automatic?.state ?? "") }) ? "Running · Optimizing" : phase.title }
 
-    public var headlineHistory: ChainHistory? { boards.flatMap(\.histories).first { $0.chain == .challenge } }
-    public var headlineSpeed: String { DisplayFormat.ips(headlineHistory?.statistics(in: HistoryRange.hour.interval(endingAt: now)).average) }
+    public var headlineHistory: ChainHistory? {
+        let histories = boards.flatMap(\.histories)
+        guard !histories.isEmpty else { return nil }
+        return ChainHistory(chain: .challenge, samples: histories.flatMap(\.samples),
+            captureIntervals: histories.flatMap(\.captureIntervals),
+            events: histories.flatMap(\.events))
+    }
+    public var headlineSpeed: String {
+        guard phase == .running, let history = headlineHistory,
+              history.hasFreshValue(at: now) else { return "—" }
+        return DisplayFormat.ips(history.statistics(in: HistoryRange.hour.interval(endingAt: now)).average)
+    }
     public var latestProof: Date? { boards.compactMap(\.lastProof).max() }
     public var proofFreshness: String {
         guard let latestProof else { return "Waiting for the first verified proof" }
@@ -162,7 +172,7 @@ public enum LivePresentation {
         else if live?.productionEnabled == true { phase = nodeReady ? .waitingForProofs : .waitingForNode }
         else { phase = .setupRequired }
         let proofCapable = live?.productionEnabled == true
-        let validHistory = history.flatMap { proofCapable && $0.servicePid == live?.servicePid && $0.apiVersion == 2 ? $0 : nil }
+        let validHistory = history.flatMap { proofCapable && $0.servicePid == live?.servicePid && $0.apiVersion == 3 ? $0 : nil }
         var boards: [BoardSnapshot]
         if let live {
             boards = live.boards.filter { board in
@@ -183,7 +193,7 @@ public enum LivePresentation {
                         let finish = min(end, Date(timeIntervalSince1970: capture.endUnix))
                         return finish > start ? DateInterval(start: start, end: finish) : nil
                     }
-                    let samples = validHistory.observations.filter { $0.chain == chain }.map { ProofObservation(date: Date(timeIntervalSince1970: $0.timestampUnix), ips: $0.ips, id: "proof-\($0.id)") }
+                    let samples = validHistory.estimatedObservations.filter { $0.chain == chain }.map { ProofObservation(date: Date(timeIntervalSince1970: $0.timestampUnix), ips: $0.ips, id: "proof-\($0.id)", sequence: $0.id) }
                     let events = validHistory.events.filter { $0.boardId == nil || $0.boardId == board.id }.compactMap { event -> HistoryEvent? in
                         guard let kind = HistoryEventKind(rawValue: event.kind) else { return nil }
                         let date = Date(timeIntervalSince1970: event.timestampUnix)

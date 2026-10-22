@@ -24,7 +24,7 @@ struct BoardCard: View {
                             HStack {
                                 Label(history.chain.title, systemImage: "circle.fill").font(.subheadline).foregroundStyle(history.chain.color)
                                 Spacer()
-                                Text(DisplayFormat.ips(history.statistics(in: HistoryRange.hour.interval(endingAt: snapshot.now)).average)).font(.headline).monospacedDigit()
+                                Text(DisplayFormat.ips(history.hasFreshValue(at: snapshot.now) && snapshot.phase == .running ? history.statistics(in: HistoryRange.hour.interval(endingAt: snapshot.now)).average : nil)).font(.headline).monospacedDigit()
                             }
                             IPSHistoryChart(history: history, range: .hour, now: snapshot.now, upperBound: snapshot.chartUpperBound, compact: true)
                                 .frame(minHeight: 42, maxHeight: .infinity)
