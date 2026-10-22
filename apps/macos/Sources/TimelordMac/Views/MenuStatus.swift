@@ -8,7 +8,10 @@ struct MenuStatus: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 15) {
             Label { Text("Timelord") } icon: { Image(nsImage: MenuBarIcon.image(for: .running)).renderingMode(.template) }.font(.headline)
-            StatusBadge(title: model.snapshot.phase.title, tone: model.snapshot.phase.tone)
+            StatusBadge(title: model.snapshot.runningTitle, tone: model.snapshot.phase.tone)
+            if model.snapshot.phase == .serviceUnavailable {
+                Text(model.snapshot.explanation).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+            }
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(model.snapshot.headlineSpeed).font(.title2).monospacedDigit()

@@ -5,6 +5,18 @@ import XCTest
 final class PresentationTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_000_000)
 
+    func testNativeClientFaultShowsReasonWithoutClaimingServiceReady() throws {
+        let view = LivePresentation.snapshot(status: try operationalStatus(state: "fault", message: "Native control closed before acknowledgement"), now: now)
+        XCTAssertEqual(view.phase, .serviceUnavailable)
+        XCTAssertEqual(view.runningTitle, "Proof service stopped")
+        XCTAssertTrue(view.explanation.contains("ASIC client connection closed unexpectedly"))
+        XCTAssertTrue(view.explanation.contains("Native control closed before acknowledgement"))
+        XCTAssertEqual(view.timelord.title, "Stopped")
+        XCTAssertEqual(view.timelord.tone, .critical)
+        let other = LivePresentation.snapshot(status: try operationalStatus(state: "fault", message: "Other failure"), now: now)
+        XCTAssertEqual(other.explanation, "Other failure")
+    }
+
     func testRestoredChartKeepsLowSamplesAndDoesNotBridgeRestartDowntime() throws {
         let object: [String: Any] = ["api_version":2,"service_pid":42,"timestamp_unix":1000000,
             "capture_intervals":[["start_unix":999880,"end_unix":999910],["start_unix":999970,"end_unix":1000000]],
@@ -237,8 +249,8 @@ extension PresentationTests {
         let unplugged=LivePresentation.snapshot(status:nil,configuration:config,detectedDevices:[],now:now)
         XCTAssertTrue(unplugged.boards.isEmpty)
     }
-    private func operationalStatus(production: Bool = true, latest: Double = 1_000_000) throws -> ServiceStatus {
-        let object: [String: Any] = ["api_version":1,"service_pid":42,"service_state":"ready","timelord_state":"running","message":"Producing verified proofs.","production_enabled":production,"started_unix":999000,"timestamp_unix":1000000,"latest_proof_unix":latest,"proofs_delivered":7,"tuning_paused":false,
+    private func operationalStatus(production: Bool = true, latest: Double = 1_000_000, state: String = "running", message: String = "Producing verified proofs.") throws -> ServiceStatus {
+        let object: [String: Any] = ["api_version":1,"service_pid":42,"service_state":"ready","timelord_state":state,"message":message,"production_enabled":production,"started_unix":999000,"timestamp_unix":1000000,"latest_proof_unix":latest,"proofs_delivered":7,"tuning_paused":false,
             "full_node":["host":"localhost","port":8444,"network":"mainnet","state":"ready"],
             "boards":[["id":"a","name":"A","client_port":18110,"assigned_chains":["challenge","reward","infused_challenge"],"connected_clients":3,"hardware_state":"connected","temperature_c":42.5,"temperature_limit_c":55,"frequency_mhz":1540,"voltage_v":1,"recoveries":2,"latest_proof_unix":latest,"profile":"Manual"]],"connected_client_count":3,"delivered_ips":1000000]
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase

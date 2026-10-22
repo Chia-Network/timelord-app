@@ -72,7 +72,7 @@ public struct AppSnapshot: Sendable {
     public var tuningPaused: Bool = false
     public var automaticActive: Bool { boards.contains { $0.isAutomatic } }
     public var readyToRun = false
-    public var runningTitle: String { readyToRun ? "Ready to run" : phase == .running && !tuningPaused && boards.contains(where: { ["learning","testing"].contains($0.automatic?.state ?? "") }) ? "Running · Optimizing" : phase.title }
+    public var runningTitle: String { phase == .serviceUnavailable && serviceAvailable ? "Proof service stopped" : readyToRun ? "Ready to run" : phase == .running && !tuningPaused && boards.contains(where: { ["learning","testing"].contains($0.automatic?.state ?? "") }) ? "Running · Optimizing" : phase.title }
 
     public var headlineHistory: ChainHistory? { boards.flatMap(\.histories).first { $0.chain == .challenge } }
     public var headlineSpeed: String { DisplayFormat.ips(headlineHistory?.statistics(in: HistoryRange.hour.interval(endingAt: now)).average) }
@@ -208,14 +208,21 @@ public enum LivePresentation {
                 boards.append(BoardSnapshot(id:board.id,name:board.name,state:.waiting,temperatureC:nil,temperatureLimitC:board.temperatureLimitC,profile:board.profileName,frequencyMHz:nil,voltageV:nil,histories:[],lastProof:nil))
             }
         }
+        let faultReason = live.flatMap { status -> String? in
+            guard status.timelordState == "fault" else { return nil }
+            if status.message == "Native control closed before acknowledgement" {
+                return "The ASIC client connection closed unexpectedly. Proof production has stopped. Pause and Run to reconnect. Details: Native control closed before acknowledgement."
+            }
+            return status.message
+        }
         return AppSnapshot(phase: phase,
-            explanation: error ?? (paused ? "Timelord is paused. Resume when you’re ready." : live?.message ?? (configuration?.node.hasIdentity == true && configuration?.hardware.clientBinary != nil && !boards.isEmpty
+            explanation: error ?? faultReason ?? (paused ? "Timelord is paused. Resume when you’re ready." : live?.message ?? (configuration?.node.hasIdentity == true && configuration?.hardware.clientBinary != nil && !boards.isEmpty
                 ? (configuration?.service.startAutomatically == true
                     ? "Timelord starts automatically when the app opens, once setup and connected boards are ready."
                     : (boards.contains(where: { $0.isAutomatic }) ? "Press Run to start producing proofs. Automatic tuning learns while Timelord runs." : "Press Run to start producing proofs."))
                 : "Connect a full node and plug in your ASIC boards to get started.")),
             node: ConnectionSnapshot(title: nodeTitle, detail: nodeDetail, tone: nodeTone, height: freshSync?.height),
-            timelord: ConnectionSnapshot(title: productive ? "Running" : live != nil ? "Ready" : "Stopped", detail: "On this Mac", tone: productive ? .positive : .neutral),
+            timelord: ConnectionSnapshot(title: phase == .serviceUnavailable ? "Stopped" : productive ? "Running" : live != nil ? "Ready" : "Stopped", detail: "On this Mac", tone: phase == .serviceUnavailable ? .critical : productive ? .positive : .neutral),
             boards: boards, proofsToday: proofCapable ? live?.proofsDelivered : nil, uptimeSeconds: proofCapable ? live.map { max(0, now.timeIntervalSince1970 - $0.startedUnix) } : nil, now: now, serviceAvailable: live != nil, tuningPaused: live?.tuningPaused ?? false, readyToRun: phase == .setupRequired && configuration?.node.hasIdentity == true && configuration?.hardware.clientBinary != nil && !boards.isEmpty)
     }
 }
