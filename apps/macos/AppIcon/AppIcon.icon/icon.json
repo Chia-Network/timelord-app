@@ -1,0 +1,47 @@
+{
+  "groups" : [
+    {
+      "layers" : [
+        { "image-name" : "clock-hands.svg", "name" : "clock-hands" },
+        { "image-name" : "clock-ring.svg", "name" : "clock-ring" },
+        { "image-name" : "clock-face.svg", "name" : "clock-face" }
+      ],
+      "name" : "Clock"
+    },
+    {
+      "layers" : [
+        { "image-name" : "chip-body.svg", "name" : "chip-body" },
+        {
+          "image-name-specializations" : [
+            { "value" : "pins-light.svg" },
+            { "appearance" : "dark", "value" : "pins-dark.svg" }
+          ],
+          "name" : "pins"
+        }
+      ],
+      "name" : "Chip"
+    },
+    {
+      "layers" : [
+        {
+          "image-name-specializations" : [
+            { "value" : "traces-light.svg" },
+            { "appearance" : "dark", "value" : "traces-dark.svg" }
+          ],
+          "name" : "traces"
+        },
+        {
+          "image-name-specializations" : [
+            { "value" : "background-light.svg" },
+            { "appearance" : "dark", "value" : "background-dark.svg" }
+          ],
+          "name" : "background"
+        }
+      ],
+      "name" : "Background"
+    }
+  ],
+  "supported-platforms" : {
+    "squares" : [ "macOS" ]
+  }
+}
