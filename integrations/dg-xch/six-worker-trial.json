@@ -72,5 +72,136 @@
   },
   "production_trial_active": true,
   "automatic_tuning_enabled": true,
-  "comparison_limit": "Initial live samples are different challenges from the earlier baseline; no controlled live IPS improvement is claimed."
+  "comparison_limit": "Initial live samples are different challenges from the earlier baseline; no controlled live IPS improvement is claimed.",
+  "handoff_measurement": {
+    "start_cdt": "2026-10-22T15:59:17.417952-05:00",
+    "end_cdt": "2026-10-22T16:05:17-05:00",
+    "clock": "POSIX CLOCK_MONOTONIC, same host, microseconds; no log timestamp subtraction",
+    "reward_changed_challenge_samples": 15,
+    "reward": {
+      "request_to_first_accepted_ms": {
+        "n": 15,
+        "median_ms": 5.237,
+        "mean_ms": 5.7014,
+        "p95_ms": 12.838,
+        "max_ms": 12.838
+      },
+      "decoded_peak_to_first_accepted_ms": {
+        "n": 15,
+        "median_ms": 5.3,
+        "mean_ms": 5.8448,
+        "p95_ms": 14.023,
+        "max_ms": 14.023
+      },
+      "discriminant_task_ms": {
+        "n": 15,
+        "median_ms": 3.815,
+        "mean_ms": 3.713,
+        "p95_ms": 6.087,
+        "max_ms": 6.087
+      },
+      "client_pool_wait_ms": {
+        "n": 15,
+        "median_ms": 0.571,
+        "mean_ms": 1.1159333333333332,
+        "p95_ms": 5.954,
+        "max_ms": 5.954
+      },
+      "native_init_to_first_accepted_ms": {
+        "n": 15,
+        "median_ms": 0.807,
+        "mean_ms": 0.8044666666666667,
+        "p95_ms": 0.937,
+        "max_ms": 0.937
+      },
+      "previous_proof_drain_ms": {
+        "n": 15,
+        "median_ms": 0.073,
+        "mean_ms": 0.5896,
+        "p95_ms": 6.39,
+        "max_ms": 6.39
+      }
+    },
+    "coverage": {
+      "native_starts": 50,
+      "matched_accepted_starts": 50,
+      "unmatched": [],
+      "missing_first_accepted": []
+    },
+    "cold_starts_excluded": 3,
+    "proofs_delivered": 81,
+    "failed_proofs": 0,
+    "recoveries": 0,
+    "node_resync_count": 1,
+    "node_resync_reason": "Node has not confirmed the infusion; reconnecting for chain state",
+    "boards": {
+      "811F0379-0E67-439C-868A-D83665CE6792": {
+        "max_temperature_c": 42.12,
+        "clocks_mhz": [
+          1600.0
+        ]
+      },
+      "92289F26-3466-4292-9A9A-7B9706FDF66E": {
+        "max_temperature_c": 41.24,
+        "clocks_mhz": [
+          1600.0
+        ]
+      },
+      "C3C584A5-5207-4F51-8FE6-8ABB345E24EB": {
+        "max_temperature_c": 38.35,
+        "clocks_mhz": [
+          1600.0
+        ]
+      }
+    },
+    "slowest_reward": {
+      "board": "92289F26-3466-4292-9A9A-7B9706FDF66E",
+      "job": 5,
+      "chain": "Reward",
+      "generation": 5,
+      "challenge": "2f13ef5487b7f6326a6c341ba82fa8e7b3ab2cbb82615ba9871f9cb36e10a712",
+      "cold": false,
+      "request_to_first_accepted_ms": 12.838,
+      "before_pool_ms": 0.005,
+      "client_pool_wait_ms": 5.954,
+      "pool_to_prime_ms": 0.0,
+      "discriminant_task_ms": 6.087,
+      "decimal_and_setup_ms": 0.002,
+      "handshake_to_native_init_ms": 0.01,
+      "native_init_to_first_accepted_ms": 0.78,
+      "accepted_iters": 44,
+      "state_init_ms": 0.064,
+      "usb_start_ms": 0.41,
+      "decoded_peak_to_first_accepted_ms": 14.023,
+      "decoded_peak_to_request_ms": 1.185,
+      "stop_to_first_accepted_ms": 13.805,
+      "previous_native_stop_ms": 6.836,
+      "previous_proof_drain_ms": 6.39,
+      "previous_state_cleanup_ms": 0.232,
+      "previous_usb_stop_ms": 0.205,
+      "ideal_client_wait_prime_overlap_saving_ms": 5.954,
+      "challenge_changed": true,
+      "first_seen_challenge": true
+    },
+    "restoration": {
+      "service_pid": 98841,
+      "state": "running",
+      "proofs": 10,
+      "latest_proof_age_seconds": 6,
+      "tuning_paused": false,
+      "hashes": {
+        "timelord-service": "d05986510515f10e97a1e41ad8f400990861e686a0c825e4dc4ee0a87f4ea146",
+        "hw_vdf_client": "5035bc5dc2eb3fb7e6c31137b1c3b84e73e4777bdd976c4acf1dc48940b49c73"
+      }
+    },
+    "raw_evidence_local": "/private/tmp/timelord-six-worker-handoff-20261022",
+    "raw_evidence_remote": "/Users/cameron/timelord-six-worker-handoff-20261022",
+    "next_candidate": "Overlap discriminant computation with client retirement/availability; current implementation waits for the client first. No overlapping implementation or gain was measured.",
+    "limitations": [
+      "Instrumented live sample; observed p95/max, not a long-term p99 estimate.",
+      "First accepted ASIC value is not a completed VDF proof.",
+      "Cold process starts are separated from warm handoffs.",
+      "Ideal overlap savings assume unchanged component times; no overlapping implementation was tested."
+    ]
+  }
 }
