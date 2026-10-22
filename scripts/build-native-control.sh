@@ -1,6 +1,24 @@
 #!/usr/bin/env bash
 # Build a pinned public chiavdf checkout plus the pipe-control integration. No USB I/O.
 set -euo pipefail
+
+# get-libft4222.sh points src/hw/libft4222 at the download directory and
+# libft4222.dylib at the versioned image. rsync -a keeps that directory
+# symlink, and copying into it writes each file onto itself. Remove the link
+# first. cp follows the dylib symlink and stores a regular file.
+# scripts/bundle-inputs-test.sh sources this helper.
+stage_ftdi_drivers() {
+  local dest="$1"
+  shift
+  rm -rf "$dest"
+  mkdir -p "$dest"
+  cp "$@" "$dest/"
+}
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 source "$ROOT/integrations/chiavdf/upstream.env"
 for tool in git cmake rsync patch shasum; do
@@ -29,10 +47,9 @@ for name in ftd2xx.h libft4222.h WinTypes.h libftd2xx.dylib libft4222.dylib; do
 done
 STAGE="$ROOT/build/controlled-native-source"
 OUTPUT="$ROOT/build/controlled-native"
-mkdir -p "$STAGE" "$OUTPUT/hw/libft4222"
+mkdir -p "$STAGE" "$OUTPUT"
 rsync -a --delete --exclude='*.o' --exclude='hw_vdf_client' --exclude='emu_hw_vdf_client' --exclude='hw_test' --exclude='*.key' "$SOURCE/src/" "$STAGE/"
-mkdir -p "$STAGE/hw/libft4222"
-cp "$DRIVERS/"*.h "$DRIVERS/libftd2xx.dylib" "$DRIVERS/libft4222.dylib" "$STAGE/hw/libft4222/"
+stage_ftdi_drivers "$STAGE/hw/libft4222" "$DRIVERS/"*.h "$DRIVERS/libftd2xx.dylib" "$DRIVERS/libft4222.dylib"
 patch --batch --forward -F0 -p1 -d "$STAGE" < "$ROOT/integrations/chiavdf/live-control.patch"
 cp "$ROOT/integrations/chiavdf/timelord_live_control.hpp" "$STAGE/hw/"
 cp "$ROOT/integrations/chiavdf/timelord_telemetry.hpp" "$STAGE/hw/"
@@ -40,7 +57,7 @@ PREFIX="${CMAKE_PREFIX_PATH:-}"
 if command -v brew >/dev/null 2>&1; then PREFIX="$(brew --prefix);$PREFIX"; fi
 cmake -S "$STAGE" -B "$OUTPUT" -DBUILD_PYTHON=OFF -DBUILD_HW_TOOLS=ON -DBUILD_VDF_CLIENT=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 -DCMAKE_PREFIX_PATH="$PREFIX" -DCHIAVDF_VERSION="$(git -C "$SOURCE" rev-parse --short HEAD)+live-control-v1"
 cmake --build "$OUTPUT" --target hw_vdf_client -j "${CMAKE_BUILD_PARALLEL_LEVEL:-4}"
-cp "$DRIVERS/libftd2xx.dylib" "$DRIVERS/libft4222.dylib" "$OUTPUT/hw/libft4222/"
+stage_ftdi_drivers "$OUTPUT/hw/libft4222" "$DRIVERS/libftd2xx.dylib" "$DRIVERS/libft4222.dylib"
 {
   git -C "$SOURCE" rev-parse HEAD
   shasum -a 256 "$ROOT/integrations/chiavdf/live-control.patch" "$ROOT/integrations/chiavdf/timelord_live_control.hpp" "$ROOT/integrations/chiavdf/timelord_telemetry.hpp" "$OUTPUT/hw_vdf_client"

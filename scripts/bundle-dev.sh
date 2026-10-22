@@ -4,6 +4,7 @@ set -euo pipefail
 export MACOSX_DEPLOYMENT_TARGET=14.0
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
+source "$PROJECT_ROOT/scripts/macho-load-commands.sh"
 [[ "$(uname -s)" == Darwin ]] || { echo 'The Mac app bundle must be built on macOS.' >&2; exit 1; }
 CLIENT="${TIMELORD_ASIC_CLIENT:-$PROJECT_ROOT/build/controlled-native/hw_vdf_client}"
 [[ -x "$CLIENT" ]] || { echo 'Build the native client first: bash scripts/build-native-control.sh' >&2; exit 1; }
@@ -23,7 +24,7 @@ cp build/rust/release/timelord-service "$APP/Contents/Helpers/timelord-service"
 cp "$CLIENT" "$APP/Contents/Helpers/hw_vdf_client"
 cp "$DRIVERS/libft4222.dylib" "$DRIVERS/libftd2xx.dylib" "$APP/Contents/Frameworks/"
 # GMP is dynamically linked by chiavdf. Include the actual linked versions.
-dependencies() { otool -L "$1" | sed '1d; s/^[[:space:]]*//; s/ (compatibility version.*$//'; }
+dependencies() { otool -L "$1" | macho_linked_libraries; }
 while IFS= read -r dependency; do
   case "$(basename "$dependency")" in
     libgmp*.dylib)
@@ -51,7 +52,7 @@ for binary in "$APP/Contents/Frameworks/"*.dylib "$APP/Contents/Helpers/hw_vdf_c
     install_name_tool -change "$dependency" "$replacement" "$binary"
   done < <(dependencies "$binary")
   # No staged source paths or Homebrew search paths remain in the shipped files.
-  while IFS= read -r rpath; do install_name_tool -delete_rpath "$rpath" "$binary"; done < <(otool -l "$binary" | awk '/LC_RPATH/{getline;getline;sub(/^ *path /,"");sub(/ \(offset.*$/,"");print}')
+  while IFS= read -r rpath; do install_name_tool -delete_rpath "$rpath" "$binary"; done < <(otool -l "$binary" | macho_rpaths)
   if [[ "$binary" == "$APP/Contents/Frameworks/"* ]]; then install_name_tool -id "@rpath/$(basename "$binary")" "$binary"; fi
   codesign --force --sign - "$binary"
 done
