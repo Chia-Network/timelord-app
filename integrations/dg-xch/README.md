@@ -11,8 +11,9 @@ service/CLI is not used: it constructs a CpuBackend and recomputes each request.
 
 The adapter keeps one logical-chain session per assigned board, retains squaring
 across requests with identical generation/challenge/input, primes the validated infused-chain input as soon as
-peak/slot state arrives (including while signage plans omit ICC), derives the canonical
-discriminant, and converts complete checkpointed native proofs without flattening.
+peak/slot state arrives (including while signage plans omit ICC), prepares the canonical
+discriminant while prior sessions retire or native clients reconnect, and converts
+complete checkpointed native proofs without flattening.
 The ASIC adapter verifies the proof; Scheduler.finish also checks generation,
 request identity and consensus proof validity before sending a node message.
 

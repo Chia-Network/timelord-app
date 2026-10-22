@@ -186,6 +186,16 @@ impl AsicBackend {
         // Take ownership during I/O. Cancellation retires the socket instead of
         // leaving a partially consumed frame in a reusable session.
         let mut active = owner.take();
+        // A new discriminant does not depend on the old socket. Start it before
+        // retiring that session or waiting for the native client to reconnect.
+        let discriminant = active
+            .as_ref()
+            .is_none_or(|s| !same_challenge(&s.key, &work))
+            .then(|| {
+                let seed = work.challenge.const_bytes().to_vec();
+                let bits = work.discriminant_bits;
+                tokio::task::spawn_blocking(move || create_discriminant_bytes(&seed, bits))
+            });
         if active
             .as_ref()
             .is_some_and(|s| !same_challenge(&s.key, &work))
@@ -206,14 +216,12 @@ impl AsicBackend {
                     .await
                     .context("Waiting for ASIC client timed out")?
                     .context("ASIC listener stopped")?;
-                // Match Python timelord: start when assigning the client, before
-                // discriminant construction and the initial handshake.
+                // Match Python timelord: start the IPS clock when assigning the
+                // client, even if discriminant preparation is already running.
                 let estimated_started = Instant::now();
-                let seed = work.challenge.const_bytes().to_vec();
-                let bits = work.discriminant_bits;
-                let magnitude =
-                    tokio::task::spawn_blocking(move || create_discriminant_bytes(&seed, bits))
-                        .await??;
+                let magnitude = discriminant
+                    .expect("A new session needs a discriminant")
+                    .await??;
                 let decimal = format!("-{}", num_bigint::BigUint::from_bytes_be(&magnitude));
                 let started = Instant::now();
                 lease
@@ -445,6 +453,54 @@ mod tests {
         let mut value = vec![0; size];
         socket.read_exact(&mut value).await.unwrap();
         std::str::from_utf8(&value).unwrap().parse().unwrap()
+    }
+    #[test]
+    fn discriminant_starts_before_a_client_is_available_and_cancellation_releases_lane() {
+        // No async worker threads: the callback can only come from spawn_blocking.
+        // The old ordering waits for a client and never creates that thread.
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let signal = started.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .on_thread_start(move || signal.add_permits(1))
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let config: Config =
+                toml::from_str("[[hardware.boards]]\nid='a'\nname='A'\nclient_port=18110\n")
+                    .unwrap();
+            let (backend, _offers) = AsicBackend::new(&config, Default::default()).unwrap();
+            let backend = Arc::new(backend);
+            let proving = tokio::spawn({
+                let backend = backend.clone();
+                async move { backend.prove(Chain::Challenge, work(10, 64)).await }
+            });
+            let permit = tokio::time::timeout(Duration::from_secs(2), started.acquire())
+                .await
+                .expect("Discriminant must start while the client pool is empty")
+                .unwrap();
+            permit.forget();
+            assert!(!proving.is_finished());
+            proving.abort();
+            assert!(
+                proving
+                    .await
+                    .err()
+                    .expect("Cancelled proof task")
+                    .is_cancelled()
+            );
+            assert!(backend.lanes[0].1.active.try_lock().unwrap().is_none());
+            assert!(backend.pools["a"].try_lock().is_ok());
+            assert!(
+                backend
+                    .runtime
+                    .lock()
+                    .unwrap()
+                    .estimated_observations
+                    .is_empty()
+            );
+        });
     }
     #[tokio::test]
     async fn successive_requests_share_a_challenge_and_stop_with_ack() {
