@@ -11,7 +11,9 @@ bash scripts/build-native-control.sh
 ```
 
 The default build fetches the pinned upstream FTDI installer into the same build
-cache. An existing FTDI SDK can be selected explicitly with `CHIAVDF_DRIVERS`.
+cache. That installer points `src/hw/libft4222` at the download directory, whose
+libraries are universal; staging copies them into a real directory. An existing
+FTDI SDK can be selected explicitly with `CHIAVDF_DRIVERS`.
 `CHIAVDF_SOURCE=/path/to/chiavdf` permits an explicit development checkout; it
 never defaults to a parent directory. Build provenance records the revision,
 patch/header hashes, native binary hash and staged source hashes. The final
