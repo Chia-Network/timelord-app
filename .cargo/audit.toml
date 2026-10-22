@@ -1,0 +1,10 @@
+[advisories]
+# Reviewed 2026-10-22 against dg_xch_utils ca437be562cec5f0514f6edd4c794adfe382dd8a.
+# dg_xch_core unconditionally depends on rsa for certificate-generation helpers.
+# Timelord imports existing identities and uses only its PEM-loading helpers;
+# network TLS private-key operations use rustls with the AWS-LC provider, not rsa.
+# The affected RustCrypto RSA private-key operations are not used by this app.
+# https://rustsec.org/advisories/RUSTSEC-2023-0071 has no patched version.
+# Reassess on changes to the upstream pin, identity handling or TLS provider;
+# remove this exception when rsa can be removed or a fixed version is available.
+ignore = ["RUSTSEC-2023-0071"]
