@@ -23,7 +23,7 @@
     "app_workspace": "passed",
     "upstream_clippy": "passed"
   },
-  "trial_service_sha256": "d05986510515f10e97a1e41ad8f400990861e686a0c825e4dc4ee0a87f4ea146",
+  "trial_service_sha256": "61764fa999cf39f5cb5a73ec9299d9afdbfbee1758d2a163e07f4fcd2523dd00",
   "raw_evidence_local": "/private/tmp/timelord-six-worker-prime-20261022",
   "raw_evidence_remote": "/Users/cameron/timelord-six-worker-prime-20261022",
   "live_initial": {
@@ -202,6 +202,181 @@
       "First accepted ASIC value is not a completed VDF proof.",
       "Cold process starts are separated from warm handoffs.",
       "Ideal overlap savings assume unchanged component times; no overlapping implementation was tested."
+    ]
+  },
+  "previous_trial_service_sha256": "d05986510515f10e97a1e41ad8f400990861e686a0c825e4dc4ee0a87f4ea146",
+  "overlap_measurement": {
+    "normal_build_supports_overlap": true,
+    "start_cdt": "2026-10-22T16:58:47.263629-05:00",
+    "end_cdt": "2026-10-22T17:04:47-05:00",
+    "clock": "POSIX CLOCK_MONOTONIC, same host, microseconds; no log timestamp subtraction",
+    "reward_changed_challenge_samples": 23,
+    "reward": {
+      "request_to_first_accepted_ms": {
+        "n": 23,
+        "median_ms": 3.637,
+        "mean_ms": 3.748913043478261,
+        "p95_ms": 5.396,
+        "max_ms": 7.078
+      },
+      "prime_compute_ms": {
+        "n": 23,
+        "median_ms": 2.896,
+        "mean_ms": 2.852521739130435,
+        "p95_ms": 4.478,
+        "max_ms": 6.201
+      },
+      "remaining_prime_await_ms": {
+        "n": 23,
+        "median_ms": 1.85,
+        "mean_ms": 1.9196086956521738,
+        "p95_ms": 3.983,
+        "max_ms": 5.727
+      },
+      "prime_compute_hidden_before_client_ms": {
+        "n": 23,
+        "median_ms": 0.654,
+        "mean_ms": 0.9475217391304348,
+        "p95_ms": 2.217,
+        "max_ms": 3.839
+      },
+      "client_pool_wait_ms": {
+        "n": 23,
+        "median_ms": 0.57,
+        "mean_ms": 0.9512608695652174,
+        "p95_ms": 2.565,
+        "max_ms": 3.843
+      },
+      "native_init_to_first_accepted_ms": {
+        "n": 23,
+        "median_ms": 0.814,
+        "mean_ms": 0.8164347826086956,
+        "p95_ms": 0.95,
+        "max_ms": 0.986
+      }
+    },
+    "coverage": {
+      "native_starts": 76,
+      "matched_accepted_starts": 76,
+      "unmatched": [],
+      "missing_first_accepted": []
+    },
+    "proofs_delivered": 82,
+    "failed_proofs": 0,
+    "recoveries": 0,
+    "node_resync_count": 2,
+    "node_resync_reason": "Node has not confirmed the infusion; reconnecting for chain state",
+    "boards": {
+      "811F0379-0E67-439C-868A-D83665CE6792": {
+        "max_temperature_c": 42.12,
+        "clocks_mhz": [
+          1600.0
+        ]
+      },
+      "92289F26-3466-4292-9A9A-7B9706FDF66E": {
+        "max_temperature_c": 41.02,
+        "clocks_mhz": [
+          1600.0
+        ]
+      },
+      "C3C584A5-5207-4F51-8FE6-8ABB345E24EB": {
+        "max_temperature_c": 37.67,
+        "clocks_mhz": [
+          1600.0
+        ]
+      }
+    },
+    "controlled_replay": {
+      "description": "Matched15 captured challenges,5 alternating-order repetitions per wait setting. Wait is simulated by a Tokio timer, not real ASIC proof-worker drain. Values are milliseconds.",
+      "delay_results": {
+        "0": {
+          "False": {
+            "total_median_ms": 6.714,
+            "prime_median_ms": 5.43,
+            "wait_median_ms": 1.245,
+            "samples": 75
+          },
+          "True": {
+            "total_median_ms": 5.866,
+            "prime_median_ms": 5.857,
+            "wait_median_ms": 1.264,
+            "samples": 75
+          }
+        },
+        "1": {
+          "False": {
+            "total_median_ms": 7.928,
+            "prime_median_ms": 5.16,
+            "wait_median_ms": 2.194,
+            "samples": 75
+          },
+          "True": {
+            "total_median_ms": 5.964,
+            "prime_median_ms": 5.947,
+            "wait_median_ms": 2.525,
+            "samples": 75
+          }
+        },
+        "6": {
+          "False": {
+            "total_median_ms": 12.711,
+            "prime_median_ms": 5.451,
+            "wait_median_ms": 7.332,
+            "samples": 75
+          },
+          "True": {
+            "total_median_ms": 7.957,
+            "prime_median_ms": 6.152,
+            "wait_median_ms": 7.379,
+            "samples": 75
+          }
+        },
+        "12": {
+          "False": {
+            "total_median_ms": 18.268,
+            "prime_median_ms": 4.796,
+            "wait_median_ms": 13.362,
+            "samples": 75
+          },
+          "True": {
+            "total_median_ms": 13.304,
+            "prime_median_ms": 5.606,
+            "wait_median_ms": 13.303,
+            "samples": 75
+          }
+        }
+      }
+    },
+    "tests": {
+      "workspace_clippy": "passed",
+      "workspace_tests": "passed",
+      "exact_six_worker_dependency_workspace": "passed",
+      "new_ordering_regression": "passed",
+      "original_ordering_negative_control": "failed as expected waiting for a client; regression proves early scheduling",
+      "cancellation_and_persistent_session_regressions": "passed"
+    },
+    "normal_deployment": {
+      "installed_unix": 1792706731.545293,
+      "service_pid": 99559,
+      "service_sha256": "61764fa999cf39f5cb5a73ec9299d9afdbfbee1758d2a163e07f4fcd2523dd00",
+      "native_sha256": "5035bc5dc2eb3fb7e6c31137b1c3b84e73e4777bdd976c4acf1dc48940b49c73",
+      "config_sha256": "61452e563888b88bad2731b0b7d830374f18010a01663ed0d8a82caa1be6f72f",
+      "log_offset": 281551274,
+      "backup_app": "/Users/cameron/timelord-overlap-20261022/Timelord-before-overlap.app",
+      "workers": 6,
+      "overlap_discriminant_and_client_retirement": true,
+      "hardware_sha": "RustCrypto sha2 asm feature on aarch64",
+      "upstream_base": "ca437be562cec5f0514f6edd4c794adfe382dd8a"
+    },
+    "normal_proofs_at_verification": 17,
+    "automatic_tuning_restored": true,
+    "raw_evidence_local": "/private/tmp/timelord-overlap-20261022",
+    "raw_evidence_remote": "/Users/cameron/timelord-overlap-20261022",
+    "limitations": [
+      "Instrumented live sample; observed p95/max, not a long-term p99 estimate.",
+      "First accepted ASIC value is not a completed VDF proof.",
+      "Cold process starts are separated from warm handoffs.",
+      "Live baseline and overlap windows have different challenges; their median difference is not a controlled gain estimate."
     ]
   }
 }
