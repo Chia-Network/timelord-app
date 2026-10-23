@@ -253,7 +253,13 @@ public enum LivePresentation {
             let counts=BoardTopology.counts(connected)
             boards = connected.enumerated().map { index, board in
                 let offset=counts.prefix(index).reduce(0,+)
-                let chains=Array(Chain.allCases.dropFirst(offset).prefix(counts[index]))
+                let chains: [Chain]
+                if let mapping = configuration?.hardware.chainAssignments, let serial = board.serial {
+                    let serials = [mapping.challenge, mapping.reward, mapping.infusedChallenge]
+                    chains = zip(Chain.allCases, serials).compactMap { chain, assigned in assigned == serial ? chain : nil }
+                } else {
+                    chains = Array(Chain.allCases.dropFirst(offset).prefix(counts[index]))
+                }
                 return BoardSnapshot(id: board.id, name: board.name, state: paused ? .paused : .waiting, temperatureC: nil, temperatureLimitC: board.temperatureLimitC, profile: board.profileName, frequencyMHz: nil, voltageV: nil, histories: chains.map(ChainHistory.empty), lastProof: nil)
             }
         }

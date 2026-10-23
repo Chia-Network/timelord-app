@@ -18,10 +18,16 @@ final class ConfigurationClientTests: XCTestCase {
         var value = try await client.load()
         XCTAssertEqual(value.node.host, "localhost")
         value.node.host = "fixture.invalid"; value.node.port = 18444; value.node.network = "testnet11"
+        value.hardware.boards = (0..<3).map { index in
+            var board = ConfiguredBoard(id: "b\(index)", name: "Board \(index)", port: 18110 + index, location: 1 + index)
+            board.serial = "serial-\(index)"; return board
+        }
+        value.hardware.chainAssignments = ChainAssignments(challenge: "serial-2", reward: "serial-0", infusedChallenge: "serial-1")
         try await client.save(value)
         let saved = try await client.load()
         XCTAssertEqual(saved.node.host, "fixture.invalid")
         XCTAssertEqual(saved.node.port, 18444)
+        XCTAssertEqual(saved.hardware.chainAssignments, value.hardware.chainAssignments)
         value.node.host = ""
         do { try await client.save(value); XCTFail("Invalid config was saved") } catch { XCTAssertFalse(error.localizedDescription.isEmpty) }
         let preserved = try await client.load()

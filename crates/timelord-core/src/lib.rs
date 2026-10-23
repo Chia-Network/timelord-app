@@ -100,6 +100,21 @@ pub struct HardwareConfig {
     pub boards: Vec<BoardConfig>,
     pub remembered_boards: Vec<BoardConfig>,
     pub automatic_state: Option<PathBuf>,
+    /// Omit for automatic ranking. Explicit assignments require three boards.
+    pub chain_assignments: Option<ChainAssignments>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainAssignments {
+    pub challenge: String,
+    pub reward: String,
+    pub infused_challenge: String,
+}
+impl ChainAssignments {
+    pub fn serials(&self) -> [&str; 3] {
+        [&self.challenge, &self.reward, &self.infused_challenge]
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,7 +309,13 @@ impl Config {
         let mut ids = HashSet::new();
         let mut ports = HashSet::from([self.service.status_listen.port()]);
         let mut locations = HashSet::new();
+        let mut serials = HashSet::new();
         for b in &self.hardware.boards {
+            if let Some(serial) = &b.serial
+                && (serial.trim().is_empty() || !serials.insert(serial.as_str()))
+            {
+                return Err("Board serials must be nonempty and unique".into());
+            }
             if !b.automatic.validate() {
                 return Err("Automatic settings require a 200–2200 MHz range, requested 0.7–1.0 V, and bounded observation/cooldown windows".into());
             }
@@ -330,13 +351,38 @@ impl Config {
                 return Err("Explicit device locations must be nonzero and unique; location zero is ambiguous".into());
             }
         }
+        if let Some(mapping) = &self.hardware.chain_assignments {
+            let selected = mapping.serials();
+            if self.hardware.boards.len() != 3
+                || selected.iter().copied().collect::<HashSet<_>>().len() != 3
+                || selected.iter().any(|s| !serials.contains(s))
+            {
+                return Err(
+                    "Explicit chain assignments require three distinct configured board serials"
+                        .into(),
+                );
+            }
+        }
         Ok(())
     }
 
     /// A configured plan, not a claim about detected hardware or connected clients.
     pub fn assignments(&self) -> Result<Vec<Assignment>, String> {
         self.validate()?;
-        let boards = &self.hardware.boards;
+        let mut boards: Vec<_> = self.hardware.boards.iter().collect();
+        if let Some(mapping) = &self.hardware.chain_assignments {
+            boards = mapping
+                .serials()
+                .iter()
+                .map(|serial| {
+                    boards
+                        .iter()
+                        .copied()
+                        .find(|b| b.serial.as_deref() == Some(*serial))
+                        .expect("validated serial")
+                })
+                .collect();
+        }
         if boards.is_empty() {
             return Ok(vec![]);
         }
@@ -439,6 +485,54 @@ mod tests {
         assert!(!disabled.start_automatically);
         let restored: ServiceConfig = toml::from_str(&toml::to_string(&disabled).unwrap()).unwrap();
         assert!(!restored.start_automatically);
+    }
+    #[test]
+    fn explicit_assignments_follow_serials_and_reject_incomplete_or_ambiguous_maps() {
+        let mut c = Config::default();
+        for (i, id) in ["a", "b", "c"].iter().enumerate() {
+            let mut b = board(id, 18110 + i as u16);
+            b.serial = Some(format!("serial-{id}"));
+            c.hardware.boards.push(b);
+        }
+        c.hardware.chain_assignments = Some(ChainAssignments {
+            challenge: "serial-c".into(),
+            reward: "serial-a".into(),
+            infused_challenge: "serial-b".into(),
+        });
+        let original = c.assignments().unwrap();
+        assert_eq!(
+            original
+                .iter()
+                .map(|a| a.board_id.as_str())
+                .collect::<Vec<_>>(),
+            ["c", "a", "b"]
+        );
+        c.hardware.boards.reverse();
+        for (i, b) in c.hardware.boards.iter_mut().enumerate() {
+            b.device_location = Some(100 + i as u32);
+        }
+        assert_eq!(c.assignments().unwrap(), original);
+        let mut bad = c.clone();
+        bad.hardware.chain_assignments.as_mut().unwrap().reward = "serial-c".into();
+        assert!(bad.validate().is_err());
+        bad = c.clone();
+        bad.hardware.chain_assignments.as_mut().unwrap().reward = "missing".into();
+        assert!(bad.validate().is_err());
+        bad = c.clone();
+        bad.hardware.boards.pop();
+        assert!(bad.validate().is_err());
+        bad = c.clone();
+        bad.hardware.chain_assignments = None;
+        bad.hardware.boards[1].serial = bad.hardware.boards[0].serial.clone();
+        assert!(bad.validate().is_err());
+        let encoded = toml::to_string(&c).unwrap();
+        assert_eq!(
+            toml::from_str::<Config>(&encoded)
+                .unwrap()
+                .assignments()
+                .unwrap(),
+            original
+        );
     }
     #[test]
     fn one_board_has_three_distinct_engines() {

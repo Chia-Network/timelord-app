@@ -142,11 +142,18 @@ pub fn board_location(board: &timelord_core::BoardConfig, devices: &[Device]) ->
 
 /// Resolve only physically enumerated boards, preserving the stored registry.
 /// This changes the launch plan, never the config file or a running service.
-pub async fn connected_configuration(mut config: Config) -> Result<Config> {
+pub async fn connected_configuration(config: Config) -> Result<Config> {
     if config.hardware.client_binary.is_none() {
         return Ok(config);
     }
     let devices = discover(&config).await?;
+    connected_plan(config, devices)
+}
+
+fn connected_plan(mut config: Config, devices: Vec<Device>) -> Result<Config> {
+    // A serial-pinned mapping remains fixed even if a board is absent. Its owner
+    // retries discovery while the healthy boards keep their existing chains.
+    let pinned = config.hardware.chain_assignments.is_some();
     config.hardware.boards.retain_mut(|board| {
         let found = devices.iter().find(|d| match &board.serial {
             Some(s) => d.serial.as_ref() == Some(s),
@@ -159,7 +166,7 @@ pub async fn connected_configuration(mut config: Config) -> Result<Config> {
             }
             true
         } else {
-            false
+            pinned
         }
     });
     // Automatically include newly plugged boards with Automatic tuning.
@@ -209,6 +216,35 @@ pub async fn connected_configuration(mut config: Config) -> Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_mapping_keeps_absent_board_while_refreshing_connected_locations() {
+        let mut config = Config::default();
+        config.hardware.boards = (0..3).map(|i| toml::from_str(&format!(
+            "id='b{i}'\nname='B{i}'\nserial='serial-{i}'\ndevice_location={}\nclient_port={}", i+1, i+18110
+        )).unwrap()).collect();
+        config.hardware.chain_assignments = Some(timelord_core::ChainAssignments {
+            challenge: "serial-2".into(),
+            reward: "serial-0".into(),
+            infused_challenge: "serial-1".into(),
+        });
+        let expected = config.assignments().unwrap();
+        let devices = vec![Device {
+            name: "Chia VDF A".into(),
+            location: 99,
+            serial: Some("serial-2".into()),
+        }];
+        let plan = connected_plan(config.clone(), devices).unwrap();
+        assert_eq!(plan.assignments().unwrap(), expected);
+        assert_eq!(plan.hardware.boards.len(), 3);
+        assert_eq!(plan.hardware.boards[2].device_location, Some(99));
+        assert_eq!(
+            connected_plan(config, vec![])
+                .unwrap()
+                .assignments()
+                .unwrap(),
+            expected
+        );
+    }
     #[test]
     fn hotplug_follows_the_serial_and_never_a_replacement_at_the_old_port() {
         let board = toml::from_str(

@@ -44,14 +44,18 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn new(path: PathBuf, config: &Config) -> Result<Self> {
+    pub fn new(
+        path: PathBuf,
+        config: &Config,
+        assignments: &[timelord_core::Assignment],
+    ) -> Result<Self> {
         // Do not attribute old chain measurements to a different node or board
         // assignment. Clock/profile/binary updates intentionally preserve charts.
         let scope = serde_json::to_vec(&(
             config.node.network,
             &config.node.host,
             config.node.port,
-            config.assignments().map_err(anyhow::Error::msg)?,
+            assignments,
         ))?;
         let scope = dg_xch_core::utils::hash_256(scope)
             .iter()
@@ -251,7 +255,12 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("timelord-history-{}-{unique}", std::process::id()));
         fs::create_dir(&directory).unwrap();
-        let store = Store::new(directory.join("config.history.json"), &Config::default()).unwrap();
+        let store = Store::new(
+            directory.join("config.history.json"),
+            &Config::default(),
+            &[],
+        )
+        .unwrap();
         (directory, store)
     }
 
@@ -353,13 +362,14 @@ mod tests {
         store.save(&store.snapshot(&first, 1000, 1050)).unwrap();
         let mut config = Config::default();
         config.node.host = "other-node".into();
-        let other = Store::new(store.path.clone(), &config).unwrap();
+        let other =
+            Store::new(store.path.clone(), &config, &config.assignments().unwrap()).unwrap();
         let mut state = RuntimeState::default();
         other.restore(&mut state, 1100).unwrap();
         assert!(state.archive.is_none());
         config.node.host = "localhost".into();
         config.node.network = timelord_core::Network::Testnet11;
-        Store::new(store.path.clone(), &config)
+        Store::new(store.path.clone(), &config, &config.assignments().unwrap())
             .unwrap()
             .restore(&mut state, 1100)
             .unwrap();
@@ -367,6 +377,41 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn history_scope_uses_the_resolved_plan_instead_of_recomputing_config_order() {
+        let (directory, _) = fixture();
+        let mut config = Config::default();
+        config.hardware.boards = (0..3)
+            .map(|i| {
+                toml::from_str(&format!(
+                    "id='b{i}'\nname='B{i}'\nclient_port={}",
+                    18110 + i
+                ))
+                .unwrap()
+            })
+            .collect();
+        let configured = config.assignments().unwrap();
+        let mut resolved = configured.clone();
+        resolved[0].board_id = "b2".into();
+        resolved[2].board_id = "b0".into();
+        let path = directory.join("ranked.json");
+        let store = Store::new(path.clone(), &config, &resolved).unwrap();
+        let mut state = RuntimeState::default();
+        state.observations.push(proof(1, 1002, 900_000.));
+        store.save(&store.snapshot(&state, 1000, 1050)).unwrap();
+        let mut restored = RuntimeState::default();
+        Store::new(path.clone(), &config, &configured)
+            .unwrap()
+            .restore(&mut restored, 1100)
+            .unwrap();
+        assert!(restored.archive.is_none());
+        Store::new(path, &config, &resolved)
+            .unwrap()
+            .restore(&mut restored, 1100)
+            .unwrap();
+        assert!(restored.archive.is_some());
+        fs::remove_dir_all(directory).unwrap();
+    }
     #[test]
     fn failed_write_and_corrupt_read_preserve_the_existing_file() {
         let (directory, store) = fixture();

@@ -51,7 +51,7 @@ pub async fn check(mut config: Config) -> Result<Vec<CheckedProof>> {
         }
     }
     let runtime = Arc::new(Mutex::new(RuntimeState::default()));
-    let (backend, offers) = AsicBackend::new(&config, runtime.clone())?;
+    let (backend, offers) = AsicBackend::new(&config, &assignments, runtime.clone())?;
     let backend = Arc::new(backend);
     let shared = Arc::new(Shared {
         config,

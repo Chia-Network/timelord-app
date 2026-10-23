@@ -38,9 +38,18 @@ public struct HardwareConfiguration: Codable, Sendable, Equatable {
     public var clientBinary: String?
     public var driverLibrary: String?
     public var automaticState: String?
+    public var chainAssignments: ChainAssignments?
     public var boards: [ConfiguredBoard] = []
     public var rememberedBoards: [ConfiguredBoard] = []
     public init() {}
+}
+public struct ChainAssignments: Codable, Sendable, Equatable {
+    public var challenge: String
+    public var reward: String
+    public var infusedChallenge: String
+    public init(challenge: String, reward: String, infusedChallenge: String) {
+        self.challenge = challenge; self.reward = reward; self.infusedChallenge = infusedChallenge
+    }
 }
 public struct ConfiguredBoard: Codable, Identifiable, Sendable, Equatable {
     public var id: String
@@ -100,6 +109,16 @@ public enum BoardTopology {
 public enum BoardDiscovery {
     public static func reconcile(_ devices:[DiscoveredDevice], hardware:HardwareConfiguration) -> HardwareConfiguration {
         var result=hardware
+        if hardware.chainAssignments != nil {
+            // Keep serial-pinned owners even while unplugged. The service retries
+            // their connections without reallocating a healthy board's chain.
+            for device in devices {
+                if let index = result.boards.firstIndex(where: { $0.serial != nil && $0.serial == device.serial }) {
+                    result.boards[index].deviceLocation = device.location
+                }
+            }
+            return result
+        }
         var remembered=hardware.rememberedBoards
         for board in hardware.boards {
             remembered.removeAll { $0.id==board.id || (board.serial != nil && $0.serial==board.serial) }

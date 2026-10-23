@@ -1,4 +1,5 @@
 mod asic;
+mod assignment;
 mod automatic;
 mod connection;
 mod diagnostics;
@@ -282,12 +283,19 @@ async fn main() -> Result<()> {
                 "Configuration valid. This does not establish node authentication or hardware readiness."
             );
         }
-        Command::Plan { config } => println!(
-            "{}",
-            serde_json::to_string_pretty(
-                &load(&config)?.assignments().map_err(anyhow::Error::msg)?
-            )?
-        ),
+        Command::Plan { config } => {
+            let mut value = load(&config)?;
+            value.hardware.automatic_state.get_or_insert(
+                config
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .join("automatic-profiles.json"),
+            );
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&assignment::resolve(&value)?)?
+            );
+        }
         Command::Serve { config } => {
             let mut value = load(&config)?;
             value.service.control_socket = Some(automatic::socket_path(&config, &value));
@@ -501,8 +509,8 @@ async fn status(State(shared): State<Arc<Shared>>) -> Json<Status> {
 
 async fn history(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
     let runtime = shared.runtime.lock().expect("runtime");
-    let store =
-        history_store::Store::new(PathBuf::new(), &shared.config).expect("validated history scope");
+    let store = history_store::Store::new(PathBuf::new(), &shared.config, &shared.assignments)
+        .expect("validated history scope");
     let saved = store.snapshot(&runtime, shared.started_unix, unix_now());
     Json(
         serde_json::json!({"api_version":3,"service_pid":std::process::id(),"timestamp_unix":unix_now(),"capture_intervals":saved.capture_intervals,"estimated_observations":saved.estimated_observations,"events":saved.events}),
@@ -511,8 +519,9 @@ async fn history(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
 
 async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
     let config = inventory::connected_configuration(config).await?;
-    hardware::validate_automatic(&config).await?;
-    let assignments = config.assignments().map_err(anyhow::Error::msg)?;
+    let assignments = assignment::resolve(&config)?;
+    hardware::validate_automatic(&config, &assignments).await?;
+    tracing::info!(plan=?assignments, "Resolved chain assignments for this run");
     // Bind every requested endpoint before starting any listener task.
     let http = TcpListener::bind(config.service.status_listen)
         .await
@@ -537,7 +546,11 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
     let active = config.node.certificate.is_some();
     let tuning_paused = config.service.tuning_paused;
     let started_unix = unix_now();
-    let store = Arc::new(history_store::Store::new(history_path, &config)?);
+    let store = Arc::new(history_store::Store::new(
+        history_path,
+        &config,
+        &assignments,
+    )?);
     let mut runtime = runtime::RuntimeState::with_tuning_paused(tuning_paused);
     // Leave unreadable/corrupt checkpoints untouched and keep proof production
     // available. A bad history file must not silently be replaced with empty data.
@@ -549,7 +562,7 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
         }
     };
     let runtime = Arc::new(Mutex::new(runtime));
-    let (backend, offers) = asic::AsicBackend::new(&config, runtime.clone())?;
+    let (backend, offers) = asic::AsicBackend::new(&config, &assignments, runtime.clone())?;
     let backend = Arc::new(backend);
     let shared = Arc::new(Shared {
         config,

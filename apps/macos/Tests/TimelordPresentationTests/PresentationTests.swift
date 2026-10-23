@@ -373,6 +373,13 @@ extension PresentationTests {
             XCTAssertEqual(snapshot.boards.map { $0.histories.count },expected)
             XCTAssertEqual(Set(snapshot.boards.flatMap(\.histories).map(\.chain)),Set(Chain.allCases))
         }
+        config.hardware.chainAssignments = ChainAssignments(challenge: "serial-2", reward: "serial-0", infusedChallenge: "serial-1")
+        let mapped = LivePresentation.snapshot(status:nil,configuration:config,detectedDevices:devices,now:now)
+        XCTAssertEqual(mapped.boards.map { $0.histories.map(\.chain) }, [[.reward], [.infusedChallenge], [.challenge]])
+        let pinned = BoardDiscovery.reconcile([DiscoveredDevice(name: "ASIC", location: 999, serial: "serial-2")], hardware: config.hardware)
+        XCTAssertEqual(pinned.boards.count, 3)
+        XCTAssertEqual(pinned.boards.map(\.serial), config.hardware.boards.map(\.serial))
+        XCTAssertEqual(pinned.boards[2].deviceLocation, 999)
         let unplugged=LivePresentation.snapshot(status:nil,configuration:config,detectedDevices:[],now:now)
         XCTAssertTrue(unplugged.boards.isEmpty)
     }
@@ -389,6 +396,20 @@ extension PresentationTests {
             "events":[["id":1,"timestamp_unix":999900,"board_id":"a","kind":"recovery"],["id":2,"timestamp_unix":999910,"board_id":NSNull(),"kind":"node_unavailable","end_unix":999920]]]
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
         return try decoder.decode(HistoryPayload.self, from: JSONSerialization.data(withJSONObject: object))
+    }
+    func testSerialChainOverridesSurviveConfigurationEditsAndDiscovery() throws {
+        var config = AppConfiguration()
+        config.hardware.chainAssignments = ChainAssignments(challenge: "serial-c", reward: "serial-a", infusedChallenge: "serial-b")
+        let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        var restored = try decoder.decode(AppConfiguration.self, from: encoder.encode(config))
+        restored.node.host = "another-node"
+        restored.hardware = BoardDiscovery.reconcile([DiscoveredDevice(name: "ASIC", location: 99, serial: "serial-c")], hardware: restored.hardware)
+        let saved = try decoder.decode(AppConfiguration.self, from: encoder.encode(restored))
+        XCTAssertEqual(saved.hardware.chainAssignments, config.hardware.chainAssignments)
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: encoder.encode(saved)) as? [String: Any])
+        var hardware = try XCTUnwrap(json["hardware"] as? [String: Any]); hardware.removeValue(forKey: "chain_assignments"); json["hardware"] = hardware
+        XCTAssertNil(try decoder.decode(AppConfiguration.self, from: JSONSerialization.data(withJSONObject: json)).hardware.chainAssignments)
     }
     func testDistinctProofsAtTheSameTimestampKeepSeparateChartIdentities() {
         let history = ChainHistory(chain: .challenge, samples: [ProofObservation(date: now.addingTimeInterval(-10), ips: 900000, id: "proof-1"), ProofObservation(date: now.addingTimeInterval(-10), ips: 900000, id: "proof-2")], captureIntervals: [HistoryRange.hour.interval(endingAt: now)], events: [])

@@ -43,8 +43,55 @@ temperature_limit_c = 55
 For multiple boards, give each a distinct id and client port (18110–18112). USB
 locations are discovered afresh; serials preserve settings across port changes.
 `remembered_boards` retains disconnected board settings. The number of detected
-boards determines chain assignments; there is no separate layout override.
-A topology change requires restarting the service. Manual settings accept
+boards determines capacity: one board runs three engines, two boards run two plus
+one, and three boards run one each. A topology change requires restarting the service.
+
+### Chain assignments
+
+With three boards, the service ranks comparable accepted Automatic profiles at
+startup: fastest to CC, next to RC, third to ICC. This is a provisional heuristic,
+not a measured optimum. Ranking uses median running raw engine-1 IPS captured at
+an accepted operating point, not delivered IPS from different chain workloads.
+Ordinary recoveries remain permitted by the tuning policy; their observed rate is
+saved with the ranking evidence. Ranking does not introduce a zero-recovery rule.
+
+All three boards need qualifying evidence: at least 12 distinct raw samples
+spanning 60 seconds, no sample gap above 15 seconds, and a profile accepted after
+its configured healthy-work interval. Evidence must match the serial, physical
+engine mask, native binary and Mac model, remain within configured operating
+bounds, and be no more than 30 days old. Missing, provisional, manual or old profiles
+preserve configuration order. Speeds within 2% retain configuration order too.
+Accepted healthy profiles refresh their evidence at most every five minutes.
+These observation and tie thresholds are engineering defaults.
+
+The resolved plan is fixed for the run. Tuning and reconnecting a board never
+shuffle chain ownership; improved evidence applies on the next service start.
+One- and two-board layouts retain their existing assignment rules. Automatic
+redistribution after a board disappears is not implemented.
+
+Administrators can override the three-board ranking by adding this table to the
+config (values are **serial numbers**, not board names or USB locations):
+
+```toml
+[hardware.chain_assignments]
+challenge = "CC_BOARD_SERIAL"
+reward = "RC_BOARD_SERIAL"
+infused_challenge = "ICC_BOARD_SERIAL"
+```
+
+Each must identify a distinct configured board; unknown or repeated serials are
+rejected. If a mapped board is unplugged, its owner retries discovery while the
+other boards retain their chains, including across service starts. Remove the
+table to restore Automatic assignment. The app preserves this override when saving settings. The status API
+reports the actual resolved chains on each board, and `plan --config FILE` previews
+the saved configuration's plan without accessing USB. Live discovery can change
+the available topology, so the running status remains authoritative.
+
+Completed proof bundles log each chain's verified-ready timestamp and milliseconds
+spent waiting for the other required chains. These local timings diagnose the
+bottleneck; they do not claim network wins or trigger automatic swaps.
+
+Manual settings accept
 200–2200 MHz and requested 0.7–1.0 V; Automatic exploration stays within its bounds.
 
 ## Node identities

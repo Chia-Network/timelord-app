@@ -183,6 +183,8 @@ struct AutomaticOwner {
     engines: usize,
     hash: String,
     host: String,
+    raw_window: crate::assignment::RawWindow,
+    last_record_unix: u64,
 }
 impl AutomaticOwner {
     async fn new(shared: &Shared, board: &BoardConfig, child: &mut Child) -> Result<Self> {
@@ -216,6 +218,8 @@ impl AutomaticOwner {
             engines,
             hash,
             host,
+            raw_window: Default::default(),
+            last_record_unix: crate::unix_now(),
         };
         if let Some(entry) =
             automatic::learned(&shared.config, board, engines, &owner.hash, &owner.host)?
@@ -311,13 +315,14 @@ impl AutomaticOwner {
             }
         }
     }
-    fn record(&self, shared: &Shared, clean: u64) -> Result<()> {
+    fn record(&mut self, shared: &Shared, board: &BoardConfig, clean: u64) -> Result<()> {
         let path = shared
             .config
             .hardware
             .automatic_state
             .as_ref()
             .context("Automatic state path missing")?;
+        self.last_record_unix = crate::unix_now();
         automatic::save(
             path,
             automatic::Learned {
@@ -331,6 +336,11 @@ impl AutomaticOwner {
                 updated_unix: crate::unix_now(),
                 ceiling_mhz: self.policy.learned_limits().0,
                 cooldown_seconds: self.policy.learned_limits().1,
+                performance: if clean >= board.automatic.healthy_seconds {
+                    self.raw_window.performance()
+                } else {
+                    None
+                },
             },
         )
     }
@@ -347,6 +357,18 @@ impl AutomaticOwner {
                 .boards
                 .get(&board.id)
                 .context("Automatic board state missing")?;
+            if self.engines == 1
+                && hardware
+                    .frequency_mhz
+                    .is_some_and(|f| (f - self.policy.point.frequency_mhz).abs() <= 1.)
+            {
+                self.raw_window.observe(
+                    self.policy.epoch,
+                    now,
+                    hardware.recoveries,
+                    &hardware.raw_speeds,
+                );
+            }
             let chains: Vec<_> = shared
                 .assignments
                 .iter()
@@ -379,9 +401,11 @@ impl AutomaticOwner {
                 paused: state.tuning_paused,
             }
         };
+        let healthy = input.healthy && !input.paused;
         match self.policy.observe(now, input) {
             Some(Action::Save) => self.record(
                 shared,
+                board,
                 self.policy
                     .status
                     .active_seconds
@@ -401,15 +425,28 @@ impl AutomaticOwner {
                 // Save rollback limits/cooldown, never an outstanding experiment.
                 // Zero clean seconds keeps the resumed point explicitly provisional.
                 if persist {
-                    self.record(shared, 0)?;
+                    self.record(shared, board, 0)?;
                 }
+                self.raw_window = Default::default();
                 let mut state = shared.runtime.lock().expect("runtime");
                 state.event(Some(board.id.clone()), "profile_change");
                 let hardware = state.boards.entry(board.id.clone()).or_default();
                 hardware.frequency_mhz = Some(actual.frequency_mhz);
                 hardware.voltage_v = Some(actual.voltage_v);
             }
-            None => {}
+            None => {
+                // Refresh only an accepted, healthy point; never persist a trial
+                // merely because it produced a few fast raw samples.
+                if healthy
+                    && !self.policy.in_trial()
+                    && ["monitoring", "cooldown"].contains(&self.policy.status.state.as_str())
+                    && self.policy.status.active_seconds >= board.automatic.healthy_seconds
+                    && now.saturating_sub(self.last_record_unix) >= 300
+                    && self.raw_window.performance().is_some()
+                {
+                    self.record(shared, board, self.policy.status.active_seconds)?;
+                }
+            }
         }
         shared
             .runtime
@@ -533,7 +570,10 @@ fn decode_frequencies(bytes: &[u8]) -> Result<Vec<f64>> {
     Ok(frequencies)
 }
 
-pub async fn validate_automatic(config: &Config) -> Result<()> {
+pub async fn validate_automatic(
+    config: &Config,
+    assignments: &[timelord_core::Assignment],
+) -> Result<()> {
     if !config
         .hardware
         .boards
@@ -575,9 +615,7 @@ pub async fn validate_automatic(config: &Config) -> Result<()> {
             let point = automatic::initial(
                 config,
                 board,
-                config
-                    .assignments()
-                    .map_err(anyhow::Error::msg)?
+                assignments
                     .iter()
                     .filter(|a| a.board_id == board.id)
                     .count(),
@@ -845,7 +883,7 @@ pub async fn run(
     backend: Arc<crate::asic::AsicBackend>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    validate_automatic(&shared.config).await?;
+    validate_automatic(&shared.config, &shared.assignments).await?;
     let mut children = JoinSet::new();
     let (stop, child_shutdown) = watch::channel(false);
     for board in &shared.config.hardware.boards {
@@ -1226,8 +1264,12 @@ done
             started_unix: crate::unix_now(),
         });
         let (stop, receiver) = watch::channel(false);
-        let (backend, _offers) =
-            crate::asic::AsicBackend::new(&shared.config, shared.runtime.clone()).unwrap();
+        let (backend, _offers) = crate::asic::AsicBackend::new(
+            &shared.config,
+            &shared.assignments,
+            shared.runtime.clone(),
+        )
+        .unwrap();
         let task = tokio::spawn(run(shared.clone(), Arc::new(backend), receiver));
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -1306,8 +1348,12 @@ while :; do printf '%s\n' 'ASIC Temp = 40.0 C; Frequency = 1500.0 MHz; freq_idx 
             runtime: Default::default(),
             started_unix: crate::unix_now(),
         });
-        let (backend, _offers) =
-            crate::asic::AsicBackend::new(&shared.config, shared.runtime.clone()).unwrap();
+        let (backend, _offers) = crate::asic::AsicBackend::new(
+            &shared.config,
+            &shared.assignments,
+            shared.runtime.clone(),
+        )
+        .unwrap();
         let backend = Arc::new(backend);
         let (stop, rx) = watch::channel(false);
         let (tx, _) = oneshot::channel();

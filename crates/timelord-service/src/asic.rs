@@ -14,7 +14,7 @@ use std::{
     sync::{Arc, Mutex as SyncMutex},
     time::{Duration, Instant},
 };
-use timelord_core::{Chain, Config};
+use timelord_core::{Assignment, Chain, Config};
 use tokio::{
     io::AsyncWriteExt,
     net::TcpStream,
@@ -64,6 +64,8 @@ impl Drop for Lease {
 pub struct ProofTiming {
     iterations: u64,
     started: Instant,
+    pub ready_at: Instant,
+    pub ready_unix_ms: u128,
 }
 impl ProofTiming {
     pub fn started_unix(&self) -> u64 {
@@ -107,9 +109,9 @@ pub struct AsicBackend {
 impl AsicBackend {
     pub fn new(
         config: &Config,
+        assignments: &[Assignment],
         runtime: Arc<SyncMutex<crate::runtime::RuntimeState>>,
     ) -> Result<(Self, HashMap<String, mpsc::Sender<Lease>>)> {
-        let assignments = config.assignments().map_err(anyhow::Error::msg)?;
         let mut pools = HashMap::new();
         let mut offers = HashMap::new();
         for board in &config.hardware.boards {
@@ -118,7 +120,8 @@ impl AsicBackend {
             pools.insert(board.id.clone(), Mutex::new(rx));
         }
         let lanes = assignments
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|a| {
                 (
                     a.chain,
@@ -392,6 +395,11 @@ impl AsicBackend {
         let timing = ProofTiming {
             iterations: work.iterations,
             started: active.started,
+            ready_at: Instant::now(),
+            ready_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
         };
         if record_metric {
             self.runtime.lock().expect("runtime").estimated(
@@ -530,6 +538,35 @@ mod tests {
         }
     }
     #[test]
+    fn backend_routes_using_the_resolved_plan_without_recomputing_board_order() {
+        let mut config = Config::default();
+        config.hardware.boards = (0..3)
+            .map(|i| {
+                toml::from_str(&format!(
+                    "id='b{i}'\nname='B{i}'\nclient_port={}",
+                    18110 + i
+                ))
+                .unwrap()
+            })
+            .collect();
+        let mut plan = config.assignments().unwrap();
+        plan[0].board_id = "b2".into();
+        plan[2].board_id = "b0".into();
+        let (backend, _) = AsicBackend::new(&config, &plan, Default::default()).unwrap();
+        assert_eq!(
+            backend
+                .lanes
+                .iter()
+                .map(|(chain, lane)| (*chain, lane.board.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Chain::Challenge, "b2"),
+                (Chain::Reward, "b1"),
+                (Chain::InfusedChallenge, "b0")
+            ]
+        );
+    }
+    #[test]
     fn converts_and_verifies_canonical_cpp_checkpoints_and_rejects_corruption() {
         let request = work(360, 1024);
         let proof = canonical();
@@ -554,7 +591,8 @@ mod tests {
     ) {
         let config: Config =
             toml::from_str("[[hardware.boards]]\nid='a'\nname='A'\nclient_port=18110\n").unwrap();
-        let (backend, offers) = AsicBackend::new(&config, Default::default()).unwrap();
+        let (backend, offers) =
+            AsicBackend::new(&config, &config.assignments().unwrap(), Default::default()).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap())
             .await
@@ -618,7 +656,8 @@ mod tests {
     async fn failed_board_reconnects_without_retiring_a_healthy_chain_session() {
         let config:Config=toml::from_str("[[hardware.boards]]\nid='healthy'\nname='Healthy'\nclient_port=18110\n[[hardware.boards]]\nid='failed'\nname='Failed'\nclient_port=18111").unwrap();
         let runtime = Arc::new(SyncMutex::new(crate::runtime::RuntimeState::default()));
-        let (backend, offers) = AsicBackend::new(&config, runtime.clone()).unwrap();
+        let (backend, offers) =
+            AsicBackend::new(&config, &config.assignments().unwrap(), runtime.clone()).unwrap();
         let backend = Arc::new(backend);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let clients = Arc::new(SyncMutex::new(BTreeSet::new()));
@@ -818,7 +857,9 @@ mod tests {
             let config: Config =
                 toml::from_str("[[hardware.boards]]\nid='a'\nname='A'\nclient_port=18110\n")
                     .unwrap();
-            let (backend, _offers) = AsicBackend::new(&config, Default::default()).unwrap();
+            let (backend, _offers) =
+                AsicBackend::new(&config, &config.assignments().unwrap(), Default::default())
+                    .unwrap();
             let backend = Arc::new(backend);
             let proving = tokio::spawn({
                 let backend = backend.clone();

@@ -382,6 +382,8 @@ pub struct Learned {
     pub updated_unix: u64,
     pub ceiling_mhz: f64,
     pub cooldown_seconds: u64,
+    #[serde(default)]
+    pub performance: Option<crate::assignment::Performance>,
 }
 impl Learned {
     fn physical_mask(&self) -> Option<u8> {
@@ -1118,6 +1120,7 @@ mod tests {
                             updated_unix: n,
                             ceiling_mhz: 1600.,
                             cooldown_seconds: 0,
+                            performance: None,
                         },
                     )
                     .unwrap()
@@ -1159,6 +1162,7 @@ mod tests {
             updated_unix: 1,
             ceiling_mhz: 1520.,
             cooldown_seconds: 30,
+            performance: None,
         };
         save(&path, entry.clone()).unwrap();
         assert_eq!(

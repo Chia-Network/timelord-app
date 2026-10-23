@@ -407,6 +407,20 @@ async fn execute(backend: Arc<AsicBackend>, plan: WorkPlan) -> Result<Completed>
     if let Some((_, speed)) = &icc {
         speeds.push((Chain::InfusedChallenge, *speed));
     }
+    let bundle_ready = Instant::now();
+    for (chain, timing) in &speeds {
+        tracing::info!(
+            ?chain,
+            generation = plan.generation,
+            total_iters = plan.total_iters,
+            ready_unix_ms = timing.ready_unix_ms,
+            bundle_wait_ms = bundle_ready
+                .saturating_duration_since(timing.ready_at)
+                .as_secs_f64()
+                * 1000.,
+            "Verified chain proof ready for bundle"
+        );
+    }
     Ok(Completed {
         plan,
         result: WorkResult {
@@ -769,7 +783,11 @@ mod tests {
                     ..Default::default()
                 },
             );
-            let (backend, _offers) = AsicBackend::new(&config, runtime.clone())?;
+            let (backend, _offers) = AsicBackend::new(
+                &config,
+                &config.assignments().map_err(anyhow::Error::msg)?,
+                runtime.clone(),
+            )?;
             let shared = Arc::new(Shared {
                 assignments: config.assignments().map_err(anyhow::Error::msg)?,
                 config,
