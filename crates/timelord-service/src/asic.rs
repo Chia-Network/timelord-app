@@ -237,6 +237,7 @@ impl AsicBackend {
                     }
                     hardware.fault_reason = Some(error.to_string());
                     hardware.raw_speeds.clear();
+                    let needs_attention = hardware.latched_fault;
                     if verification {
                         state.failed_proofs += 1;
                     }
@@ -248,7 +249,11 @@ impl AsicBackend {
                         state.event(Some(lane.board.clone()), "board_fault");
                     }
                     state.phase = "waiting_for_clients".into();
-                    state.message = "Waiting for ASIC recovery.".into();
+                    state.message = if needs_attention {
+                        format!("An ASIC needs attention: {error}")
+                    } else {
+                        "Waiting for ASIC recovery.".into()
+                    };
                     tracing::warn!(board=%lane.board, %error, verification, "ASIC proof lane unavailable");
                 }
             }

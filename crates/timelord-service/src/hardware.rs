@@ -746,6 +746,18 @@ async fn supervise_board(
             hardware.raw_speeds.clear();
             hardware.fault_reason = Some(error.to_string());
             let stop = hardware.latched_fault;
+            if !state
+                .boards
+                .iter()
+                .any(|(id, b)| id != &board.id && b.state == "connected")
+            {
+                state.phase = "waiting_for_clients".into();
+                state.message = if stop {
+                    format!("{} needs attention: {error}", board.name)
+                } else {
+                    format!("Recovering {}: {error}", board.name)
+                };
+            }
             if !state.events.iter().any(|e| {
                 e.board_id.as_ref() == Some(&board.id)
                     && e.kind == "board_fault"
@@ -1120,14 +1132,15 @@ done
         let task = tokio::spawn(run(shared.clone(), Arc::new(backend), receiver));
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if shared
-                    .runtime
-                    .lock()
-                    .unwrap()
-                    .boards
-                    .get("a")
-                    .is_some_and(|b| b.state == "thermal_stop" && b.latched_fault)
-                {
+                let stopped = {
+                    let state = shared.runtime.lock().unwrap();
+                    state
+                        .boards
+                        .get("a")
+                        .is_some_and(|b| b.state == "thermal_stop" && b.latched_fault)
+                        && state.message.contains("needs attention")
+                };
+                if stopped {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1138,6 +1151,14 @@ done
         assert!(
             !task.is_finished(),
             "A thermal stop must not end other board supervision"
+        );
+        assert!(
+            shared
+                .runtime
+                .lock()
+                .unwrap()
+                .message
+                .contains("needs attention")
         );
         stop.send(true).unwrap();
         tokio::time::timeout(Duration::from_secs(5), task)
