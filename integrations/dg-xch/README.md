@@ -103,3 +103,12 @@ raw sampling/idle states while preserving the proof and tuning implementations.
 update. The normal recovery-cost policy remains in place; severe bursts bypass
 proof-score gating and live control continues draining native logs. The recorded
 1920 MHz trace requests backoff at five seconds in the offline regression.
+
+`readback-retry-deployment.json` records the native control-only update: initial
+and final readback each allow three attempts, 20 ms apart, while engines remain
+paused. Rejected samples include separate clock-register snapshots. PLL/voltage
+writes are never retried, and persistent unexpected state still stops the client.
+The service, prover, UI machine code and libraries remain unchanged. The explicit
+development deployment preserves learned points, ceilings and cooldowns for the
+new native hash; this is not automatic cache migration in normal app builds.
+The 60-second live health check did not inject or reproduce a hardware fault.

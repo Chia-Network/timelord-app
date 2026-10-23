@@ -1,0 +1,95 @@
+{
+  "host": "m6mini",
+  "source_commit": "bcbf529",
+  "manifest": {
+    "native_revision": "446a0e1d118051364742648c7b8f3239b12a3dcb",
+    "source_queue_sha256": "f16b6ed5838ceb0ad383df23145f742932b5f18dd6ebe5f1b9d022097fe9b800",
+    "baseline_native_sha256": "e7330cf8193fc98e6defb295c88a7219c2501e5b04f727e2fe745e48e18e8325",
+    "native_sha256": "dd8cbeae65e0d1dbefb7aae08bfd01b074bea1efa5941ddef9dad592a7a9563e",
+    "service_sha256": "9c07cc8bbb5da5134849ec3a3d837637d0420320c28e09b44ffd31c8f157d84d",
+    "ui_sha256": "d5cb600116480fac1d6ae00c4fcc3eee74d68ccf3eb9e44cea086602846d9b09",
+    "archive_sha256": "06daf015315adc3e77bb30cb5de00f784687a1b2ea8dfcbb16fd91eada3551ba",
+    "libraries": {
+      "libgmpxx.4.dylib": "875e1391d7c896c64004ada5997a6f3c1fe2ed8f2bc15c36776d76ca86cc4396",
+      "libft4222.dylib": "453b21f3c6dbf89168916be1ea26483084b83314b8d78d7cabd74e82a0202075",
+      "libftd2xx.dylib": "0a3ae31f16da56ec212c60ead43921bca22868cf0c502efdc8105cf017d1c7ad",
+      "libgmp.10.dylib": "bc89479f845374ae610aee6f5758d6e083f55a7c22e684bbb2ecf20f5db6c10b"
+    },
+    "readback_attempts_per_stage": 3,
+    "retry_delay_ms": 20,
+    "voltage_ceiling_v": 1,
+    "temperature_guard_c": 55,
+    "service_unchanged": true,
+    "ui_machine_code_unchanged": true,
+    "prover_unchanged": true
+  },
+  "deployment": {
+    "installed": true,
+    "left_running": true,
+    "opened_unix": 1792772495.4789839,
+    "completed_unix": 1792772555.504433,
+    "service_pid": 12421,
+    "proofs_delivered": 18,
+    "failed_proofs": 0,
+    "recoveries": 0,
+    "configuration_unchanged": true,
+    "learned_points_ceilings_cooldowns_preserved": true
+  },
+  "profile_migration": {
+    "reason": "control-only update; same prover and configuration",
+    "profiles": [
+      {
+        "serial": "CHIA0000000116",
+        "engines": 1,
+        "host": "macos-aarch64-Mac18,5",
+        "client_sha256": "dd8cbeae65e0d1dbefb7aae08bfd01b074bea1efa5941ddef9dad592a7a9563e",
+        "point": {
+          "frequency_mhz": 1900.0,
+          "voltage_v": 1.0
+        },
+        "active_seconds": 120,
+        "updated_unix": 1792772171,
+        "ceiling_mhz": 1910.0,
+        "cooldown_seconds": 540
+      },
+      {
+        "serial": "CHIA0000000032",
+        "engines": 1,
+        "host": "macos-aarch64-Mac18,5",
+        "client_sha256": "dd8cbeae65e0d1dbefb7aae08bfd01b074bea1efa5941ddef9dad592a7a9563e",
+        "point": {
+          "frequency_mhz": 1880.0,
+          "voltage_v": 1.0
+        },
+        "active_seconds": 120,
+        "updated_unix": 1792772171,
+        "ceiling_mhz": 1890.0,
+        "cooldown_seconds": 540
+      },
+      {
+        "serial": "CHIA0000000063",
+        "engines": 1,
+        "host": "macos-aarch64-Mac18,5",
+        "client_sha256": "dd8cbeae65e0d1dbefb7aae08bfd01b074bea1efa5941ddef9dad592a7a9563e",
+        "point": {
+          "frequency_mhz": 1900.0,
+          "voltage_v": 1.0
+        },
+        "active_seconds": 120,
+        "updated_unix": 1792772451,
+        "ceiling_mhz": 1910.0,
+        "cooldown_seconds": 660
+      }
+    ]
+  },
+  "validation": {
+    "native_no_usb_fixtures": "transient and persistent initial/final readback; no repeated writes or resume on rejection; register read error diagnostics",
+    "rust_tests": 65,
+    "swift_tests": 40,
+    "cargo_fmt_clippy": "passed",
+    "swift_build": "passed",
+    "live_check_seconds": 60,
+    "injected_live_failure": false
+  },
+  "limitation": "Short live health check; no deliberate hardware fault injected and original 100 MHz readback was not reproduced. Native readback retries are not service-level automatic restart recovery."
+}
