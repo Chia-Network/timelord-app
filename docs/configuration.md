@@ -94,11 +94,22 @@ The objective is delivered proof performance. Automatic never reduces voltage
 because a board is stable. It explores supported PLL settings within the configured
 frequency ceiling, holds otherwise stable trials even without a small measured
 IPS gain, and permits recoveries while their delivered IPS cost stays acceptable.
-There is no fixed recoveries-per-hour rejection limit.
+There is no fixed recoveries-per-hour rejection limit for ordinary recoveries.
+
+A separate fast guard rejects severe recovery storms: **20 restarts within a
+rolling 10-second window**. It reduces frequency without waiting for a delivered
+IPS score, fresh proofs, or the normal consecutive-window test. Five seconds of
+settling after a clock change exclude residual logs from the old point. The guard
+uses at most 20 event timestamps and works during cooldown, but respects Pause
+tuning. It returns to the previous trial point or a supported lower clock,
+preserves voltage, and saves the normal cooldown and reduced search ceiling.
+These are provisional engineering thresholds, not characterized silicon limits.
+Live clock changes continue draining native logs while awaiting acknowledgement,
+so the recovery flood cannot fill stderr and block the USB control owner.
 
 After at least `healthy_seconds` of active verified work and three qualifying
 proofs per assigned chain (configurable above), a setting can be retained. Idle
-time and stale telemetry do not advance that active-work timer. Recovery-related
+time and stale telemetry do not advance that active-work timer. For ordinary recoveries,
 backoff requires delivered IPS more than `recovery_loss_percent` below the
 accepted baseline in `recovery_bad_windows` consecutive windows of
 `recovery_window_seconds` each. Every bad window must contain recoveries and

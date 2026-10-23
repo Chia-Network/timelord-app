@@ -1,7 +1,10 @@
 //! Online policy. All USB writes are acknowledged by the native client's owner thread.
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+};
 use timelord_core::{AutomaticConfig, Config};
 
 pub fn fingerprint(config: &Config) -> Result<String> {
@@ -55,6 +58,43 @@ pub struct Input {
     pub temperature_limit: f64,
     pub paused: bool,
 }
+// A severe burst is independent of proof throughput: a storm can starve proofs.
+// Keep only the last 20 events, and allow five seconds after a clock write for
+// settling and pre-write log backlog. Normal recoveries still use the IPS policy.
+const STORM_RECOVERIES: usize = 20;
+const STORM_WINDOW_SECONDS: u64 = 10;
+const SETTLING_SECONDS: u64 = 5;
+#[derive(Default)]
+struct RecoveryBurst {
+    events: VecDeque<u64>,
+    settled_at: u64,
+}
+impl RecoveryBurst {
+    fn reset(&mut self, now: u64) {
+        self.events.clear();
+        self.settled_at = now.saturating_add(SETTLING_SECONDS);
+    }
+    fn observe(&mut self, now: u64, count: u64) -> bool {
+        if now < self.settled_at {
+            self.events.clear();
+            return false;
+        }
+        while self
+            .events
+            .front()
+            .is_some_and(|&t| now.saturating_sub(t) >= STORM_WINDOW_SECONDS)
+        {
+            self.events.pop_front();
+        }
+        for _ in 0..count.min(STORM_RECOVERIES as u64) {
+            if self.events.len() == STORM_RECOVERIES {
+                self.events.pop_front();
+            }
+            self.events.push_back(now);
+        }
+        self.events.len() == STORM_RECOVERIES
+    }
+}
 pub struct Policy {
     pub point: Point,
     pub status: Status,
@@ -65,6 +105,7 @@ pub struct Policy {
     trial: bool,
     last_tick: u64,
     recoveries: u64,
+    recovery_burst: RecoveryBurst,
     window_started: u64,
     window_recoveries: u64,
     degraded_windows: u32,
@@ -84,6 +125,10 @@ impl Policy {
             epoch: now,
             last_tick: now,
             recoveries: 0,
+            recovery_burst: RecoveryBurst {
+                settled_at: now.saturating_add(SETTLING_SECONDS),
+                ..Default::default()
+            },
             window_started: now,
             window_recoveries: 0,
             degraded_windows: 0,
@@ -111,8 +156,12 @@ impl Policy {
     pub fn learned_limits(&self) -> (f64, u64) {
         (self.ceiling, self.status.cooldown_seconds)
     }
+    pub fn synchronize_recoveries(&mut self, count: u64) {
+        self.recoveries = count;
+    }
     pub fn applied(&mut self, point: Point, now: u64, reason: String) {
         self.point = point;
+        self.recovery_burst.reset(now);
         self.epoch = now;
         self.last_tick = now;
         self.window_started = now;
@@ -122,8 +171,8 @@ impl Policy {
         self.status.state = if self.trial { "testing" } else { "learning" }.into();
         self.status.message = reason;
     }
-    fn backoff(&mut self, reason: &str, thermal: bool) -> Option<Action> {
-        let target = if !thermal && self.point.voltage_v < 1.0 {
+    fn backoff(&mut self, reason: &str, force_frequency: bool) -> Option<Action> {
+        let target = if !force_frequency && self.point.voltage_v < 1.0 {
             Point {
                 voltage_v: 1.0,
                 ..self.point
@@ -166,13 +215,18 @@ impl Policy {
         Some(Action::Set(target, reason.into()))
     }
     pub fn observe(&mut self, now: u64, input: Input) -> Option<Action> {
+        let clock_reversed = now < self.last_tick;
         let dt = now.saturating_sub(self.last_tick).min(5);
         self.last_tick = now;
-        self.window_recoveries = self
-            .window_recoveries
-            .saturating_add(input.recoveries.saturating_sub(self.recoveries));
+        let reset_counter = input.recoveries < self.recoveries;
+        let mut new_recoveries = input.recoveries.saturating_sub(self.recoveries);
+        if reset_counter {
+            self.recovery_burst.reset(now);
+        }
+        self.window_recoveries = self.window_recoveries.saturating_add(new_recoveries);
         self.recoveries = input.recoveries;
-        if now < self.epoch {
+        if now < self.epoch || clock_reversed {
+            self.recovery_burst.reset(now);
             self.epoch = now;
             self.window_started = now;
             self.window_recoveries = 0;
@@ -182,6 +236,7 @@ impl Policy {
             return None;
         }
         if input.paused {
+            self.recovery_burst.reset(now);
             self.status.state = "paused".into();
             self.status.message = "Current settings held; proof production continues".into();
             self.was_paused = true;
@@ -190,6 +245,8 @@ impl Policy {
             return None;
         }
         if self.was_paused {
+            self.recovery_burst.reset(now);
+            new_recoveries = 0;
             self.was_paused = false;
             self.epoch = now;
             self.window_started = now;
@@ -197,6 +254,10 @@ impl Policy {
             self.degraded_windows = 0;
             self.status.active_seconds = 0;
             self.baseline = None;
+        }
+        if self.recovery_burst.observe(now, new_recoveries) {
+            self.recovery_burst.reset(now);
+            return self.backoff("Recovery storm: 20 restarts within 10 seconds", true);
         }
         if !input.healthy {
             self.status.state = "waiting".into();
@@ -634,6 +695,186 @@ mod tests {
         }
         assert_eq!(p.point.frequency_mhz, 1460.);
         p
+    }
+
+    #[test]
+    fn storm_rejects_a_trial_without_a_score_or_fresh_proofs() {
+        let mut p = raised_trial();
+        let mut sample = input();
+        sample.healthy = false;
+        sample.score = None;
+        sample.recoveries = 19;
+        assert!(p.observe(40, sample).is_none());
+        let mut storm = input();
+        storm.healthy = false;
+        storm.score = None;
+        storm.recoveries = 20;
+        let Some(Action::Set(target, reason)) = p.observe(40, storm) else {
+            panic!("storm must not wait for a score");
+        };
+        assert_eq!(target.frequency_mhz, 1450.);
+        assert!(reason.contains("Recovery storm"));
+        assert_eq!(p.learned_limits(), (1450., 30));
+        p.applied(target, 40, reason);
+        p.synchronize_recoveries(20);
+        let mut settled = input();
+        settled.recoveries = 20;
+        settled.score = None;
+        assert!(
+            p.observe(45, settled).is_none(),
+            "Do not count the previous point twice"
+        );
+    }
+
+    #[test]
+    fn recorded_1920_burst_backs_off_in_five_seconds() {
+        // First six one-second bins from ASIC 2's October 22 20:34 CDT trial.
+        let counts = [14, 3, 2, 5, 5, 82];
+        let point = Point {
+            frequency_mhz: 1920.,
+            voltage_v: 1.,
+        };
+        let mut p = Policy::new(
+            AutomaticConfig::default(),
+            point,
+            0,
+            vec![1880., 1900., 1920., 1940.],
+        );
+        let mut total = 0;
+        for (now, count) in counts.into_iter().enumerate() {
+            for _ in 0..count {
+                total += 1;
+                let mut sample = input();
+                sample.healthy = false;
+                sample.score = None;
+                sample.recoveries = total;
+                if let Some(Action::Set(target, _)) = p.observe(now as u64, sample) {
+                    assert_eq!(now, 5);
+                    assert_eq!(
+                        target,
+                        Point {
+                            frequency_mhz: 1900.,
+                            voltage_v: 1.
+                        }
+                    );
+                    assert_eq!(total, 49);
+                    assert!(p.recovery_burst.events.len() <= STORM_RECOVERIES);
+                    return;
+                }
+            }
+        }
+        panic!("recorded storm was not rejected");
+    }
+
+    #[test]
+    fn rolling_storm_window_expires_and_memory_is_bounded() {
+        let mut p = policy();
+        let mut sample = input();
+        sample.score = None;
+        sample.recoveries = 19;
+        assert!(p.observe(5, sample).is_none());
+        let mut next = input();
+        next.score = None;
+        next.recoveries = 20;
+        assert!(
+            p.observe(15, next).is_none(),
+            "Recoveries ten seconds apart are not a burst"
+        );
+        let mut burst = RecoveryBurst::default();
+        assert!(burst.observe(10, u64::MAX));
+        assert_eq!(burst.events.len(), STORM_RECOVERIES);
+        assert!(!burst.observe(20, 0));
+    }
+
+    #[test]
+    fn pause_counter_reset_and_clock_reversal_do_not_create_storms() {
+        let mut p = policy();
+        let mut paused = input();
+        paused.paused = true;
+        paused.recoveries = 100;
+        assert!(p.observe(5, paused).is_none());
+        let mut resumed = input();
+        resumed.recoveries = 200;
+        resumed.score = None;
+        assert!(p.observe(6, resumed).is_none());
+        let mut unchanged = input();
+        unchanged.recoveries = 200;
+        unchanged.score = None;
+        assert!(p.observe(11, unchanged).is_none());
+        let mut reset = input();
+        reset.score = None;
+        reset.recoveries = 0;
+        assert!(p.observe(12, reset).is_none());
+        let mut nineteen = input();
+        nineteen.score = None;
+        nineteen.recoveries = 19;
+        assert!(p.observe(20, nineteen).is_none());
+        let mut backwards = input();
+        backwards.score = None;
+        backwards.recoveries = 20;
+        assert!(p.observe(19, backwards).is_none());
+        let mut later = input();
+        later.score = None;
+        later.recoveries = 20;
+        assert!(p.observe(24, later).is_none());
+    }
+
+    #[test]
+    fn storm_forces_lower_frequency_even_at_lower_voltage_and_during_cooldown() {
+        let mut p = policy();
+        p.point.voltage_v = 0.95;
+        p.status.cooldown_seconds = 30;
+        let mut sample = input();
+        sample.recoveries = 20;
+        sample.score = None;
+        let Some(Action::Set(target, reason)) = p.observe(5, sample) else {
+            panic!("missing fast backoff");
+        };
+        assert!(target.frequency_mhz < p.point.frequency_mhz);
+        assert_eq!(target.voltage_v, 0.95);
+        p.applied(target, 5, reason);
+        p.synchronize_recoveries(20);
+        let mut old_logs = input();
+        old_logs.recoveries = 150;
+        old_logs.score = None;
+        assert!(p.observe(6, old_logs).is_none());
+        let mut no_new_errors = input();
+        no_new_errors.recoveries = 150;
+        no_new_errors.score = None;
+        assert!(
+            p.observe(10, no_new_errors).is_none(),
+            "Old-point log backlog must not reject the new point"
+        );
+        let mut continued = input();
+        continued.recoveries = 170;
+        continued.score = None;
+        let Some(Action::Set(lower, _)) = p.observe(10, continued) else {
+            panic!("cooldown must not block protective backoff");
+        };
+        assert!(lower.frequency_mhz < target.frequency_mhz);
+    }
+
+    #[test]
+    fn storm_at_frequency_floor_does_not_repeat_a_hardware_write() {
+        let mut p = policy();
+        p.settings.min_frequency_mhz = p.point.frequency_mhz;
+        let mut storm = input();
+        storm.recoveries = 20;
+        storm.score = None;
+        assert!(p.observe(5, storm).is_none());
+        assert!(p.status.message.contains("minimum frequency"));
+    }
+
+    #[test]
+    fn moderately_bursty_recoveries_with_good_performance_remain_allowed() {
+        let mut p = policy();
+        p.settings.max_frequency_mhz = p.point.frequency_mhz;
+        p.ceiling = p.point.frequency_mhz;
+        for now in (5..=3600).step_by(5) {
+            let mut sample = input();
+            sample.recoveries = now / 10 * 3;
+            assert!(!matches!(p.observe(now, sample), Some(Action::Set(..))));
+        }
     }
 
     #[test]

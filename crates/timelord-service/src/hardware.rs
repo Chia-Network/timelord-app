@@ -86,6 +86,77 @@ async fn terminate(child: &mut Child) {
         let _ = child.wait().await;
     }
 }
+// Drain stderr even while control is awaiting its acknowledgement. A recovery
+// flood must not fill the pipe and block the USB owner before it reads TLSET.
+struct ClientLog {
+    lines: tokio::io::Lines<BufReader<tokio::process::ChildStderr>>,
+    ready: Option<oneshot::Sender<()>>,
+    last_temperature: tokio::time::Instant,
+    recent: std::collections::VecDeque<String>,
+}
+impl ClientLog {
+    fn new(stderr: tokio::process::ChildStderr, ready: oneshot::Sender<()>) -> Self {
+        Self {
+            lines: BufReader::new(stderr).lines(),
+            ready: Some(ready),
+            last_temperature: tokio::time::Instant::now(),
+            recent: Default::default(),
+        }
+    }
+    async fn read(&mut self, shared: &Shared, board: &BoardConfig) -> Result<bool> {
+        let Some(line) = self.lines.next_line().await? else {
+            bail!(
+                "ASIC client log closed; recent log: {}",
+                self.recent.iter().cloned().collect::<Vec<_>>().join(" | ")
+            );
+        };
+        self.recent.push_back(line.clone());
+        if self.recent.len() > 8 {
+            self.recent.pop_front();
+        }
+        tracing::info!(board=%board.id, "{line}");
+        let mut state = shared.runtime.lock().expect("runtime");
+        if let Some((engine, ips, activity)) = raw_speed(&line) {
+            state
+                .boards
+                .entry(board.id.clone())
+                .or_default()
+                .raw_sample(engine, ips, activity, crate::unix_now());
+        }
+        if let Some(value) = line
+            .split_once("Board voltage is now ")
+            .and_then(|(_, s)| s.split_whitespace().next())
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+        {
+            state.boards.entry(board.id.clone()).or_default().voltage_v = Some(value);
+        }
+        if let Some((temp, freq)) = temperature(&line) {
+            self.last_temperature = tokio::time::Instant::now();
+            let hardware = state.boards.entry(board.id.clone()).or_default();
+            hardware.temperature_unix = crate::unix_now();
+            hardware.temperature_c = Some(temp);
+            hardware.frequency_mhz = Some(freq);
+            hardware.state = "connected".into();
+            if temp >= board.temperature_limit_c {
+                hardware.state = "thermal_stop".into();
+                state.event(Some(board.id.clone()), "thermal_stop");
+                bail!("ASIC reached its configured temperature limit");
+            }
+        }
+        let recovery = line.contains("Restarting VDF at ");
+        if recovery {
+            state.boards.entry(board.id.clone()).or_default().recoveries += 1;
+            state.event(Some(board.id.clone()), "recovery");
+        }
+        if line.contains("Connected to timelord, waiting for challenge")
+            && let Some(ready) = self.ready.take()
+        {
+            let _ = ready.send(());
+        }
+        Ok(recovery)
+    }
+}
 struct AutomaticOwner {
     policy: Policy,
     input: tokio::process::ChildStdin,
@@ -206,6 +277,23 @@ impl AutomaticOwner {
         .await
         .context("Native live control timed out")?
     }
+    async fn change_with_logs(
+        &mut self,
+        target: Point,
+        seconds: u64,
+        log: &mut ClientLog,
+        shared: &Shared,
+        board: &BoardConfig,
+    ) -> Result<Point> {
+        let response = self.change(target, seconds);
+        tokio::pin!(response);
+        loop {
+            tokio::select! {
+                result = &mut response => return result,
+                result = log.read(shared, board) => { result?; }
+            }
+        }
+    }
     fn record(&self, shared: &Shared, clean: u64) -> Result<()> {
         let path = shared
             .config
@@ -228,7 +316,12 @@ impl AutomaticOwner {
             },
         )
     }
-    async fn tick(&mut self, shared: &Shared, board: &BoardConfig) -> Result<()> {
+    async fn tick(
+        &mut self,
+        shared: &Shared,
+        board: &BoardConfig,
+        log: &mut ClientLog,
+    ) -> Result<()> {
         let now = crate::unix_now();
         let input = {
             let state = shared.runtime.lock().expect("runtime");
@@ -280,10 +373,13 @@ impl AutomaticOwner {
                 let persist = !self.policy.in_trial();
                 tracing::info!(board=%board.name, frequency_mhz=point.frequency_mhz, voltage_v=point.voltage_v, %reason, "Applying automatic setting");
                 let actual = self
-                    .change(point, 5)
+                    .change_with_logs(point, 5, log, shared, board)
                     .await
                     .map_err(|error| anyhow::anyhow!("{}: {error}", board.name))?;
                 self.policy.applied(actual, crate::unix_now(), reason);
+                self.policy.synchronize_recoveries(
+                    shared.runtime.lock().expect("runtime").boards[&board.id].recoveries,
+                );
                 // Save rollback limits/cooldown, never an outstanding experiment.
                 // Zero clean seconds keeps the resumed point explicitly provisional.
                 if persist {
@@ -337,47 +433,20 @@ async fn supervise(
         None => None,
     };
     let output = child.stderr.take().context("ASIC client log unavailable")?;
-    let mut lines = BufReader::new(output).lines();
-    let mut ready = Some(ready);
-    let mut last_temperature = tokio::time::Instant::now();
+    let mut log = ClientLog::new(output, ready);
     let mut watchdog = tokio::time::interval(Duration::from_secs(5));
-    let mut recent = std::collections::VecDeque::new();
     let result: Result<()> = loop {
         tokio::select! {
             _ = shutdown.changed() => break Ok(()),
             _ = watchdog.tick() => {
                 if shared.runtime.lock().expect("runtime").phase == "fault" { break Err(anyhow::anyhow!("Timelord needs attention")); }
-                if last_temperature.elapsed() > Duration::from_secs(60) { break Err(anyhow::anyhow!("ASIC temperature telemetry stopped")); }
+                if log.last_temperature.elapsed() > Duration::from_secs(60) { break Err(anyhow::anyhow!("ASIC temperature telemetry stopped")); }
                 if let Some(exit)=child.try_wait()? { break Err(anyhow::anyhow!("ASIC client exited: {exit}")); }
-                if let Some(owner)=&mut automatic && let Err(error)=owner.tick(&shared,&board).await {break Err(error);}
+                if let Some(owner)=&mut automatic && let Err(error)=owner.tick(&shared,&board,&mut log).await {break Err(error);}
             }
-            line = lines.next_line() => {
-                let Some(line) = line? else {
-                    let exit=tokio::time::timeout(Duration::from_secs(1),child.wait()).await;
-                    break Err(anyhow::anyhow!("ASIC client exited ({exit:?}); recent log: {}",recent.iter().cloned().collect::<Vec<String>>().join(" | ")));
-                };
-                recent.push_back(line.clone());if recent.len()>8 {recent.pop_front();}
-                tracing::info!(board=%board.id, "{line}");
-                {
-                let mut state = shared.runtime.lock().expect("runtime");
-                if let Some((engine, ips, activity))=raw_speed(&line) {
-                    let hardware = state.boards.entry(board.id.clone()).or_default();
-                    hardware.raw_sample(engine, ips, activity, crate::unix_now());
-                }
-                if let Some(value)=line.split_once("Board voltage is now ").and_then(|(_,s)|s.split_whitespace().next()).and_then(|v|v.parse::<f64>().ok()).filter(|v|v.is_finite()) { state.boards.entry(board.id.clone()).or_default().voltage_v=Some(value); }
-                if let Some((temp, freq)) = temperature(&line) {
-                    last_temperature = tokio::time::Instant::now();
-                    let status = state.boards.entry(board.id.clone()).or_default();
-                    status.temperature_unix=crate::unix_now();status.temperature_c = Some(temp); status.frequency_mhz = Some(freq); status.state = "connected".into();
-                    if temp >= board.temperature_limit_c {
-                        status.state = "thermal_stop".into(); state.event(Some(board.id.clone()), "thermal_stop");
-                        break Err(anyhow::anyhow!("ASIC reached its configured temperature limit"));
-                    }
-                }
-                if line.contains("Restarting VDF at ") { state.boards.entry(board.id.clone()).or_default().recoveries += 1; state.event(Some(board.id.clone()), "recovery"); }
-                if line.contains("Connected to timelord, waiting for challenge") && let Some(ready) = ready.take() { let _ = ready.send(()); }
-                }
-                if line.contains("Restarting VDF at ") && let Some(owner)=&mut automatic && let Err(error)=owner.tick(&shared,&board).await {break Err(error);}
+            result = log.read(&shared, &board) => {
+                let recovery = match result { Ok(recovery) => recovery, Err(error) => break Err(error) };
+                if recovery && let Some(owner)=&mut automatic && let Err(error)=owner.tick(&shared,&board,&mut log).await {break Err(error);}
             }
         }
     };
@@ -708,6 +777,80 @@ mod tests {
         );
         terminate(&mut child).await;
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_backoff_drains_a_full_stderr_pipe_before_acknowledgement() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tl-storm-pipe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("client");
+        std::fs::write(
+            &binary,
+            r#"#!/bin/sh
+if [ "$1" = --control-frequencies ]; then echo '[1430,1450,1460]'; exit 0; fi
+while read command version id frequency voltage; do
+ if [ "$id" = 2 ]; then
+  n=0
+  while [ "$n" -lt 5000 ]; do
+   printf '%s\n' 'VDF 0: Restarting VDF at 123456789 iters (fixture recovery log flood)' >&2
+   n=$((n + 1))
+  done
+ fi
+ printf 'TLACK 1 %s %s %s\n' "$id" "$frequency" "$voltage"
+done
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut config: Config = toml::from_str("[[hardware.boards]]\nid='storm'\nname='Storm'\nclient_port=18110\ndevice_location=1\nserial='fixture-only'\n").unwrap();
+        config.hardware.client_binary = Some(binary.clone());
+        let board = config.hardware.boards[0].clone();
+        let shared = Shared {
+            assignments: config.assignments().unwrap(),
+            config,
+            clients: Default::default(),
+            runtime: Default::default(),
+            started_unix: crate::unix_now(),
+        };
+        let mut child = Command::new(binary)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut owner = AutomaticOwner::new(&shared, &board, &mut child)
+            .await
+            .unwrap();
+        let (ready, _receiver) = oneshot::channel();
+        let mut log = ClientLog::new(child.stderr.take().unwrap(), ready);
+        let result = owner
+            .change_with_logs(
+                Point {
+                    frequency_mhz: 1430.,
+                    voltage_v: 1.,
+                },
+                5,
+                &mut log,
+                &shared,
+                &board,
+            )
+            .await;
+        assert_eq!(result.unwrap().frequency_mhz, 1430.);
+        while shared.runtime.lock().unwrap().boards["storm"].recoveries < 5000 {
+            tokio::time::timeout(Duration::from_secs(1), log.read(&shared, &board))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        terminate(&mut child).await;
+        assert_eq!(
+            shared.runtime.lock().unwrap().boards["storm"].recoveries,
+            5000
+        );
+        assert_eq!(log.recent.len(), 8);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
