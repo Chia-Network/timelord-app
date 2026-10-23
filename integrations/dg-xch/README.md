@@ -84,8 +84,13 @@ prefix. The app's normal native pin and integration patch are unchanged. The
 original app/configuration were restored after both live captures; sustained
 paired IPS measurement and long-chain coarsening remain follow-up work.
 
-The subsequent user-requested deployment is recorded in `pr450-deployment.json`.
-The M6 now runs the clean PR #450 native client with the unchanged startup service
-(hardware SHA, six workers and preparation/retirement overlap), retained GMP/FTDI
-libraries and the existing 1600 MHz / 1.0 V board points. This is an explicit
-runtime development build; the normal repository dependency pin is unchanged.
+The initial user-requested PR #450 deployment at 1600 MHz is recorded in
+`pr450-deployment.json`. The subsequent live build is recorded in
+`live-ips-ceiling-deployment.json`: it retains checkpoint reuse, hardware SHA,
+six-worker discriminant search, preparation/retirement overlap and GMP/FTDI
+libraries, and adds recent raw IPS telemetry and a 2200 MHz Automatic ceiling.
+Boards resume at their prior points and explore supported PLL steps under the
+requested 1.0 V ceiling and 55°C guard. A short deployment health check does not
+establish stability at the maximum clock or a sustained performance gain.
+This remains an explicit runtime development build; normal dependency pins are
+unchanged.
