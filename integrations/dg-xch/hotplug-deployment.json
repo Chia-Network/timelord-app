@@ -1,0 +1,106 @@
+{
+  "host": "m6mini",
+  "manifest": {
+    "source_commit": "1daf1dd",
+    "native_revision": "446a0e1d118051364742648c7b8f3239b12a3dcb",
+    "baseline_service_sha256": "d3436d0a2bfa7cade88a7c9268584fe2414dda442483b11b61d1bfed385f6635",
+    "baseline_native_sha256": "dd8cbeae65e0d1dbefb7aae08bfd01b074bea1efa5941ddef9dad592a7a9563e",
+    "service_sha256": "cd94daf2e1829f26a93f30a005c9d4cb3c632e92cce693f10c9807fbd5e22d00",
+    "native_sha256": "134f666770d17a79838376cd79a8d52112631805e2d2009cf1ae45941a56a69d",
+    "ui_sha256": "49824bc68034d75fce8c9c39f52c3f7db39ee3af7737a7c6764a2c2a3137cc13",
+    "archive_sha256": "309e0e48fb1967b6246ce20f476ad14eca79b91d4cfc062be02311332d99ceb8",
+    "libraries": {
+      "libgmpxx.4.dylib": "875e1391d7c896c64004ada5997a6f3c1fe2ed8f2bc15c36776d76ca86cc4396",
+      "libft4222.dylib": "453b21f3c6dbf89168916be1ea26483084b83314b8d78d7cabd74e82a0202075",
+      "libftd2xx.dylib": "0a3ae31f16da56ec212c60ead43921bca22868cf0c502efdc8105cf017d1c7ad",
+      "libgmp.10.dylib": "bc89479f845374ae610aee6f5758d6e083f55a7c22e684bbb2ecf20f5db6c10b"
+    },
+    "startup_optimizations_retained": [
+      "hardware SHA",
+      "six-worker canonical discriminant search",
+      "preparation overlaps client retirement"
+    ],
+    "voltage_ceiling_v": 1,
+    "temperature_guard_c": 55,
+    "reconnect_delays_s": [
+      1,
+      5,
+      30
+    ],
+    "retries_expire": false,
+    "single_engine_mask": 2,
+    "six_worker_dependency": "/private/tmp/timelord-six-worker-prime-20261022/dg-xch",
+    "tests": {
+      "rust": 73,
+      "swift": 42,
+      "native_control": "pass"
+    },
+    "native_source_provenance_sha256": "e99a1b02f377d7cd31e763829d8c8082257e77d413aeb29dc00c6faab18db964"
+  },
+  "deployment": {
+    "installed": true,
+    "source_commit": "1daf1dd",
+    "left_running": true,
+    "opened_unix": 1792780225.429367,
+    "completed_unix": 1792780285.466122,
+    "service_pid": 14388,
+    "proofs_delivered": 12,
+    "failed_proofs": 0,
+    "configuration_unchanged": true,
+    "native_sha256": "134f666770d17a79838376cd79a8d52112631805e2d2009cf1ae45941a56a69d",
+    "service_sha256": "cd94daf2e1829f26a93f30a005c9d4cb3c632e92cce693f10c9807fbd5e22d00",
+    "hardware_hotplug_not_injected": true
+  },
+  "observed_recoveries": 0,
+  "boards": [
+    {
+      "name": "ASIC 1",
+      "serial": "CHIA0000000116",
+      "frequency_mhz": 1680.0,
+      "voltage_v": 1.0,
+      "temperature_c": 40.8,
+      "temperature_limit_c": 55.0,
+      "raw_speeds": [
+        {
+          "state": "running",
+          "engine": 1,
+          "ips": 1092151.0,
+          "timestamp_unix": 1792780284
+        }
+      ]
+    },
+    {
+      "name": "ASIC 2",
+      "serial": "CHIA0000000032",
+      "frequency_mhz": 1680.0,
+      "voltage_v": 1.0,
+      "temperature_c": 42.78,
+      "temperature_limit_c": 55.0,
+      "raw_speeds": [
+        {
+          "state": "running",
+          "engine": 1,
+          "ips": 1101546.0,
+          "timestamp_unix": 1792780285
+        }
+      ]
+    },
+    {
+      "name": "ASIC 3",
+      "serial": "CHIA0000000063",
+      "frequency_mhz": 1640.0,
+      "voltage_v": 1.0,
+      "temperature_c": 42.35,
+      "temperature_limit_c": 55.0,
+      "raw_speeds": [
+        {
+          "state": "running",
+          "engine": 1,
+          "ips": 1065829.0,
+          "timestamp_unix": 1792780284
+        }
+      ]
+    }
+  ],
+  "validation_boundary": "73 offline Rust tests, 42 Swift tests, native control fixtures, and a one-minute live deployment check with 12 verified proofs. No physical USB hotplug was injected during live validation; repeated disconnect/reconnect, retained healthy process, serial relocation, thermal latching and cancellation paths were checked with offline fixtures."
+}
