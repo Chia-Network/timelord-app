@@ -29,7 +29,9 @@ struct Overview: View {
                         Image(systemName: "circle.fill").font(.system(size: 12)).foregroundStyle(model.snapshot.phase.tone.color)
                         Text(model.snapshot.runningTitle).font(.system(size: 30, weight: .semibold))
                     }
-                    Text(model.snapshot.explanation).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+                    if model.snapshot.phase != .running {
+                        Text(model.snapshot.explanation).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+                    }
                     Text(model.snapshot.proofFreshness)
                         .font(.caption).foregroundStyle(.secondary).lineLimit(2)
                 }.frame(maxWidth: .infinity, alignment: .leading)
