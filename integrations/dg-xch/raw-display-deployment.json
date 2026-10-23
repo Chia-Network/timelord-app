@@ -1,0 +1,59 @@
+{
+  "host": "m6mini",
+  "ui_source_commit": "a1bb73a",
+  "ui_sha256": "22fcb8a9d03eb1edac510735a1e9fa13dd55fdc78a36f1322624e0599aaa17ae",
+  "native_sha256": "134f666770d17a79838376cd79a8d52112631805e2d2009cf1ae45941a56a69d",
+  "service_sha256": "cd94daf2e1829f26a93f30a005c9d4cb3c632e92cce693f10c9807fbd5e22d00",
+  "native_and_service_unchanged": true,
+  "deployment": {
+    "installed": true,
+    "source_commit": "a1bb73a",
+    "left_running": true,
+    "opened_unix": 1792781471.884043,
+    "completed_unix": 1792781501.8999429,
+    "service_pid": 14671,
+    "proofs_delivered": 6,
+    "failed_proofs": 0,
+    "configuration_unchanged": true,
+    "native_sha256": "134f666770d17a79838376cd79a8d52112631805e2d2009cf1ae45941a56a69d",
+    "service_sha256": "cd94daf2e1829f26a93f30a005c9d4cb3c632e92cce693f10c9807fbd5e22d00",
+    "hardware_hotplug_not_injected": true
+  },
+  "swift_tests": 43,
+  "mapping": "One assigned chain uses physical engine 1; two or three chains use engines in ascending order. Raw-rate freshness and idle handling are unchanged.",
+  "boards": [
+    {
+      "name": "ASIC 1",
+      "raw_speeds": [
+        {
+          "state": "running",
+          "engine": 1,
+          "ips": 1137449.0,
+          "timestamp_unix": 1792781501
+        }
+      ]
+    },
+    {
+      "name": "ASIC 2",
+      "raw_speeds": [
+        {
+          "state": "running",
+          "engine": 1,
+          "ips": 1137646.0,
+          "timestamp_unix": 1792781501
+        }
+      ]
+    },
+    {
+      "name": "ASIC 3",
+      "raw_speeds": [
+        {
+          "state": "running",
+          "engine": 1,
+          "ips": 1072654.0,
+          "timestamp_unix": 1792781501
+        }
+      ]
+    }
+  ]
+}
