@@ -137,9 +137,12 @@ impl ClientLog {
             hardware.temperature_unix = crate::unix_now();
             hardware.temperature_c = Some(temp);
             hardware.frequency_mhz = Some(freq);
-            hardware.state = "connected".into();
+            if hardware.state == "starting" || hardware.state == "connected" {
+                hardware.state = "connected".into();
+            }
             if temp >= board.temperature_limit_c {
                 hardware.state = "thermal_stop".into();
+                hardware.latched_fault = true;
                 state.event(Some(board.id.clone()), "thermal_stop");
                 bail!("ASIC reached its configured temperature limit");
             }
@@ -426,8 +429,11 @@ async fn supervise(
             terminate(&mut child).await;
             let mut state = shared.runtime.lock().expect("runtime");
             state.boards.entry(board.id.clone()).or_default().state = "fault".into();
-            state.phase = "fault".into();
-            state.message = error.to_string();
+            state
+                .boards
+                .entry(board.id.clone())
+                .or_default()
+                .fault_reason = Some(error.to_string());
             return Err(error);
         }
         None => None,
@@ -439,9 +445,16 @@ async fn supervise(
         tokio::select! {
             _ = shutdown.changed() => break Ok(()),
             _ = watchdog.tick() => {
-                if shared.runtime.lock().expect("runtime").phase == "fault" { break Err(anyhow::anyhow!("Timelord needs attention")); }
+                if let Some(hardware) = shared.runtime.lock().expect("runtime").boards.get(&board.id)
+                    && (hardware.latched_fault || hardware.state == "fault") {
+                    break Err(anyhow::anyhow!(hardware.fault_reason.clone().unwrap_or_else(|| "ASIC needs attention".into())));
+                }
                 if log.last_temperature.elapsed() > Duration::from_secs(60) { break Err(anyhow::anyhow!("ASIC temperature telemetry stopped")); }
-                if let Some(exit)=child.try_wait()? { break Err(anyhow::anyhow!("ASIC client exited: {exit}")); }
+                match child.try_wait() {
+                    Ok(Some(exit)) => break Err(anyhow::anyhow!("ASIC client exited: {exit}")),
+                    Err(error) => break Err(error.into()),
+                    Ok(None) => {}
+                }
                 if let Some(owner)=&mut automatic && let Err(error)=owner.tick(&shared,&board,&mut log).await {break Err(error);}
             }
             result = log.read(&shared, &board) => {
@@ -458,8 +471,11 @@ async fn supervise(
         hardware.state = if result.is_ok() { "stopped" } else { "fault" }.into();
     }
     if let Err(error) = &result {
-        state.message = format!("{}: {error}", board.name);
-        state.phase = "fault".into();
+        state
+            .boards
+            .entry(board.id.clone())
+            .or_default()
+            .fault_reason = Some(error.to_string());
     }
     result
 }
@@ -566,47 +582,247 @@ pub async fn validate_automatic(config: &Config) -> Result<()> {
     Ok(())
 }
 
-pub async fn run(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) -> Result<()> {
-    let binary = shared
-        .config
-        .hardware
-        .client_binary
-        .as_ref()
-        .context("No native client configured")?;
+const RESTART_DELAYS: [u64; 3] = [1, 5, 30];
+struct RestartBudget {
+    used: usize,
+    delays: [Duration; 3],
+}
+impl Default for RestartBudget {
+    fn default() -> Self {
+        Self {
+            used: 0,
+            delays: RESTART_DELAYS.map(Duration::from_secs),
+        }
+    }
+}
+impl RestartBudget {
+    fn next(&mut self, established: bool) -> Option<Duration> {
+        if established {
+            self.used = 0;
+        }
+        let delay = *self.delays.get(self.used)?;
+        self.used += 1;
+        Some(delay)
+    }
+}
+fn established(shared: &Shared, board: &BoardConfig, started: u64, elapsed: Duration) -> bool {
+    if elapsed < Duration::from_secs(600) {
+        return false;
+    }
+    let now = crate::unix_now();
+    let state = shared.runtime.lock().expect("runtime");
+    let telemetry_fresh = state
+        .boards
+        .get(&board.id)
+        .is_some_and(|b| now.saturating_sub(b.temperature_unix) <= 30);
+    telemetry_fresh
+        && shared
+            .assignments
+            .iter()
+            .filter(|a| a.board_id == board.id)
+            .all(|a| {
+                let proofs: Vec<_> = state
+                    .observations
+                    .iter()
+                    .filter(|o| o.chain == a.chain && o.work_started_unix >= started)
+                    .collect();
+                proofs.len() >= 3
+                    && proofs
+                        .last()
+                        .is_some_and(|o| now.saturating_sub(o.timestamp_unix) <= 30)
+            })
+}
+async fn launch(shared: &Shared, board: &BoardConfig) -> Result<Child> {
+    let engines = shared
+        .assignments
+        .iter()
+        .filter(|a| a.board_id == board.id)
+        .count();
+    let mut args = arguments(board, engines)?;
+    let automatic = board.profile == ProfileMode::Automatic;
+    if automatic {
+        let point = automatic::initial(
+            &shared.config,
+            board,
+            engines,
+            &automatic::fingerprint(&shared.config)?,
+            &automatic::host(),
+        )?;
+        let frequency = args
+            .iter()
+            .position(|a| a == "--freq")
+            .context("Automatic frequency missing")?
+            + 1;
+        let voltage = args
+            .iter()
+            .position(|a| a == "--voltage")
+            .context("Automatic voltage missing")?
+            + 1;
+        args[frequency] = point.frequency_mhz.to_string();
+        args[voltage] = point.voltage_v.to_string();
+    }
+    Command::new(
+        shared
+            .config
+            .hardware
+            .client_binary
+            .as_ref()
+            .context("No native client configured")?,
+    )
+    .args(args)
+    .stdin(if automatic {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(if automatic {
+        Stdio::piped()
+    } else {
+        Stdio::inherit()
+    })
+    .stderr(Stdio::piped())
+    .kill_on_drop(true)
+    .spawn()
+    .context("Launching native ASIC client")
+}
+async fn supervise_board(
+    shared: Arc<Shared>,
+    backend: Arc<crate::asic::AsicBackend>,
+    board: BoardConfig,
+    ready: oneshot::Sender<()>,
+    mut shutdown: watch::Receiver<bool>,
+    mut budget: RestartBudget,
+) {
+    let mut ready = Some(ready);
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        {
+            let mut state = shared.runtime.lock().expect("runtime");
+            let hardware = state.boards.entry(board.id.clone()).or_default();
+            if hardware.latched_fault {
+                return;
+            }
+            hardware.generation += 1;
+            hardware.started_unix = crate::unix_now();
+            hardware.state = "starting".into();
+            hardware.raw_speeds.clear();
+            hardware.temperature_unix = 0;
+            hardware.temperature_c = None;
+            hardware.fault_reason = None;
+        }
+        let started = tokio::time::Instant::now();
+        let started_unix = crate::unix_now();
+        let tx = ready.take().unwrap_or_else(|| oneshot::channel().0);
+        let result = match launch(&shared, &board).await {
+            Ok(child) => {
+                supervise(shared.clone(), board.clone(), child, tx, shutdown.clone()).await
+            }
+            Err(error) => {
+                drop(tx);
+                Err(error)
+            }
+        };
+        if *shutdown.borrow() || result.is_ok() {
+            return;
+        }
+        let error = result.unwrap_err();
+        let delay = budget.next(established(
+            &shared,
+            &board,
+            started_unix,
+            started.elapsed(),
+        ));
+        let stop = {
+            let mut state = shared.runtime.lock().expect("runtime");
+            let hardware = state.boards.entry(board.id.clone()).or_default();
+            // Temperature/sensor stops and invalid proofs require explicit attention.
+            hardware.latched_fault |=
+                delay.is_none() || error.to_string().to_lowercase().contains("temperature");
+            if hardware.state != "thermal_stop" {
+                hardware.state = "fault".into();
+            }
+            hardware.raw_speeds.clear();
+            hardware.fault_reason = Some(error.to_string());
+            let stop = hardware.latched_fault;
+            if !state.events.iter().any(|e| {
+                e.board_id.as_ref() == Some(&board.id)
+                    && e.kind == "board_fault"
+                    && e.end_unix.is_none()
+            }) {
+                state.event(Some(board.id.clone()), "board_fault");
+            }
+            stop
+        };
+        backend.stop_board(&board.id).await;
+        tracing::warn!(board=%board.name, %error, attempt=budget.used, retry_seconds=?delay.map(|d| d.as_secs()), stop, "ASIC client stopped; other boards remain supervised");
+        if stop {
+            return;
+        }
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            _ = tokio::time::sleep(delay.expect("restart delay")) => {}
+        }
+    }
+}
+pub async fn run(
+    shared: Arc<Shared>,
+    backend: Arc<crate::asic::AsicBackend>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
     validate_automatic(&shared.config).await?;
     let mut children = JoinSet::new();
     let (stop, child_shutdown) = watch::channel(false);
-    let result: Result<()> = async {
-        for board in &shared.config.hardware.boards {
-            let engines = shared.assignments.iter().filter(|a| a.board_id == board.id).count(); if engines == 0 { continue; }
-            shared.runtime.lock().expect("runtime").boards.insert(board.id.clone(), HardwareState { state: "starting".into(), ..Default::default() });
-            let is_automatic=board.profile==ProfileMode::Automatic;
-            let mut args=arguments(board,engines)?;
-            if is_automatic {
-                let point=automatic::initial(&shared.config,board,engines,&automatic::fingerprint(&shared.config)?,&automatic::host())?;
-                let frequency=args.iter().position(|a|a=="--freq").context("Automatic frequency missing")?+1;
-                let voltage=args.iter().position(|a|a=="--voltage").context("Automatic voltage missing")?+1;
-                args[frequency]=point.frequency_mhz.to_string();args[voltage]=point.voltage_v.to_string();
-            }
-            let child = Command::new(binary).args(args).stdin(if is_automatic{Stdio::piped()}else{Stdio::null()}).stdout(if is_automatic{Stdio::piped()}else{Stdio::inherit()}).stderr(Stdio::piped()).kill_on_drop(true).spawn().context("Launching native ASIC client")?;
-            let (tx, rx) = oneshot::channel(); children.spawn(supervise(shared.clone(), board.clone(), child, tx, child_shutdown.clone()));
-            tokio::select! { _ = shutdown.changed() => return Ok(()), Some(result) = children.join_next(), if !children.is_empty() => { result??; bail!("ASIC stopped during initialization"); }, initialized = tokio::time::timeout(Duration::from_secs(30), rx) => { initialized.context("ASIC initialization timed out")?.context("ASIC initialization failed")?; } }
+    for board in &shared.config.hardware.boards {
+        if !shared.assignments.iter().any(|a| a.board_id == board.id) {
+            continue;
         }
-        tokio::select! { _ = shutdown.changed() => {}, Some(result) = children.join_next(), if !children.is_empty() => { result??; bail!("An ASIC client stopped"); } }
-        Ok(())
-    }.await;
+        shared.runtime.lock().expect("runtime").boards.insert(
+            board.id.clone(),
+            HardwareState {
+                state: "starting".into(),
+                ..Default::default()
+            },
+        );
+        let (tx, rx) = oneshot::channel();
+        children.spawn(supervise_board(
+            shared.clone(),
+            backend.clone(),
+            board.clone(),
+            tx,
+            child_shutdown.clone(),
+            RestartBudget::default(),
+        ));
+        // Keep normal USB initialization sequential, but one broken board must
+        // not prevent the next board from starting or bring down existing owners.
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            initialized = tokio::time::timeout(Duration::from_secs(30), rx) => {
+                if !matches!(initialized, Ok(Ok(()))) {
+                    tracing::warn!(board=%board.name, "ASIC not ready yet; continuing other boards");
+                }
+            }
+        }
+    }
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            Some(result) = children.join_next(), if !children.is_empty() => {
+                if let Err(error) = result { tracing::error!(%error, "ASIC supervisor task failed"); }
+            }
+        }
+    }
     let _ = stop.send(true);
     while let Some(result) = children.join_next().await {
         if let Err(error) = result {
             tracing::warn!(%error, "ASIC shutdown failed");
         }
     }
-    if let Err(error) = &result {
-        let mut state = shared.runtime.lock().expect("runtime");
-        state.phase = "fault".into();
-        state.message = error.to_string();
-    }
-    result
+    Ok(())
 }
 
 #[cfg(test)]
@@ -898,16 +1114,183 @@ done
             runtime: Default::default(),
             started_unix: crate::unix_now(),
         });
-        let (_stop, receiver) = watch::channel(false);
-        let result = tokio::time::timeout(Duration::from_secs(5), run(shared.clone(), receiver))
-            .await
-            .unwrap();
-        assert!(result.is_err());
-        assert_eq!(
-            shared.runtime.lock().unwrap().boards["a"].state,
-            "thermal_stop"
+        let (stop, receiver) = watch::channel(false);
+        let (backend, _offers) =
+            crate::asic::AsicBackend::new(&shared.config, shared.runtime.clone()).unwrap();
+        let task = tokio::spawn(run(shared.clone(), Arc::new(backend), receiver));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if shared
+                    .runtime
+                    .lock()
+                    .unwrap()
+                    .boards
+                    .get("a")
+                    .is_some_and(|b| b.state == "thermal_stop" && b.latched_fault)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !task.is_finished(),
+            "A thermal stop must not end other board supervision"
         );
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn restart_backoff_is_bounded_and_only_established_work_renews_the_budget() {
+        let mut budget = RestartBudget::default();
+        assert_eq!(budget.next(false), Some(Duration::from_secs(1)));
+        assert_eq!(budget.next(false), Some(Duration::from_secs(5)));
+        assert_eq!(budget.next(false), Some(Duration::from_secs(30)));
+        assert_eq!(budget.next(false), None);
+        assert_eq!(budget.next(true), Some(Duration::from_secs(1)));
+    }
+    #[tokio::test]
+    async fn flapping_board_exhausts_retries_without_restarting_healthy_board() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tl-board-isolation-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("client");
+        std::fs::write(&binary,r#"#!/bin/sh
+root=$(dirname "$0")
+while [ "$#" -gt 0 ]; do
+ if [ "$1" = --device-loc ]; then loc=$2; break; fi
+ shift
+done
+echo $$ >> "$root/launches-$loc"
+trap 'exit 0' TERM INT
+printf '%s\n' 'ASIC Temp = 40.0 C; Frequency = 1500.0 MHz; freq_idx = 1' 'VDF 0: Connected to timelord, waiting for challenge' >&2
+if [ "$loc" = 2 ]; then exit 1; fi
+while :; do printf '%s\n' 'ASIC Temp = 40.0 C; Frequency = 1500.0 MHz; freq_idx = 1' >&2; sleep .05; done
+"#).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut config:Config=toml::from_str("[[hardware.boards]]\nid='healthy'\nname='Healthy'\nclient_port=18110\ndevice_location=1\nprofile='manual'\n[[hardware.boards]]\nid='flaky'\nname='Flaky'\nclient_port=18111\ndevice_location=2\nprofile='manual'").unwrap();
+        config.hardware.client_binary = Some(binary);
+        let shared = Arc::new(Shared {
+            assignments: config.assignments().unwrap(),
+            config,
+            clients: Default::default(),
+            runtime: Default::default(),
+            started_unix: crate::unix_now(),
+        });
+        let (backend, _offers) =
+            crate::asic::AsicBackend::new(&shared.config, shared.runtime.clone()).unwrap();
+        let backend = Arc::new(backend);
+        let (stop, rx) = watch::channel(false);
+        let (tx, _) = oneshot::channel();
+        let healthy = tokio::spawn(supervise_board(
+            shared.clone(),
+            backend.clone(),
+            shared.config.hardware.boards[0].clone(),
+            tx,
+            rx.clone(),
+            RestartBudget::default(),
+        ));
+        let (tx, _) = oneshot::channel();
+        let flaky = tokio::spawn(supervise_board(
+            shared.clone(),
+            backend.clone(),
+            shared.config.hardware.boards[1].clone(),
+            tx,
+            rx.clone(),
+            RestartBudget {
+                used: 0,
+                delays: [Duration::from_millis(10); 3],
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(5), flaky)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!healthy.is_finished());
+        {
+            let state = shared.runtime.lock().unwrap();
+            assert!(state.boards["flaky"].latched_fault);
+            assert_eq!(state.boards["flaky"].generation, 4);
+            assert_eq!(state.boards["healthy"].generation, 1);
+            assert_eq!(state.boards["healthy"].state, "connected");
+            assert_ne!(state.phase, "fault");
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("launches-1"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("launches-2"))
+                .unwrap()
+                .lines()
+                .count(),
+            4
+        );
+        // An explicit new recovery session can be cancelled during a long backoff.
+        shared
+            .runtime
+            .lock()
+            .unwrap()
+            .boards
+            .get_mut("flaky")
+            .unwrap()
+            .latched_fault = false;
+        let (tx, _) = oneshot::channel();
+        let retrying = tokio::spawn(supervise_board(
+            shared.clone(),
+            backend.clone(),
+            shared.config.hardware.boards[1].clone(),
+            tx,
+            rx.clone(),
+            RestartBudget {
+                used: 0,
+                delays: [Duration::from_secs(30); 3],
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if shared
+                    .runtime
+                    .lock()
+                    .unwrap()
+                    .boards
+                    .get("flaky")
+                    .is_some_and(|b| b.generation == 5 && b.state == "fault")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), retrying)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("launches-2"))
+                .unwrap()
+                .lines()
+                .count(),
+            5
+        );
+        tokio::time::timeout(Duration::from_secs(3), healthy)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn temperature_parser_rejects_nonfinite_measurements() {

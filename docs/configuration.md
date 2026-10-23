@@ -201,3 +201,28 @@ service; it will not stop or replace one it did not launch.
 Automatic tuning can explore supported PLL points up to 2200 MHz. This is a search
 ceiling, not the starting clock or a guarantee of stability. Requested voltage stays
 at or below 1.0 V and the temperature guard stays at or below 55°C.
+
+## Board recovery
+
+Native readback retries are separate from client recovery: three reads per stage,
+20 ms apart, with engines paused and no repeated voltage/PLL writes. Persistent
+unexpected state still stops that native client.
+
+The service supervises each physical board independently. After a transient
+client/control/socket failure it restarts only that board, with delays of 1, 5,
+and 30 seconds. Initialization must reapply and verify the saved operating point;
+verified proofs are required before the board appears productive again. Restart
+attempts never raise its saved voltage or frequency. An unaccepted Automatic
+trial returns to the last saved point. The retry budget can renew after at least
+ten minutes of operation, three verified outputs for each assigned chain from
+that run, and fresh proof/temperature telemetry.
+
+Exhausted retries, failed proof verification, thermal stops and missing temperature
+telemetry require attention; these are not retried indefinitely. Pause/Run starts
+a new supervision session. Pausing or quitting cancels pending restarts.
+
+Other boards keep their processes, settings and chain sessions during a board
+outage. The full-node connection remains open to receive progress from other
+timelords. The service never submits an incomplete combined proof or treats an
+unavailable board as productive. History gaps apply to the affected board; healthy
+boards' verified samples remain available.

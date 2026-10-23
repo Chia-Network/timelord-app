@@ -198,12 +198,13 @@ public enum LivePresentation {
         let nodeDetail = freshSync.map { $0.syncing ? "Syncing" : $0.synced ? "Synced" : "Not synced" } ?? "Sync status unavailable"
         let nodeTone: StatusTone = freshSync.map { $0.synced && !$0.syncing ? .positive : .attention } ?? .neutral
         let nodeReady = ["authenticated", "ready"].contains(live?.fullNode.state ?? "")
-        let productive = live?.productionEnabled == true && live?.timelordState == "running" && live?.latestProofUnix.map { now.timeIntervalSince1970 - $0 < 90 } == true
+        let productive = live?.boards.contains(where: { $0.hardwareState == "connected" }) == true && live?.productionEnabled == true && live?.timelordState == "running" && live?.latestProofUnix.map { now.timeIntervalSince1970 - $0 < 90 } == true
         let thermal = live?.boards.contains { $0.hardwareState == "thermal_stop" } == true
+        let allBoardsFailed = live.map { !$0.boards.isEmpty && $0.boards.allSatisfy { ["fault", "thermal_stop"].contains($0.hardwareState) } } ?? false
         let phase: AppPhase
         if starting { phase = .starting }
-        else if thermal { phase = .temperatureLimit }
-        else if error != nil || live?.timelordState == "fault" { phase = .serviceUnavailable }
+        else if thermal && !productive { phase = .temperatureLimit }
+        else if error != nil || live?.timelordState == "fault" || allBoardsFailed { phase = .serviceUnavailable }
         else if paused { phase = .paused }
         else if productive { phase = .running }
         else if live?.fullNode.state == "disconnected" { phase = .nodeUnreachable }
@@ -222,7 +223,7 @@ public enum LivePresentation {
             }.map { board in
                 let last = proofCapable ? board.latestProofUnix.map(Date.init(timeIntervalSince1970:)) : nil
                 let freshProof = last.map { now.timeIntervalSince($0) < 90 } ?? false
-                let state: BoardState = board.hardwareState == "thermal_stop" ? .thermalStop : board.hardwareState == "fault" ? .disconnected : productive && freshProof ? .active : board.hardwareState == "connected" ? .waiting : .uninspected
+                let state: BoardState = board.hardwareState == "thermal_stop" ? .thermalStop : board.hardwareState == "fault" ? .disconnected : productive && freshProof && board.hardwareState == "connected" ? .active : board.hardwareState == "connected" ? .waiting : .uninspected
                 let histories = board.assignedChains.compactMap(Chain.init(rawValue:)).map { chain -> ChainHistory in
                     guard let validHistory else { return .empty(chain) }
                     let end = min(now, Date(timeIntervalSince1970: validHistory.timestampUnix))
@@ -231,11 +232,11 @@ public enum LivePresentation {
                         let finish = min(end, Date(timeIntervalSince1970: capture.endUnix))
                         return finish > start ? DateInterval(start: start, end: finish) : nil
                     }
-                    let samples = validHistory.estimatedObservations.filter { $0.chain == chain }.map { ProofObservation(date: Date(timeIntervalSince1970: $0.timestampUnix), ips: $0.ips, id: "proof-\($0.id)", sequence: $0.id) }
+                    let samples = validHistory.estimatedObservations.filter { $0.chain == chain }.map { ProofObservation(date: Date(timeIntervalSince1970: $0.timestampUnix), ips: $0.ips, id: "proof-\($0.id)", sequence: $0.id, boardID: board.id) }
                     let events = validHistory.events.filter { $0.boardId == nil || $0.boardId == board.id }.compactMap { event -> HistoryEvent? in
                         guard let kind = HistoryEventKind(rawValue: event.kind) else { return nil }
                         let date = Date(timeIntervalSince1970: event.timestampUnix)
-                        return HistoryEvent(date: date, end: kind.interruptsWork ? event.endUnix.map(Date.init(timeIntervalSince1970:)) ?? end : nil, kind: kind, id: "event-\(event.id)")
+                        return HistoryEvent(date: date, end: kind.interruptsWork ? event.endUnix.map(Date.init(timeIntervalSince1970:)) ?? end : nil, kind: kind, id: "event-\(event.id)", boardID: event.boardId)
                     }
                     return ChainHistory(chain: chain, samples: samples, captureIntervals: captures, events: events)
                 }

@@ -396,5 +396,38 @@ extension PresentationTests {
         XCTAssertNil(incapable.latestProof)
         XCTAssertNil(incapable.proofsToday)
     }
+    func testBoardFaultDoesNotHideHealthyBoardGaugeOrHover() {
+        let start = Date(timeIntervalSince1970: 0)
+        let window = DateInterval(start: start, duration: 120)
+        let samples = [ProofObservation(date: start.addingTimeInterval(25), ips: 1_100_000, boardID: "healthy"),
+                       ProofObservation(date: start.addingTimeInterval(55), ips: 1_200_000, boardID: "healthy")]
+        let failure = HistoryEvent(date: start.addingTimeInterval(20), end: nil, kind: .boardFault, boardID: "failed")
+        let history = ChainHistory(chain: .challenge, samples: samples, captureIntervals: [window], events: [failure])
+        XCTAssertEqual(history.sampledObservations(in: window).count, 4)
+        XCTAssertNotNil(history.observation(near: start.addingTimeInterval(60), in: window))
+        XCTAssertEqual(Set(history.plotPoints(in: window).map(\.segment)), [0])
+        let ownFailure = HistoryEvent(date: start.addingTimeInterval(20), end: nil, kind: .boardFault, boardID: "healthy")
+        XCTAssertTrue(ChainHistory(chain: .challenge, samples: samples, captureIntervals: [window], events: [ownFailure]).sampledObservations(in: window).isEmpty)
+    }
+    func testOneStoppedBoardDoesNotMakeHealthyBoardOrServiceLookStopped() throws {
+        func status(_ states: [String]) throws -> ServiceStatus {
+            let boards: [[String: Any]] = states.enumerated().map { index, state in
+                ["id": "board-\(index)", "name": "ASIC \(index)", "assigned_chains": [index == 0 ? "challenge" : "infused_challenge"],
+                 "connected_clients": state == "connected" ? 1 : 0, "hardware_state": state, "latest_proof_unix": 1_000_000, "profile": "Automatic"]
+            }
+            let object: [String: Any] = ["api_version": 1, "service_pid": 42, "timestamp_unix": 1_000_000, "started_unix": 999000,
+                "timelord_state": "running", "message": "Producing proofs", "production_enabled": true, "proofs_delivered": 7, "tuning_paused": false,
+                "latest_proof_unix": 1_000_000, "full_node": ["host": "localhost", "port": 8444, "network": "mainnet", "state": "ready"], "boards": boards]
+            let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+            return try decoder.decode(ServiceStatus.self, from: JSONSerialization.data(withJSONObject: object))
+        }
+        for failed in ["fault", "thermal_stop", "starting"] {
+            let view = LivePresentation.snapshot(status: try status(["connected", failed]), now: now)
+            XCTAssertEqual(view.phase, .running)
+            XCTAssertEqual(view.boards[0].state, .active)
+            XCTAssertNotEqual(view.boards[1].state, .active)
+        }
+        XCTAssertEqual(LivePresentation.snapshot(status: try status(["fault", "fault"]), now: now).phase, .serviceUnavailable)
+    }
 
 }

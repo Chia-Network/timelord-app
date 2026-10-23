@@ -467,10 +467,16 @@ async fn status(State(shared): State<Arc<Shared>>) -> Json<Status> {
                     .iter()
                     .rev()
                     .find(|o| {
-                        shared
-                            .assignments
-                            .iter()
-                            .any(|a| a.board_id == b.id && a.chain == o.chain)
+                        o.work_started_unix
+                            >= runtime
+                                .boards
+                                .get(&b.id)
+                                .map(|h| h.started_unix)
+                                .unwrap_or(0)
+                            && shared
+                                .assignments
+                                .iter()
+                                .any(|a| a.board_id == b.id && a.chain == o.chain)
                     })
                     .map(|o| o.timestamp_unix),
             })
@@ -581,10 +587,11 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
         });
     }
     if shared.config.hardware.client_binary.is_some() && active {
+        let backend = backend.clone();
         let shared = shared.clone();
         let shutdown = receiver.clone();
         tasks.spawn(async move {
-            if let Err(error) = hardware::run(shared, shutdown).await {
+            if let Err(error) = hardware::run(shared, backend, shutdown).await {
                 tracing::warn!(%error, "ASIC supervision stopped");
             }
             Ok(())
@@ -641,7 +648,8 @@ async fn client_listener(
                 let slot={let mut connected=shared.clients.lock().expect("client state lock");let slot=(0..capacity).find(|slot|!connected.contains(&(id.clone(),*slot)));if let Some(slot)=slot {connected.insert((id.clone(),slot));}slot};
                 if let Some(slot)=slot {
                     if let Some(offers) = &offers {
-                        let lease = asic::Lease { socket, board: id.clone(), slot, clients: shared.clients.clone() };
+                        let generation = shared.runtime.lock().expect("runtime").boards.get(&id).map(|b| b.generation).unwrap_or(0);
+                        let lease = asic::Lease { socket, board: id.clone(), slot, generation, clients: shared.clients.clone() };
                         if offers.try_send(lease).is_err() { tracing::warn!(board=%id, "ASIC socket queue full"); }
                         continue;
                     }

@@ -72,7 +72,7 @@ pub async fn check(mut config: Config) -> Result<Vec<CheckedProof>> {
             offers.get(&id).cloned(),
         ));
     }
-    let mut supervisor = tokio::spawn(hardware::run(shared.clone(), shutdown));
+    let mut supervisor = tokio::spawn(hardware::run(shared.clone(), backend.clone(), shutdown));
     let workload = async {
         let mut checked = vec![];
         // Round two must reuse each session; round three must reset it.

@@ -61,6 +61,14 @@ pub struct RawSpeed {
 }
 #[derive(Clone, Default, Serialize)]
 pub struct HardwareState {
+    #[serde(skip)]
+    pub generation: u64,
+    #[serde(skip)]
+    pub started_unix: u64,
+    #[serde(skip)]
+    pub latched_fault: bool,
+    #[serde(skip)]
+    pub fault_reason: Option<String>,
     pub raw_speeds: Vec<RawSpeed>,
     pub temperature_c: Option<f64>,
     pub frequency_mhz: Option<f64>,
@@ -382,12 +390,12 @@ struct Completed {
     speeds: Vec<(Chain, ProofTiming)>,
 }
 async fn execute(backend: Arc<AsicBackend>, plan: WorkPlan) -> Result<Completed> {
-    let cc = backend.prove(Chain::Challenge, plan.challenge.clone());
-    let rc = backend.prove(Chain::Reward, plan.reward.clone());
+    let cc = backend.prove_when_available(Chain::Challenge, plan.challenge.clone(), true);
+    let rc = backend.prove_when_available(Chain::Reward, plan.reward.clone(), true);
     let icc = async {
         match &plan.infused {
             Some(work) => backend
-                .prove(Chain::InfusedChallenge, work.clone())
+                .prove_when_available(Chain::InfusedChallenge, work.clone(), true)
                 .await
                 .map(Some),
             None => Ok(None),
@@ -438,16 +446,6 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
     let mut last_message = Instant::now();
     let connected = Instant::now();
     loop {
-        if shared
-            .runtime
-            .lock()
-            .expect("runtime")
-            .boards
-            .values()
-            .any(|b| b.state == "fault" || b.state == "thermal_stop")
-        {
-            bail!("An ASIC client needs attention");
-        }
         if scheduler.needs_resync() {
             bail!("Node has not confirmed the infusion; reconnecting for chain state");
         }
@@ -528,7 +526,6 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
         tokio::select! {
             _ = tick.tick() => {
                 if !scheduler.initialized() && connected.elapsed() > Duration::from_secs(30) { bail!("Node has not supplied chain state yet"); }
-                if shared.runtime.lock().expect("runtime").boards.values().any(|b| b.state == "thermal_stop" || b.state == "fault") { bail!("An ASIC client needs attention"); }
             }
             _ = heartbeat.tick() => {
                 if last_message.elapsed() > Duration::from_secs(90) { bail!("Full-node heartbeat expired"); }
@@ -587,43 +584,10 @@ pub async fn run(
                 }
                 state.event(Some(failure.board_id.clone()), "board_fault");
             }
-            let hardware_fault = state
-                .boards
-                .values()
-                .any(|b| b.state == "thermal_stop" || b.state == "fault");
-            let message = if hardware_fault
-                && state.phase == "fault"
-                && error.downcast_ref::<AsicFailure>().is_none()
-            {
-                state.message.clone()
-            } else {
-                error.to_string()
-            };
-            state.transition(
-                if hardware_fault {
-                    "fault"
-                } else {
-                    "waiting_for_node"
-                },
-                "disconnected",
-                &message,
-            );
-            if !hardware_fault {
-                state.event(None, "node_unavailable");
-            }
+            state.transition("waiting_for_node", "disconnected", &error.to_string());
+            state.event(None, "node_unavailable");
         }
         backend.stop_all().await;
-        let hardware_fault = shared
-            .runtime
-            .lock()
-            .expect("runtime")
-            .boards
-            .values()
-            .any(|b| b.state == "thermal_stop" || b.state == "fault");
-        if hardware_fault {
-            let _ = shutdown.changed().await;
-            break;
-        }
         tokio::select! { _ = shutdown.changed() => break, _ = tokio::time::sleep(Duration::from_secs(5)) => {} }
     }
     backend.stop_all().await;
@@ -694,7 +658,7 @@ mod tests {
                 .is_err()
         );
     }
-    async fn fixture(server_name: &str) -> Result<()> {
+    async fn fixture(server_name: &str, board_fault: bool) -> Result<()> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let mut parameters = CertificateParams::new(vec!["fixture-ca".into()])?;
         parameters.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -771,9 +735,54 @@ mod tests {
                     None,
                 )?)
                 .await?;
-            let _ = socket.next().await;
+            if board_fault {
+                socket
+                    .send(Message::Ping(b"board-isolation".to_vec().into()))
+                    .await?;
+                loop {
+                    match socket
+                        .next()
+                        .await
+                        .context("Peer closed during board fault")??
+                    {
+                        Message::Pong(value) if value.as_ref() == b"board-isolation" => break,
+                        Message::Ping(value) => socket.send(Message::Pong(value)).await?,
+                        _ => {}
+                    }
+                }
+            } else {
+                let _ = socket.next().await;
+            }
             Ok::<_, anyhow::Error>(())
         });
+        if board_fault {
+            config.hardware.boards = vec![toml::from_str(
+                "id='failed'\nname='Failed'\nclient_port=18110",
+            )?];
+            let runtime = Arc::new(std::sync::Mutex::new(RuntimeState::default()));
+            runtime.lock().unwrap().boards.insert(
+                "failed".into(),
+                HardwareState {
+                    state: "fault".into(),
+                    latched_fault: true,
+                    ..Default::default()
+                },
+            );
+            let (backend, _offers) = AsicBackend::new(&config, runtime.clone())?;
+            let shared = Arc::new(Shared {
+                assignments: config.assignments().map_err(anyhow::Error::msg)?,
+                config,
+                clients: Default::default(),
+                runtime,
+                started_unix: unix_now(),
+            });
+            let session = tokio::spawn(session(shared, Arc::new(backend)));
+            let result = tokio::time::timeout(Duration::from_secs(3), task).await;
+            session.abort();
+            let _ = session.await;
+            result???;
+            return Ok(());
+        }
         let result = connect(&config).await;
         match result {
             Ok(mut socket) => {
@@ -790,10 +799,14 @@ mod tests {
     }
     #[tokio::test]
     async fn authenticates_a_mutual_tls_chia_websocket_with_a_fixture_only_identity() {
-        fixture("chia.net").await.unwrap();
+        fixture("chia.net", false).await.unwrap();
     }
     #[tokio::test]
     async fn rejects_an_incorrect_tls_server_name() {
-        assert!(fixture("wrong.invalid").await.is_err());
+        assert!(fixture("wrong.invalid", false).await.is_err());
+    }
+    #[tokio::test]
+    async fn full_node_session_keeps_answering_while_a_board_is_latched_off() {
+        fixture("chia.net", true).await.unwrap();
     }
 }

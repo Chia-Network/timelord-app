@@ -22,7 +22,8 @@ public struct ProofObservation: Identifiable, Sendable {
     public let ips: Double
     public let id: String
     public let sequence: Int
-    public init(date: Date, ips: Double, id: String? = nil, sequence: Int = 0) { self.date = date; self.ips = ips; self.id = id ?? "\(date.timeIntervalSince1970)-\(ips)"; self.sequence = sequence }
+    public let boardID: String?
+    public init(date: Date, ips: Double, id: String? = nil, sequence: Int = 0, boardID: String? = nil) { self.date = date; self.ips = ips; self.id = id ?? "\(date.timeIntervalSince1970)-\(ips)"; self.sequence = sequence; self.boardID = boardID }
 }
 
 public enum HistoryEventKind: String, Sendable {
@@ -52,8 +53,9 @@ public struct HistoryEvent: Identifiable, Sendable {
     public let date: Date
     public let end: Date?
     public let kind: HistoryEventKind
+    public let boardID: String?
     public let id: String
-    public init(date: Date, end: Date?, kind: HistoryEventKind, id: String? = nil) { self.date = date; self.end = end; self.kind = kind; self.id = id ?? "\(kind.rawValue)-\(date.timeIntervalSince1970)" }
+    public init(date: Date, end: Date?, kind: HistoryEventKind, id: String? = nil, boardID: String? = nil) { self.date = date; self.end = end; self.kind = kind; self.id = id ?? "\(kind.rawValue)-\(date.timeIntervalSince1970)"; self.boardID = boardID }
     public var title: String { kind.title }
 }
 
@@ -98,7 +100,7 @@ public struct ChainHistory: Identifiable, Sendable {
     private func value(at date: Date, source: ProofObservation?, coverage: [DateInterval]) -> Double? {
         guard let source, (0..<Self.staleSeconds).contains(date.timeIntervalSince(source.date)),
               coverage.contains(where: { $0.start <= source.date && $0.end >= date }),
-              !events.contains(where: { $0.kind.interruptsWork && $0.date <= date && ($0.end ?? date) >= source.date }) else { return nil }
+              !events.contains(where: { $0.kind.interruptsWork && ($0.boardID == nil || source.boardID == nil || $0.boardID == source.boardID) && $0.date <= date && ($0.end ?? date) >= source.date }) else { return nil }
         return source.ips
     }
 
@@ -126,7 +128,7 @@ public struct ChainHistory: Identifiable, Sendable {
                 source = sources[index]; index += 1
             }
             if let ips = value(at: date, source: source, coverage: coverage) {
-                result.append(ProofObservation(date: date, ips: ips, id: "scrape-\(tick)"))
+                result.append(ProofObservation(date: date, ips: ips, id: "scrape-\(tick)", boardID: source?.boardID))
             }
             tick += Self.scrapeSeconds
         }
@@ -165,7 +167,7 @@ public struct ChainHistory: Identifiable, Sendable {
             if let previous {
                 let capturedContinuously = coverage.contains { $0.start <= previous && $0.end >= sample.date }
                 let interrupted = events.contains {
-                    $0.kind.interruptsWork && $0.date < sample.date && ($0.end ?? $0.date) > previous
+                    $0.kind.interruptsWork && ($0.boardID == nil || sample.boardID == nil || $0.boardID == sample.boardID) && $0.date < sample.date && ($0.end ?? $0.date) > previous
                 }
                 if !capturedContinuously || interrupted || sample.date.timeIntervalSince(previous) > Self.scrapeSeconds { segment += 1 }
             }
@@ -176,8 +178,9 @@ public struct ChainHistory: Identifiable, Sendable {
 
     public func observation(near date: Date, in window: DateInterval) -> ProofObservation? {
         guard window.contains(date), mergedCaptureIntervals(in: window).contains(where: { $0.contains(date) }) else { return nil }
-        guard !events.contains(where: { $0.kind.interruptsWork && $0.date <= date && ($0.end ?? $0.date) > date }) else { return nil }
-        return sampledObservations(in: window).filter { abs($0.date.timeIntervalSince(date)) <= Self.scrapeSeconds / 2 }.min { abs($0.date.timeIntervalSince(date)) < abs($1.date.timeIntervalSince(date)) }
+        guard let sample = sampledObservations(in: window).filter({ abs($0.date.timeIntervalSince(date)) <= Self.scrapeSeconds / 2 }).min(by: { abs($0.date.timeIntervalSince(date)) < abs($1.date.timeIntervalSince(date)) }) else { return nil }
+        guard !events.contains(where: { $0.kind.interruptsWork && ($0.boardID == nil || sample.boardID == nil || $0.boardID == sample.boardID) && $0.date <= date && ($0.end ?? $0.date) > date }) else { return nil }
+        return sample
     }
 
     public func events(in window: DateInterval) -> [HistoryEvent] {

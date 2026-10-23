@@ -29,6 +29,7 @@ pub struct Lease {
     pub socket: TcpStream,
     pub board: String,
     pub slot: u8,
+    pub generation: u64,
     pub clients: Arc<SyncMutex<BTreeSet<(String, u8)>>>,
 }
 impl Drop for Lease {
@@ -160,9 +161,102 @@ impl AsicBackend {
             }
         })
     }
+    // A hardware outage belongs to one physical board. Keep other proof futures
+    // and the authenticated node session alive while that board's supervisor recovers.
+    pub async fn prove_when_available(
+        &self,
+        chain: Chain,
+        work: ProofRequest,
+        record_metric: bool,
+    ) -> Result<(ProofResult, ProofTiming)> {
+        work.validate_regular()?;
+        if work.iterations > MAX_REQUEST_ITERATIONS {
+            bail!("Request exceeds the native challenge iteration limit");
+        }
+        let lane = self
+            .lanes
+            .iter()
+            .find(|(c, _)| *c == chain)
+            .map(|(_, lane)| lane)
+            .context("Chain has no assigned ASIC")?;
+        loop {
+            let (generation, unavailable) = {
+                let state = self.runtime.lock().expect("runtime");
+                state
+                    .boards
+                    .get(&lane.board)
+                    .map(|b| {
+                        (
+                            b.generation,
+                            b.latched_fault || b.state == "fault" || b.state == "thermal_stop",
+                        )
+                    })
+                    .unwrap_or((0, false))
+            };
+            if unavailable {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+            let result = tokio::select! {
+                result = self.prove_inner(chain, work.clone(), record_metric) => result,
+                _ = async {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        let state = self.runtime.lock().expect("runtime");
+                        if state.boards.get(&lane.board).is_some_and(|b| b.generation != generation
+                            || b.latched_fault || b.state == "fault" || b.state == "thermal_stop") { break; }
+                    }
+                } => continue,
+            };
+            match result {
+                Ok(proof) => {
+                    let mut state = self.runtime.lock().expect("runtime");
+                    for event in &mut state.events {
+                        if event.board_id.as_ref() == Some(&lane.board)
+                            && event.kind == "board_fault"
+                            && event.end_unix.is_none()
+                        {
+                            event.end_unix = Some(crate::unix_now());
+                        }
+                    }
+                    return Ok(proof);
+                }
+                Err(error) => {
+                    let mut state = self.runtime.lock().expect("runtime");
+                    let hardware = state.boards.entry(lane.board.clone()).or_default();
+                    // A delayed EOF from the previous process must not kill its replacement.
+                    if hardware.generation != generation {
+                        continue;
+                    }
+                    let verification = error
+                        .downcast_ref::<AsicFailure>()
+                        .is_some_and(|e| e.verification);
+                    hardware.latched_fault |= verification;
+                    if hardware.state != "thermal_stop" {
+                        hardware.state = "fault".into();
+                    }
+                    hardware.fault_reason = Some(error.to_string());
+                    hardware.raw_speeds.clear();
+                    if verification {
+                        state.failed_proofs += 1;
+                    }
+                    if !state.events.iter().any(|e| {
+                        e.board_id.as_ref() == Some(&lane.board)
+                            && e.kind == "board_fault"
+                            && e.end_unix.is_none()
+                    }) {
+                        state.event(Some(lane.board.clone()), "board_fault");
+                    }
+                    state.phase = "waiting_for_clients".into();
+                    state.message = "Waiting for ASIC recovery.".into();
+                    tracing::warn!(board=%lane.board, %error, verification, "ASIC proof lane unavailable");
+                }
+            }
+        }
+    }
     pub async fn prime(&self, work: ProofRequest) -> Result<()> {
         // A one-iteration primer keeps ICC ready; it is not a scheduled VDF output.
-        self.prove_inner(Chain::InfusedChallenge, work, false)
+        self.prove_when_available(Chain::InfusedChallenge, work, false)
             .await?;
         Ok(())
     }
@@ -185,7 +279,15 @@ impl AsicBackend {
         let mut owner = lane.active.lock().await;
         // Take ownership during I/O. Cancellation retires the socket instead of
         // leaving a partially consumed frame in a reusable session.
-        let mut active = owner.take();
+        let generation = self
+            .runtime
+            .lock()
+            .expect("runtime")
+            .boards
+            .get(&lane.board)
+            .map(|b| b.generation)
+            .unwrap_or(0);
+        let mut active = owner.take().filter(|a| a.lease.generation == generation);
         // A new discriminant does not depend on the old socket. Start it before
         // retiring that session or waiting for the native client to reconnect.
         let discriminant = active
@@ -212,10 +314,24 @@ impl AsicBackend {
                     .context("Missing board listener")?
                     .lock()
                     .await;
-                let mut lease = tokio::time::timeout(Duration::from_secs(30), pool.recv())
-                    .await
-                    .context("Waiting for ASIC client timed out")?
-                    .context("ASIC listener stopped")?;
+                let mut lease = tokio::time::timeout(Duration::from_secs(30), async {
+                    loop {
+                        let lease = pool.recv().await.context("ASIC listener stopped")?;
+                        let current = self
+                            .runtime
+                            .lock()
+                            .expect("runtime")
+                            .boards
+                            .get(&lane.board)
+                            .map(|b| b.generation)
+                            .unwrap_or(0);
+                        if lease.generation == current {
+                            return Ok::<_, anyhow::Error>(lease);
+                        }
+                    }
+                })
+                .await
+                .context("Waiting for ASIC client timed out")??;
                 // Match Python timelord: start the IPS clock when assigning the
                 // client, even if discriminant preparation is already running.
                 let estimated_started = Instant::now();
@@ -285,6 +401,19 @@ impl AsicBackend {
             && let Some(mut active) = lane.active.lock().await.take()
         {
             let _ = stop(&mut active.lease.socket).await;
+        }
+    }
+    pub async fn stop_board(&self, board: &str) {
+        for (_, lane) in &self.lanes {
+            if lane.board == board
+                && let Some(mut active) = lane.active.lock().await.take()
+            {
+                let _ = stop(&mut active.lease.socket).await;
+            }
+        }
+        if let Some(pool) = self.pools.get(board) {
+            let mut pool = pool.lock().await;
+            while pool.try_recv().is_ok() {}
         }
     }
     pub async fn stop_all(&self) {
@@ -430,6 +559,7 @@ mod tests {
                 socket,
                 board: "a".into(),
                 slot: 0,
+                generation: 0,
                 clients: clients.clone(),
             })
             .await
@@ -453,6 +583,217 @@ mod tests {
         let mut value = vec![0; size];
         socket.read_exact(&mut value).await.unwrap();
         std::str::from_utf8(&value).unwrap().parse().unwrap()
+    }
+    async fn send_fixture_proof(socket: &mut TcpStream, request: &ProofRequest) {
+        let proof = dg_xch_vdf::proof::prove_result(
+            request.challenge.as_ref(),
+            request.input.data.as_ref(),
+            64,
+            request.iterations,
+        )
+        .unwrap();
+        let mut raw = request.iterations.to_be_bytes().to_vec();
+        raw.extend(100_u64.to_be_bytes());
+        raw.extend_from_slice(&proof[..100]);
+        raw.push(0);
+        raw.extend_from_slice(&proof[100..]);
+        let hex: Vec<_> = raw
+            .iter()
+            .flat_map(|b| format!("{b:02x}").into_bytes())
+            .collect();
+        socket
+            .write_all(&(hex.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        socket.write_all(&hex).await.unwrap();
+    }
+    #[tokio::test]
+    async fn failed_board_reconnects_without_retiring_a_healthy_chain_session() {
+        let config:Config=toml::from_str("[[hardware.boards]]\nid='healthy'\nname='Healthy'\nclient_port=18110\n[[hardware.boards]]\nid='failed'\nname='Failed'\nclient_port=18111").unwrap();
+        let runtime = Arc::new(SyncMutex::new(crate::runtime::RuntimeState::default()));
+        let (backend, offers) = AsicBackend::new(&config, runtime.clone()).unwrap();
+        let backend = Arc::new(backend);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let clients = Arc::new(SyncMutex::new(BTreeSet::new()));
+        let mut sockets = Vec::new();
+        for board in ["healthy", "failed"] {
+            let client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (socket, _) = listener.accept().await.unwrap();
+            clients.lock().unwrap().insert((board.into(), 0));
+            offers[board]
+                .send(Lease {
+                    socket,
+                    board: board.into(),
+                    slot: 0,
+                    generation: 0,
+                    clients: clients.clone(),
+                })
+                .await
+                .ok()
+                .unwrap();
+            sockets.push(client);
+        }
+        let mut healthy = sockets.remove(0);
+        let mut failed = sockets.remove(0);
+        let bad = tokio::spawn({
+            let backend = backend.clone();
+            async move {
+                backend
+                    .prove_when_available(Chain::InfusedChallenge, work(20, 64), true)
+                    .await
+            }
+        });
+        handshake(&mut failed).await;
+        assert_eq!(requested(&mut failed).await, 20);
+        drop(failed);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if runtime
+                    .lock()
+                    .unwrap()
+                    .boards
+                    .get("failed")
+                    .is_some_and(|b| b.state == "fault")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (release, hold) = tokio::sync::oneshot::channel();
+        let healthy_fixture = tokio::spawn(async move {
+            handshake(&mut healthy).await;
+            for n in [20, 40] {
+                assert_eq!(requested(&mut healthy).await, n);
+                send_fixture_proof(&mut healthy, &work(n, 64)).await;
+            }
+            let _ = hold.await; // Keep the same socket alive through the sibling restart.
+        });
+        backend
+            .prove_when_available(Chain::Challenge, work(20, 64), true)
+            .await
+            .unwrap();
+        backend.stop_board("failed").await;
+        runtime
+            .lock()
+            .unwrap()
+            .boards
+            .get_mut("failed")
+            .unwrap()
+            .generation = 1;
+        runtime
+            .lock()
+            .unwrap()
+            .boards
+            .get_mut("failed")
+            .unwrap()
+            .state = "starting".into();
+        // A queued socket from the dead process is discarded, never assigned to the replacement.
+        let stale = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        offers["failed"]
+            .send(Lease {
+                socket,
+                board: "failed".into(),
+                slot: 1,
+                generation: 0,
+                clients: clients.clone(),
+            })
+            .await
+            .ok()
+            .unwrap();
+        drop(stale);
+        let mut replacement = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        offers["failed"]
+            .send(Lease {
+                socket,
+                board: "failed".into(),
+                slot: 0,
+                generation: 1,
+                clients: clients.clone(),
+            })
+            .await
+            .ok()
+            .unwrap();
+        let replacement_fixture = tokio::spawn(async move {
+            handshake(&mut replacement).await;
+            assert_eq!(requested(&mut replacement).await, 20);
+            send_fixture_proof(&mut replacement, &work(20, 64)).await;
+        });
+        backend
+            .prove_when_available(Chain::Challenge, work(40, 64), true)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), bad)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        release.send(()).unwrap();
+        healthy_fixture.await.unwrap();
+        replacement_fixture.await.unwrap();
+        let state = runtime.lock().unwrap();
+        assert_eq!(state.failed_proofs, 0);
+        assert_eq!(state.estimated_observations.len(), 3);
+        assert!(
+            state
+                .events
+                .iter()
+                .any(|e| e.board_id.as_deref() == Some("failed")
+                    && e.kind == "board_fault"
+                    && e.end_unix.is_some())
+        );
+    }
+    #[tokio::test]
+    async fn invalid_proof_latches_only_its_board_and_never_publishes_an_ips_sample() {
+        let (backend, mut socket, _clients) = setup().await;
+        let pending = tokio::spawn({
+            let backend = backend.clone();
+            async move {
+                backend
+                    .prove_when_available(Chain::Challenge, work(20, 64), true)
+                    .await
+            }
+        });
+        handshake(&mut socket).await;
+        assert_eq!(requested(&mut socket).await, 20);
+        // A mathematically valid proof for a different iteration count must be rejected.
+        send_fixture_proof(&mut socket, &work(19, 64)).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if backend
+                    .runtime
+                    .lock()
+                    .unwrap()
+                    .boards
+                    .get("a")
+                    .is_some_and(|b| b.latched_fault)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        {
+            let state = backend.runtime.lock().unwrap();
+            assert_eq!(state.failed_proofs, 1);
+            assert!(state.estimated_observations.is_empty());
+            assert_eq!(state.boards["a"].state, "fault");
+        }
+        assert!(!pending.is_finished());
+        pending.abort();
+        let _ = pending.await;
     }
     #[test]
     fn discriminant_starts_before_a_client_is_available_and_cancellation_releases_lane() {
