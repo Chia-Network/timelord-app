@@ -10,30 +10,28 @@ struct BoardCard: View {
         VStack(alignment: .leading, spacing: 10) {
             Button(action: open) {
                 VStack(alignment: .leading, spacing: 10) {
-                    VStack(alignment: .leading, spacing: 7) {
-                        HStack {
-                            Image(systemName: "cpu").font(.title2).foregroundStyle(board.state.tone.color)
-                            Text(board.name).font(.headline).lineLimit(1)
-                            Spacer()
-                            Text(board.temperatureText).font(.headline).monospacedDigit().foregroundStyle(board.state == .thermalStop ? Color.red : Color.primary)
-                        }
-                        Text(board.state.title).font(.caption).foregroundStyle(.secondary)
+                    HStack {
+                        Image(systemName: "cpu").font(.title2).foregroundStyle(board.state.tone.color)
+                            .help(board.state.title).accessibilityLabel(board.state.title)
+                        Text(board.name).font(.headline).lineLimit(1)
+                        Spacer()
+                        Text(board.temperatureText).font(.headline).monospacedDigit().foregroundStyle(board.state == .thermalStop ? Color.red : Color.primary)
                     }
-                    if !board.histories.isEmpty { Text("Delivered IPS · 5-minute mean").font(.caption2).foregroundStyle(.secondary) }
                     ForEach(Array(board.histories.enumerated()), id: \.element.id) { index, history in
                         VStack(alignment: .leading, spacing: 6) {
                             HStack {
                                 Label(history.chain.title, systemImage: "circle.fill").font(.subheadline).foregroundStyle(history.chain.color)
                                 Spacer()
-                                Text(snapshot.recentSpeed(for: history)).font(.headline).monospacedDigit()
                             }
                             HStack(spacing: 12) {
                                 let raw = board.state == .active || board.state == .waiting ? board.rawSpeeds.first(where: { $0.engine == index })?.freshIPS(at: snapshot.now) : nil
                                 Text("Raw \(DisplayFormat.ips(raw))")
                                     .help("Recent hardware iterations per second, refreshed about every 2 seconds. Not verified proof throughput. The gap to delivered IPS includes startup, USB, and proof work.")
+                                Text("Mean \(snapshot.recentSpeed(for: history))")
+                                    .help("Five-minute mean of verified delivered IPS, sampled every 30 seconds like the Grafana gauge.")
                                 Text("Median \(snapshot.recentMedian(for: history))")
                                     .help("Median of the same 30-second delivered IPS gauge samples in the last 5 minutes.")
-                            }.font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                            }.font(.caption).monospacedDigit().foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.85)
                             IPSHistoryChart(history: history, range: .hour, now: snapshot.now, upperBound: snapshot.chartUpperBound, compact: true)
                                 .frame(minHeight: 42, maxHeight: .infinity)
                         }
