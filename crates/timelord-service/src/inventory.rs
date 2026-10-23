@@ -100,17 +100,28 @@ fn native(path: &Path) -> Result<Vec<Device>> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn driver_path(config: &Config, helper: &Path) -> std::path::PathBuf {
+    if let Some(path) = &config.hardware.driver_library {
+        return path.clone();
+    }
+    // Discovery runs before the app saves its bundled client into a fresh config.
+    // Resolve from this helper's bundle so copied apps work on first launch.
+    config
+        .hardware
+        .client_binary
+        .as_deref()
+        .unwrap_or(helper)
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("../Frameworks/libftd2xx.dylib")
+}
+
 pub async fn discover(config: &Config) -> Result<Vec<Device>> {
     #[cfg(target_os = "macos")]
     {
-        let path = config.hardware.driver_library.clone().or_else(|| {
-            config.hardware.client_binary.as_ref().map(|p| {
-                p.parent()
-                    .unwrap_or(Path::new("."))
-                    .join("../Frameworks/libftd2xx.dylib")
-            })
-        });
-        if let Some(path) = path.filter(|p| p.is_file()) {
+        let path = driver_path(config, &std::env::current_exe()?);
+        if path.is_file() {
             return tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 tokio::task::spawn_blocking(move || native(&path)),
@@ -138,6 +149,44 @@ pub fn board_location(board: &timelord_core::BoardConfig, devices: &[Device]) ->
         );
     }
     Ok(matches[0].location)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod driver_path_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_config_discovers_driver_from_relocated_app_without_saving_paths() {
+        let config = Config::default();
+        for bundle in [
+            "/Applications/Timelord.app",
+            "/Users/test/Downloads/My Timelord.app",
+        ] {
+            let helper = Path::new(bundle).join("Contents/Helpers/timelord-service");
+            assert_eq!(
+                driver_path(&config, &helper),
+                Path::new(bundle).join("Contents/Helpers/../Frameworks/libftd2xx.dylib")
+            );
+        }
+        assert!(config.hardware.client_binary.is_none());
+        assert!(config.hardware.driver_library.is_none());
+    }
+
+    #[test]
+    fn explicit_driver_and_external_client_locations_remain_authoritative() {
+        let mut config = Config::default();
+        let helper = Path::new("/Applications/Timelord.app/Contents/Helpers/timelord-service");
+        config.hardware.client_binary = Some("/custom/Helpers/hw_vdf_client".into());
+        assert_eq!(
+            driver_path(&config, helper),
+            Path::new("/custom/Helpers/../Frameworks/libftd2xx.dylib")
+        );
+        config.hardware.driver_library = Some("/custom/driver.dylib".into());
+        assert_eq!(
+            driver_path(&config, helper),
+            Path::new("/custom/driver.dylib")
+        );
+    }
 }
 
 /// Resolve only physically enumerated boards, preserving the stored registry.
