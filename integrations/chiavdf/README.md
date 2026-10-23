@@ -50,11 +50,16 @@ libraries. FTDI binaries and GMP are obtained as build dependencies, never check
 into this repository. The app bundle includes the linked dynamic libraries with
 relative loader paths and dependency notices/licenses.
 
-`TLRAW 1 engine ips` reports recent hardware counter deltas about once a second,
+`TLRAW 2 engine ips state` reports recent hardware counter deltas about once a second,
 using values the USB owner loop already reads. Idle, rollback and new challenge
-transitions invalidate the previous sample with `ips = -1`. Status exposes these
+transitions publish `ips = -1` with an explicit `idle` or `sampling` state.
+The most recent raw rate can bridge a handoff for at most six seconds; its
+measurement timestamp never advances during the handoff. Idle shows no active
+rate. Status exposes these
 per-engine samples separately from verified delivered IPS; the dashboard refreshes
-every two seconds and hides samples six seconds old. No chain speeds are summed.
+every two seconds and expires numeric samples six seconds old. No chain speeds are summed.
 The displayed delivered mean and median use the same five-minute window of
-30-second exporter-equivalent gauge samples. The raw/delivered gap includes startup,
+30-second exporter-equivalent gauge samples. These historical statistics remain
+visible between proofs and during temporary idle or node interruptions; stale
+gauge samples and interruption intervals remain excluded from the calculation. The raw/delivered gap includes startup,
 USB and proof work; it is not a direct measurement of proof-construction time.

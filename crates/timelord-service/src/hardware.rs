@@ -2,7 +2,7 @@
 use crate::{
     Shared,
     automatic::{self, Action, Point, Policy},
-    runtime::HardwareState,
+    runtime::{HardwareState, RawState},
 };
 use anyhow::{Context, Result, bail};
 use std::{process::Stdio, sync::Arc, time::Duration};
@@ -45,14 +45,19 @@ pub fn arguments(board: &BoardConfig, engines: usize) -> Result<Vec<String>> {
     }
     Ok(arguments)
 }
-// Versioned native telemetry, per engine. Negative values invalidate a sample.
-fn raw_speed(line: &str) -> Option<(usize, f64)> {
-    let (_, payload) = line.split_once("TLRAW 1 ")?;
+// Versioned native telemetry distinguishes a new rate baseline from real idle.
+fn raw_speed(line: &str) -> Option<(usize, f64, RawState)> {
+    let (_, payload) = line.split_once("TLRAW 2 ")?;
     let mut parts = payload.split_whitespace();
     let engine = parts.next()?.parse::<usize>().ok()?;
     let ips = parts.next()?.parse::<f64>().ok()?;
-    (engine < 3 && ips.is_finite() && (ips == -1. || ips >= 0.) && parts.next().is_none())
-        .then_some((engine, ips))
+    let state = match parts.next()? {
+        "running" if ips >= 0. => RawState::Running,
+        "sampling" if ips == -1. => RawState::Sampling,
+        "idle" if ips == -1. => RawState::Idle,
+        _ => return None,
+    };
+    (engine < 3 && ips.is_finite() && parts.next().is_none()).then_some((engine, ips, state))
 }
 
 fn temperature(line: &str) -> Option<(f64, f64)> {
@@ -355,10 +360,9 @@ async fn supervise(
                 tracing::info!(board=%board.id, "{line}");
                 {
                 let mut state = shared.runtime.lock().expect("runtime");
-                if let Some((engine, ips))=raw_speed(&line) {
+                if let Some((engine, ips, activity))=raw_speed(&line) {
                     let hardware = state.boards.entry(board.id.clone()).or_default();
-                    hardware.raw_speeds.retain(|speed| speed.engine != engine);
-                    if ips >= 0. { hardware.raw_speeds.push(crate::runtime::RawSpeed { engine, ips, timestamp_unix: crate::unix_now() }); }
+                    hardware.raw_sample(engine, ips, activity, crate::unix_now());
                 }
                 if let Some(value)=line.split_once("Board voltage is now ").and_then(|(_,s)|s.split_whitespace().next()).and_then(|v|v.parse::<f64>().ok()).filter(|v|v.is_finite()) { state.boards.entry(board.id.clone()).or_default().voltage_v=Some(value); }
                 if let Some((temp, freq)) = temperature(&line) {
@@ -558,21 +562,46 @@ mod tests {
 
     #[test]
     fn raw_speed_telemetry_is_bounded_and_engine_specific() {
+        use super::RawState::*;
         assert_eq!(
-            super::raw_speed("time TLRAW 1 2 1055000"),
-            Some((2, 1055000.))
+            super::raw_speed("time TLRAW 2 2 1055000 running"),
+            Some((2, 1055000., Running))
         );
-        assert_eq!(super::raw_speed("TLRAW 1 0 -1"), Some((0, -1.)));
+        assert_eq!(
+            super::raw_speed("TLRAW 2 0 -1 sampling"),
+            Some((0, -1., Sampling))
+        );
+        assert_eq!(super::raw_speed("TLRAW 2 0 -1 idle"), Some((0, -1., Idle)));
         for line in [
-            "TLRAW 1 3 10",
-            "TLRAW 1 0 NaN",
-            "TLRAW 1 0 inf",
-            "TLRAW 1 0 -2",
-            "TLRAW 1 0 12 extra",
-            "TLRAW 2 0 10",
+            "TLRAW 2 3 10 running",
+            "TLRAW 2 0 NaN running",
+            "TLRAW 2 0 inf running",
+            "TLRAW 2 0 -2 idle",
+            "TLRAW 2 0 12 running extra",
+            "TLRAW 1 0 10",
+            "TLRAW 2 0 -1 running",
+            "TLRAW 2 0 12 idle",
         ] {
             assert!(super::raw_speed(line).is_none(), "{line}");
         }
+    }
+    #[test]
+    fn handoff_preserves_last_raw_value_without_refreshing_its_age_or_calling_it_current() {
+        use super::RawState::*;
+        let mut h = super::HardwareState::default();
+        h.raw_sample(0, 1055000., Running, 100);
+        h.raw_sample(0, -1., Sampling, 101);
+        assert_eq!(h.raw_speeds[0].ips, 1055000.);
+        assert_eq!(h.raw_speeds[0].timestamp_unix, 100);
+        assert_eq!(h.raw_speeds[0].state, Sampling);
+        h.raw_sample(0, -1., Idle, 102);
+        assert_eq!(h.raw_speeds[0].state, Idle);
+        h.raw_sample(1, -1., Sampling, 103);
+        assert_eq!(h.raw_speeds[1].ips, -1.);
+        h.raw_sample(0, 1060000., Running, 104);
+        assert_eq!(h.raw_speeds[0].timestamp_unix, 104);
+        assert_eq!(h.raw_speeds[0].state, Running);
+        assert_eq!(h.raw_speeds.len(), 2);
     }
 
     use super::*;

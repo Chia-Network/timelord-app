@@ -24,13 +24,13 @@ struct BoardCard: View {
                                 Spacer()
                             }
                             HStack(spacing: 12) {
-                                let raw = board.state == .active || board.state == .waiting ? board.rawSpeeds.first(where: { $0.engine == index })?.freshIPS(at: snapshot.now) : nil
-                                Text("Raw \(DisplayFormat.ips(raw))")
-                                    .help("Recent hardware iterations per second, refreshed about every 2 seconds. Not verified proof throughput. The gap to delivered IPS includes startup, USB, and proof work.")
+                                let raw = board.state == .active || board.state == .waiting ? board.rawSpeeds.first(where: { $0.engine == index }) : nil
+                                Text("Raw \(raw?.displayText(at: snapshot.now) ?? "—")")
+                                    .help(raw?.state == "sampling" ? "Last sample; starting a new chain." : "Recent hardware speed.")
                                 Text("Mean \(snapshot.recentSpeed(for: history))")
-                                    .help("Five-minute mean of verified delivered IPS, sampled every 30 seconds like the Grafana gauge.")
+                                    .help("Delivered IPS · 5-minute mean")
                                 Text("Median \(snapshot.recentMedian(for: history))")
-                                    .help("Median of the same 30-second delivered IPS gauge samples in the last 5 minutes.")
+                                    .help("Delivered IPS · 5-minute median")
                             }.font(.caption).monospacedDigit().foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.85)
                             IPSHistoryChart(history: history, range: .hour, now: snapshot.now, upperBound: snapshot.chartUpperBound, compact: true)
                                 .frame(minHeight: 42, maxHeight: .infinity)

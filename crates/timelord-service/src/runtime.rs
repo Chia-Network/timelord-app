@@ -45,8 +45,16 @@ pub struct Event {
     pub kind: String,
     pub end_unix: Option<u64>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RawState {
+    Running,
+    Sampling,
+    Idle,
+}
 #[derive(Clone, Serialize)]
 pub struct RawSpeed {
+    pub state: RawState,
     pub engine: usize,
     pub ips: f64,
     pub timestamp_unix: u64,
@@ -61,6 +69,24 @@ pub struct HardwareState {
     pub recoveries: u64,
     pub temperature_unix: u64,
     pub automatic: Option<crate::automatic::Status>,
+}
+impl HardwareState {
+    pub fn raw_sample(&mut self, engine: usize, ips: f64, state: RawState, now: u64) {
+        if let Some(sample) = self.raw_speeds.iter_mut().find(|s| s.engine == engine) {
+            sample.state = state;
+            if state == RawState::Running {
+                sample.ips = ips;
+                sample.timestamp_unix = now;
+            }
+        } else {
+            self.raw_speeds.push(RawSpeed {
+                engine,
+                ips,
+                state,
+                timestamp_unix: now,
+            });
+        }
+    }
 }
 pub struct RuntimeState {
     pub phase: String,

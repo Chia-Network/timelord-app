@@ -6,12 +6,30 @@ final class PresentationTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_000_000)
 
     func testDeliveredMedianUsesTheSameScrapeWindowAndStopsWhenPaused() {
-        let snapshot = PresentationScenario.runningOneBoard.snapshot(now: now)
+        let fixture = PresentationScenario.runningOneBoard.snapshot(now: now)
+        let snapshot = AppSnapshot(phase: .running, explanation: "", node: fixture.node, timelord: fixture.timelord, boards: fixture.boards, proofsToday: nil, uptimeSeconds: nil, now: now, serviceAvailable: true)
         let history = snapshot.boards[0].histories[0]
+        XCTAssertEqual(fixture.recentMedian(for: history), "—", "An unavailable service must not show historical data as live telemetry")
         let values = history.sampledObservations(in: DateInterval(start: now.addingTimeInterval(-300), end: now)).map(\.ips).sorted()
         XCTAssertFalse(values.isEmpty)
         XCTAssertEqual(snapshot.recentMedian(for: history), DisplayFormat.ips((values[(values.count - 1) / 2] + values[values.count / 2]) / 2))
         XCTAssertEqual(PresentationScenario.runningOneBoard.snapshot(now: now, paused: true).recentMedian(for: history), "—")
+    }
+
+    func testRawHandoffKeepsOnlyARecentMeasurementAndIdleDoesNotShowItAsActive() throws {
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        func sample(_ state: String, ips: Double = 1055000) throws -> RawSpeed {
+            try decoder.decode(RawSpeed.self, from: Data("{\"engine\":0,\"ips\":\(ips),\"timestamp_unix\":1000000,\"state\":\"\(state)\"}".utf8))
+        }
+        let handoff = try sample("sampling")
+        XCTAssertNil(handoff.freshIPS(at: now))
+        XCTAssertEqual(handoff.displayText(at: now.addingTimeInterval(2)), "1.055M")
+        XCTAssertEqual(handoff.displayText(at: now.addingTimeInterval(6)), "Starting")
+        XCTAssertEqual(try sample("sampling", ips: -1).displayText(at: now), "Starting")
+        let idle = try sample("idle")
+        XCTAssertNil(idle.freshIPS(at: now))
+        XCTAssertEqual(idle.displayText(at: now), "Idle")
+        XCTAssertEqual(try sample("running").displayText(at: now.addingTimeInterval(6)), "—")
     }
 
     func testRawSpeedExpiresAndRejectsInvalidValues() throws {
@@ -87,7 +105,12 @@ final class PresentationTests: XCTestCase {
         }
         XCTAssertEqual(snapshot(end).recentSpeed(for: history), "1.000M")
         XCTAssertEqual(snapshot(end).headlineSpeed, "455K")
-        XCTAssertEqual(snapshot(end.addingTimeInterval(90)).recentSpeed(for: history), "—")
+        XCTAssertEqual(snapshot(end.addingTimeInterval(90)).recentSpeed(for: history), "1.000M")
+        XCTAssertEqual(snapshot(end.addingTimeInterval(90)).recentMedian(for: history), "1.000M")
+        XCTAssertEqual(snapshot(end.addingTimeInterval(90), phase: .waitingForProofs).recentSpeed(for: history), "1.000M")
+        XCTAssertEqual(snapshot(end.addingTimeInterval(90), phase: .nodeUnreachable).recentMedian(for: history), "1.000M")
+        XCTAssertEqual(snapshot(end.addingTimeInterval(400)).recentSpeed(for: history), "—")
+        XCTAssertEqual(snapshot(end.addingTimeInterval(400)).recentMedian(for: history), "—")
         XCTAssertEqual(snapshot(end, phase: .paused).recentSpeed(for: history), "—")
     }
 

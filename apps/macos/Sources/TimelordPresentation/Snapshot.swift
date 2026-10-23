@@ -87,14 +87,16 @@ public struct AppSnapshot: Sendable {
               history.hasFreshValue(at: now) else { return "—" }
         return DisplayFormat.ips(history.statistics(in: HistoryRange.hour.interval(endingAt: now)).average)
     }
+    /// Historical five-minute statistics remain valid between proofs or during idle.
+    /// The sampled inputs still exclude stale gauges and interruptions.
     /// Board tiles respond to tuning changes while smoothing individual proof variation.
     /// Use the same 30-second gauge samples as the headline, over a shorter window.
     public func recentSpeed(for history: ChainHistory) -> String {
-        guard phase == .running, history.hasFreshValue(at: now) else { return "—" }
+        guard serviceAvailable, phase != .paused else { return "—" }
         return DisplayFormat.ips(history.statistics(in: DateInterval(start: now.addingTimeInterval(-300), end: now)).average)
     }
     public func recentMedian(for history: ChainHistory) -> String {
-        guard phase == .running, history.hasFreshValue(at: now) else { return "—" }
+        guard serviceAvailable, phase != .paused else { return "—" }
         let values = history.sampledObservations(in: DateInterval(start: now.addingTimeInterval(-300), end: now)).map(\.ips).sorted()
         guard !values.isEmpty else { return "—" }
         return DisplayFormat.ips((values[(values.count - 1) / 2] + values[values.count / 2]) / 2)
@@ -143,9 +145,21 @@ public struct RawSpeed: Decodable, Sendable {
     public let engine: Int
     public let ips: Double
     public let timestampUnix: Double
+    public let state: String?
     public func freshIPS(at now: Date) -> Double? {
+        guard state == nil || state == "running" else { return nil }
+        return recentIPS(at: now)
+    }
+    private func recentIPS(at now: Date) -> Double? {
         guard ips.isFinite, ips >= 0, (0..<6).contains(now.timeIntervalSince1970 - timestampUnix) else { return nil }
         return ips
+    }
+    public func displayText(at now: Date) -> String {
+        switch state {
+        case "idle": return "Idle"
+        case "sampling": return recentIPS(at: now).map(DisplayFormat.ips) ?? "Starting"
+        default: return freshIPS(at: now).map(DisplayFormat.ips) ?? "—"
+        }
     }
 }
 
