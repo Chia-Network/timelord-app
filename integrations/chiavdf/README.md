@@ -3,7 +3,7 @@
 The build uses the public Chia-Network/chiavdf repository at the commit in
 [upstream.env](upstream.env). It downloads that checkout into `build/upstream/`
 and copies source into an ignored staging directory before applying
-`live-control.patch`. The original checkout is not patched. No prover or USB
+`live-control.patch` and `raw-speed.patch`. The original checkout is not patched. No prover or USB
 driver is maintained in this repository.
 
 ```sh
@@ -26,7 +26,7 @@ engines. `TLACK 1 ID MHz V\n` confirms actual settings.
 A rejected hardware operation returns bounded `TLERR 1 ID reason\n` before the
 client stops, preserving the native failure even while the coordinator awaits
 its control reply. IDs increase and frames
-are bounded. Live commands accept 200–1600 MHz / requested 0.7–1.0 V. A 55°C
+are bounded. Live commands accept 200–2200 MHz / requested 0.7–1.0 V. A 55°C
 pre-write guard supplements the coordinator's sampled guard. Failed commands,
 readback mismatch or controller EOF quiesce engines and terminate the child.
 `--control-frequencies` reports eligible 10 MHz-grid requests directly from the
@@ -49,3 +49,12 @@ settling and proof continuity during live changes still require hardware testing
 libraries. FTDI binaries and GMP are obtained as build dependencies, never checked
 into this repository. The app bundle includes the linked dynamic libraries with
 relative loader paths and dependency notices/licenses.
+
+`TLRAW 1 engine ips` reports recent hardware counter deltas about once a second,
+using values the USB owner loop already reads. Idle, rollback and new challenge
+transitions invalidate the previous sample with `ips = -1`. Status exposes these
+per-engine samples separately from verified delivered IPS; the dashboard refreshes
+every two seconds and hides samples six seconds old. No chain speeds are summed.
+The displayed delivered mean and median use the same five-minute window of
+30-second exporter-equivalent gauge samples. The raw/delivered gap includes startup,
+USB and proof work; it is not a direct measurement of proof-construction time.

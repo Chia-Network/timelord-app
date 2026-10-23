@@ -45,8 +45,15 @@ pub struct Event {
     pub kind: String,
     pub end_unix: Option<u64>,
 }
+#[derive(Clone, Serialize)]
+pub struct RawSpeed {
+    pub engine: usize,
+    pub ips: f64,
+    pub timestamp_unix: u64,
+}
 #[derive(Clone, Default, Serialize)]
 pub struct HardwareState {
+    pub raw_speeds: Vec<RawSpeed>,
     pub temperature_c: Option<f64>,
     pub frequency_mhz: Option<f64>,
     pub voltage_v: Option<f64>,

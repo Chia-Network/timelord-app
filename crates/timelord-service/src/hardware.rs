@@ -45,6 +45,16 @@ pub fn arguments(board: &BoardConfig, engines: usize) -> Result<Vec<String>> {
     }
     Ok(arguments)
 }
+// Versioned native telemetry, per engine. Negative values invalidate a sample.
+fn raw_speed(line: &str) -> Option<(usize, f64)> {
+    let (_, payload) = line.split_once("TLRAW 1 ")?;
+    let mut parts = payload.split_whitespace();
+    let engine = parts.next()?.parse::<usize>().ok()?;
+    let ips = parts.next()?.parse::<f64>().ok()?;
+    (engine < 3 && ips.is_finite() && (ips == -1. || ips >= 0.) && parts.next().is_none())
+        .then_some((engine, ips))
+}
+
 fn temperature(line: &str) -> Option<(f64, f64)> {
     let (_, value) = line.split_once("ASIC Temp = ")?;
     let (temp, frequency) = value.split_once(" C; Frequency = ")?;
@@ -345,6 +355,11 @@ async fn supervise(
                 tracing::info!(board=%board.id, "{line}");
                 {
                 let mut state = shared.runtime.lock().expect("runtime");
+                if let Some((engine, ips))=raw_speed(&line) {
+                    let hardware = state.boards.entry(board.id.clone()).or_default();
+                    hardware.raw_speeds.retain(|speed| speed.engine != engine);
+                    if ips >= 0. { hardware.raw_speeds.push(crate::runtime::RawSpeed { engine, ips, timestamp_unix: crate::unix_now() }); }
+                }
                 if let Some(value)=line.split_once("Board voltage is now ").and_then(|(_,s)|s.split_whitespace().next()).and_then(|v|v.parse::<f64>().ok()).filter(|v|v.is_finite()) { state.boards.entry(board.id.clone()).or_default().voltage_v=Some(value); }
                 if let Some((temp, freq)) = temperature(&line) {
                     last_temperature = tokio::time::Instant::now();
@@ -365,6 +380,7 @@ async fn supervise(
     terminate(&mut child).await;
     let mut state = shared.runtime.lock().expect("runtime");
     let hardware = state.boards.entry(board.id.clone()).or_default();
+    hardware.raw_speeds.clear();
     if hardware.state != "thermal_stop" {
         hardware.state = if result.is_ok() { "stopped" } else { "fault" }.into();
     }
@@ -393,13 +409,17 @@ async fn supported_frequencies(config: &Config) -> Result<Vec<f64>> {
     if !output.status.success() || output.stdout.len() > 2048 {
         bail!("Native client could not report supported Automatic frequencies");
     }
-    let frequencies: Vec<f64> = serde_json::from_slice(&output.stdout)
+    decode_frequencies(&output.stdout)
+}
+
+fn decode_frequencies(bytes: &[u8]) -> Result<Vec<f64>> {
+    let frequencies: Vec<f64> = serde_json::from_slice(bytes)
         .context("Native client needs the bundled supported-frequency capability")?;
     if frequencies.is_empty()
-        || frequencies.len() > 141
+        || frequencies.len() > 201
         || frequencies
             .iter()
-            .any(|f| !f.is_finite() || !(200. ..=1600.).contains(f))
+            .any(|f| !f.is_finite() || !(200. ..=2200.).contains(f))
         || frequencies.windows(2).any(|f| f[0] >= f[1])
     {
         bail!("Native client reported invalid supported frequencies");
@@ -518,6 +538,43 @@ pub async fn run(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) -> Re
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn capability_accepts_the_complete_2200_mhz_grid_and_rejects_invalid_lists() {
+        let full: Vec<f64> = (200..=2200).step_by(10).map(f64::from).collect();
+        assert_eq!(
+            super::decode_frequencies(&serde_json::to_vec(&full).unwrap()).unwrap(),
+            full
+        );
+        for invalid in [
+            vec![],
+            vec![200., 2201.],
+            vec![200., 200.],
+            vec![2200., 200.],
+            vec![200.; 202],
+        ] {
+            assert!(super::decode_frequencies(&serde_json::to_vec(&invalid).unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn raw_speed_telemetry_is_bounded_and_engine_specific() {
+        assert_eq!(
+            super::raw_speed("time TLRAW 1 2 1055000"),
+            Some((2, 1055000.))
+        );
+        assert_eq!(super::raw_speed("TLRAW 1 0 -1"), Some((0, -1.)));
+        for line in [
+            "TLRAW 1 3 10",
+            "TLRAW 1 0 NaN",
+            "TLRAW 1 0 inf",
+            "TLRAW 1 0 -2",
+            "TLRAW 1 0 12 extra",
+            "TLRAW 2 0 10",
+        ] {
+            assert!(super::raw_speed(line).is_none(), "{line}");
+        }
+    }
+
     use super::*;
     #[tokio::test]
     async fn native_control_requires_matching_acknowledgements_and_keeps_hard_limits() {
@@ -556,7 +613,7 @@ mod tests {
             owner
                 .change(
                     Point {
-                        frequency_mhz: 1700.,
+                        frequency_mhz: 2201.,
                         voltage_v: 1.
                     },
                     1

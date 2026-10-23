@@ -50,7 +50,7 @@ final class ConfigurationClientTests: XCTestCase {
         let model = TimelordModel(controller: controller, initialConfiguration: saved, monitoringEnabled: false)
         XCTAssertFalse(model.hasUnsavedSettings)
         model.configuration.hardware.boards[0].profile = "automatic"
-        model.configuration.hardware.boards[0].automatic.maxFrequencyMhz = 1700
+        model.configuration.hardware.boards[0].automatic.maxFrequencyMhz = 2201
         XCTAssertTrue(model.hasUnsavedSettings)
         let invalidDismiss = await model.finishSettings()
         XCTAssertFalse(invalidDismiss, "Validation failure must keep the sheet open")
@@ -59,7 +59,7 @@ final class ConfigurationClientTests: XCTestCase {
         let unchanged = try await client.load()
         XCTAssertEqual(unchanged.hardware.boards[0].profile, "manual")
         XCTAssertEqual(model.configuration.hardware.boards[0].profile, "automatic", "Preserve the user's draft for correction")
-        model.configuration.hardware.boards[0].automatic.maxFrequencyMhz = 1600
+        model.configuration.hardware.boards[0].automatic.maxFrequencyMhz = 2200
         let dismiss = await model.finishSettings()
         XCTAssertTrue(dismiss)
         XCTAssertFalse(model.hasUnsavedSettings)
@@ -112,13 +112,13 @@ final class ConfigurationClientTests: XCTestCase {
         let oldPid = try XCTUnwrap(controller.processID)
         XCTAssertEqual(model.settingsDoneTitle, "Done")
         model.configuration.hardware.boards[0].profile = "automatic"
-        model.configuration.hardware.boards[0].automatic.maxFrequencyMhz = 1700
+        model.configuration.hardware.boards[0].automatic.maxFrequencyMhz = 2201
         XCTAssertEqual(model.settingsDoneTitle, "Save & Restart")
         let invalidDismiss = await model.finishSettings()
         XCTAssertFalse(invalidDismiss)
         XCTAssertTrue(controller.ownsService, "Invalid edits must not stop the running service")
         XCTAssertEqual(controller.processID, oldPid)
-        model.configuration.hardware.boards[0].automatic.maxFrequencyMhz = 1600
+        model.configuration.hardware.boards[0].automatic.maxFrequencyMhz = 2200
         let dismiss = await model.finishSettings()
         XCTAssertTrue(dismiss)
         let deadline = Date().addingTimeInterval(5)

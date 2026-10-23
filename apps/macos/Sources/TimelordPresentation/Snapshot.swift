@@ -50,6 +50,7 @@ public struct BoardSnapshot: Identifiable, Sendable {
     public let voltageV: Double?
     public let histories: [ChainHistory]
     public let lastProof: Date?
+    public var rawSpeeds: [RawSpeed] = []
     public var automatic: AutomaticStatus? = nil
     public var isAutomatic: Bool { profile.lowercased() == "automatic" }
     public var automaticTitle: String {
@@ -92,6 +93,12 @@ public struct AppSnapshot: Sendable {
         guard phase == .running, history.hasFreshValue(at: now) else { return "—" }
         return DisplayFormat.ips(history.statistics(in: DateInterval(start: now.addingTimeInterval(-300), end: now)).average)
     }
+    public func recentMedian(for history: ChainHistory) -> String {
+        guard phase == .running, history.hasFreshValue(at: now) else { return "—" }
+        let values = history.sampledObservations(in: DateInterval(start: now.addingTimeInterval(-300), end: now)).map(\.ips).sorted()
+        guard !values.isEmpty else { return "—" }
+        return DisplayFormat.ips((values[(values.count - 1) / 2] + values[values.count / 2]) / 2)
+    }
     public var latestProof: Date? { boards.compactMap(\.lastProof).max() }
     public var proofFreshness: String {
         guard let latestProof else { return "Waiting for the first verified proof" }
@@ -132,6 +139,16 @@ public struct NodeStatus: Decodable, Sendable {
     public let state: String
 }
 
+public struct RawSpeed: Decodable, Sendable {
+    public let engine: Int
+    public let ips: Double
+    public let timestampUnix: Double
+    public func freshIPS(at now: Date) -> Double? {
+        guard ips.isFinite, ips >= 0, (0..<6).contains(now.timeIntervalSince1970 - timestampUnix) else { return nil }
+        return ips
+    }
+}
+
 public struct BoardStatus: Decodable, Identifiable, Sendable {
     public let id: String
     public let name: String
@@ -147,6 +164,7 @@ public struct BoardStatus: Decodable, Identifiable, Sendable {
     public let deviceLocation: Int?
     public let serial: String?
     public let automatic: AutomaticStatus?
+    public let rawSpeeds: [RawSpeed]?
 }
 
 public struct AutomaticStatus: Decodable, Sendable {
@@ -207,7 +225,7 @@ public enum LivePresentation {
                     }
                     return ChainHistory(chain: chain, samples: samples, captureIntervals: captures, events: events)
                 }
-                return BoardSnapshot(id: board.id, name: board.name, state: state, temperatureC: board.temperatureC, temperatureLimitC: board.temperatureLimitC, profile: board.profile, frequencyMHz: board.frequencyMhz, voltageV: board.voltageV, histories: histories, lastProof: last, automatic: board.automatic)
+                return BoardSnapshot(id: board.id, name: board.name, state: state, temperatureC: board.temperatureC, temperatureLimitC: board.temperatureLimitC, profile: board.profile, frequencyMHz: board.frequencyMhz, voltageV: board.voltageV, histories: histories, lastProof: last, rawSpeeds: board.rawSpeeds ?? [], automatic: board.automatic)
             }
         } else {
             let connected = (detectedDevices ?? []).compactMap { BoardTopology.matching($0,in:configuration?.hardware.boards ?? []) }

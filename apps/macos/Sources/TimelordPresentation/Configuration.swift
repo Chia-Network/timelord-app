@@ -65,7 +65,7 @@ public struct AutomaticConfiguration: Codable, Sendable, Equatable {
     public var startFrequencyMhz = 1450.0
     public var startVoltageV = 1.0
     public var minFrequencyMhz = 1000.0
-    public var maxFrequencyMhz = 1600.0
+    public var maxFrequencyMhz = 2200.0
     public var minVoltageV = 0.9
     public var healthySeconds = 120
     public var cooldownSeconds = 900

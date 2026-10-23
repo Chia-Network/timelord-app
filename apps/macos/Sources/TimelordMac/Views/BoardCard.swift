@@ -19,14 +19,21 @@ struct BoardCard: View {
                         }
                         Text(board.state.title).font(.caption).foregroundStyle(.secondary)
                     }
-                    if !board.histories.isEmpty { Text("IPS · 5-minute averages").font(.caption2).foregroundStyle(.secondary) }
-                    ForEach(board.histories) { history in
+                    if !board.histories.isEmpty { Text("Delivered IPS · 5-minute mean").font(.caption2).foregroundStyle(.secondary) }
+                    ForEach(Array(board.histories.enumerated()), id: \.element.id) { index, history in
                         VStack(alignment: .leading, spacing: 6) {
                             HStack {
                                 Label(history.chain.title, systemImage: "circle.fill").font(.subheadline).foregroundStyle(history.chain.color)
                                 Spacer()
                                 Text(snapshot.recentSpeed(for: history)).font(.headline).monospacedDigit()
                             }
+                            HStack(spacing: 12) {
+                                let raw = board.state == .active || board.state == .waiting ? board.rawSpeeds.first(where: { $0.engine == index })?.freshIPS(at: snapshot.now) : nil
+                                Text("Raw \(DisplayFormat.ips(raw))")
+                                    .help("Recent hardware iterations per second, refreshed about every 2 seconds. Not verified proof throughput. The gap to delivered IPS includes startup, USB, and proof work.")
+                                Text("Median \(snapshot.recentMedian(for: history))")
+                                    .help("Median of the same 30-second delivered IPS gauge samples in the last 5 minutes.")
+                            }.font(.caption).monospacedDigit().foregroundStyle(.secondary)
                             IPSHistoryChart(history: history, range: .hour, now: snapshot.now, upperBound: snapshot.chartUpperBound, compact: true)
                                 .frame(minHeight: 42, maxHeight: .infinity)
                         }

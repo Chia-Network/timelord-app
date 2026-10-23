@@ -161,7 +161,7 @@ impl Default for AutomaticConfig {
             start_frequency_mhz: 1450.,
             start_voltage_v: 1.,
             min_frequency_mhz: 1000.,
-            max_frequency_mhz: 1600.,
+            max_frequency_mhz: 2200.,
             min_voltage_v: 0.9,
             healthy_seconds: 120,
             cooldown_seconds: 900,
@@ -181,8 +181,8 @@ impl AutomaticConfig {
             && (self.min_voltage_v..=1.).contains(&voltage)
     }
     fn validate(&self) -> bool {
-        (200. ..=1600.).contains(&self.min_frequency_mhz)
-            && (self.min_frequency_mhz..=1600.).contains(&self.max_frequency_mhz)
+        (200. ..=2200.).contains(&self.min_frequency_mhz)
+            && (self.min_frequency_mhz..=2200.).contains(&self.max_frequency_mhz)
             && (0.7..=1.).contains(&self.min_voltage_v)
             && self.contains(self.start_frequency_mhz, self.start_voltage_v)
             && self.healthy_seconds >= 30
@@ -286,7 +286,7 @@ impl Config {
         let mut locations = HashSet::new();
         for b in &self.hardware.boards {
             if !b.automatic.validate() {
-                return Err("Automatic settings require a 200–1600 MHz range, requested 0.7–1.0 V, and bounded observation/cooldown windows".into());
+                return Err("Automatic settings require a 200–2200 MHz range, requested 0.7–1.0 V, and bounded observation/cooldown windows".into());
             }
             if !b.frequency_mhz.is_finite()
                 || !(200.0..=2200.0).contains(&b.frequency_mhz)
@@ -492,6 +492,20 @@ mod tests {
         config.hardware.boards[0].temperature_limit_c = 55.0;
         config.hardware.boards[0].frequency_mhz = f64::NAN;
         assert!(config.validate().is_err());
+    }
+    #[test]
+    fn automatic_frequency_ceiling_preserves_voltage_and_temperature_limits() {
+        let mut c: Config =
+            toml::from_str(include_str!("../../../config/three-boards.toml")).unwrap();
+        let b = &mut c.hardware.boards[0];
+        b.automatic.max_frequency_mhz = 2200.;
+        b.automatic.start_frequency_mhz = 2200.;
+        assert!(c.validate().is_ok());
+        c.hardware.boards[0].automatic.max_frequency_mhz = 2201.;
+        assert!(c.validate().is_err());
+        c.hardware.boards[0].automatic.max_frequency_mhz = 2200.;
+        c.hardware.boards[0].automatic.start_voltage_v = 1.01;
+        assert!(c.validate().is_err());
     }
     #[test]
     fn supplied_examples_parse_and_validate() {

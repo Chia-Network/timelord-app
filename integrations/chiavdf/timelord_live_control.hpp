@@ -16,7 +16,7 @@ namespace timelord_control {
 struct Point { double frequency; double voltage; };
 inline bool valid(Point p) {
     return std::isfinite(p.frequency) && std::isfinite(p.voltage)
-        && p.frequency >= 200 && p.frequency <= 1600 && p.voltage >= .7 && p.voltage <= 1.;
+        && p.frequency >= 200 && p.frequency <= 2200 && p.voltage >= .7 && p.voltage <= 1.;
 }
 // Return the same floor entry used for live PLL writes.
 template<class Entry>
@@ -33,7 +33,7 @@ template<class Entry>
 void print_frequencies(const Entry *entries, size_t count) {
     bool first = true;
     fputs("[",stdout);
-    for (int f = 200; f <= 1600; f += 10) {
+    for (int f = 200; f <= 2200; f += 10) {
         if (!supported_frequency(f,entries,count)) continue;
         printf("%s%d",first?"":",",f); first = false;
     }

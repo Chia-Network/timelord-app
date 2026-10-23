@@ -80,7 +80,7 @@ Optional per-board `[hardware.boards.automatic]` defaults:
 start_frequency_mhz = 1450
 start_voltage_v = 1.0
 min_frequency_mhz = 1000
-max_frequency_mhz = 1600
+max_frequency_mhz = 2200
 min_voltage_v = 0.9
 healthy_seconds = 120
 cooldown_seconds = 900
@@ -186,3 +186,7 @@ startup never becomes an automatic restart loop.
 App administrator overrides: `TIMELORD_CONFIG`, `TIMELORD_SERVICE_BINARY`, and
 `TIMELORD_STATUS_URL`. Run only one owner of a board. The app can observe an external
 service; it will not stop or replace one it did not launch.
+
+Automatic tuning can explore supported PLL points up to 2200 MHz. This is a search
+ceiling, not the starting clock or a guarantee of stability. Requested voltage stays
+at or below 1.0 V and the temperature guard stays at or below 55°C.

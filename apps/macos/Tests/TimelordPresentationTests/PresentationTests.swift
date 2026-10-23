@@ -5,6 +5,24 @@ import XCTest
 final class PresentationTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_000_000)
 
+    func testDeliveredMedianUsesTheSameScrapeWindowAndStopsWhenPaused() {
+        let snapshot = PresentationScenario.runningOneBoard.snapshot(now: now)
+        let history = snapshot.boards[0].histories[0]
+        let values = history.sampledObservations(in: DateInterval(start: now.addingTimeInterval(-300), end: now)).map(\.ips).sorted()
+        XCTAssertFalse(values.isEmpty)
+        XCTAssertEqual(snapshot.recentMedian(for: history), DisplayFormat.ips((values[(values.count - 1) / 2] + values[values.count / 2]) / 2))
+        XCTAssertEqual(PresentationScenario.runningOneBoard.snapshot(now: now, paused: true).recentMedian(for: history), "—")
+    }
+
+    func testRawSpeedExpiresAndRejectsInvalidValues() throws {
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let speed = try decoder.decode(RawSpeed.self, from: Data(#"{"engine":2,"ips":1055000,"timestamp_unix":1000000}"#.utf8))
+        XCTAssertEqual(speed.engine, 2)
+        XCTAssertEqual(speed.freshIPS(at: now.addingTimeInterval(5)), 1055000)
+        XCTAssertNil(speed.freshIPS(at: now.addingTimeInterval(6)))
+        XCTAssertNil(speed.freshIPS(at: now.addingTimeInterval(-1)))
+    }
+
     func testScrapeMeanWeightsTimeInsteadOfProofCountAndKeepsLowRecoveryValues() {
         // A burst of three fast outputs must not outweigh three scrapes held at 400K.
         let start = Date(timeIntervalSince1970: 900_000)

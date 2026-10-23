@@ -51,6 +51,7 @@ mkdir -p "$STAGE" "$OUTPUT"
 rsync -a --delete --exclude='*.o' --exclude='hw_vdf_client' --exclude='emu_hw_vdf_client' --exclude='hw_test' --exclude='*.key' "$SOURCE/src/" "$STAGE/"
 stage_ftdi_drivers "$STAGE/hw/libft4222" "$DRIVERS/"*.h "$DRIVERS/libftd2xx.dylib" "$DRIVERS/libft4222.dylib"
 patch --batch --forward -F0 -p1 -d "$STAGE" < "$ROOT/integrations/chiavdf/live-control.patch"
+patch --batch --forward -F0 -p1 -d "$STAGE" < "$ROOT/integrations/chiavdf/raw-speed.patch"
 cp "$ROOT/integrations/chiavdf/timelord_live_control.hpp" "$STAGE/hw/"
 cp "$ROOT/integrations/chiavdf/timelord_telemetry.hpp" "$STAGE/hw/"
 PREFIX="${CMAKE_PREFIX_PATH:-}"
@@ -60,7 +61,7 @@ cmake --build "$OUTPUT" --target hw_vdf_client -j "${CMAKE_BUILD_PARALLEL_LEVEL:
 stage_ftdi_drivers "$OUTPUT/hw/libft4222" "$DRIVERS/libftd2xx.dylib" "$DRIVERS/libft4222.dylib"
 {
   git -C "$SOURCE" rev-parse HEAD
-  shasum -a 256 "$ROOT/integrations/chiavdf/live-control.patch" "$ROOT/integrations/chiavdf/timelord_live_control.hpp" "$ROOT/integrations/chiavdf/timelord_telemetry.hpp" "$OUTPUT/hw_vdf_client"
+  shasum -a 256 "$ROOT/integrations/chiavdf/live-control.patch" "$ROOT/integrations/chiavdf/raw-speed.patch" "$ROOT/integrations/chiavdf/timelord_live_control.hpp" "$ROOT/integrations/chiavdf/timelord_telemetry.hpp" "$OUTPUT/hw_vdf_client"
   (cd "$STAGE" && find . -type f \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) -exec shasum -a 256 {} +)
 } > "$OUTPUT/provenance.txt"
 "$OUTPUT/hw_vdf_client" --control-version

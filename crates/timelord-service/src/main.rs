@@ -373,6 +373,7 @@ struct NodeStatus {
 }
 #[derive(Serialize)]
 struct BoardStatus {
+    raw_speeds: Vec<runtime::RawSpeed>,
     id: String,
     name: String,
     client_port: u16,
@@ -447,6 +448,11 @@ async fn status(State(shared): State<Arc<Shared>>) -> Json<Status> {
                     .get(&b.id)
                     .map(|b| b.state.clone())
                     .unwrap_or_else(|| "not_inspected".into()),
+                raw_speeds: runtime
+                    .boards
+                    .get(&b.id)
+                    .map(|b| b.raw_speeds.clone())
+                    .unwrap_or_default(),
                 temperature_c: runtime.boards.get(&b.id).and_then(|b| b.temperature_c),
                 temperature_limit_c: b.temperature_limit_c,
                 frequency_mhz: runtime.boards.get(&b.id).and_then(|b| b.frequency_mhz),
