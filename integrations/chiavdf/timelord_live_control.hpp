@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <stdexcept>
 #include <string>
+#include <initializer_list>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -39,20 +40,64 @@ void print_frequencies(const Entry *entries, size_t count) {
     }
     puts("]");
 }
+// Read-only diagnostics are a separate snapshot, never a substitute for readback.
+struct Register { const char *name; uint32_t address; };
+template<class ReadRegister>
+std::string clock_registers(ReadRegister read, std::initializer_list<Register> registers) {
+    std::string result;
+    for (const auto &reg : registers) {
+        uint32_t value = 0;
+        const int error = read(reg.address, value);
+        char field[96];
+        if (error) snprintf(field, sizeof(field), "%s=error(%d)", reg.name, error);
+        else snprintf(field, sizeof(field), "%s=0x%08x", reg.name, unsigned(value));
+        if (!result.empty()) result += " ";
+        result += field;
+    }
+    return result;
+}
+struct NoDiagnostics { std::string operator()() const { return {}; } };
+struct RetryDelay { void operator()() const { usleep(20000); } };
+constexpr unsigned READBACK_ATTEMPTS = 3;
+template<class Read, class Accept, class Diagnostics, class Delay>
+Point checked_readback(const char *phase, Read read, Accept accept,
+        Diagnostics diagnostics, Delay delay) {
+    for (unsigned attempt = 1; attempt <= READBACK_ATTEMPTS; ++attempt) {
+        const Point actual = read();
+        if (accept(actual)) {
+            if (attempt > 1) fprintf(stderr,
+                "Live control readback recovered phase=%s attempt=%u frequency=%.6f voltage=%.6f\n",
+                phase, attempt, actual.frequency, actual.voltage);
+            return actual;
+        }
+        const auto registers = diagnostics();
+        fprintf(stderr,
+            "Live control readback rejected phase=%s attempt=%u/%u frequency=%.6f voltage=%.6f registers=[%s]\n",
+            phase, attempt, READBACK_ATTEMPTS, actual.frequency, actual.voltage, registers.c_str());
+        if (attempt == READBACK_ATTEMPTS) throw std::runtime_error(std::string(phase)
+            + " attempts=" + std::to_string(attempt) + " frequency=" + std::to_string(actual.frequency)
+            + " voltage=" + std::to_string(actual.voltage) + " registers=[" + registers + "]");
+        delay();
+    }
+    throw std::runtime_error("readback_unreachable");
+}
 // The caller must leave engines paused on any exception and terminate the client.
-template<class Read, class Voltage, class Frequency, class Pause>
-Point apply(Point target, Read read, Voltage voltage, Frequency frequency, Pause pause) {
+// Retry reads only: never repeat a PLL/voltage write or resume after failed readback.
+template<class Read, class Voltage, class Frequency, class Pause,
+         class Diagnostics = NoDiagnostics, class Delay = RetryDelay>
+Point apply(Point target, Read read, Voltage voltage, Frequency frequency, Pause pause,
+        Diagnostics diagnostics = {}, Delay delay = {}) {
     if (!valid(target)) throw std::runtime_error("limits");
-    Point old = read();
-    if (!valid(old)) throw std::runtime_error("initial_readback frequency=" + std::to_string(old.frequency) + " voltage=" + std::to_string(old.voltage));
     pause(false);
+    const Point old = checked_readback("initial_readback", read,
+        [](Point p) { return valid(p); }, diagnostics, delay);
     if (target.voltage > old.voltage) voltage(target.voltage);
     frequency(target.frequency);
     if (target.voltage < old.voltage) voltage(target.voltage);
-    const Point actual = read();
-    if (!valid(actual) || std::abs(actual.frequency - target.frequency) > 1.
-        || std::abs(actual.voltage - target.voltage) > .0063)
-        throw std::runtime_error("readback frequency=" + std::to_string(actual.frequency) + " voltage=" + std::to_string(actual.voltage) + " requested_frequency=" + std::to_string(target.frequency) + " requested_voltage=" + std::to_string(target.voltage));
+    const Point actual = checked_readback("readback", read, [&](Point p) {
+        return valid(p) && std::abs(p.frequency - target.frequency) <= 1.
+            && std::abs(p.voltage - target.voltage) <= .0063;
+    }, diagnostics, delay);
     pause(true);
     return actual;
 }

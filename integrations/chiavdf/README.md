@@ -28,7 +28,13 @@ client stops, preserving the native failure even while the coordinator awaits
 its control reply. IDs increase and frames
 are bounded. Live commands accept 200–2200 MHz / requested 0.7–1.0 V. A 55°C
 pre-write guard supplements the coordinator's sampled guard. Failed commands,
-readback mismatch or controller EOF quiesce engines and terminate the child.
+persistent readback mismatch or controller EOF quiesce engines and terminate the child.
+Initial and final readback each allow at most three reads, 20 ms apart, with
+engines paused throughout. Retries never repeat voltage/PLL writes or widen
+accepted ranges/tolerances. Rejected samples log the stage, attempt, frequency,
+voltage and a separate read-only snapshot of clock control/status/divider
+registers (including individual USB read errors); recovery is also logged.
+Persistent failures include the last diagnostic snapshot in the control error.
 `--control-frequencies` reports eligible 10 MHz-grid requests directly from the
 pinned PLL table, before USB initialization. Automatic tuning chooses from that
 list for trials and backoff; unsupported gaps such as 1510 MHz are skipped.

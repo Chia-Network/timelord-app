@@ -54,6 +54,55 @@ int main() {
     actions.clear();current=Point{1450.,.95};int reads=0;
     try {apply(Point{1460.,1.},[&](){return ++reads==1?current:Point{1000.,1.};},voltage,frequency,pause);assert(false);}catch(...){}
     assert(actions.back()!="resume");
+    // One bad initial sample can recover, but no write is allowed until a valid read.
+    actions.clear(); current=Point{1900.,1.}; reads=0;
+    unsigned diagnostics=0, waits=0;
+    auto diagnose=[&](){++diagnostics;return std::string("control=0x00000008 status=0x00000001");};
+    auto delay=[&](){++waits;};
+    auto transient=[&](){
+        assert(!actions.empty() && actions.front()=="pause");
+        if (++reads==1) { assert(actions.size()==1); return Point{100.,1.}; }
+        return current;
+    };
+    auto result=apply(Point{1880.,1.},transient,voltage,frequency,pause,diagnose,delay);
+    assert(result.frequency==1880. && reads==3 && diagnostics==1 && waits==1);
+    assert((actions==std::vector<std::string>{"pause","frequency","resume"}));
+    // Persistent unexpected initial state never writes hardware or resumes.
+    for (Point bad : {Point{100.,1.}, Point{0.,1.}, Point{1900.,1.1}, Point{NAN,1.}}) {
+        actions.clear(); reads=0; diagnostics=0; waits=0;
+        try {
+            apply(Point{1880.,1.},[&](){++reads;return bad;},voltage,frequency,pause,diagnose,delay);
+            assert(false);
+        } catch(const std::runtime_error &error) {
+            const std::string reason=error.what();
+            assert(reason.find("initial_readback attempts=3")!=std::string::npos);
+            assert(reason.find("control=0x00000008")!=std::string::npos);
+        }
+        assert(reads==3 && diagnostics==3 && waits==2);
+        assert((actions==std::vector<std::string>{"pause"}));
+    }
+    // Transient final readback retries the read, never the PLL or voltage writes.
+    actions.clear(); current=Point{1900.,1.}; reads=0; diagnostics=0; waits=0;
+    result=apply(Point{1880.,1.},[&](){return ++reads==2?Point{100.,1.}:current;},
+        voltage,frequency,pause,diagnose,delay);
+    assert(result.frequency==1880. && reads==3 && diagnostics==1 && waits==1);
+    assert((actions==std::vector<std::string>{"pause","frequency","resume"}));
+    // In-range but incorrect final frequency is still rejected after the bounded reads.
+    actions.clear(); current=Point{1900.,1.}; reads=0; diagnostics=0; waits=0;
+    try {
+        apply(Point{1880.,1.},[&](){return ++reads==1?current:Point{1800.,1.};},
+            voltage,frequency,pause,diagnose,delay);
+        assert(false);
+    } catch(const std::runtime_error &error) {
+        assert(std::string(error.what()).find("readback attempts=3")!=std::string::npos);
+    }
+    assert(reads==4 && diagnostics==3 && waits==2);
+    assert((actions==std::vector<std::string>{"pause","frequency"}));
+    // Error snapshots must distinguish an unreadable register from a valid zero.
+    const auto registers=clock_registers([](uint32_t address,uint32_t &value){
+        value=address==0?8:0;return address==4?17:0;
+    }, {{"control",0},{"status",4},{"pre_divide",8}});
+    assert(registers=="control=0x00000008 status=error(17) pre_divide=0x00000000");
     auto exchange=[](std::string request, bool accepted) {
         int in[2],out[2];assert(!pipe(in)&&!pipe(out));Channel channel(in[0],out[1]);assert(channel.start());
         int writes=0;assert(write(in[1],request.data(),request.size())==static_cast<ssize_t>(request.size()));
