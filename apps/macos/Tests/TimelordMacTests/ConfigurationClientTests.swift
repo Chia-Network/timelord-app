@@ -23,11 +23,13 @@ final class ConfigurationClientTests: XCTestCase {
             board.serial = "serial-\(index)"; return board
         }
         value.hardware.chainAssignments = ChainAssignments(challenge: "serial-2", reward: "serial-0", infusedChallenge: "serial-1")
+        value.hardware.boards[0].automatic.retestAfterSeconds = 0
         try await client.save(value)
         let saved = try await client.load()
         XCTAssertEqual(saved.node.host, "fixture.invalid")
         XCTAssertEqual(saved.node.port, 18444)
         XCTAssertEqual(saved.hardware.chainAssignments, value.hardware.chainAssignments)
+        XCTAssertEqual(saved.hardware.boards[0].automatic.retestAfterSeconds, 0)
         value.node.host = ""
         do { try await client.save(value); XCTFail("Invalid config was saved") } catch { XCTAssertFalse(error.localizedDescription.isEmpty) }
         let preserved = try await client.load()

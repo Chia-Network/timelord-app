@@ -162,6 +162,8 @@ pub struct AutomaticConfig {
     pub min_voltage_v: f64,
     pub healthy_seconds: u64,
     pub cooldown_seconds: u64,
+    /// Healthy-work interval before retesting a rejected clock; zero disables retries.
+    pub retest_after_seconds: u64,
     /// Read existing configs without reviving the removed voltage search.
     #[serde(skip_serializing)]
     pub voltage_after_seconds: u64,
@@ -180,6 +182,7 @@ impl Default for AutomaticConfig {
             min_voltage_v: 0.9,
             healthy_seconds: 120,
             cooldown_seconds: 900,
+            retest_after_seconds: 7200,
             voltage_after_seconds: 3600,
             recovery_window_seconds: 300,
             recovery_loss_percent: 5.,
@@ -202,6 +205,8 @@ impl AutomaticConfig {
             && self.contains(self.start_frequency_mhz, self.start_voltage_v)
             && self.healthy_seconds >= 30
             && self.cooldown_seconds >= self.healthy_seconds
+            && (self.retest_after_seconds == 0
+                || (self.cooldown_seconds..=86400).contains(&self.retest_after_seconds))
             && self.recovery_window_seconds >= self.healthy_seconds
             && self.recovery_window_seconds <= 3600
             && self.recovery_loss_percent.is_finite()
@@ -452,6 +457,19 @@ mod tests {
         assert!(!invalid.validate());
     }
 
+    #[test]
+    fn periodic_retest_defaults_are_bounded_and_can_be_disabled() {
+        let mut config = AutomaticConfig::default();
+        assert_eq!(config.retest_after_seconds, 7200);
+        config.retest_after_seconds = 0;
+        assert!(config.validate());
+        config.retest_after_seconds = 899;
+        assert!(!config.validate());
+        config.retest_after_seconds = 86400;
+        assert!(config.validate());
+        config.retest_after_seconds = 86401;
+        assert!(!config.validate());
+    }
     #[test]
     fn profiles_are_automatic_by_default_and_manual_is_explicit() {
         let mut b: BoardConfig = toml::from_str("id='a'\nname='A'\nclient_port=18110").unwrap();

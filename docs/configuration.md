@@ -137,6 +137,7 @@ max_frequency_mhz = 2200
 min_voltage_v = 0.9
 healthy_seconds = 120
 cooldown_seconds = 900
+retest_after_seconds = 7200 # 0 disables periodic retries
 recovery_window_seconds = 300
 recovery_loss_percent = 5.0
 recovery_bad_windows = 2
@@ -180,6 +181,32 @@ upward exploration pauses within 3°C. The hard temperature/missing-telemetry st
 failed-readback handling, and invalid-proof fault behavior remain enforced. At a
 performance floor the policy holds and reports the problem rather than repeatedly
 writing the same setting. Normal recoveries alone never stop proof production.
+
+A rejected frequency is periodically reconsidered so changes in cooling or
+operating conditions do not leave a board permanently capped. By default, a retry
+becomes eligible after **two hours of healthy verified work**, with at least 5°C
+of temperature headroom. Idle time, paused tuning, missing scores/telemetry and
+performance-degraded windows do not advance this timer. Ordinary recoveries are
+still permitted. Only the next supported frequency is tested, within the configured
+maximum and without changing voltage or physical engine selection.
+
+Retries use a longer acceptance period: at least `healthy_seconds` and
+`recovery_window_seconds * recovery_bad_windows` of healthy work (ten minutes with
+defaults). Storm, thermal and sustained-loss protections stay active. A rejected
+retry returns to the previous accepted point and doubles the next healthy-work
+wait: 4, 8, 16, then at most 24 hours with defaults. A successful retry clears the
+learned ceiling and permits normal upward exploration again. Set
+`retest_after_seconds = 0` to disable retries; otherwise it must be at least the
+configured cooldown and no more than one day.
+
+Retry waits and attempt counts are saved with the serial/engine-bound profile.
+The next wait is reserved before issuing a retry command, so a command failure or
+process restart cannot immediately repeat the attempt. Offline time does not
+advance it. Older profiles without retry state begin a fresh wait. Pausing tuning
+during a retry holds the clock; resuming restarts its full acceptance window and
+retains its previous rollback point. The board detail message and service status
+report the remaining healthy-work wait. These retry intervals are engineering
+defaults, not a guarantee that a cooler board can sustain a higher clock.
 
 The old `voltage_after_seconds` config key is accepted when reading existing
 configs, ignored, and omitted from newly saved configs. Voltage optimization has

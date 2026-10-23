@@ -302,6 +302,7 @@ mod tests {
                 ceiling_mhz: 1600.,
                 cooldown_seconds: 0,
                 performance: Some(performance(900_000. + i as f64 * 100_000.)),
+                retest: None,
             })
             .collect();
         for entry in &entries {

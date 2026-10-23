@@ -45,6 +45,7 @@ pub struct Status {
     pub message: String,
     pub active_seconds: u64,
     pub cooldown_seconds: u64,
+    pub retest_seconds_remaining: Option<u64>,
 }
 pub enum Action {
     Set(Point, String),
@@ -95,6 +96,13 @@ impl RecoveryBurst {
         self.events.len() == STORM_RECOVERIES
     }
 }
+/// Countdown counts only healthy verified work, never offline wall time.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RetestState {
+    pub attempts: u32,
+    pub remaining_seconds: u64,
+}
 pub struct Policy {
     pub point: Point,
     pub status: Status,
@@ -103,6 +111,8 @@ pub struct Policy {
     best: Point,
     baseline: Option<f64>,
     trial: bool,
+    retest_trial: bool,
+    retest: RetestState,
     last_tick: u64,
     recoveries: u64,
     recovery_burst: RecoveryBurst,
@@ -117,6 +127,11 @@ impl Policy {
     pub fn new(settings: AutomaticConfig, point: Point, now: u64, frequencies: Vec<f64>) -> Self {
         Self {
             ceiling: settings.max_frequency_mhz,
+            retest: RetestState {
+                attempts: 0,
+                remaining_seconds: settings.retest_after_seconds,
+            },
+            retest_trial: false,
             settings,
             point,
             best: point,
@@ -149,6 +164,34 @@ impl Policy {
                 .max(self.point.frequency_mhz);
         }
         self.status.cooldown_seconds = entry.cooldown_seconds.min(self.settings.cooldown_seconds);
+        if let Some(retest) = &entry.retest {
+            self.retest = RetestState {
+                attempts: retest.attempts.min(16),
+                remaining_seconds: retest.remaining_seconds.min(86400),
+            };
+        }
+        self.status.retest_seconds_remaining = self.retest_remaining();
+    }
+    pub fn is_retest(&self) -> bool {
+        self.retest_trial
+    }
+    pub fn retest_state(&self) -> RetestState {
+        self.retest.clone()
+    }
+    pub fn retest_remaining(&self) -> Option<u64> {
+        (self.settings.retest_after_seconds > 0
+            && self.ceiling < self.settings.max_frequency_mhz
+            && self
+                .frequencies
+                .iter()
+                .any(|&f| f > self.ceiling && f <= self.settings.max_frequency_mhz))
+        .then_some(self.retest.remaining_seconds)
+    }
+    fn retest_delay(&self) -> u64 {
+        self.settings
+            .retest_after_seconds
+            .saturating_mul(1u64 << self.retest.attempts.min(16))
+            .min(86400)
     }
     pub fn in_trial(&self) -> bool {
         self.trial
@@ -200,6 +243,7 @@ impl Policy {
             }
         };
         self.trial = false;
+        self.retest_trial = false;
         self.degraded_windows = 0;
         self.window_recoveries = 0;
         self.status.cooldown_seconds = self.settings.cooldown_seconds;
@@ -210,11 +254,14 @@ impl Policy {
         }
         if target.frequency_mhz < self.point.frequency_mhz {
             self.ceiling = self.point.frequency_mhz - 10.;
+            self.retest.remaining_seconds = self.retest_delay();
         }
+        self.status.retest_seconds_remaining = self.retest_remaining();
         self.baseline = None;
         Some(Action::Set(target, reason.into()))
     }
     pub fn observe(&mut self, now: u64, input: Input) -> Option<Action> {
+        self.status.retest_seconds_remaining = self.retest_remaining();
         let clock_reversed = now < self.last_tick;
         let dt = now.saturating_sub(self.last_tick).min(5);
         self.last_tick = now;
@@ -240,8 +287,10 @@ impl Policy {
             self.status.state = "paused".into();
             self.status.message = "Current settings held; proof production continues".into();
             self.was_paused = true;
-            self.trial = false;
-            self.best = self.point;
+            if !self.retest_trial {
+                self.trial = false;
+                self.best = self.point;
+            }
             return None;
         }
         if self.was_paused {
@@ -253,7 +302,9 @@ impl Policy {
             self.window_recoveries = 0;
             self.degraded_windows = 0;
             self.status.active_seconds = 0;
-            self.baseline = None;
+            if !self.retest_trial {
+                self.baseline = None;
+            }
         }
         if self.recovery_burst.observe(now, new_recoveries) {
             self.recovery_burst.reset(now);
@@ -291,7 +342,15 @@ impl Policy {
                 return self.backoff("Sustained delivered IPS loss with recoveries in consecutive observation windows",false);
             }
         }
-        if self.status.active_seconds < self.settings.healthy_seconds {
+        let required_seconds = if self.retest_trial {
+            self.settings.healthy_seconds.max(
+                self.settings.recovery_window_seconds
+                    * u64::from(self.settings.recovery_bad_windows),
+            )
+        } else {
+            self.settings.healthy_seconds
+        };
+        if self.status.active_seconds < required_seconds {
             return None;
         }
         if self.degraded_windows > 0 {
@@ -312,6 +371,15 @@ impl Policy {
                 return None;
             }
             self.trial = false;
+            if self.retest_trial {
+                self.ceiling = self.settings.max_frequency_mhz;
+                self.retest = RetestState {
+                    attempts: 0,
+                    remaining_seconds: self.settings.retest_after_seconds,
+                };
+                self.retest_trial = false;
+                self.status.retest_seconds_remaining = None;
+            }
             self.best = self.point;
             self.baseline = Some(score);
             self.epoch = now;
@@ -332,6 +400,14 @@ impl Policy {
             self.status.message =
                 "Saved observed performance baseline; recoveries are permitted".into();
             return Some(Action::Save);
+        }
+        if self.retest_remaining().is_some()
+            && input
+                .temperature
+                .is_some_and(|t| t <= input.temperature_limit - 5.)
+        {
+            self.retest.remaining_seconds = self.retest.remaining_seconds.saturating_sub(dt);
+            self.status.retest_seconds_remaining = self.retest_remaining();
         }
         if self.status.cooldown_seconds > 0 {
             self.status.state = "cooldown".into();
@@ -360,9 +436,43 @@ impl Policy {
                 format!("Testing supported frequency {frequency_mhz:.0} MHz"),
             ));
         }
+        if self.retest_remaining() == Some(0)
+            && input
+                .temperature
+                .is_some_and(|t| t <= input.temperature_limit - 5.)
+            && let Some(frequency_mhz) = self.frequencies.iter().copied().find(|&f| {
+                f >= self.point.frequency_mhz + 10. - 0.000001
+                    && f <= self.settings.max_frequency_mhz
+            })
+        {
+            self.best = self.point;
+            self.trial = true;
+            self.retest_trial = true;
+            self.retest.attempts = self.retest.attempts.saturating_add(1).min(16);
+            // Reserve the next wait before touching hardware. A crash or failed
+            // command cannot turn a restart into an immediate repeated test.
+            self.retest.remaining_seconds = self.retest_delay();
+            self.status.retest_seconds_remaining = self.retest_remaining();
+            return Some(Action::Set(
+                Point {
+                    frequency_mhz,
+                    ..self.point
+                },
+                format!(
+                    "Retesting supported frequency {frequency_mhz:.0} MHz after healthy operation"
+                ),
+            ));
+        }
         self.status.state = "monitoring".into();
-        self.status.message =
-            "Holding frequency and voltage; monitoring delivered IPS and recovery cost".into();
+        self.status.message = match self.retest_remaining() {
+            Some(seconds) => format!(
+                "Monitoring; higher frequency retry after {} more healthy minutes",
+                seconds.div_ceil(60)
+            ),
+            None => {
+                "Holding frequency and voltage; monitoring delivered IPS and recovery cost".into()
+            }
+        };
         None
     }
 }
@@ -384,6 +494,8 @@ pub struct Learned {
     pub cooldown_seconds: u64,
     #[serde(default)]
     pub performance: Option<crate::assignment::Performance>,
+    #[serde(default)]
+    pub retest: Option<RetestState>,
 }
 impl Learned {
     fn physical_mask(&self) -> Option<u8> {
@@ -593,6 +705,193 @@ mod tests {
             0,
             frequencies(),
         )
+    }
+    fn capped_retest_policy() -> Policy {
+        let mut config = settings();
+        config.retest_after_seconds = 60;
+        let mut p = Policy::new(
+            config,
+            Point {
+                frequency_mhz: 1450.,
+                voltage_v: 1.,
+            },
+            0,
+            frequencies(),
+        );
+        p.ceiling = 1459.;
+        p.baseline = Some(950000.);
+        p.status.active_seconds = 30;
+        p
+    }
+    fn start_retest(p: &mut Policy, now: u64) {
+        p.retest.remaining_seconds = 0;
+        let Some(Action::Set(target, reason)) = p.observe(now, input()) else {
+            panic!("missing periodic retry")
+        };
+        assert_eq!(
+            target,
+            Point {
+                frequency_mhz: 1460.,
+                voltage_v: 1.
+            }
+        );
+        assert!(p.is_retest());
+        p.applied(target, now, reason);
+    }
+    #[test]
+    fn retests_only_after_healthy_cool_work_and_honors_disable_and_limits() {
+        let mut p = capped_retest_policy();
+        let mut paused = input();
+        paused.paused = true;
+        assert!(p.observe(1, paused).is_none());
+        let remaining = p.retest.remaining_seconds;
+        let mut idle = input();
+        idle.healthy = false;
+        assert!(p.observe(10000, idle).is_none());
+        assert_eq!(p.retest.remaining_seconds, remaining);
+        for now in 10001..10100 {
+            assert!(!matches!(
+                p.observe(
+                    now,
+                    Input {
+                        temperature: Some(51.),
+                        ..input()
+                    }
+                ),
+                Some(Action::Set(..))
+            ));
+        }
+        assert_eq!(p.retest.remaining_seconds, remaining);
+        let mut missing_score = input();
+        missing_score.score = None;
+        assert!(p.observe(10100, missing_score).is_none());
+        assert_eq!(p.retest.remaining_seconds, remaining);
+        // Separate stable run: ordinary recoveries do not prohibit a retry.
+        p = capped_retest_policy();
+        for now in 1..60 {
+            let mut sample = input();
+            sample.recoveries = now / 20;
+            assert!(!matches!(p.observe(now, sample), Some(Action::Set(..))));
+        }
+        let mut sample = input();
+        sample.recoveries = 3;
+        let Some(Action::Set(target, _)) = p.observe(60, sample) else {
+            panic!("retry never became due")
+        };
+        assert_eq!(target.frequency_mhz, 1460.);
+        assert_eq!(target.voltage_v, 1.);
+        assert!(p.is_retest());
+        assert_eq!(p.retest.attempts, 1);
+        assert_eq!(p.retest.remaining_seconds, 120);
+        for disabled in [true, false] {
+            let mut p = capped_retest_policy();
+            if disabled {
+                p.settings.retest_after_seconds = 0;
+            } else {
+                p.settings.max_frequency_mhz = 1450.;
+            }
+            p.retest.remaining_seconds = 0;
+            for now in 1..200 {
+                assert!(!matches!(p.observe(now, input()), Some(Action::Set(..))));
+            }
+        }
+    }
+    #[test]
+    fn unsupported_gap_below_configured_maximum_has_no_retry_countdown() {
+        let mut p = capped_retest_policy();
+        p.settings.max_frequency_mhz = 1455.;
+        p.ceiling = 1450.;
+        assert_eq!(p.retest_remaining(), None);
+    }
+    #[test]
+    fn failed_retests_roll_back_and_exponentially_delay_the_next_trial() {
+        let mut p = capped_retest_policy();
+        for attempt in 1..=12 {
+            let now = attempt * 100;
+            start_retest(&mut p, now);
+            let mut storm = input();
+            storm.recoveries = attempt * 20;
+            let Some(Action::Set(target, _)) = p.observe(now + 6, storm) else {
+                panic!("storm was not rejected")
+            };
+            assert_eq!(target.frequency_mhz, 1450.);
+            assert!(!p.in_trial());
+            assert_eq!(p.ceiling, 1450.);
+            assert_eq!(
+                p.retest.remaining_seconds,
+                (60 * (1u64 << attempt)).min(86400)
+            );
+            p.applied(target, now + 6, "rollback".into());
+            p.baseline = Some(950000.);
+            p.status.active_seconds = 30;
+            p.status.cooldown_seconds = 0;
+            // Keep the next observation's recovery counter synchronized.
+            p.synchronize_recoveries(0);
+        }
+    }
+    #[test]
+    fn successful_retest_requires_the_full_recovery_window_before_reopening_search() {
+        let mut p = capped_retest_policy();
+        start_retest(&mut p, 1);
+        for now in 2..121 {
+            assert!(!matches!(p.observe(now, input()), Some(Action::Save)));
+            assert!(p.is_retest());
+            assert!(p.ceiling < p.point.frequency_mhz);
+        }
+        assert!(matches!(p.observe(121, input()), Some(Action::Save)));
+        assert!(!p.is_retest());
+        assert_eq!(p.ceiling, p.settings.max_frequency_mhz);
+        assert_eq!(p.retest.attempts, 0);
+    }
+    #[test]
+    fn pause_during_retest_keeps_probation_and_the_previous_rollback_point() {
+        let mut p = capped_retest_policy();
+        start_retest(&mut p, 1);
+        let mut paused = input();
+        paused.paused = true;
+        assert!(p.observe(20, paused).is_none());
+        assert!(p.is_retest());
+        assert_eq!(p.best.frequency_mhz, 1450.);
+        for now in 21..100 {
+            assert!(!matches!(p.observe(now, input()), Some(Action::Save)));
+        }
+        let mut storm = input();
+        storm.recoveries = 20;
+        let Some(Action::Set(target, _)) = p.observe(101, storm) else {
+            panic!("missing rollback")
+        };
+        assert_eq!(target.frequency_mhz, 1450.);
+    }
+    #[test]
+    fn retry_wait_is_serialized_before_the_trial_and_old_profiles_get_a_fresh_wait() {
+        let mut p = capped_retest_policy();
+        p.retest.remaining_seconds = 0;
+        assert!(matches!(p.observe(1, input()), Some(Action::Set(..))));
+        // This is the pre-command cache point: no unconfirmed target is saved.
+        assert_eq!(p.point.frequency_mhz, 1450.);
+        let mut entry: Learned = serde_json::from_value(serde_json::json!({
+            "serial":"fixture", "engines":1, "engine_mask":2, "host":"mac", "client_sha256":"hash",
+            "point":p.point, "active_seconds":0, "updated_unix":1,
+            "ceiling_mhz":p.ceiling, "cooldown_seconds":0
+        }))
+        .unwrap();
+        let mut old = capped_retest_policy();
+        old.restore(&entry);
+        assert_eq!(old.retest.remaining_seconds, 60);
+        entry.retest = Some(p.retest_state());
+        let saved: Learned = serde_json::from_slice(&serde_json::to_vec(&entry).unwrap()).unwrap();
+        let mut restarted = capped_retest_policy();
+        restarted.restore(&saved);
+        assert_eq!(restarted.retest.remaining_seconds, 120);
+        assert_eq!(restarted.retest.attempts, 1);
+        let mut idle = input();
+        idle.healthy = false;
+        assert!(restarted.observe(100000, idle).is_none());
+        assert_eq!(restarted.retest.remaining_seconds, 120);
+        let remaining = restarted.retest.remaining_seconds;
+        assert!(restarted.observe(0, input()).is_none());
+        assert_eq!(restarted.retest.remaining_seconds, remaining);
+        assert!(!restarted.is_retest());
     }
     #[test]
     fn sparse_pll_steps_skip_unsupported_requests_and_respect_soft_ceiling() {
@@ -1121,6 +1420,7 @@ mod tests {
                             ceiling_mhz: 1600.,
                             cooldown_seconds: 0,
                             performance: None,
+                            retest: None,
                         },
                     )
                     .unwrap()
@@ -1163,6 +1463,7 @@ mod tests {
             ceiling_mhz: 1520.,
             cooldown_seconds: 30,
             performance: None,
+            retest: None,
         };
         save(&path, entry.clone()).unwrap();
         assert_eq!(

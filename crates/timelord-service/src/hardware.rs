@@ -336,6 +336,7 @@ impl AutomaticOwner {
                 updated_unix: crate::unix_now(),
                 ceiling_mhz: self.policy.learned_limits().0,
                 cooldown_seconds: self.policy.learned_limits().1,
+                retest: Some(self.policy.retest_state()),
                 performance: if clean >= board.automatic.healthy_seconds {
                     self.raw_window.performance()
                 } else {
@@ -413,6 +414,11 @@ impl AutomaticOwner {
             )?,
             Some(Action::Set(point, reason)) => {
                 let persist = !self.policy.in_trial();
+                if self.policy.is_retest() {
+                    // Observe has selected a target but point is still the last
+                    // accepted setting. Persist its reserved retry wait first.
+                    self.record(shared, board, 0)?;
+                }
                 tracing::info!(board=%board.name, frequency_mhz=point.frequency_mhz, voltage_v=point.voltage_v, %reason, "Applying automatic setting");
                 let actual = self
                     .change_with_logs(point, 5, log, shared, board)
@@ -442,7 +448,8 @@ impl AutomaticOwner {
                     && ["monitoring", "cooldown"].contains(&self.policy.status.state.as_str())
                     && self.policy.status.active_seconds >= board.automatic.healthy_seconds
                     && now.saturating_sub(self.last_record_unix) >= 300
-                    && self.raw_window.performance().is_some()
+                    && (self.raw_window.performance().is_some()
+                        || self.policy.retest_remaining().is_some())
                 {
                     self.record(shared, board, self.policy.status.active_seconds)?;
                 }
