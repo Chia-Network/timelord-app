@@ -13,7 +13,9 @@ no parent, sibling, or private chiavdf checkout is required.
 Connect one to three ASIC boards and select your node's Chia folder or import an
 administrator-provided connection bundle. Timelord starts automatically when setup
 is ready. One board runs three engines; two boards run two plus one; three boards
-run one engine each. Only detected boards appear.
+run one engine each. A board running a single engine uses physical engine 1
+(zero-based); two-engine boards use engines 0 and 1, and three-engine boards use
+all three. Only detected boards appear.
 
 New boards use **Automatic** tuning, starting at 1450 MHz / requested 1.0 V or a
 learned setting for that board, engine count, Mac model and native client. Manual

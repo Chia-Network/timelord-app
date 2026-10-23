@@ -15,9 +15,12 @@ use tokio::{
 };
 
 pub fn arguments(board: &BoardConfig, engines: usize) -> Result<Vec<String>> {
+    let mask = timelord_core::engine_mask(engines).context("Expected one to three engines")?;
     let mut arguments = vec![
         "--ip".into(),
         "127.0.0.1".into(),
+        "--vdfs-mask".into(),
+        mask.to_string(),
         "--device-loc".into(),
         board
             .device_location
@@ -309,6 +312,7 @@ impl AutomaticOwner {
             automatic::Learned {
                 serial: self.serial.clone(),
                 engines: self.engines,
+                engine_mask: timelord_core::engine_mask(self.engines),
                 host: self.host.clone(),
                 client_sha256: self.hash.clone(),
                 point: self.policy.point,
@@ -1100,6 +1104,43 @@ done
                 .windows(2)
                 .any(|w| w == ["--checkpoint-threshold", "250000"])
         );
+    }
+
+    #[test]
+    fn native_mask_matches_physical_assignments_and_profile_mode() {
+        let mut config = Config::default();
+        for boards in 1..=3 {
+            config.hardware.boards = (0..boards)
+                .map(|n| {
+                    toml::from_str(&format!(
+                        "id='b{n}'\nname='Board {n}'\nclient_port={}\ndevice_location={}\n",
+                        18110 + n,
+                        n + 1
+                    ))
+                    .unwrap()
+                })
+                .collect();
+            let assignments = config.assignments().unwrap();
+            for board in &config.hardware.boards {
+                let assigned: Vec<_> = assignments
+                    .iter()
+                    .filter(|a| a.board_id == board.id)
+                    .collect();
+                let expected = assigned.iter().fold(0u8, |mask, a| mask | (1 << a.engine));
+                for mode in [ProfileMode::Automatic, ProfileMode::Manual] {
+                    let mut board = board.clone();
+                    board.profile = mode;
+                    let args = arguments(&board, assigned.len()).unwrap();
+                    assert!(
+                        args.windows(2)
+                            .any(|w| w == ["--vdfs-mask", &expected.to_string()])
+                    );
+                }
+            }
+        }
+        let board = &config.hardware.boards[0];
+        assert!(arguments(board, 0).is_err());
+        assert!(arguments(board, 4).is_err());
     }
 
     #[tokio::test]

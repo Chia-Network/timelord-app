@@ -229,6 +229,16 @@ impl Chain {
     pub const ALL: [Self; 3] = [Self::Challenge, Self::Reward, Self::InfusedChallenge];
 }
 
+/// Physical engines selected by the native client for each board workload.
+pub fn engine_mask(engines: usize) -> Option<u8> {
+    match engines {
+        1 => Some(0b010),
+        2 => Some(0b011),
+        3 => Some(0b111),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Assignment {
     pub board_id: String,
@@ -335,7 +345,7 @@ impl Config {
             2 => [2, 1, 0],
             _ => [1, 1, 1],
         };
-        let mut engine = [0; 3];
+        let mut engine = counts.map(|count| if count == 1 { 1 } else { 0 });
         Ok(Chain::ALL
             .into_iter()
             .enumerate()
@@ -446,7 +456,7 @@ mod tests {
         let mut c = Config::default();
         c.hardware.boards = vec![board("a", 18110), board("b", 18111), board("c", 18112)];
         let p = c.assignments().unwrap();
-        assert!(p.iter().all(|a| a.engine == 0));
+        assert!(p.iter().all(|a| a.engine == 1));
         assert_eq!(p[2].board_id, "c");
         assert_eq!(p[2].chain, Chain::InfusedChallenge);
     }
@@ -457,6 +467,10 @@ mod tests {
         let plan = c.assignments().unwrap();
         assert_eq!(plan.iter().filter(|a| a.board_id == "a").count(), 2);
         assert_eq!(plan[2].board_id, "b");
+        assert_eq!(
+            plan.iter().map(|a| a.engine).collect::<Vec<_>>(),
+            vec![0, 1, 1]
+        );
     }
     #[test]
     fn rejects_ambiguous_devices_and_ports() {

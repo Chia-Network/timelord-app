@@ -372,6 +372,9 @@ impl Policy {
 pub struct Learned {
     pub serial: String,
     pub engines: usize,
+    // Missing in older profiles, which used the lowest-numbered engines.
+    #[serde(default)]
+    pub engine_mask: Option<u8>,
     pub host: String,
     pub client_sha256: String,
     pub point: Point,
@@ -379,6 +382,14 @@ pub struct Learned {
     pub updated_unix: u64,
     pub ceiling_mhz: f64,
     pub cooldown_seconds: u64,
+}
+impl Learned {
+    fn physical_mask(&self) -> Option<u8> {
+        self.engine_mask.or_else(|| match self.engines {
+            1..=3 => Some((1 << self.engines) - 1),
+            _ => None,
+        })
+    }
 }
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -434,6 +445,7 @@ pub fn learned(
         .filter(|e| {
             Some(&e.serial) == board.serial.as_ref()
                 && e.engines == engines
+                && e.physical_mask() == timelord_core::engine_mask(engines)
                 && e.client_sha256 == hash
                 && e.host == host
                 && board
@@ -468,6 +480,7 @@ pub fn save(path: &Path, entry: Learned) -> Result<()> {
     value.entries.retain(|e| {
         !(e.serial == entry.serial
             && e.engines == entry.engines
+            && e.physical_mask() == entry.physical_mask()
             && e.host == entry.host
             && e.client_sha256 == entry.client_sha256)
     });
@@ -1052,7 +1065,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("tl-profile-migration-{}.json", std::process::id()));
         let old = serde_json::json!({"schema_version":1,"entries":[{
-            "serial":"a","engines":1,"host":"mac","client_sha256":"hash",
+            "serial":"a","engines":2,"host":"mac","client_sha256":"hash",
             "point":{"frequency_mhz":1500.,"voltage_v":0.95},"active_seconds":120,
             "updated_unix":1,"ceiling_mhz":1500.,"cooldown_seconds":900,"voltage_rejected":true}]});
         std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
@@ -1060,7 +1073,7 @@ mod tests {
         config.hardware.automatic_state = Some(path.clone());
         let board: timelord_core::BoardConfig =
             toml::from_str("id='a'\nname='A'\nclient_port=18110\nserial='a'").unwrap();
-        let point = initial(&config, &board, 1, "hash", "mac").unwrap();
+        let point = initial(&config, &board, 2, "hash", "mac").unwrap();
         assert_eq!(
             point,
             Point {
@@ -1094,6 +1107,7 @@ mod tests {
                         Learned {
                             serial: format!("board-{n}"),
                             engines: 1,
+                            engine_mask: Some(2),
                             host: "mac".into(),
                             client_sha256: "hash".into(),
                             point: Point {
@@ -1134,6 +1148,7 @@ mod tests {
         let entry = Learned {
             serial: "a".into(),
             engines: 3,
+            engine_mask: None,
             host: "mac".into(),
             client_sha256: "hash".into(),
             point: Point {
@@ -1145,7 +1160,7 @@ mod tests {
             ceiling_mhz: 1520.,
             cooldown_seconds: 30,
         };
-        save(&path, entry).unwrap();
+        save(&path, entry.clone()).unwrap();
         assert_eq!(
             initial(&config, &board, 3, "hash", "mac")
                 .unwrap()
@@ -1168,6 +1183,26 @@ mod tests {
                 1450.
             );
         }
+        // An old single-engine profile belongs to engine 0, not the new engine 1.
+        let mut old = entry;
+        old.engines = 1;
+        old.engine_mask = None;
+        save(&path, old.clone()).unwrap();
+        assert!(
+            learned(&config, &board, 1, "hash", "mac")
+                .unwrap()
+                .is_none()
+        );
+        let mut current = old;
+        current.engine_mask = Some(2);
+        current.ceiling_mhz = 1980.;
+        save(&path, current.clone()).unwrap();
+        let restored = learned(&config, &board, 1, "hash", "mac").unwrap().unwrap();
+        assert_eq!(restored.engine_mask, Some(2));
+        assert_eq!(restored.ceiling_mhz, 1980.);
+        current.ceiling_mhz = 1960.;
+        save(&path, current).unwrap();
+        assert_eq!(cache(&path).unwrap().entries.len(), 3);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
