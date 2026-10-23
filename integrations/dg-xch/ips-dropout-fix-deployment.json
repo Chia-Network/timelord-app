@@ -1,0 +1,84 @@
+{
+  "host": "m6mini",
+  "source_commit": "6c89eb9",
+  "manifest": {
+    "native_revision": "446a0e1d118051364742648c7b8f3239b12a3dcb",
+    "source_queue_sha256": "f16b6ed5838ceb0ad383df23145f742932b5f18dd6ebe5f1b9d022097fe9b800",
+    "native_sha256": "e7330cf8193fc98e6defb295c88a7219c2501e5b04f727e2fe745e48e18e8325",
+    "service_sha256": "d48363eea929fc8ddb0426c2ee64f10a7629c098b726044492691ea4d9520079",
+    "ui_sha256": "01a3d85b648a0709bacf618c1798e64e620a1812426692f82595f9f9c3367ff7",
+    "archive_sha256": "a69809b3c16be78d4b8284c247f5bec45dd981f8e4f40002d0b3858cb8416cff",
+    "libraries": {
+      "libgmpxx.4.dylib": "875e1391d7c896c64004ada5997a6f3c1fe2ed8f2bc15c36776d76ca86cc4396",
+      "libft4222.dylib": "453b21f3c6dbf89168916be1ea26483084b83314b8d78d7cabd74e82a0202075",
+      "libftd2xx.dylib": "0a3ae31f16da56ec212c60ead43921bca22868cf0c502efdc8105cf017d1c7ad",
+      "libgmp.10.dylib": "bc89479f845374ae610aee6f5758d6e083f55a7c22e684bbb2ecf20f5db6c10b"
+    },
+    "automatic_max_mhz": 2200,
+    "requested_voltage_ceiling_v": 1,
+    "temperature_guard_c": 55,
+    "startup_optimizations": [
+      "hardware SHA",
+      "six-worker canonical discriminant search",
+      "preparation overlaps client retirement"
+    ],
+    "raw_speed": "one-second counter deltas; explicit running/sampling/idle state; recent raw rate bridges handoffs for less than six seconds; historical five-minute stats survive between proofs"
+  },
+  "validation": {
+    "installed": true,
+    "validation_completed_unix": 1792715482.908142,
+    "service_pid": 2621,
+    "proofs_delivered": 20,
+    "failed_proofs": 0,
+    "recoveries": 0,
+    "raw_telemetry_seen_on_boards": 3,
+    "left_running": true
+  },
+  "native_states_observed": {
+    "sampling": 15,
+    "running": 258,
+    "idle": 12
+  },
+  "starting_points": {
+    "811F0379-0E67-439C-868A-D83665CE6792": [
+      1680.0,
+      1.0
+    ],
+    "92289F26-3466-4292-9A9A-7B9706FDF66E": [
+      1680.0,
+      1.0
+    ],
+    "C3C584A5-5207-4F51-8FE6-8ABB345E24EB": [
+      1640.0,
+      1.0
+    ]
+  },
+  "requested_voltage_ceiling_v": 1,
+  "temperature_guard_c": 55,
+  "automatic_ceiling_mhz": 2200,
+  "checks": {
+    "rust_tests": 57,
+    "swift_tests": 40,
+    "clippy_warnings_denied": "passed",
+    "format": "passed",
+    "native_fixtures": "passed",
+    "native_build": "passed",
+    "default_pin_patch_application": "passed"
+  },
+  "behavior": [
+    "Five-minute mean and median retain valid historical samples between proofs, through idle, and during brief node interruptions. Stale gauge samples and interruption intervals are still excluded.",
+    "Recent raw speed bridges handoffs for less than six seconds without refreshing its measurement timestamp. No active raw rate is displayed for idle.",
+    "Labels and tooltips remain concise. No explanatory UI panels added."
+  ],
+  "local_evidence": "/private/tmp/timelord-ips-dropout-20261022",
+  "remote_evidence": "/Users/cameron/timelord-ips-dropout-20261022",
+  "evidence_sha256": {
+    "completed.json": "17acc17ff4ecef9f20070931a342d76316fc688204ec2ae5dc41bf594ad32729",
+    "status-samples.jsonl": "daf49b342c51226bb595217ffb85e42dc98e57e7c58084d62b5220ddc0fd3bd7",
+    "capture.log": "76a167bcf0cf5990fab36b28f8f5e224ec14807f6b599be048253a7c11f818d3"
+  },
+  "limits": [
+    "90-second deployment health check, not a sustained performance or stability result.",
+    "Normal dependency pins remain unchanged; the live build retains the explicit PR 450 and six-worker DG sources."
+  ]
+}

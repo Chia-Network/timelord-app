@@ -94,3 +94,7 @@ requested 1.0 V ceiling and 55°C guard. A short deployment health check does no
 establish stability at the maximum clock or a sustained performance gain.
 This remains an explicit runtime development build; normal dependency pins are
 unchanged.
+
+The follow-up display fix is recorded in `ips-dropout-fix-deployment.json`. It
+keeps valid five-minute statistics visible between proofs and reports explicit
+raw sampling/idle states while preserving the proof and tuning implementations.
