@@ -98,3 +98,8 @@ unchanged.
 The follow-up display fix is recorded in `ips-dropout-fix-deployment.json`. It
 keeps valid five-minute statistics visible between proofs and reports explicit
 raw sampling/idle states while preserving the proof and tuning implementations.
+
+`recovery-storm-deployment.json` records the subsequent service-only fast-backoff
+update. The normal recovery-cost policy remains in place; severe bursts bypass
+proof-score gating and live control continues draining native logs. The recorded
+1920 MHz trace requests backoff at five seconds in the offline regression.

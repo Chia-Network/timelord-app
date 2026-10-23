@@ -48,7 +48,7 @@
       "median_ms": 5.9085,
       "qualification": "Different seed/workload window; higher than earlier 3.637 ms baseline, needs paired replay"
     },
-    "current_deployment": "ips-dropout-fix-deployment.json; hardware SHA, six workers and startup overlap retained"
+    "current_deployment": "recovery-storm-deployment.json; hardware SHA, six workers and startup overlap retained"
   },
   "completed_proof": {
     "status": "Deployed to m6mini at user request; sustained paired IPS and long-chain measurement remain open",
@@ -74,7 +74,7 @@
       "34 regressions and 96 independently verified final M6 fixture proofs plus negative controls",
       "Three-minute final mainnet validation, then original app/configuration restored"
     ],
-    "deployment_evidence": "ips-dropout-fix-deployment.json",
+    "deployment_evidence": "recovery-storm-deployment.json",
     "deployed_native_revision": "446a0e1d118051364742648c7b8f3239b12a3dcb"
   }
 }
