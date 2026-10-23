@@ -112,3 +112,9 @@ The service, prover, UI machine code and libraries remain unchanged. The explici
 development deployment preserves learned points, ceilings and cooldowns for the
 new native hash; this is not automatic cache migration in normal app builds.
 The 60-second live health check did not inject or reproduce a hardware fault.
+
+`board-recovery-deployment.json` records per-board supervision and bounded client
+restarts, with healthy native sessions and the full-node peer connection retained
+during an isolated hardware outage. Offline socket/process/TLS fixtures exercise
+recovery, exhaustion and safety latches. The live check verifies deployment health
+only; it does not inject a physical board fault or establish an IPS improvement.
