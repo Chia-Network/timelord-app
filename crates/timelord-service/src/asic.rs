@@ -188,7 +188,9 @@ impl AsicBackend {
                     .map(|b| {
                         (
                             b.generation,
-                            b.latched_fault || b.state == "fault" || b.state == "thermal_stop",
+                            b.latched_fault
+                                || ["fault", "thermal_stop", "reconnecting"]
+                                    .contains(&b.state.as_str()),
                         )
                     })
                     .unwrap_or((0, false))
@@ -204,7 +206,7 @@ impl AsicBackend {
                         tokio::time::sleep(Duration::from_millis(250)).await;
                         let state = self.runtime.lock().expect("runtime");
                         if state.boards.get(&lane.board).is_some_and(|b| b.generation != generation
-                            || b.latched_fault || b.state == "fault" || b.state == "thermal_stop") { break; }
+                            || b.latched_fault || ["fault", "thermal_stop", "reconnecting"].contains(&b.state.as_str())) { break; }
                     }
                 } => continue,
             };

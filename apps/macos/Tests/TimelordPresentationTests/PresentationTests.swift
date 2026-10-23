@@ -421,13 +421,16 @@ extension PresentationTests {
             let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
             return try decoder.decode(ServiceStatus.self, from: JSONSerialization.data(withJSONObject: object))
         }
-        for failed in ["fault", "thermal_stop", "starting"] {
+        for failed in ["fault", "thermal_stop", "starting", "reconnecting"] {
             let view = LivePresentation.snapshot(status: try status(["connected", failed]), now: now)
             XCTAssertEqual(view.phase, .running)
             XCTAssertEqual(view.boards[0].state, .active)
             XCTAssertNotEqual(view.boards[1].state, .active)
         }
         XCTAssertEqual(LivePresentation.snapshot(status: try status(["fault", "fault"]), now: now).phase, .serviceUnavailable)
+        let reconnecting = LivePresentation.snapshot(status: try status(["reconnecting", "reconnecting"]), now: now)
+        XCTAssertEqual(reconnecting.phase, .waitingForProofs)
+        XCTAssertTrue(reconnecting.boards.allSatisfy { $0.state == .disconnected })
     }
 
 }

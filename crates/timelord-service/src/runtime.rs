@@ -63,6 +63,7 @@ pub struct RawSpeed {
 pub struct HardwareState {
     #[serde(skip)]
     pub generation: u64,
+    pub device_location: Option<u32>,
     #[serde(skip)]
     pub started_unix: u64,
     #[serde(skip)]

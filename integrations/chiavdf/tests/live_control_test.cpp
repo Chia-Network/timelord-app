@@ -4,6 +4,15 @@
 #include <vector>
 using namespace timelord_control;
 int main() {
+    check_temperature(40.);
+    for (double value : {0., -1., double(NAN), double(INFINITY)}) {
+        try { check_temperature(value); assert(false); }
+        catch(const std::runtime_error &e) { assert(std::string(e.what())=="temperature_unavailable"); }
+    }
+    for (double value : {55., 60.}) {
+        try { check_temperature(value); assert(false); }
+        catch(const std::runtime_error &e) { assert(std::string(e.what())=="temperature_limit"); }
+    }
     // Sparse high-clock PLL entries must not be advertised as exact 10 MHz steps.
     struct Entry { double freq; };
     const Entry pll[]={{1490.},{1500.},{1511.111111},{1520.},{1525.},{1533.333333},{1540.},{1560.},{1566.666667},{1571.428571},{1580.},{1600.}};

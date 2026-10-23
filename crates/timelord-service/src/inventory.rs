@@ -122,6 +122,24 @@ pub async fn discover(config: &Config) -> Result<Vec<Device>> {
     bail!("Select the packaged D2XX library to enumerate ASIC serial identities")
 }
 
+/// Never substitute a different board at the old USB location for a known serial.
+pub fn board_location(board: &timelord_core::BoardConfig, devices: &[Device]) -> Result<u32> {
+    let matches: Vec<_> = devices
+        .iter()
+        .filter(|d| match &board.serial {
+            Some(serial) => d.serial.as_ref() == Some(serial),
+            None => board.device_location == Some(d.location),
+        })
+        .collect();
+    if matches.len() != 1 {
+        bail!(
+            "{} is disconnected, busy, or has an ambiguous USB identity",
+            board.name
+        );
+    }
+    Ok(matches[0].location)
+}
+
 /// Resolve only physically enumerated boards, preserving the stored registry.
 /// This changes the launch plan, never the config file or a running service.
 pub async fn connected_configuration(mut config: Config) -> Result<Config> {
@@ -186,4 +204,30 @@ pub async fn connected_configuration(mut config: Config) -> Result<Config> {
     }
     config.validate().map_err(anyhow::Error::msg)?;
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn hotplug_follows_the_serial_and_never_a_replacement_at_the_old_port() {
+        let board = toml::from_str(
+            "id='a'\nname='A'\nclient_port=18110\ndevice_location=1\nserial='known'",
+        )
+        .unwrap();
+        let other = Device {
+            name: "Chia VDF A".into(),
+            location: 1,
+            serial: Some("other".into()),
+        };
+        assert!(board_location(&board, &[]).is_err());
+        assert!(board_location(&board, std::slice::from_ref(&other)).is_err());
+        let moved = Device {
+            location: 9,
+            serial: Some("known".into()),
+            ..other.clone()
+        };
+        assert_eq!(board_location(&board, &[other, moved.clone()]).unwrap(), 9);
+        assert!(board_location(&board, &[moved.clone(), moved]).is_err());
+    }
 }

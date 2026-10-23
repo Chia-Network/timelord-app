@@ -223,7 +223,7 @@ public enum LivePresentation {
             }.map { board in
                 let last = proofCapable ? board.latestProofUnix.map(Date.init(timeIntervalSince1970:)) : nil
                 let freshProof = last.map { now.timeIntervalSince($0) < 90 } ?? false
-                let state: BoardState = board.hardwareState == "thermal_stop" ? .thermalStop : board.hardwareState == "fault" ? .disconnected : productive && freshProof && board.hardwareState == "connected" ? .active : board.hardwareState == "connected" ? .waiting : .uninspected
+                let state: BoardState = board.hardwareState == "thermal_stop" ? .thermalStop : ["fault", "reconnecting"].contains(board.hardwareState) ? .disconnected : productive && freshProof && board.hardwareState == "connected" ? .active : board.hardwareState == "connected" ? .waiting : .uninspected
                 let histories = board.assignedChains.compactMap(Chain.init(rawValue:)).map { chain -> ChainHistory in
                     guard let validHistory else { return .empty(chain) }
                     let end = min(now, Date(timeIntervalSince1970: validHistory.timestampUnix))

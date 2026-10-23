@@ -91,9 +91,12 @@ async fn terminate(child: &mut Child) {
 }
 // Drain stderr even while control is awaiting its acknowledgement. A recovery
 // flood must not fill the pipe and block the USB owner before it reads TLSET.
+static INITIALIZATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct ClientLog {
     lines: tokio::io::Lines<BufReader<tokio::process::ChildStderr>>,
     ready: Option<oneshot::Sender<()>>,
+    initialization: Option<tokio::sync::MutexGuard<'static, ()>>,
     last_temperature: tokio::time::Instant,
     recent: std::collections::VecDeque<String>,
 }
@@ -102,6 +105,7 @@ impl ClientLog {
         Self {
             lines: BufReader::new(stderr).lines(),
             ready: Some(ready),
+            initialization: None,
             last_temperature: tokio::time::Instant::now(),
             recent: Default::default(),
         }
@@ -134,7 +138,13 @@ impl ClientLog {
         {
             state.boards.entry(board.id.clone()).or_default().voltage_v = Some(value);
         }
+        if line.contains("ASIC Temp = ") && temperature(&line).is_none() {
+            bail!("ASIC temperature telemetry unavailable");
+        }
         if let Some((temp, freq)) = temperature(&line) {
+            if temp <= 0. {
+                bail!("ASIC temperature telemetry unavailable");
+            }
             self.last_temperature = tokio::time::Instant::now();
             let hardware = state.boards.entry(board.id.clone()).or_default();
             hardware.temperature_unix = crate::unix_now();
@@ -155,10 +165,11 @@ impl ClientLog {
             state.boards.entry(board.id.clone()).or_default().recoveries += 1;
             state.event(Some(board.id.clone()), "recovery");
         }
-        if line.contains("Connected to timelord, waiting for challenge")
-            && let Some(ready) = self.ready.take()
-        {
-            let _ = ready.send(());
+        if line.contains("Connected to timelord, waiting for challenge") {
+            self.initialization.take();
+            if let Some(ready) = self.ready.take() {
+                let _ = ready.send(());
+            }
         }
         Ok(recovery)
     }
@@ -418,6 +429,7 @@ async fn supervise(
     mut child: Child,
     ready: oneshot::Sender<()>,
     mut shutdown: watch::Receiver<bool>,
+    initialization: tokio::sync::MutexGuard<'static, ()>,
 ) -> Result<()> {
     let automatic = if board.profile == ProfileMode::Automatic {
         tokio::select! {
@@ -444,6 +456,7 @@ async fn supervise(
     };
     let output = child.stderr.take().context("ASIC client log unavailable")?;
     let mut log = ClientLog::new(output, ready);
+    log.initialization = Some(initialization);
     let mut watchdog = tokio::time::interval(Duration::from_secs(5));
     let result: Result<()> = loop {
         tokio::select! {
@@ -587,11 +600,11 @@ pub async fn validate_automatic(config: &Config) -> Result<()> {
 }
 
 const RESTART_DELAYS: [u64; 3] = [1, 5, 30];
-struct RestartBudget {
+struct RestartBackoff {
     used: usize,
     delays: [Duration; 3],
 }
-impl Default for RestartBudget {
+impl Default for RestartBackoff {
     fn default() -> Self {
         Self {
             used: 0,
@@ -599,14 +612,14 @@ impl Default for RestartBudget {
         }
     }
 }
-impl RestartBudget {
-    fn next(&mut self, established: bool) -> Option<Duration> {
+impl RestartBackoff {
+    fn next(&mut self, established: bool) -> Duration {
         if established {
             self.used = 0;
         }
-        let delay = *self.delays.get(self.used)?;
-        self.used += 1;
-        Some(delay)
+        let delay = self.delays[self.used.min(self.delays.len() - 1)];
+        self.used = self.used.saturating_add(1);
+        delay
     }
 }
 fn established(shared: &Shared, board: &BoardConfig, started: u64, elapsed: Duration) -> bool {
@@ -689,13 +702,18 @@ async fn launch(shared: &Shared, board: &BoardConfig) -> Result<Child> {
     .spawn()
     .context("Launching native ASIC client")
 }
+fn thermal_rejection(error: &anyhow::Error) -> bool {
+    let reason = error.to_string();
+    reason.contains(": temperature_limit") || reason.contains(": temperature_guard")
+}
+
 async fn supervise_board(
     shared: Arc<Shared>,
     backend: Arc<crate::asic::AsicBackend>,
-    board: BoardConfig,
+    mut board: BoardConfig,
     ready: oneshot::Sender<()>,
     mut shutdown: watch::Receiver<bool>,
-    mut budget: RestartBudget,
+    mut budget: RestartBackoff,
 ) {
     let mut ready = Some(ready);
     loop {
@@ -719,12 +737,44 @@ async fn supervise_board(
         let started = tokio::time::Instant::now();
         let started_unix = crate::unix_now();
         let tx = ready.take().unwrap_or_else(|| oneshot::channel().0);
-        let result = match launch(&shared, &board).await {
-            Ok(child) => {
-                supervise(shared.clone(), board.clone(), child, tx, shutdown.clone()).await
-            }
+        // D2XX enumeration and opening must not race another board's initialization.
+        let initialization = tokio::select! {
+            guard = INITIALIZATION.lock() => guard,
+            _ = shutdown.changed() => return,
+        };
+        let preparation: Result<()> = tokio::select! {
+            result = async {
+                if board.serial.is_some() {
+                    let devices = crate::inventory::discover(&shared.config).await?;
+                    board.device_location = Some(crate::inventory::board_location(&board, &devices)?);
+                }
+                shared.runtime.lock().expect("runtime").boards.get_mut(&board.id).expect("board").device_location = board.device_location;
+                Ok(())
+            } => result,
+            _ = shutdown.changed() => return,
+        };
+        let result = match preparation {
+            Ok(()) => match launch(&shared, &board).await {
+                Ok(child) => {
+                    supervise(
+                        shared.clone(),
+                        board.clone(),
+                        child,
+                        tx,
+                        shutdown.clone(),
+                        initialization,
+                    )
+                    .await
+                }
+                Err(error) => {
+                    drop(tx);
+                    drop(initialization);
+                    Err(error)
+                }
+            },
             Err(error) => {
                 drop(tx);
+                drop(initialization);
                 Err(error)
             }
         };
@@ -741,13 +791,21 @@ async fn supervise_board(
         let stop = {
             let mut state = shared.runtime.lock().expect("runtime");
             let hardware = state.boards.entry(board.id.clone()).or_default();
-            // Temperature/sensor stops and invalid proofs require explicit attention.
-            hardware.latched_fault |=
-                delay.is_none() || error.to_string().to_lowercase().contains("temperature");
-            if hardware.state != "thermal_stop" {
-                hardware.state = "fault".into();
+            // Missing USB/sensor data is recoverable. Explicit overtemperature and
+            // invalid verified proofs remain latched. Old ambiguous guards fail closed.
+            let thermal = thermal_rejection(&error);
+            hardware.latched_fault |= thermal;
+            hardware.state = if thermal || hardware.state == "thermal_stop" {
+                "thermal_stop"
+            } else if hardware.latched_fault {
+                "fault"
+            } else {
+                "reconnecting"
             }
+            .into();
             hardware.raw_speeds.clear();
+            hardware.temperature_c = None;
+            hardware.temperature_unix = 0;
             hardware.fault_reason = Some(error.to_string());
             let stop = hardware.latched_fault;
             if !state
@@ -772,13 +830,13 @@ async fn supervise_board(
             stop
         };
         backend.stop_board(&board.id).await;
-        tracing::warn!(board=%board.name, %error, attempt=budget.used, retry_seconds=?delay.map(|d| d.as_secs()), stop, "ASIC client stopped; other boards remain supervised");
+        tracing::warn!(board=%board.name, %error, attempt=budget.used, retry_seconds=delay.as_secs(), stop, "ASIC client stopped; other boards remain supervised");
         if stop {
             return;
         }
         tokio::select! {
             _ = shutdown.changed() => return,
-            _ = tokio::time::sleep(delay.expect("restart delay")) => {}
+            _ = tokio::time::sleep(delay) => {}
         }
     }
 }
@@ -808,7 +866,7 @@ pub async fn run(
             board.clone(),
             tx,
             child_shutdown.clone(),
-            RestartBudget::default(),
+            RestartBackoff::default(),
         ));
         // Keep normal USB initialization sequential, but one broken board must
         // not prevent the next board from starting or bring down existing owners.
@@ -1210,16 +1268,18 @@ done
         std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
-    fn restart_backoff_is_bounded_and_only_established_work_renews_the_budget() {
-        let mut budget = RestartBudget::default();
-        assert_eq!(budget.next(false), Some(Duration::from_secs(1)));
-        assert_eq!(budget.next(false), Some(Duration::from_secs(5)));
-        assert_eq!(budget.next(false), Some(Duration::from_secs(30)));
-        assert_eq!(budget.next(false), None);
-        assert_eq!(budget.next(true), Some(Duration::from_secs(1)));
+    fn restart_delay_is_capped_and_never_exhausts_for_communication_faults() {
+        let mut budget = RestartBackoff::default();
+        assert_eq!(budget.next(false), Duration::from_secs(1));
+        assert_eq!(budget.next(false), Duration::from_secs(5));
+        assert_eq!(budget.next(false), Duration::from_secs(30));
+        for _ in 0..100 {
+            assert_eq!(budget.next(false), Duration::from_secs(30));
+        }
+        assert_eq!(budget.next(true), Duration::from_secs(1));
     }
     #[tokio::test]
-    async fn flapping_board_exhausts_retries_without_restarting_healthy_board() {
+    async fn hotplug_recovers_after_repeated_failures_without_restarting_healthy_board() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("tl-board-isolation-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1232,8 +1292,8 @@ while [ "$#" -gt 0 ]; do
 done
 echo $$ >> "$root/launches-$loc"
 trap 'exit 0' TERM INT
+if [ "$loc" = 2 ] && [ ! -f "$root/reconnected" ]; then echo "ASIC Temp = 0.0 C; Frequency = 1500.0 MHz" >&2; exit 1; fi
 printf '%s\n' 'ASIC Temp = 40.0 C; Frequency = 1500.0 MHz; freq_idx = 1' 'VDF 0: Connected to timelord, waiting for challenge' >&2
-if [ "$loc" = 2 ]; then exit 1; fi
 while :; do printf '%s\n' 'ASIC Temp = 40.0 C; Frequency = 1500.0 MHz; freq_idx = 1' >&2; sleep .05; done
 "#).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1257,7 +1317,7 @@ while :; do printf '%s\n' 'ASIC Temp = 40.0 C; Frequency = 1500.0 MHz; freq_idx 
             shared.config.hardware.boards[0].clone(),
             tx,
             rx.clone(),
-            RestartBudget::default(),
+            RestartBackoff::default(),
         ));
         let (tx, _) = oneshot::channel();
         let flaky = tokio::spawn(supervise_board(
@@ -1266,23 +1326,54 @@ while :; do printf '%s\n' 'ASIC Temp = 40.0 C; Frequency = 1500.0 MHz; freq_idx 
             shared.config.hardware.boards[1].clone(),
             tx,
             rx.clone(),
-            RestartBudget {
+            RestartBackoff {
                 used: 0,
                 delays: [Duration::from_millis(10); 3],
             },
         ));
-        tokio::time::timeout(Duration::from_secs(5), flaky)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if shared
+                    .runtime
+                    .lock()
+                    .unwrap()
+                    .boards
+                    .get("flaky")
+                    .is_some_and(|b| b.generation >= 6)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!flaky.is_finished());
         assert!(!healthy.is_finished());
+        std::fs::write(dir.join("reconnected"), "").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if shared
+                    .runtime
+                    .lock()
+                    .unwrap()
+                    .boards
+                    .get("flaky")
+                    .is_some_and(|b| b.state == "connected")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         {
             let state = shared.runtime.lock().unwrap();
-            assert!(state.boards["flaky"].latched_fault);
-            assert_eq!(state.boards["flaky"].generation, 4);
+            assert!(!state.boards["flaky"].latched_fault);
+            assert!(state.boards["flaky"].generation >= 6);
             assert_eq!(state.boards["healthy"].generation, 1);
             assert_eq!(state.boards["healthy"].state, "connected");
-            assert_ne!(state.phase, "fault");
         }
         assert_eq!(
             std::fs::read_to_string(dir.join("launches-1"))
@@ -1291,30 +1382,23 @@ while :; do printf '%s\n' 'ASIC Temp = 40.0 C; Frequency = 1500.0 MHz; freq_idx 
                 .count(),
             1
         );
-        assert_eq!(
-            std::fs::read_to_string(dir.join("launches-2"))
+        stop.send(true).unwrap();
+        for task in [flaky, healthy] {
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
                 .unwrap()
-                .lines()
-                .count(),
-            4
-        );
-        // An explicit new recovery session can be cancelled during a long backoff.
-        shared
-            .runtime
-            .lock()
-            .unwrap()
-            .boards
-            .get_mut("flaky")
-            .unwrap()
-            .latched_fault = false;
+                .unwrap();
+        }
+        std::fs::remove_file(dir.join("reconnected")).unwrap();
+        let (stop, rx) = watch::channel(false);
         let (tx, _) = oneshot::channel();
         let retrying = tokio::spawn(supervise_board(
             shared.clone(),
-            backend.clone(),
+            backend,
             shared.config.hardware.boards[1].clone(),
             tx,
-            rx.clone(),
-            RestartBudget {
+            rx,
+            RestartBackoff {
                 used: 0,
                 delays: [Duration::from_secs(30); 3],
             },
@@ -1327,7 +1411,7 @@ while :; do printf '%s\n' 'ASIC Temp = 40.0 C; Frequency = 1500.0 MHz; freq_idx 
                     .unwrap()
                     .boards
                     .get("flaky")
-                    .is_some_and(|b| b.generation == 5 && b.state == "fault")
+                    .is_some_and(|b| b.state == "reconnecting")
                 {
                     break;
                 }
@@ -1341,18 +1425,25 @@ while :; do printf '%s\n' 'ASIC Temp = 40.0 C; Frequency = 1500.0 MHz; freq_idx 
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dir.join("launches-2"))
-                .unwrap()
-                .lines()
-                .count(),
-            5
-        );
-        tokio::time::timeout(Duration::from_secs(3), healthy)
-            .await
-            .unwrap()
-            .unwrap();
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn missing_sensor_data_is_not_a_thermal_rejection() {
+        for reason in [
+            "temperature_unavailable",
+            "initial_readback attempts=3",
+            "ASIC temperature telemetry stopped",
+            "USB open failed",
+        ] {
+            assert!(!thermal_rejection(&anyhow::anyhow!(
+                "Native control rejected request 2: {reason}"
+            )));
+        }
+        for reason in ["temperature_limit", "temperature_guard"] {
+            assert!(thermal_rejection(&anyhow::anyhow!(
+                "Native control rejected request 2: {reason}"
+            )));
+        }
     }
     #[test]
     fn temperature_parser_rejects_nonfinite_measurements() {

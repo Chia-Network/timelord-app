@@ -458,7 +458,11 @@ async fn status(State(shared): State<Arc<Shared>>) -> Json<Status> {
                 frequency_mhz: runtime.boards.get(&b.id).and_then(|b| b.frequency_mhz),
                 voltage_v: runtime.boards.get(&b.id).and_then(|b| b.voltage_v),
                 profile: b.profile_name(),
-                device_location: b.device_location,
+                device_location: runtime
+                    .boards
+                    .get(&b.id)
+                    .and_then(|h| h.device_location)
+                    .or(b.device_location),
                 serial: b.serial.clone(),
                 recoveries: runtime.boards.get(&b.id).map(|b| b.recoveries).unwrap_or(0),
                 automatic: runtime.boards.get(&b.id).and_then(|b| b.automatic.clone()),

@@ -19,6 +19,12 @@ inline bool valid(Point p) {
     return std::isfinite(p.frequency) && std::isfinite(p.voltage)
         && p.frequency >= 200 && p.frequency <= 2200 && p.voltage >= .7 && p.voltage <= 1.;
 }
+// A missing sensor read must stop this client, but is not proof of overheating.
+inline void check_temperature(double temperature) {
+    if (!std::isfinite(temperature) || temperature <= 0.)
+        throw std::runtime_error("temperature_unavailable");
+    if (temperature >= 55.) throw std::runtime_error("temperature_limit");
+}
 // Return the same floor entry used for live PLL writes.
 template<class Entry>
 size_t frequency_index(double target, const Entry *entries, size_t count) {

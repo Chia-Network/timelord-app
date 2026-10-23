@@ -33,6 +33,13 @@ service running. Quit from the app, menu bar, Dock, or system logout waits for t
 app’s owned service to stop its ASIC clients and save chart history. An externally
 started service is observed without taking ownership.
 
+USB disconnects and unreadable sensor data stop only the affected client. The
+service retries after 1, 5, then at most every 30 seconds without exhausting a
+retry budget, and finds a returning board by serial even if its USB location
+changes. Other boards keep running. Confirmed overtemperature and invalid proofs
+remain stopped for attention; missing telemetry never permits bypassing the
+native control checks. Returning boards keep their assigned chains.
+
 While its owned service runs, the app prevents idle system sleep and App Nap;
 the display can still sleep and the screen can lock. Pause/exit releases the
 activity after the service exits. Explicit system sleep is not prevented.
