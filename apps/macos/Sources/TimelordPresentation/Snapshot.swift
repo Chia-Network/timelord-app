@@ -52,6 +52,12 @@ public struct BoardSnapshot: Identifiable, Sendable {
     public let lastProof: Date?
     public var rawSpeeds: [RawSpeed] = []
     public var automatic: AutomaticStatus? = nil
+    public func rawSpeed(for chain: Chain) -> RawSpeed? {
+        guard state == .active || state == .waiting,
+              let index = histories.firstIndex(where: { $0.chain == chain }) else { return nil }
+        let physicalEngine = histories.count == 1 ? 1 : index
+        return rawSpeeds.first { $0.engine == physicalEngine }
+    }
     public var isAutomatic: Bool { profile.lowercased() == "automatic" }
     public var automaticTitle: String {
         guard let automatic else { return "Learning starts with Timelord" }

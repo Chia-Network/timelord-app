@@ -17,14 +17,14 @@ struct BoardCard: View {
                         Spacer()
                         Text(board.temperatureText).font(.headline).monospacedDigit().foregroundStyle(board.state == .thermalStop ? Color.red : Color.primary)
                     }
-                    ForEach(Array(board.histories.enumerated()), id: \.element.id) { index, history in
+                    ForEach(board.histories) { history in
                         VStack(alignment: .leading, spacing: 6) {
                             HStack {
                                 Label(history.chain.title, systemImage: "circle.fill").font(.subheadline).foregroundStyle(history.chain.color)
                                 Spacer()
                             }
                             HStack(spacing: 12) {
-                                let raw = board.state == .active || board.state == .waiting ? board.rawSpeeds.first(where: { $0.engine == index }) : nil
+                                let raw = board.rawSpeed(for: history.chain)
                                 Text("Raw \(raw?.displayText(at: snapshot.now) ?? "—")")
                                     .help(raw?.state == "sampling" ? "Last sample; starting a new chain." : "Recent hardware speed.")
                                 Text("Mean \(snapshot.recentSpeed(for: history))")

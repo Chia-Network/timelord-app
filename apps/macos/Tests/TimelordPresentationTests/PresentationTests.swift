@@ -32,6 +32,24 @@ final class PresentationTests: XCTestCase {
         XCTAssertEqual(try sample("running").displayText(at: now.addingTimeInterval(6)), "—")
     }
 
+    func testRawSpeedUsesThePhysicalEngineForEachAssignedChain() {
+        let chains: [Chain] = [.challenge, .reward, .infusedChallenge]
+        for count in 1...3 {
+            let histories = Array(chains.prefix(count)).map(ChainHistory.empty)
+            var board = BoardSnapshot(id: "a", name: "A", state: .active, temperatureC: 40,
+                temperatureLimitC: 55, profile: "Automatic", frequencyMHz: 1900,
+                voltageV: 1, histories: histories, lastProof: now,
+                rawSpeeds: (0...2).map { RawSpeed(engine: $0, ips: Double(1_000_000 + $0), timestampUnix: now.timeIntervalSince1970, state: "running") })
+            for (index, history) in histories.enumerated() {
+                let expected = count == 1 ? 1 : index
+                XCTAssertEqual(board.rawSpeed(for: history.chain)?.engine, expected)
+                XCTAssertEqual(board.rawSpeed(for: history.chain)?.ips, Double(1_000_000 + expected))
+            }
+            board.rawSpeeds = []
+            XCTAssertNil(board.rawSpeed(for: histories[0].chain))
+        }
+    }
+
     func testRawSpeedExpiresAndRejectsInvalidValues() throws {
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
         let speed = try decoder.decode(RawSpeed.self, from: Data(#"{"engine":2,"ips":1055000,"timestamp_unix":1000000}"#.utf8))
