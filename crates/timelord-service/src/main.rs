@@ -103,6 +103,12 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Internal disposable driver process; never loads D2XX into the service.
+    #[command(hide = true)]
+    UsbInventory {
+        #[arg(long)]
+        driver_library: PathBuf,
+    },
     /// Run a bounded, isolated three-chain ASIC proof check without a full node.
     CheckHardware {
         #[arg(long)]
@@ -271,6 +277,12 @@ async fn main() -> Result<()> {
             "{}",
             serde_json::to_string(&inventory::discover(&load(&config)?).await?)?
         ),
+        Command::UsbInventory { driver_library } => {
+            println!(
+                "{}",
+                serde_json::to_string(&inventory::native(&driver_library)?)?
+            );
+        }
         Command::CheckHardware { config } => {
             println!(
                 "{}",

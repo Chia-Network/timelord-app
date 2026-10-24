@@ -30,8 +30,13 @@ It makes one startup attempt per app launch and respects Pause, unsaved settings
 and shutdown. Starting at macOS login and crash-independent launch-agent ownership
 are outside the current implementation.
 
-Discovery resolves D2XX enumeration exports only: it never opens or initializes
-an ASIC. Serial identity survives USB-port changes. The active plan includes only
+Discovery calls only D2XX inventory APIs in a disposable helper process; it sends
+no engine, voltage or clock commands. The proof service never loads the USB driver.
+A ten-second timeout kills and reaps a stuck helper instead of leaving a blocking
+thread running. Helper crashes, invalid JSON and bounded-output failures are
+inventory errors, not an empty inventory or a reason to stop healthy boards.
+The driver stays loaded until its helper exits, avoiding unload while its USB
+background threads may still be running. Serial identity survives USB-port changes. The active plan includes only
 detected boards; one/two/three boards receive 3 / 2+1 / 1+1+1 engines. The service
 polls USB every five seconds and requires three consistent inventories before
 replacing the layout. Enumeration errors leave the existing layout intact; fresh
