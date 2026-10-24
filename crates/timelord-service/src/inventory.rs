@@ -285,9 +285,18 @@ pub(crate) fn connected_plan(mut config: Config, devices: Vec<Device>) -> Result
 pub struct TopologyChange {
     pending: Vec<(String, Option<String>, Option<u32>)>,
     confirmations: usize,
+    pending_since: Option<std::time::Instant>,
 }
 impl TopologyChange {
     pub fn observe(&mut self, current: &Config, candidate: Result<Config>) -> Option<Config> {
+        self.observe_at(current, candidate, std::time::Instant::now())
+    }
+    fn observe_at(
+        &mut self,
+        current: &Config,
+        candidate: Result<Config>,
+        now: std::time::Instant,
+    ) -> Option<Config> {
         fn key(config: &Config) -> Vec<(String, Option<String>, Option<u32>)> {
             let mut key: Vec<_> = config
                 .hardware
@@ -313,12 +322,17 @@ impl TopologyChange {
         }
         if self.confirmations == 0 || next != self.pending {
             self.pending = next;
+            self.pending_since = Some(now);
             self.confirmations = 1;
         } else {
             self.confirmations += 1;
         }
         // Three polls, five seconds apart: at least ten seconds of agreement.
-        if self.confirmations < 3 {
+        if self.confirmations < 3
+            || self
+                .pending_since
+                .is_none_or(|start| now.duration_since(start) < std::time::Duration::from_secs(10))
+        {
             return None;
         }
         self.confirmations = 0;
@@ -436,30 +450,47 @@ mod tests {
         let one = connected_plan(current.clone(), devices(&[0])).unwrap();
         let two = connected_plan(current.clone(), devices(&[0, 1])).unwrap();
         let mut debounce = TopologyChange::default();
-        assert!(debounce.observe(&current, Ok(one.clone())).is_none());
-        assert!(debounce.observe(&current, Ok(one.clone())).is_none());
-        assert!(
-            debounce
-                .observe(&current, Err(anyhow::anyhow!("busy")))
-                .is_none()
-        );
-        assert!(debounce.observe(&current, Ok(one.clone())).is_none());
-        assert!(debounce.observe(&current, Ok(two)).is_none());
-        assert!(debounce.observe(&current, Ok(one.clone())).is_none());
-        assert!(debounce.observe(&current, Ok(current.clone())).is_none());
+        let mut now = std::time::Instant::now();
+        let mut observe = |candidate| {
+            now += std::time::Duration::from_secs(5);
+            debounce.observe_at(&current, candidate, now)
+        };
+        assert!(observe(Ok(one.clone())).is_none());
+        assert!(observe(Ok(one.clone())).is_none());
+        assert!(observe(Err(anyhow::anyhow!("busy"))).is_none());
+        assert!(observe(Ok(one.clone())).is_none());
+        assert!(observe(Ok(two)).is_none());
+        assert!(observe(Ok(one.clone())).is_none());
+        assert!(observe(Ok(current.clone())).is_none());
         let mut reordered = current.clone();
         reordered.hardware.boards.reverse();
-        assert!(debounce.observe(&current, Ok(reordered)).is_none());
-        assert!(debounce.observe(&current, Ok(one.clone())).is_none());
-        assert!(debounce.observe(&current, Ok(one.clone())).is_none());
-        assert_eq!(
-            debounce
-                .observe(&current, Ok(one))
-                .unwrap()
-                .hardware
-                .boards
-                .len(),
-            1
+        assert!(observe(Ok(reordered)).is_none());
+        assert!(observe(Ok(one.clone())).is_none());
+        assert!(observe(Ok(one.clone())).is_none());
+        assert_eq!(observe(Ok(one)).unwrap().hardware.boards.len(), 1);
+    }
+    #[test]
+    fn missed_poll_ticks_cannot_shorten_the_debounce_period() {
+        let current = configured();
+        let one = connected_plan(current.clone(), devices(&[0])).unwrap();
+        let mut change = TopologyChange::default();
+        let now = std::time::Instant::now();
+        for _ in 0..4 {
+            assert!(change.observe_at(&current, Ok(one.clone()), now).is_none());
+        }
+        assert!(
+            change
+                .observe_at(
+                    &current,
+                    Ok(one.clone()),
+                    now + std::time::Duration::from_secs(9)
+                )
+                .is_none()
+        );
+        assert!(
+            change
+                .observe_at(&current, Ok(one), now + std::time::Duration::from_secs(10))
+                .is_some()
         );
     }
     #[test]
