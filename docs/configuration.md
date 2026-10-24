@@ -44,7 +44,16 @@ For multiple boards, give each a distinct id and client port (18110–18112). US
 locations are discovered afresh; serials preserve settings across port changes.
 `remembered_boards` retains disconnected board settings. The number of detected
 boards determines capacity: one board runs three engines, two boards run two plus
-one, and three boards run one each. A topology change requires restarting the service.
+one, and three boards run one each. Automatic layouts rebalance while the service
+runs, after three agreeing five-second discovery polls. This briefly stops proof
+work and reconnects the node with the new layout; it does not restart the app or
+status endpoint. No boards leaves the service waiting for hardware. USB discovery
+errors do not trigger redistribution. A changed layout uses its separately learned
+engine-count/mask profile, or its configured Automatic starting frequency/voltage
+if no matching profile exists. A high single-engine clock is never reused as a
+three-engine learned setting. Thermal and invalid-proof faults stay latched.
+Changed assignments start fresh chart scopes and run counters, preserving correct
+board attribution; ordinary same-layout client reconnects retain the charts.
 
 ### Chain assignments
 
@@ -64,10 +73,10 @@ preserve configuration order. Speeds within 2% retain configuration order too.
 Accepted healthy profiles refresh their evidence at most every five minutes.
 These observation and tie thresholds are engineering defaults.
 
-The resolved plan is fixed for the run. Tuning and reconnecting a board never
-shuffle chain ownership; improved evidence applies on the next service start.
-One- and two-board layouts retain their existing assignment rules. Automatic
-redistribution after a board disappears is not implemented.
+The resolved plan stays fixed while the hardware topology is unchanged. Tuning
+alone does not shuffle chain ownership. Improved ranking evidence applies on the
+next service start or stable topology change. One- and two-board layouts retain
+their existing assignment rules.
 
 Administrators can override the three-board ranking by adding this table to the
 config (values are **serial numbers**, not board names or USB locations):

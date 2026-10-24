@@ -87,7 +87,7 @@ final class TimelordModel: ObservableObject {
         var serviceAbsent = false
         do {
             let result = try await liveClient.fetch(expectedPID: controller.processID)
-            if liveStatus?.servicePid != result.servicePid { history = nil; lastHistoryFetch = .distantPast }
+            if liveStatus?.servicePid != result.servicePid || liveStatus?.startedUnix != result.startedUnix { history = nil; lastHistoryFetch = .distantPast }
             liveStatus = result
             automaticStartPending = false // Observe an existing service without taking ownership.
             if Date().timeIntervalSince(lastHistoryFetch) >= 15 {
@@ -281,10 +281,8 @@ final class TimelordModel: ObservableObject {
             if errorMessage==discoveryError {errorMessage=nil};discoveryError=nil
             savedConfiguration.hardware=BoardDiscovery.reconcile(devices,hardware:savedConfiguration.hardware)
             configuration.hardware=BoardDiscovery.reconcile(devices,hardware:configuration.hardware)
-            if let liveStatus {
-                let counts=BoardTopology.counts(savedConfiguration.hardware.boards)
-                if Set(liveStatus.boards.map(\.id)) != Set(savedConfiguration.hardware.boards.map(\.id)) || savedConfiguration.hardware.boards.enumerated().contains(where:{index,b in liveStatus.boards.first(where:{$0.id==b.id})?.assignedChains.count != counts[index]}) {configurationNeedsRestart=true}
-            }
+            // The service owns debounced topology changes, including headless
+            // deployments. Discovery must not ask users to restart it manually.
             updateSnapshot()
         } catch { if liveStatus == nil {discoveredDevices=[];updateSnapshot()}; discoveryError=error.localizedDescription;errorMessage=error.localizedDescription }
     }

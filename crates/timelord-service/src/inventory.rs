@@ -190,7 +190,7 @@ mod driver_path_tests {
 }
 
 /// Resolve only physically enumerated boards, preserving the stored registry.
-/// This changes the launch plan, never the config file or a running service.
+/// The returned plan never changes the on-disk configuration.
 pub async fn connected_configuration(config: Config) -> Result<Config> {
     if config.hardware.client_binary.is_none() {
         return Ok(config);
@@ -199,7 +199,29 @@ pub async fn connected_configuration(config: Config) -> Result<Config> {
     connected_plan(config, devices)
 }
 
-fn connected_plan(mut config: Config, devices: Vec<Device>) -> Result<Config> {
+pub(crate) fn connected_plan(mut config: Config, devices: Vec<Device>) -> Result<Config> {
+    // Preserve each board's identity and settings while it is unplugged. Learned
+    // operating points are separately keyed by serial, engine count and mask.
+    for board in &config.hardware.boards {
+        config
+            .hardware
+            .remembered_boards
+            .retain(|b| b.id != board.id);
+        config.hardware.remembered_boards.push(board.clone());
+    }
+    let mut identities = std::collections::BTreeSet::new();
+    for device in &devices {
+        if !identities.insert((
+            device.serial.clone(),
+            if device.serial.is_some() {
+                0
+            } else {
+                device.location
+            },
+        )) {
+            bail!("Ambiguous ASIC identity; retry discovery");
+        }
+    }
     // A serial-pinned mapping remains fixed even if a board is absent. Its owner
     // retries discovery while the healthy boards keep their existing chains.
     let pinned = config.hardware.chain_assignments.is_some();
@@ -253,18 +275,197 @@ fn connected_plan(mut config: Config, devices: Vec<Device>) -> Result<Config> {
         board.serial = device.serial;
         config.hardware.boards.push(board);
     }
-    if config.hardware.boards.is_empty() {
-        bail!(
-            "No available Chia ASICs detected. Check USB connections and that another client is not using them."
-        );
-    }
     config.validate().map_err(anyhow::Error::msg)?;
     Ok(config)
+}
+
+/// Debounce successful physical inventories. Enumeration failures break the
+/// streak; they are never interpreted as unplugged boards.
+#[derive(Default)]
+pub struct TopologyChange {
+    pending: Vec<(String, Option<String>, Option<u32>)>,
+    confirmations: usize,
+}
+impl TopologyChange {
+    pub fn observe(&mut self, current: &Config, candidate: Result<Config>) -> Option<Config> {
+        fn key(config: &Config) -> Vec<(String, Option<String>, Option<u32>)> {
+            let mut key: Vec<_> = config
+                .hardware
+                .boards
+                .iter()
+                .map(|b| (b.id.clone(), b.serial.clone(), b.device_location))
+                .collect();
+            key.sort();
+            key
+        }
+        let candidate = match candidate {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::debug!(%error, "USB inventory unavailable; retaining current topology");
+                self.confirmations = 0;
+                return None;
+            }
+        };
+        let next = key(&candidate);
+        if next == key(current) {
+            self.confirmations = 0;
+            return None;
+        }
+        if self.confirmations == 0 || next != self.pending {
+            self.pending = next;
+            self.confirmations = 1;
+        } else {
+            self.confirmations += 1;
+        }
+        // Three polls, five seconds apart: at least ten seconds of agreement.
+        if self.confirmations < 3 {
+            return None;
+        }
+        self.confirmations = 0;
+        Some(candidate)
+    }
+}
+
+pub async fn live_configuration(shared: &crate::Shared) -> Result<Config> {
+    // Explicit administrator mappings retain their fixed chain ownership.
+    if shared.config.hardware.client_binary.is_none()
+        || shared.config.hardware.chain_assignments.is_some()
+    {
+        return Ok(shared.config.clone());
+    }
+    let _initialization = crate::hardware::INITIALIZATION.lock().await;
+    let mut devices = discover(&shared.config).await?;
+    {
+        // Keep the same lock order as the status handler.
+        let clients = shared.clients.lock().expect("clients");
+        let runtime = shared.runtime.lock().expect("runtime");
+        // Open FTDI interfaces can omit metadata. Require recent hardware
+        // telemetry as well as a live socket; an old connection is not presence.
+        for board in &shared.config.hardware.boards {
+            if runtime.boards.get(&board.id).is_some_and(|state| {
+                state.state == "connected"
+                    && state.temperature_unix.saturating_add(15) >= crate::unix_now()
+            }) && clients.iter().any(|(id, _)| id == &board.id)
+                && !devices.iter().any(|d| {
+                    d.serial == board.serial && d.serial.is_some()
+                        || Some(d.location) == board.device_location
+                })
+                && let Some(location) = runtime
+                    .boards
+                    .get(&board.id)
+                    .and_then(|b| b.device_location)
+                    .or(board.device_location)
+            {
+                devices.push(Device {
+                    name: board.name.clone(),
+                    serial: board.serial.clone(),
+                    location,
+                });
+            }
+        }
+    }
+    connected_plan(shared.config.clone(), devices)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn configured() -> Config {
+        let mut config = Config::default();
+        config.hardware.boards = (0..3).map(|i| toml::from_str(&format!(
+            "id='b{i}'\nname='B{i}'\nserial='serial-{i}'\ndevice_location={}\nclient_port={}\nprofile='automatic'", i+1, i+18110
+        )).unwrap()).collect();
+        config.hardware.boards[0].automatic.start_frequency_mhz = 1460.;
+        config
+    }
+    fn devices(indices: &[u32]) -> Vec<Device> {
+        indices
+            .iter()
+            .map(|i| Device {
+                name: "Chia VDF A".into(),
+                location: i + 1,
+                serial: Some(format!("serial-{i}")),
+            })
+            .collect()
+    }
+    #[test]
+    fn automatic_topology_survives_three_one_zero_two_three_and_remembers_settings() {
+        let original = configured();
+        let mut config = original.clone();
+        for (present, counts) in [
+            (vec![0], vec![3]),
+            (vec![], vec![]),
+            (vec![0, 1], vec![2, 1]),
+            (vec![0, 1, 2], vec![1, 1, 1]),
+        ] {
+            config = connected_plan(config, devices(&present)).unwrap();
+            let plan = config.assignments().unwrap();
+            assert_eq!(
+                config
+                    .hardware
+                    .boards
+                    .iter()
+                    .map(|b| plan.iter().filter(|a| a.board_id == b.id).count())
+                    .collect::<Vec<_>>(),
+                counts
+            );
+            assert_eq!(plan.len(), if present.is_empty() { 0 } else { 3 });
+            assert_eq!(config.hardware.remembered_boards.len(), 3);
+        }
+        assert_eq!(
+            config.hardware.boards[0].automatic.start_frequency_mhz,
+            1460.
+        );
+        for board in &config.hardware.boards {
+            let saved = original
+                .hardware
+                .boards
+                .iter()
+                .find(|b| b.id == board.id)
+                .unwrap();
+            assert_eq!(saved.serial, board.serial);
+            assert_eq!(
+                serde_json::to_value(&saved.automatic).unwrap(),
+                serde_json::to_value(&board.automatic).unwrap()
+            );
+        }
+    }
+    #[test]
+    fn topology_requires_three_consistent_successes_and_ignores_order() {
+        let current = configured();
+        let one = connected_plan(current.clone(), devices(&[0])).unwrap();
+        let two = connected_plan(current.clone(), devices(&[0, 1])).unwrap();
+        let mut debounce = TopologyChange::default();
+        assert!(debounce.observe(&current, Ok(one.clone())).is_none());
+        assert!(debounce.observe(&current, Ok(one.clone())).is_none());
+        assert!(
+            debounce
+                .observe(&current, Err(anyhow::anyhow!("busy")))
+                .is_none()
+        );
+        assert!(debounce.observe(&current, Ok(one.clone())).is_none());
+        assert!(debounce.observe(&current, Ok(two)).is_none());
+        assert!(debounce.observe(&current, Ok(one.clone())).is_none());
+        assert!(debounce.observe(&current, Ok(current.clone())).is_none());
+        let mut reordered = current.clone();
+        reordered.hardware.boards.reverse();
+        assert!(debounce.observe(&current, Ok(reordered)).is_none());
+        assert!(debounce.observe(&current, Ok(one.clone())).is_none());
+        assert!(debounce.observe(&current, Ok(one.clone())).is_none());
+        assert_eq!(
+            debounce
+                .observe(&current, Ok(one))
+                .unwrap()
+                .hardware
+                .boards
+                .len(),
+            1
+        );
+    }
+    #[test]
+    fn ambiguous_serial_is_not_a_topology_change() {
+        assert!(connected_plan(configured(), devices(&[0, 0])).is_err());
+    }
     #[test]
     fn explicit_mapping_keeps_absent_board_while_refreshing_connected_locations() {
         let mut config = Config::default();

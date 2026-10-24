@@ -91,7 +91,7 @@ async fn terminate(child: &mut Child) {
 }
 // Drain stderr even while control is awaiting its acknowledgement. A recovery
 // flood must not fill the pipe and block the USB owner before it reads TLSET.
-static INITIALIZATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static INITIALIZATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct ClientLog {
     lines: tokio::io::Lines<BufReader<tokio::process::ChildStderr>>,
@@ -895,6 +895,16 @@ pub async fn run(
     let (stop, child_shutdown) = watch::channel(false);
     for board in &shared.config.hardware.boards {
         if !shared.assignments.iter().any(|a| a.board_id == board.id) {
+            continue;
+        }
+        if shared
+            .runtime
+            .lock()
+            .expect("runtime")
+            .boards
+            .get(&board.id)
+            .is_some_and(|b| b.latched_fault)
+        {
             continue;
         }
         shared.runtime.lock().expect("runtime").boards.insert(

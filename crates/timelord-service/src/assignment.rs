@@ -1,4 +1,4 @@
-//! Resolve once per run. Tuning and USB reconnects never mutate chain ownership.
+//! Resolve per topology generation. Tuning alone never mutates chain ownership.
 use crate::{
     automatic,
     runtime::{RawSpeed, RawState},

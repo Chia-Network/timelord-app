@@ -38,7 +38,11 @@ service retries after 1, 5, then at most every 30 seconds without exhausting a
 retry budget, and finds a returning board by serial even if its USB location
 changes. Other boards keep running. Confirmed overtemperature and invalid proofs
 remain stopped for attention; missing telemetry never permits bypassing the
-native control checks. Returning boards keep their assigned chains.
+native control checks. Automatic layouts rebalance after a stable USB change:
+one board runs three engines, two run two plus one, and three run one each.
+This briefly restarts the proof session and native clients, while the status API
+stays available. Each layout uses its own learned tuning profile. Explicit
+serial-pinned chain assignments retain their mapping instead.
 
 While its owned service runs, the app prevents idle system sleep and App Nap;
 the display can still sleep and the screen can lock. Pause/exit releases the
@@ -146,8 +150,7 @@ need validation. This repository is development source, not a production release
 
 The pinned Rust scheduler needs a narrow decoder for current Chia unfinished-block
 messages. Absent MMR roots are supported; active header MMR roots fail closed.
-Automatic hotplug failover, live configuration reload and start-at-login service
-registration are not implemented. Chart history is checkpointed to disk for up to
+Live configuration reload and start-at-login service registration are not implemented. Chart history is checkpointed to disk for up to
 24 hours and restored after service restarts, with downtime shown as gaps. Current
 uptime, proof counts and health still start fresh for each service run.
 

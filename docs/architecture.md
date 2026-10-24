@@ -32,8 +32,17 @@ are outside the current implementation.
 
 Discovery resolves D2XX enumeration exports only: it never opens or initializes
 an ASIC. Serial identity survives USB-port changes. The active plan includes only
-detected boards; one/two/three boards receive 3 / 2+1 / 1+1+1 engines. Reassignment
-requires restart. The UI keeps a separate registry of disconnected board settings.
+detected boards; one/two/three boards receive 3 / 2+1 / 1+1+1 engines. The service
+polls USB every five seconds and requires three consistent inventories before
+replacing the layout. Enumeration errors leave the existing layout intact; fresh
+client telemetry covers metadata omitted by open FTDI interfaces. Old scheduler,
+client listeners and native owners stop before new ones start, while the status
+HTTP listener stays available. Zero boards waits for reconnection. Each layout
+selects its own engine-count/mask tuning profile, and safety faults remain latched
+across transitions. Explicit serial-pinned mappings do not redistribute. A changed
+assignment starts a new chart scope and run counters; old chain samples never
+become observations for another board. The service and UI keep disconnected
+board settings by serial. Configuration edits still require a manual restart.
 
 ## Proof path
 
