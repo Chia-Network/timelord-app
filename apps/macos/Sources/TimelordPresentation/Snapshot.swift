@@ -116,7 +116,8 @@ public struct AppSnapshot: Sendable {
     }
     public var chartUpperBound: Double {
         let values = boards.flatMap(\.histories).flatMap { $0.observations(in: HistoryRange.day.interval(endingAt: now)) }.map(\.ips)
-        return max(1_000_000, values.max() ?? 0) * 1.08
+        // Leave visible space above peaks and avoid small scale changes between refreshes.
+        return ceil(max(1_000_000, values.max() ?? 0) * 1.2 / 100_000) * 100_000
     }
 }
 

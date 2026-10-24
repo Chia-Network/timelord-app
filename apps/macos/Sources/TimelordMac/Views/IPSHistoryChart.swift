@@ -27,7 +27,7 @@ struct IPSHistoryChart: View {
                         }
                     }
                     .chartYAxis {
-                        AxisMarks(position: .leading, values: .automatic(desiredCount: 4)) { value in
+                        AxisMarks(position: .leading, values: (0...4).map { upperBound * Double($0) / 4 }) { value in
                             AxisGridLine()
                             AxisValueLabel { if let ips = value.as(Double.self) { Text(DisplayFormat.ips(ips)) } }
                         }
