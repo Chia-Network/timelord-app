@@ -62,6 +62,12 @@ pub struct RawSpeed {
 #[derive(Clone, Default, Serialize)]
 pub struct HardwareState {
     #[serde(skip)]
+    pub native_initialized: bool,
+    #[serde(skip)]
+    pub verified_generation: Option<u64>,
+    #[serde(skip)]
+    pub verified_slots: std::collections::BTreeSet<u8>,
+    #[serde(skip)]
     pub generation: u64,
     pub device_location: Option<u32>,
     #[serde(skip)]
@@ -98,6 +104,12 @@ impl HardwareState {
     }
 }
 pub struct RuntimeState {
+    pub metrics: Option<Arc<crate::observability::Metrics>>,
+    pub metric_epoch: u64,
+    pub pending: [u32; 3],
+    pub scheduler_initialized: bool,
+    pub scheduler_height: Option<u32>,
+    pub scheduler_deficit: Option<u8>,
     pub phase: String,
     pub node: String,
     pub message: String,
@@ -115,6 +127,12 @@ pub struct RuntimeState {
 impl Default for RuntimeState {
     fn default() -> Self {
         Self {
+            metrics: None,
+            metric_epoch: 0,
+            pending: [0; 3],
+            scheduler_initialized: false,
+            scheduler_height: None,
+            scheduler_deficit: None,
             phase: "setup_required".into(),
             node: "not_configured".into(),
             message: "Connect a full node to get started.".into(),
@@ -317,6 +335,18 @@ async fn send(socket: &mut Socket, message: Message) -> Result<()> {
         .context("Node send timed out")??;
     Ok(())
 }
+async fn submit(
+    shared: &Shared,
+    kind: &str,
+    sending: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    let started = Instant::now();
+    sending.await?;
+    if let Some(metrics) = &shared.runtime.lock().expect("runtime").metrics {
+        metrics.submitted(kind, started.elapsed());
+    }
+    Ok(())
+}
 fn proof_digest(
     proof: &dg_xch_core::blockchain::vdf_proof::VdfProof,
 ) -> Result<dg_xch_core::blockchain::sized_bytes::Bytes32> {
@@ -409,6 +439,11 @@ async fn execute(backend: Arc<AsicBackend>, plan: WorkPlan) -> Result<Completed>
     }
     let bundle_ready = Instant::now();
     for (chain, timing) in &speeds {
+        backend.observe_duration(
+            *chain,
+            "bundle_wait",
+            bundle_ready.saturating_duration_since(timing.ready_at),
+        );
         tracing::info!(
             ?chain,
             generation = plan.generation,
@@ -432,6 +467,15 @@ async fn execute(backend: Arc<AsicBackend>, plan: WorkPlan) -> Result<Completed>
     })
 }
 async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
+    {
+        let mut state = shared.runtime.lock().expect("runtime");
+        if let Some(metrics) = &state.metrics {
+            state.metric_epoch = metrics.begin_session();
+        }
+        state.scheduler_initialized = false;
+        state.scheduler_height = None;
+        state.scheduler_deficit = None;
+    }
     shared.runtime.lock().expect("runtime").transition(
         "waiting_for_node",
         "connecting",
@@ -444,7 +488,13 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
     let bits = resolved.constants.discriminant_size_bits as usize;
     let mut scheduler = Scheduler::new(resolved.constants, resolved.allows_bootstrap, None)?;
     let mut socket = connect(&shared.config).await?;
-    shared.runtime.lock().expect("runtime").connected();
+    {
+        let mut state = shared.runtime.lock().expect("runtime");
+        state.connected();
+        if let Some(metrics) = &state.metrics {
+            metrics.connected();
+        }
+    }
     shared.runtime.lock().expect("runtime").transition(
         "waiting_for_node",
         "authenticated",
@@ -465,6 +515,11 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
             bail!("Node has not confirmed the infusion; reconnecting for chain state");
         }
         let next = scheduler.next_plan()?;
+        shared
+            .runtime
+            .lock()
+            .expect("runtime")
+            .scheduler_initialized = scheduler.initialized();
         if active.as_ref().is_some_and(|current| {
             next.as_ref().is_none_or(|next| {
                 current.generation != next.generation
@@ -512,6 +567,11 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                     }
                     _ => None,
                 };
+                let kind = match &output {
+                    Output::SignagePoint(_) => "signage",
+                    Output::InfusionPoint(_) => "infusion",
+                    Output::EndOfSubSlot(_) => "end_of_sub_slot",
+                };
                 let message = match output {
                     Output::SignagePoint(value) => {
                         tracing::info!(index=value.index_from_challenge, cc=%value.challenge_chain_sp_vdf.output.hash()?, rc=%value.reward_chain_sp_vdf.output.hash()?, cc_proof=%proof_digest(&value.challenge_chain_sp_proof)?, rc_proof=%proof_digest(&value.reward_chain_sp_proof)?, "Submitting verified signage point");
@@ -525,7 +585,7 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                         encode(ProtocolMessageTypes::NewEndOfSubSlotVdf, &value, None)?
                     }
                 };
-                send(&mut socket, message).await?;
+                submit(&shared, kind, send(&mut socket, message)).await?;
                 shared
                     .runtime
                     .lock()
@@ -554,13 +614,26 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
             }
             incoming = socket.next() => {
                 last_message = Instant::now();
+                if incoming.as_ref().is_some_and(|r|r.is_ok()) && let Some(metrics)=&shared.runtime.lock().expect("runtime").metrics {metrics.stamp("last_node_message_timestamp_seconds",&[]);}
                 match incoming.context("Node disconnected")?? {
                     Message::Binary(bytes) => {
                         let message: ChiaMessage = decode_exact(&bytes)?;
                         match message.msg_type {
                             ProtocolMessageTypes::NewPeakTimelord => {
                                 let peak: dg_xch_core::protocols::timelord::NewPeakTimelord=decode_exact(message.data.as_slice())?;
-                                if scheduler.set_peak(peak.clone())? {
+                                let metrics=shared.runtime.lock().expect("runtime").metrics.clone();
+                                if let Some(metrics)=&metrics {metrics.stamp("last_peak_received_timestamp_seconds",&[]);}
+                                let accepted=match scheduler.set_peak(peak.clone()) {
+                                    Ok(accepted)=>accepted,
+                                    Err(error)=>{if let Some(metrics)=&metrics {metrics.inc("peak_updates_total",&["rejected"]);}return Err(error.into());}
+                                };
+                                if let Some(metrics)=&metrics {metrics.inc("peak_updates_total",&[if accepted {"accepted"} else {"ignored"}]);}
+                                if accepted {
+                                    {
+                                        let mut state=shared.runtime.lock().expect("runtime");
+                                        state.scheduler_height=Some(peak.reward_chain_block.height);
+                                        state.scheduler_deficit=Some(peak.deficit);
+                                    }
                                     let work=infused_from_peak(&peak,scheduler.generation(),bits,minimum_deficit)?;
                                     prime_infused(&mut primers,backend.clone(),work);
                                 }
@@ -599,6 +672,10 @@ pub async fn run(
                 }
                 state.event(Some(failure.board_id.clone()), "board_fault");
             }
+            if let Some(metrics) = &state.metrics {
+                metrics.disconnect(state.metric_epoch);
+            }
+            state.scheduler_initialized = false;
             state.transition("waiting_for_node", "disconnected", &error.to_string());
             state.event(None, "node_unavailable");
         }
@@ -815,6 +892,28 @@ mod tests {
                 Err(error)
             }
         }
+    }
+    #[tokio::test]
+    async fn submissions_count_only_successful_sends() {
+        let metrics = crate::observability::Metrics::new(timelord_core::Network::Mainnet).unwrap();
+        let shared = Shared {
+            config: Config::default(),
+            assignments: vec![],
+            clients: Default::default(),
+            runtime: Arc::new(std::sync::Mutex::new(RuntimeState {
+                metrics: Some(metrics.clone()),
+                ..Default::default()
+            })),
+            started_unix: unix_now(),
+        };
+        assert!(
+            submit(&shared, "signage", async { bail!("fixture send failed") })
+                .await
+                .is_err()
+        );
+        assert_eq!(metrics.counter("submissions_total", &["signage"]), 0);
+        submit(&shared, "signage", async { Ok(()) }).await.unwrap();
+        assert_eq!(metrics.counter("submissions_total", &["signage"]), 1);
     }
     #[tokio::test]
     async fn authenticates_a_mutual_tls_chia_websocket_with_a_fixture_only_identity() {

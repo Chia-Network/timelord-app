@@ -220,3 +220,119 @@ fn helper_reports_real_socket_state_without_claiming_productivity() {
         serde_json::from_slice(&std::fs::read(checkpoint).unwrap()).unwrap();
     assert_eq!(flushed["observations"][0]["id"], 50);
 }
+
+fn raw_get(port: u16, path: &str) -> (u16, String, String) {
+    let mut socket =
+        TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_secs(1)).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    socket
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .unwrap();
+    let mut response = String::new();
+    socket.read_to_string(&mut response).unwrap();
+    let (header, body) = response.split_once("\r\n\r\n").unwrap();
+    (
+        header.split_whitespace().nth(1).unwrap().parse().unwrap(),
+        header.to_owned(),
+        body.to_owned(),
+    )
+}
+fn observed_fixture() -> (Fixture, u16, u16) {
+    let status = TcpListener::bind("127.0.0.1:0").unwrap();
+    let observe = TcpListener::bind("127.0.0.1:0").unwrap();
+    let status_port = status.local_addr().unwrap().port();
+    let observe_port = observe.local_addr().unwrap().port();
+    let directory = std::env::temp_dir().join(format!(
+        "observability-http-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let config = directory.join("config.toml");
+    std::fs::write(&config,format!("[service]\nstatus_listen='127.0.0.1:{status_port}'\nobservability_listen='127.0.0.1:{observe_port}'\n")).unwrap();
+    drop(status);
+    drop(observe);
+    let child = Command::new(env!("CARGO_BIN_EXE_timelord-service"))
+        .args(["serve", "--config"])
+        .arg(&config)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let fixture = Fixture { child, directory };
+    wait_for(status_port, 0);
+    (fixture, status_port, observe_port)
+}
+#[test]
+fn deployment_listener_is_read_only_serves_metrics_while_unready_and_shuts_down_cleanly() {
+    let (mut fixture, status, observe) = observed_fixture();
+    for port in [status, observe] {
+        let (code, _, body) = raw_get(port, "/healthz");
+        assert_eq!(code, 200);
+        assert_eq!(body, "Ok\n");
+        let (code, _, body) = raw_get(port, "/readyz");
+        assert_eq!(code, 503);
+        assert!(body.contains("setup_required"));
+        let (code, headers, body) = raw_get(port, "/metrics");
+        assert_eq!(code, 200);
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("content-type: text/plain; version=0.0.4")
+        );
+        assert!(
+            body.lines()
+                .any(|line| line.starts_with("chia_timelord_version{")
+                    && line.contains("network=\"mainnet\""))
+        );
+        assert!(body.contains("chia_timelord_proofs_verified_total"));
+        assert!(!body.contains("chia_timelord_estimated_ips{"));
+    }
+    for path in ["/v1/status", "/v3/history", "/health"] {
+        assert_eq!(raw_get(observe, path).0, 404);
+    }
+    assert_eq!(raw_get(status, "/health").0, 200);
+    unsafe {
+        assert_eq!(libc::kill(fixture.child.id() as i32, libc::SIGTERM), 0);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = fixture.child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(TcpStream::connect(("127.0.0.1", status)).is_err());
+    assert!(TcpStream::connect(("127.0.0.1", observe)).is_err());
+}
+#[test]
+fn occupied_observability_port_fails_startup_with_a_clear_error() {
+    let status = TcpListener::bind("127.0.0.1:0").unwrap();
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = status.local_addr().unwrap().port();
+    let other = occupied.local_addr().unwrap().port();
+    let directory = std::env::temp_dir().join(format!("observability-bind-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let config = directory.join("config.toml");
+    std::fs::write(&config,format!("[service]\nstatus_listen='127.0.0.1:{port}'\nobservability_listen='127.0.0.1:{other}'\n")).unwrap();
+    drop(status);
+    let result = Command::new(env!("CARGO_BIN_EXE_timelord-service"))
+        .args(["serve", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Binding observability endpoint"));
+    assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+    std::fs::remove_dir_all(directory).unwrap();
+}

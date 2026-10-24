@@ -7,6 +7,7 @@ mod hardware;
 mod history_store;
 mod inventory;
 mod node_status;
+mod observability;
 mod private_control;
 mod runtime;
 
@@ -407,15 +408,15 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-async fn health(State(current): State<watch::Receiver<Arc<Shared>>>) -> Json<serde_json::Value> {
-    let shared = current.borrow().clone();
+async fn health(State(http): State<observability::HttpState>) -> Json<serde_json::Value> {
+    let shared = http.current.borrow().clone();
     Json(
         serde_json::json!({"service":"timelord-service","api_version":1,"production_enabled":shared.config.node.certificate.is_some()}),
     )
 }
 
-async fn status(State(current): State<watch::Receiver<Arc<Shared>>>) -> Json<Status> {
-    let shared = current.borrow().clone();
+async fn status(State(http): State<observability::HttpState>) -> Json<Status> {
+    let shared = http.current.borrow().clone();
     let clients = shared.clients.lock().expect("client state lock");
     let runtime = shared.runtime.lock().expect("runtime");
     Json(Status {
@@ -509,8 +510,8 @@ async fn status(State(current): State<watch::Receiver<Arc<Shared>>>) -> Json<Sta
     })
 }
 
-async fn history(State(current): State<watch::Receiver<Arc<Shared>>>) -> Json<serde_json::Value> {
-    let shared = current.borrow().clone();
+async fn history(State(http): State<observability::HttpState>) -> Json<serde_json::Value> {
+    let shared = http.current.borrow().clone();
     let runtime = shared.runtime.lock().expect("runtime");
     let store = history_store::Store::new(PathBuf::new(), &shared.config, &shared.assignments)
         .expect("validated history scope");
@@ -551,6 +552,10 @@ impl Run {
                 tracing::warn!(%error, "Final chart history checkpoint could not be saved");
             }
         }
+        let runtime = self.shared.runtime.lock().expect("runtime");
+        if let Some(metrics) = &runtime.metrics {
+            metrics.disconnect(runtime.metric_epoch);
+        }
         failure.map_or(Ok(()), Err)
     }
 }
@@ -559,6 +564,7 @@ async fn start_run(
     config: Config,
     history_path: PathBuf,
     faults: &std::collections::HashMap<String, runtime::HardwareState>,
+    metrics: Arc<observability::Metrics>,
 ) -> Result<Run> {
     let assignments = assignment::resolve(&config)?;
     hardware::validate_automatic(&config, &assignments).await?;
@@ -599,6 +605,9 @@ async fn start_run(
         }
     };
     runtime.boards = faults.clone();
+    runtime.metric_epoch = metrics.begin_session();
+    metrics.register_boards(&config);
+    runtime.metrics = Some(metrics);
     if assignments.is_empty() {
         runtime.transition(
             "waiting_for_clients",
@@ -673,28 +682,65 @@ async fn start_run(
     })
 }
 
+async fn essential_exit(tasks: &mut JoinSet<Result<()>>, metrics: &observability::Metrics) {
+    let task = tasks.join_next().await;
+    metrics
+        .failed
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    tracing::error!(?task, "Essential service task exited unexpectedly");
+}
+
 async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
     // The status listener outlives each topology. No UI or external supervisor
     // is required to restart the service after a USB change.
     let http = TcpListener::bind(config.service.status_listen)
         .await
         .context("Binding status endpoint")?;
+    let observer = if let Some(address) = config.service.observability_listen {
+        Some(
+            TcpListener::bind(address)
+                .await
+                .with_context(|| format!("Binding observability endpoint {address}"))?,
+        )
+    } else {
+        None
+    };
+    let metrics = observability::Metrics::new(config.node.network)?;
     let config = inventory::connected_configuration(config).await?;
     let mut faults = std::collections::HashMap::new();
-    let mut run = start_run(config, history_path.clone(), &faults).await?;
+    let mut run = start_run(config, history_path.clone(), &faults, metrics.clone()).await?;
     let (current, state) = watch::channel(run.shared.clone());
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/status", get(status))
         .route("/v3/history", get(history))
-        .with_state(state);
+        .merge(observability::routes())
+        .with_state(observability::HttpState {
+            current: state.clone(),
+            metrics: metrics.clone(),
+        });
     let (http_stop, mut stopped) = watch::channel(false);
+    let observation_stopped = stopped.clone();
     let mut server = tokio::spawn(async move {
         axum::serve(http, app)
             .with_graceful_shutdown(async move {
                 let _ = stopped.changed().await;
             })
             .await
+    });
+    let mut observation_server = observer.map(|listener| {
+        let mut stopped = observation_stopped.clone();
+        let app = observability::routes().with_state(observability::HttpState {
+            current: state,
+            metrics: metrics.clone(),
+        });
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = stopped.changed().await;
+                })
+                .await
+        })
     });
     let signal = shutdown_signal();
     tokio::pin!(signal);
@@ -704,6 +750,11 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
     let result = loop {
         let candidate = tokio::select! {
             _ = &mut signal => break Ok(()),
+            _ = essential_exit(&mut run.tasks, &metrics), if !run.tasks.is_empty() => continue,
+            result = async { observation_server.as_mut().expect("observer").await }, if observation_server.is_some() => {
+                metrics.failed.store(true,std::sync::atomic::Ordering::Relaxed);
+                break result.context("Observability task failed")?.context("Observability server failed");
+            }
             result = &mut server => break result.context("Status task failed")?.context("Status server failed"),
             _ = poll.tick() => {
                 tokio::select! {
@@ -734,6 +785,10 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
                 board.raw_speeds.clear();
             }
         }
+        metrics
+            .reconfiguring
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        metrics.inc("topology_changes_total", &[]);
         tracing::info!(plan=?plan, "USB topology changed; replacing chain owners");
         let previous = run.shared.clone();
         run.stop().await?;
@@ -754,13 +809,24 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
                     (id.clone(), fault)
                 }),
         );
-        run = start_run(config, history_path.clone(), &faults).await?;
+        run = start_run(config, history_path.clone(), &faults, metrics.clone()).await?;
         current.send_replace(run.shared.clone());
+        metrics
+            .reconfiguring
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     };
+    metrics
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     run.stop().await?;
     let _ = http_stop.send(true);
     if !server.is_finished() {
         server.await.context("Status task failed")??;
+    }
+    if let Some(server) = observation_server
+        && !server.is_finished()
+    {
+        server.await.context("Observability task failed")??;
     }
     result
 }
@@ -783,7 +849,13 @@ async fn client_listener(
                 let slot={let mut connected=shared.clients.lock().expect("client state lock");let slot=(0..capacity).find(|slot|!connected.contains(&(id.clone(),*slot)));if let Some(slot)=slot {connected.insert((id.clone(),slot));}slot};
                 if let Some(slot)=slot {
                     if let Some(offers) = &offers {
-                        let generation = shared.runtime.lock().expect("runtime").boards.get(&id).map(|b| b.generation).unwrap_or(0);
+                        let generation = {
+                            let mut runtime = shared.runtime.lock().expect("runtime");
+                            let hardware = runtime.boards.entry(id.clone()).or_default();
+                            // Reusing a slot must never reuse its predecessor's verified readiness.
+                            hardware.verified_slots.remove(&slot);
+                            hardware.generation
+                        };
                         let lease = asic::Lease { socket, board: id.clone(), slot, generation, clients: shared.clients.clone() };
                         if offers.try_send(lease).is_err() { tracing::warn!(board=%id, "ASIC socket queue full"); }
                         continue;
@@ -835,6 +907,8 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn topology_generations_release_owners_keep_status_and_preserve_faults() {
+        let metrics = observability::Metrics::new(Network::Mainnet).unwrap();
+        metrics.inc("topology_changes_total", &[]);
         // All ports and files belong to this fixture; no node, native binary or USB.
         let dir = std::env::temp_dir().join(format!(
             "topology-{}-{}",
@@ -863,18 +937,22 @@ mod tests {
             },
         );
         drop(reserved);
-        let mut run = start_run(config, dir.join("history.json"), &faults)
+        let mut run = start_run(config, dir.join("history.json"), &faults, metrics.clone())
             .await
             .unwrap();
         let (current, state) = watch::channel(run.shared.clone());
         let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = http.local_addr().unwrap();
+        let http_metrics = metrics.clone();
         let server = tokio::spawn(async move {
             axum::serve(
                 http,
-                Router::new()
-                    .route("/v1/status", get(status))
-                    .with_state(state),
+                Router::new().route("/v1/status", get(status)).with_state(
+                    observability::HttpState {
+                        current: state,
+                        metrics: http_metrics,
+                    },
+                ),
             )
             .await
             .unwrap();
@@ -916,10 +994,11 @@ mod tests {
                 );
             }
             assert!(!dir.join("control.sock").exists());
-            run = start_run(next, dir.join("history.json"), &faults)
+            run = start_run(next, dir.join("history.json"), &faults, metrics.clone())
                 .await
                 .unwrap();
             current.send_replace(run.shared.clone());
+            assert_eq!(metrics.counter("topology_changes_total", &[]), 1);
             assert!(run.shared.runtime.lock().unwrap().boards["b2"].latched_fault);
             assert_eq!(
                 run.shared.assignments.len(),
@@ -944,6 +1023,17 @@ mod tests {
         server.abort();
         let _ = server.await;
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn unexpected_supervisor_exit_is_latched_as_unhealthy() {
+        let metrics = observability::Metrics::new(Network::Mainnet).unwrap();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async { Ok(()) });
+        essential_exit(&mut tasks, &metrics).await;
+        assert!(!metrics.healthy());
+        // Creating a replacement runtime cannot clear the process health latch.
+        metrics.begin_session();
+        assert!(!metrics.healthy());
     }
     #[tokio::test]
     async fn idle_clients_stop_cleanly_and_release_their_slot() {

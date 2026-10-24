@@ -154,9 +154,16 @@ impl ClientLog {
                 hardware.state = "connected".into();
             }
             if temp >= board.temperature_limit_c {
+                let first = !hardware.latched_fault;
                 hardware.state = "thermal_stop".into();
                 hardware.latched_fault = true;
                 state.event(Some(board.id.clone()), "thermal_stop");
+                if first && let Some(metrics) = &state.metrics {
+                    metrics.inc(
+                        "thermal_stops_total",
+                        &[&crate::observability::board(&shared.config, &board.id)],
+                    );
+                }
                 bail!("ASIC reached its configured temperature limit");
             }
         }
@@ -164,8 +171,29 @@ impl ClientLog {
         if recovery {
             state.boards.entry(board.id.clone()).or_default().recoveries += 1;
             state.event(Some(board.id.clone()), "recovery");
+            if let Some(metrics) = &state.metrics {
+                let engine = line
+                    .split_once("VDF ")
+                    .and_then(|(_, s)| s.split_once(':'))
+                    .and_then(|(n, _)| n.parse::<u8>().ok())
+                    .filter(|n| *n < 3)
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                metrics.inc(
+                    "asic_recoveries_total",
+                    &[
+                        &crate::observability::board(&shared.config, &board.id),
+                        &engine,
+                    ],
+                );
+            }
         }
         if line.contains("Connected to timelord, waiting for challenge") {
+            state
+                .boards
+                .entry(board.id.clone())
+                .or_default()
+                .native_initialized = true;
             self.initialization.take();
             if let Some(ready) = self.ready.take() {
                 let _ = ready.send(());
@@ -424,6 +452,22 @@ impl AutomaticOwner {
                     .change_with_logs(point, 5, log, shared, board)
                     .await
                     .map_err(|error| anyhow::anyhow!("{}: {error}", board.name))?;
+                if let Some(metrics) = &shared.runtime.lock().expect("runtime").metrics {
+                    let kind = if !persist {
+                        "trial"
+                    } else if reason.to_ascii_lowercase().contains("restor") {
+                        "restore"
+                    } else {
+                        "backoff"
+                    };
+                    metrics.inc(
+                        "operating_point_changes_total",
+                        &[
+                            &crate::observability::board(&shared.config, &board.id),
+                            kind,
+                        ],
+                    );
+                }
                 self.policy.applied(actual, crate::unix_now(), reason);
                 self.policy.synchronize_recoveries(
                     shared.runtime.lock().expect("runtime").boards[&board.id].recoveries,
@@ -761,6 +805,7 @@ async fn supervise_board(
     mut budget: RestartBackoff,
 ) {
     let mut ready = Some(ready);
+    let mut previous_failure = "topology";
     loop {
         if *shutdown.borrow() {
             return;
@@ -774,6 +819,7 @@ async fn supervise_board(
             hardware.generation += 1;
             hardware.started_unix = crate::unix_now();
             hardware.state = "starting".into();
+            hardware.native_initialized = false;
             hardware.raw_speeds.clear();
             hardware.temperature_unix = 0;
             hardware.temperature_c = None;
@@ -801,6 +847,12 @@ async fn supervise_board(
         let result = match preparation {
             Ok(()) => match launch(&shared, &board).await {
                 Ok(child) => {
+                    if let Some(metrics) = &shared.runtime.lock().expect("runtime").metrics {
+                        metrics.client_started(
+                            &crate::observability::board(&shared.config, &board.id),
+                            previous_failure,
+                        );
+                    }
                     supervise(
                         shared.clone(),
                         board.clone(),
@@ -827,6 +879,18 @@ async fn supervise_board(
             return;
         }
         let error = result.unwrap_err();
+        previous_failure = crate::observability::restart_reason(&error.to_string());
+        {
+            let state = shared.runtime.lock().expect("runtime");
+            if let Some(metrics) = &state.metrics {
+                let label = crate::observability::board(&shared.config, &board.id);
+                if thermal_rejection(&error)
+                    && !state.boards.get(&board.id).is_some_and(|b| b.latched_fault)
+                {
+                    metrics.inc("thermal_stops_total", &[&label]);
+                }
+            }
+        }
         let delay = budget.next(established(
             &shared,
             &board,
@@ -941,7 +1005,10 @@ pub async fn run(
         tokio::select! {
             _ = shutdown.changed() => break,
             Some(result) = children.join_next(), if !children.is_empty() => {
-                if let Err(error) = result { tracing::error!(%error, "ASIC supervisor task failed"); }
+                if let Err(error) = result {
+                    if let Some(metrics)=&shared.runtime.lock().expect("runtime").metrics {metrics.failed.store(true,std::sync::atomic::Ordering::Relaxed);}
+                    tracing::error!(%error, "ASIC supervisor task failed");
+                }
             }
         }
     }

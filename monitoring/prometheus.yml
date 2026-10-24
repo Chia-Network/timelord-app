@@ -1,0 +1,17 @@
+# Merge into your deployment's existing Prometheus configuration.
+scrape_configs:
+  - job_name: timelord-app
+    honor_labels: true
+    scrape_interval: 30s
+    scrape_timeout: 5s
+    static_configs:
+      - targets: [timelord-host:9258]
+        labels:
+          application: timelord-app
+          component: timelord
+          region: msp
+          instance_name: timelord-mac-01
+          network: mainnet
+    # The application also supplies network. Keep target and service in agreement.
+rule_files:
+  - alerts.yml

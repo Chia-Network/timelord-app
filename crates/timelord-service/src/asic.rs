@@ -88,6 +88,7 @@ struct Active {
 struct Lane {
     board: String,
     active: Mutex<Option<Active>>,
+    started_once: std::sync::atomic::AtomicBool,
 }
 #[derive(Debug)]
 pub struct AsicFailure {
@@ -128,6 +129,7 @@ impl AsicBackend {
                     Lane {
                         board: a.board_id,
                         active: Mutex::new(None),
+                        started_once: std::sync::atomic::AtomicBool::new(false),
                     },
                 )
             })
@@ -140,6 +142,11 @@ impl AsicBackend {
             },
             offers,
         ))
+    }
+    pub fn observe_duration(&self, chain: Chain, stage: &str, duration: Duration) {
+        if let Some(metrics) = &self.runtime.lock().expect("runtime").metrics {
+            metrics.duration(chain, stage, duration);
+        }
     }
     pub async fn prove(
         &self,
@@ -182,6 +189,8 @@ impl AsicBackend {
             .find(|(c, _)| *c == chain)
             .map(|(_, lane)| lane)
             .context("Chain has no assigned ASIC")?;
+        let mut activity =
+            record_metric.then(|| crate::observability::Activity::new(self.runtime.clone(), chain));
         loop {
             let (generation, unavailable) = {
                 let state = self.runtime.lock().expect("runtime");
@@ -223,6 +232,10 @@ impl AsicBackend {
                         {
                             event.end_unix = Some(crate::unix_now());
                         }
+                    }
+                    drop(state);
+                    if let Some(activity) = &mut activity {
+                        activity.finish();
                     }
                     return Ok(proof);
                 }
@@ -286,6 +299,10 @@ impl AsicBackend {
             .find(|(c, _)| *c == chain)
             .context("No board assigned to chain")?
             .1;
+        let (metrics, epoch) = {
+            let state = self.runtime.lock().expect("runtime");
+            (state.metrics.clone(), state.metric_epoch)
+        };
         let mut owner = lane.active.lock().await;
         // Take ownership during I/O. Cancellation retires the socket instead of
         // leaving a partially consumed frame in a reusable session.
@@ -300,13 +317,24 @@ impl AsicBackend {
         let mut active = owner.take().filter(|a| a.lease.generation == generation);
         // A new discriminant does not depend on the old socket. Start it before
         // retiring that session or waiting for the native client to reconnect.
+        let changed_input = active
+            .as_ref()
+            .is_some_and(|s| !same_challenge(&s.key, &work));
         let discriminant = active
             .as_ref()
             .is_none_or(|s| !same_challenge(&s.key, &work))
             .then(|| {
                 let seed = work.challenge.const_bytes().to_vec();
                 let bits = work.discriminant_bits;
-                tokio::task::spawn_blocking(move || create_discriminant_bytes(&seed, bits))
+                let metrics = metrics.clone();
+                tokio::task::spawn_blocking(move || {
+                    let started = Instant::now();
+                    let result = create_discriminant_bytes(&seed, bits);
+                    if let Some(metrics) = metrics {
+                        metrics.duration(chain, "discriminant", started.elapsed());
+                    }
+                    result
+                })
             });
         if active
             .as_ref()
@@ -318,6 +346,7 @@ impl AsicBackend {
         let mut active = match active {
             Some(session) => session,
             None => {
+                let waiting = Instant::now();
                 let mut pool = self
                     .pools
                     .get(&lane.board)
@@ -342,6 +371,9 @@ impl AsicBackend {
                 })
                 .await
                 .context("Waiting for ASIC client timed out")??;
+                if let Some(metrics) = &metrics {
+                    metrics.duration(chain, "client_wait", waiting.elapsed());
+                }
                 // Match Python timelord: start the IPS clock when assigning the
                 // client, even if discriminant preparation is already running.
                 let estimated_started = Instant::now();
@@ -362,6 +394,22 @@ impl AsicBackend {
                 .await??;
                 if &ok != b"OK" {
                     bail!("ASIC client rejected the challenge");
+                }
+                if let Some(metrics) = &metrics {
+                    let reason = if !lane
+                        .started_once
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        "initial"
+                    } else if changed_input {
+                        "input_change"
+                    } else {
+                        "reconnect"
+                    };
+                    metrics.inc(
+                        "vdf_sessions_started_total",
+                        &[crate::observability::chain(chain), reason],
+                    );
                 }
                 Active {
                     lease,
@@ -385,13 +433,30 @@ impl AsicBackend {
         // Publish only after the proof has passed verification.
         let ips = estimated_ips(work.iterations, active.estimated_started.elapsed());
         let checked = work.clone();
-        let result = tokio::task::spawn_blocking(move || verify(&checked, *proof))
-            .await?
-            .map_err(|error| AsicFailure {
+        let verification_started = Instant::now();
+        let verification = tokio::task::spawn_blocking(move || verify(&checked, *proof)).await?;
+        if let Some(metrics) = &metrics {
+            metrics.duration(chain, "verification", verification_started.elapsed());
+        }
+        let result = verification.map_err(|error| {
+            if let Some(metrics) = &metrics {
+                metrics.inc(
+                    "proof_verification_failures_total",
+                    &[crate::observability::chain(chain)],
+                );
+            }
+            AsicFailure {
                 board_id: lane.board.clone(),
                 verification: true,
                 message: error.to_string(),
-            })?;
+            }
+        })?;
+        {
+            let mut state = self.runtime.lock().expect("runtime");
+            let hardware = state.boards.entry(lane.board.clone()).or_default();
+            hardware.verified_generation = Some(active.lease.generation);
+            hardware.verified_slots.insert(active.lease.slot);
+        }
         let timing = ProofTiming {
             iterations: work.iterations,
             started: active.started,
@@ -402,6 +467,9 @@ impl AsicBackend {
                 .as_millis(),
         };
         if record_metric {
+            if let Some(metrics) = &metrics {
+                metrics.verified(epoch, chain, ips);
+            }
             self.runtime.lock().expect("runtime").estimated(
                 chain,
                 ips,
@@ -591,8 +659,18 @@ mod tests {
     ) {
         let config: Config =
             toml::from_str("[[hardware.boards]]\nid='a'\nname='A'\nclient_port=18110\n").unwrap();
-        let (backend, offers) =
-            AsicBackend::new(&config, &config.assignments().unwrap(), Default::default()).unwrap();
+        let metrics = crate::observability::Metrics::new(config.node.network).unwrap();
+        let runtime = crate::runtime::RuntimeState {
+            metric_epoch: metrics.begin_session(),
+            metrics: Some(metrics),
+            ..Default::default()
+        };
+        let (backend, offers) = AsicBackend::new(
+            &config,
+            &config.assignments().unwrap(),
+            Arc::new(SyncMutex::new(runtime)),
+        )
+        .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap())
             .await
@@ -960,6 +1038,15 @@ mod tests {
             );
             assert!(state.observations.is_empty());
             assert_eq!(state.proofs_delivered, 0);
+            let metrics = state.metrics.as_ref().unwrap();
+            assert_eq!(
+                metrics.counter("proofs_verified_total", &["infused_challenge"]),
+                1
+            );
+            assert_eq!(
+                metrics.counter("proof_verification_failures_total", &["infused_challenge"]),
+                0
+            );
         }
         backend.stop_all().await;
         fixture.await.unwrap();
@@ -998,14 +1085,14 @@ mod tests {
         });
         assert!(backend.prove(Chain::Challenge, work(20, 64)).await.is_err());
         fixture.await.unwrap();
-        assert!(
-            backend
-                .runtime
-                .lock()
-                .unwrap()
-                .estimated_observations
-                .is_empty()
+        let state = backend.runtime.lock().unwrap();
+        assert!(state.estimated_observations.is_empty());
+        let metrics = state.metrics.as_ref().unwrap();
+        assert_eq!(
+            metrics.counter("proof_verification_failures_total", &["challenge"]),
+            1
         );
+        assert_eq!(metrics.counter("proofs_verified_total", &["challenge"]), 0);
     }
 
     #[tokio::test]

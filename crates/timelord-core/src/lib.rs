@@ -76,6 +76,7 @@ pub enum Network {
 #[serde(default, deny_unknown_fields)]
 pub struct ServiceConfig {
     pub status_listen: SocketAddr,
+    pub observability_listen: Option<SocketAddr>,
     pub control_socket: Option<PathBuf>,
     pub tuning_paused: bool,
     pub start_automatically: bool,
@@ -85,6 +86,7 @@ impl Default for ServiceConfig {
     fn default() -> Self {
         Self {
             status_listen: SocketAddr::from(([127, 0, 0, 1], 9257)),
+            observability_listen: None,
             control_socket: None,
             tuning_paused: false,
             start_automatically: true,
@@ -311,8 +313,21 @@ impl Config {
         if self.hardware.boards.len() > 3 {
             return Err("This version supports up to three configured boards".into());
         }
+        if self
+            .service
+            .observability_listen
+            .is_some_and(|a| a.port() == 0 || a.port() == self.service.status_listen.port())
+        {
+            return Err(
+                "Observability requires a nonzero port distinct from status and client ports"
+                    .into(),
+            );
+        }
         let mut ids = HashSet::new();
         let mut ports = HashSet::from([self.service.status_listen.port()]);
+        if let Some(address) = self.service.observability_listen {
+            ports.insert(address.port());
+        }
         let mut locations = HashSet::new();
         let mut serials = HashSet::new();
         for b in &self.hardware.boards {
@@ -436,6 +451,24 @@ mod tests {
             voltage_v: default_voltage(),
             temperature_limit_c: default_temperature_limit(),
         }
+    }
+    #[test]
+    fn deployment_listener_is_optional_and_cannot_collide_with_local_endpoints() {
+        let mut c = Config::default();
+        assert!(c.service.observability_listen.is_none());
+        c.service.observability_listen = Some("0.0.0.0:9258".parse().unwrap());
+        assert!(c.validate().is_ok());
+        c.service.observability_listen = Some("0.0.0.0:9257".parse().unwrap());
+        assert!(c.validate().is_err());
+        c.service.observability_listen = Some("127.0.0.1:0".parse().unwrap());
+        assert!(c.validate().is_err());
+        c.service.observability_listen = Some("[::]:18110".parse().unwrap());
+        c.hardware.boards.push(board("a", 18110));
+        assert!(c.validate().is_err());
+        c.service.observability_listen = Some("[::]:9258".parse().unwrap());
+        assert!(c.validate().is_ok());
+        c.service.status_listen = "0.0.0.0:9257".parse().unwrap();
+        assert!(c.validate().is_err());
     }
     #[test]
     fn old_voltage_search_key_is_read_only_and_recovery_limits_are_validated() {

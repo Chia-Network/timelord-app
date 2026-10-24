@@ -1,0 +1,76 @@
+groups:
+  - name: timelord-app
+    interval: 30s
+    rules:
+      - alert: TimelordScrapeFailed
+        expr: |
+          up{job="timelord-app"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Timelord metrics cannot be scraped
+      - alert: TimelordInternalFailure
+        expr: |
+          chia_timelord_healthy{job="timelord-app"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: Timelord supervision is unhealthy
+      - alert: TimelordMetricsMissing
+        expr: |
+          up{job="timelord-app"} == 1 unless on(job, instance) chia_timelord_healthy{job="timelord-app"}
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Timelord health metric is missing
+      - alert: TimelordNodeDisconnected
+        expr: |
+          chia_timelord_node_connected{job="timelord-app"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Timelord is disconnected from its full node
+      - alert: TimelordRequiredEngineMissing
+        expr: |
+          (chia_timelord_chain_required{job="timelord-app"} == 1 and on(job, instance, network, chain) chia_timelord_chain_available{job="timelord-app"} == 0) and on(job, instance, network) chia_timelord_node_connected{job="timelord-app"} == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: A required VDF chain has no usable client
+      - alert: TimelordProofVerificationFailed
+        expr: |
+          increase(chia_timelord_proof_verification_failures_total{job="timelord-app"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: Native VDF proof verification failed
+      - alert: TimelordThermalStop
+        expr: |
+          increase(chia_timelord_thermal_stops_total{job="timelord-app"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: An ASIC stopped at its temperature guard
+      - alert: TimelordNoVerifiedProgressMainnet
+        expr: |
+          (chia_timelord_work_pending{job="timelord-app",network="mainnet"} > 0 and on(job, instance, network, chain) increase(chia_timelord_proofs_verified_total{job="timelord-app",network="mainnet"}[5m]) == 0) and on(job, instance, network) chia_timelord_node_connected{job="timelord-app"} == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Pending VDF work has no verified progress
+      - alert: TimelordNoVerifiedProgressTestnet
+        expr: |
+          (chia_timelord_work_pending{job="timelord-app",network="testnet11"} > 0 and on(job, instance, network, chain) increase(chia_timelord_proofs_verified_total{job="timelord-app",network="testnet11"}[5m]) == 0) and on(job, instance, network) chia_timelord_node_connected{job="timelord-app"} == 1
+        for: 2h
+        labels:
+          severity: warning
+        annotations:
+          summary: Pending VDF work has no verified progress
