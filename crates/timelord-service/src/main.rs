@@ -363,6 +363,7 @@ struct Shared {
     clients: Arc<Mutex<BTreeSet<(String, u8)>>>,
     runtime: Arc<Mutex<runtime::RuntimeState>>,
     started_unix: u64,
+    service_started_unix: u64,
 }
 
 #[derive(Serialize)]
@@ -374,6 +375,7 @@ struct Status {
     message: String,
     production_enabled: bool,
     started_unix: u64,
+    service_started_unix: u64,
     timestamp_unix: u64,
     full_node: NodeStatus,
     boards: Vec<BoardStatus>,
@@ -438,6 +440,7 @@ async fn status(State(current): State<watch::Receiver<Arc<Shared>>>) -> Json<Sta
         message: runtime.message.clone(),
         production_enabled: shared.config.node.certificate.is_some(),
         started_unix: shared.started_unix,
+        service_started_unix: shared.service_started_unix,
         timestamp_unix: unix_now(),
         full_node: NodeStatus {
             host: shared.config.node.host.clone(),
@@ -571,6 +574,7 @@ async fn start_run(
     config: Config,
     history_path: PathBuf,
     faults: &std::collections::HashMap<String, runtime::HardwareState>,
+    service_started_unix: u64,
 ) -> Result<Run> {
     let assignments = assignment::resolve(&config)?;
     hardware::validate_automatic(&config, &assignments).await?;
@@ -627,6 +631,7 @@ async fn start_run(
         clients: Arc::new(Mutex::new(BTreeSet::new())),
         runtime,
         started_unix,
+        service_started_unix,
     });
     let (shutdown, receiver) = watch::channel(false);
     let mut tasks = JoinSet::new();
@@ -686,6 +691,7 @@ async fn start_run(
 }
 
 async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
+    let service_started_unix = unix_now();
     // The status listener outlives each topology. No UI or external supervisor
     // is required to restart the service after a USB change.
     let http = TcpListener::bind(config.service.status_listen)
@@ -693,7 +699,7 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
         .context("Binding status endpoint")?;
     let config = inventory::connected_configuration(config).await?;
     let mut faults = std::collections::HashMap::new();
-    let mut run = start_run(config, history_path.clone(), &faults).await?;
+    let mut run = start_run(config, history_path.clone(), &faults, service_started_unix).await?;
     let (current, state) = watch::channel(run.shared.clone());
     let app = Router::new()
         .route("/health", get(health))
@@ -766,7 +772,7 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
                     (id.clone(), fault)
                 }),
         );
-        run = start_run(config, history_path.clone(), &faults).await?;
+        run = start_run(config, history_path.clone(), &faults, service_started_unix).await?;
         current.send_replace(run.shared.clone());
     };
     run.stop().await?;
@@ -875,9 +881,10 @@ mod tests {
             },
         );
         drop(reserved);
-        let mut run = start_run(config, dir.join("history.json"), &faults)
+        let mut run = start_run(config, dir.join("history.json"), &faults, unix_now() - 3600)
             .await
             .unwrap();
+        let service_started_unix = run.shared.service_started_unix;
         let (current, state) = watch::channel(run.shared.clone());
         let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = http.local_addr().unwrap();
@@ -928,9 +935,14 @@ mod tests {
                 );
             }
             assert!(!dir.join("control.sock").exists());
-            run = start_run(next, dir.join("history.json"), &faults)
-                .await
-                .unwrap();
+            run = start_run(
+                next,
+                dir.join("history.json"),
+                &faults,
+                service_started_unix,
+            )
+            .await
+            .unwrap();
             current.send_replace(run.shared.clone());
             assert!(run.shared.runtime.lock().unwrap().boards["b2"].latched_fault);
             assert_eq!(
@@ -951,6 +963,8 @@ mod tests {
             assert_eq!(value["boards"].as_array().unwrap().len(), indices.len());
             assert_eq!(value["connected_client_count"], 0);
             assert_eq!(value["proofs_delivered"], 0);
+            assert_eq!(value["service_started_unix"], service_started_unix);
+            assert!(value["started_unix"].as_u64().unwrap() >= service_started_unix + 3600);
         }
         run.stop().await.unwrap();
         server.abort();
@@ -967,6 +981,7 @@ mod tests {
             clients: Arc::new(Mutex::new(BTreeSet::new())),
             runtime: Default::default(),
             started_unix: unix_now(),
+            service_started_unix: crate::unix_now(),
         });
         let (stop, rx) = watch::channel(false);
         let task = tokio::spawn(client_listener(

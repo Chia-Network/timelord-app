@@ -510,7 +510,7 @@ async fn supervise(
                     && (hardware.latched_fault || hardware.state == "fault") {
                     break Err(anyhow::anyhow!(hardware.fault_reason.clone().unwrap_or_else(|| "ASIC needs attention".into())));
                 }
-                if log.last_temperature.elapsed() > Duration::from_secs(60) { break Err(anyhow::anyhow!("ASIC temperature telemetry stopped")); }
+                if log.last_temperature.elapsed() > Duration::from_secs(TEMPERATURE_TIMEOUT_SECONDS) { break Err(anyhow::anyhow!("ASIC temperature telemetry stopped")); }
                 match child.try_wait() {
                     Ok(Some(exit)) => break Err(anyhow::anyhow!("ASIC client exited: {exit}")),
                     Err(error) => break Err(error.into()),
@@ -643,6 +643,8 @@ pub async fn validate_automatic(
     }
     Ok(())
 }
+
+pub(crate) const TEMPERATURE_TIMEOUT_SECONDS: u64 = 60;
 
 const RESTART_DELAYS: [u64; 3] = [1, 5, 30];
 struct RestartBackoff {
@@ -1041,6 +1043,7 @@ mod tests {
             clients: Default::default(),
             runtime: Default::default(),
             started_unix: crate::unix_now(),
+            service_started_unix: crate::unix_now(),
         };
         let mut child = Command::new(binary)
             .stdin(Stdio::piped())
@@ -1157,6 +1160,7 @@ done
             clients: Default::default(),
             runtime: Default::default(),
             started_unix: crate::unix_now(),
+            service_started_unix: crate::unix_now(),
         };
         let mut child = Command::new(binary)
             .stdin(Stdio::piped())
@@ -1279,6 +1283,7 @@ done
             clients: Arc::new(std::sync::Mutex::new(Default::default())),
             runtime: Default::default(),
             started_unix: crate::unix_now(),
+            service_started_unix: crate::unix_now(),
         });
         let (stop, receiver) = watch::channel(false);
         let (backend, _offers) = crate::asic::AsicBackend::new(
@@ -1364,6 +1369,7 @@ while :; do printf '%s\n' 'ASIC Temp = 40.0 C; Frequency = 1500.0 MHz; freq_idx 
             clients: Default::default(),
             runtime: Default::default(),
             started_unix: crate::unix_now(),
+            service_started_unix: crate::unix_now(),
         });
         let (backend, _offers) = crate::asic::AsicBackend::new(
             &shared.config,

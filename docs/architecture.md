@@ -40,7 +40,10 @@ background threads may still be running. Serial identity survives USB-port chang
 detected boards; one/two/three boards receive 3 / 2+1 / 1+1+1 engines. The service
 polls USB every five seconds and requires three consistent inventories before
 replacing the layout. Enumeration errors leave the existing layout intact; fresh
-client telemetry covers metadata omitted by open FTDI interfaces. Old scheduler,
+supervised owner telemetry covers metadata omitted by open FTDI interfaces.
+An idle chain needs no leased proof socket. Presence uses the native owner's
+60-second sensor deadline, rather than a separate shorter topology threshold;
+faulted owners and expired telemetry do not mask unplugged hardware. Old scheduler,
 client listeners and native owners stop before new ones start, while the status
 HTTP listener stays available. Zero boards waits for reconnection. Each layout
 selects its own engine-count/mask tuning profile, and safety faults remain latched
@@ -108,3 +111,8 @@ Tests use canonical C++ proof fixtures, generated TLS identities, local peers an
 owned fake processes. Presentation scenarios compile only in the test target.
 Hardware/consensus acceptance, physical live transitions and clean-machine
 installation remain separate validation work; see README for current limits.
+
+The status API reports `service_started_unix` once per coordinator process and
+`started_unix` once per engine-assignment session. The dashboard shows Service
+uptime with the engine-session age beneath it. Topology replacements still reset
+session proof counters and chart scope, but never the displayed service uptime.

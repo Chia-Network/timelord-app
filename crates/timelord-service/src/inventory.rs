@@ -403,36 +403,45 @@ pub async fn live_configuration(shared: &crate::Shared) -> Result<Config> {
     }
     let _initialization = crate::hardware::INITIALIZATION.lock().await;
     let mut devices = discover(&shared.config).await?;
-    {
-        // Keep the same lock order as the status handler.
-        let clients = shared.clients.lock().expect("clients");
-        let runtime = shared.runtime.lock().expect("runtime");
-        // Open FTDI interfaces can omit metadata. Require recent hardware
-        // telemetry as well as a live socket; an old connection is not presence.
-        for board in &shared.config.hardware.boards {
-            if runtime.boards.get(&board.id).is_some_and(|state| {
-                state.state == "connected"
-                    && state.temperature_unix.saturating_add(15) >= crate::unix_now()
-            }) && clients.iter().any(|(id, _)| id == &board.id)
-                && !devices.iter().any(|d| {
-                    d.serial == board.serial && d.serial.is_some()
-                        || Some(d.location) == board.device_location
-                })
-                && let Some(location) = runtime
-                    .boards
-                    .get(&board.id)
-                    .and_then(|b| b.device_location)
-                    .or(board.device_location)
-            {
-                devices.push(Device {
-                    name: board.name.clone(),
-                    serial: board.serial.clone(),
-                    location,
-                });
-            }
+    preserve_managed_boards(
+        &shared.config,
+        &mut devices,
+        &shared.runtime.lock().expect("runtime"),
+        crate::unix_now(),
+    );
+    connected_plan(shared.config.clone(), devices)
+}
+
+fn preserve_managed_boards(
+    config: &Config,
+    devices: &mut Vec<Device>,
+    runtime: &crate::runtime::RuntimeState,
+    now: u64,
+) {
+    // D2XX can omit metadata for interfaces owned by a native client. An idle
+    // chain may have no leased socket, but that does not release its USB owner.
+    // Defer to the owner's health interval instead of a separate 15-second
+    // topology deadline. Its watchdog detects exit/IO failure and stale sensors.
+    for board in &config.hardware.boards {
+        if let Some(state) = runtime.boards.get(&board.id)
+            && state.state == "connected"
+            && !state.latched_fault
+            && state.temperature_unix > 0
+            && now.saturating_sub(state.temperature_unix)
+                <= crate::hardware::TEMPERATURE_TIMEOUT_SECONDS
+            && !devices.iter().any(|d| {
+                d.serial == board.serial && d.serial.is_some()
+                    || Some(d.location) == state.device_location.or(board.device_location)
+            })
+            && let Some(location) = state.device_location.or(board.device_location)
+        {
+            devices.push(Device {
+                name: board.name.clone(),
+                serial: board.serial.clone(),
+                location,
+            });
         }
     }
-    connected_plan(shared.config.clone(), devices)
 }
 
 #[cfg(test)]
@@ -550,6 +559,69 @@ mod tests {
     #[test]
     fn ambiguous_serial_is_not_a_topology_change() {
         assert!(connected_plan(configured(), devices(&[0, 0])).is_err());
+    }
+    #[test]
+    fn idle_owner_without_socket_keeps_three_board_layout_through_metadata_gaps() {
+        let config = configured();
+        let mut runtime = crate::runtime::RuntimeState::default();
+        runtime.boards.insert(
+            "b2".into(),
+            crate::runtime::HardwareState {
+                state: "connected".into(),
+                temperature_unix: 1000,
+                device_location: Some(3),
+                ..Default::default()
+            },
+        );
+        let mut topology = TopologyChange::default();
+        let instant = std::time::Instant::now();
+        // No socket or recent raw IPS is required for an idle, supervised owner.
+        for elapsed in [0, 10, 20, 30, 45, 59, 60] {
+            let mut detected = devices(&[0, 1]);
+            preserve_managed_boards(&config, &mut detected, &runtime, 1000 + elapsed);
+            let next = connected_plan(config.clone(), detected).unwrap();
+            assert_eq!(next.hardware.boards.len(), 3);
+            assert!(
+                topology
+                    .observe_at(&config, Ok(next), instant + Duration::from_secs(elapsed))
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn absent_faulted_or_stale_owner_does_not_hide_an_unplugged_board() {
+        let config = configured();
+        for (state, latched, age) in [
+            ("reconnecting", false, 1),
+            ("fault", false, 1),
+            ("starting", false, 1),
+            ("connected", true, 1),
+            ("connected", false, 61),
+        ] {
+            let mut runtime = crate::runtime::RuntimeState::default();
+            runtime.boards.insert(
+                "b2".into(),
+                crate::runtime::HardwareState {
+                    state: state.into(),
+                    latched_fault: latched,
+                    temperature_unix: 1000,
+                    ..Default::default()
+                },
+            );
+            let mut detected = devices(&[0, 1]);
+            preserve_managed_boards(&config, &mut detected, &runtime, 1000 + age);
+            let next = connected_plan(config.clone(), detected).unwrap();
+            assert_eq!(next.hardware.boards.len(), 2);
+            assert_eq!(
+                next.assignments()
+                    .unwrap()
+                    .iter()
+                    .filter(|a| a.board_id == "b0")
+                    .count(),
+                2
+            );
+        }
     }
     #[test]
     fn explicit_mapping_keeps_absent_board_while_refreshing_connected_locations() {

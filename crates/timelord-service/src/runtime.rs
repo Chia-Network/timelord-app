@@ -794,6 +794,7 @@ mod tests {
                 clients: Default::default(),
                 runtime,
                 started_unix: unix_now(),
+                service_started_unix: crate::unix_now(),
             });
             let session = tokio::spawn(session(shared, Arc::new(backend)));
             let result = tokio::time::timeout(Duration::from_secs(3), task).await;

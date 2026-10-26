@@ -79,6 +79,7 @@ public struct AppSnapshot: Sendable {
     public var tuningPaused: Bool = false
     public var automaticActive: Bool { boards.contains { $0.isAutomatic } }
     public var readyToRun = false
+    public var sessionUptimeSeconds: TimeInterval? = nil
     public var runningTitle: String { phase == .serviceUnavailable && serviceAvailable ? "Proof service stopped" : readyToRun ? "Ready to run" : phase == .running && !tuningPaused && boards.contains(where: { ["learning","testing"].contains($0.automatic?.state ?? "") }) ? "Running · Optimizing" : phase.title }
 
     public var headlineHistory: ChainHistory? {
@@ -131,6 +132,7 @@ public struct ServiceStatus: Decodable, Sendable {
     public let boards: [BoardStatus]
     public let timestampUnix: Double
     public let startedUnix: Double
+    public let serviceStartedUnix: Double?
     public let latestProofUnix: Double?
     public let proofsDelivered: Int
     public let tuningPaused: Bool
@@ -285,6 +287,6 @@ public enum LivePresentation {
                 : "Connect a full node and plug in your ASIC boards to get started.")),
             node: ConnectionSnapshot(title: nodeTitle, detail: nodeDetail, tone: nodeTone, height: freshSync?.height),
             timelord: ConnectionSnapshot(title: phase == .serviceUnavailable ? "Stopped" : productive ? "Running" : live != nil ? "Ready" : "Stopped", detail: "On this Mac", tone: phase == .serviceUnavailable ? .critical : productive ? .positive : .neutral),
-            boards: boards, proofsToday: proofCapable ? live?.proofsDelivered : nil, uptimeSeconds: proofCapable ? live.map { max(0, now.timeIntervalSince1970 - $0.startedUnix) } : nil, now: now, serviceAvailable: live != nil, tuningPaused: live?.tuningPaused ?? false, readyToRun: phase == .setupRequired && configuration?.node.hasIdentity == true && configuration?.hardware.clientBinary != nil && !boards.isEmpty)
+            boards: boards, proofsToday: proofCapable ? live?.proofsDelivered : nil, uptimeSeconds: proofCapable ? live.map { max(0, now.timeIntervalSince1970 - ($0.serviceStartedUnix ?? $0.startedUnix)) } : nil, now: now, serviceAvailable: live != nil, tuningPaused: live?.tuningPaused ?? false, readyToRun: phase == .setupRequired && configuration?.node.hasIdentity == true && configuration?.hardware.clientBinary != nil && !boards.isEmpty, sessionUptimeSeconds: proofCapable ? live.map { max(0, now.timeIntervalSince1970 - $0.startedUnix) } : nil)
     }
 }

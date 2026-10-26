@@ -5,6 +5,27 @@ import XCTest
 final class PresentationTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_000_000)
 
+    func testServiceUptimeSurvivesAnEngineSessionRestart() throws {
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        func status(sessionStart: Double) throws -> ServiceStatus {
+            let original = try operationalStatus()
+            // Preserve the fixture's node/board fields while changing only clocks.
+            let object: [String: Any] = ["api_version":original.apiVersion, "service_pid":original.servicePid,
+                "timelord_state":"running", "message":"", "production_enabled":true,
+                "full_node":["host":"localhost", "state":"ready"], "boards":[],
+                "started_unix":sessionStart, "service_started_unix":900000,
+                "timestamp_unix":1000000, "latest_proof_unix":1000000,
+                "proofs_delivered":0, "tuning_paused":false]
+            return try decoder.decode(ServiceStatus.self, from: JSONSerialization.data(withJSONObject:object))
+        }
+        let before = LivePresentation.snapshot(status:try status(sessionStart:999000), now:now)
+        let after = LivePresentation.snapshot(status:try status(sessionStart:999700), now:now)
+        XCTAssertEqual(before.uptimeSeconds, 100000)
+        XCTAssertEqual(after.uptimeSeconds, before.uptimeSeconds)
+        XCTAssertEqual(before.sessionUptimeSeconds, 1000)
+        XCTAssertEqual(after.sessionUptimeSeconds, 300)
+    }
+
     func testDeliveredMedianUsesTheSameScrapeWindowAndStopsWhenPaused() {
         let fixture = PresentationScenario.runningOneBoard.snapshot(now: now)
         let snapshot = AppSnapshot(phase: .running, explanation: "", node: fixture.node, timelord: fixture.timelord, boards: fixture.boards, proofsToday: nil, uptimeSeconds: nil, now: now, serviceAvailable: true)

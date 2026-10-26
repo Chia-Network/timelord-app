@@ -41,7 +41,7 @@ struct Overview: View {
                         Divider()
                         MetricTile(title: "Proofs delivered", value: model.snapshot.proofsToday.map { $0.formatted() } ?? "—", caption: "Verified proofs sent to your node this run")
                         Divider()
-                        MetricTile(title: "Uptime", value: DisplayFormat.uptime(model.snapshot.uptimeSeconds), caption: "Since the timelord started")
+                        MetricTile(title: "Service uptime", value: DisplayFormat.uptime(model.snapshot.uptimeSeconds), caption: "Engine session: \(DisplayFormat.uptime(model.snapshot.sessionUptimeSeconds))")
                     }.fixedSize(horizontal: false, vertical: true)
                         .frame(width: 550).timelordCard(padding: 16)
                 }
