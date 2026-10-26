@@ -273,8 +273,11 @@ final class TimelordModel: ObservableObject {
             // Open D2XX interfaces can hide their enumeration metadata. A fresh
             // supervised USB owner remains presence evidence when its chain is idle.
             for status in liveStatus?.boards ?? [] where status.hardwareState == "connected" || (status.connectedClients>0 && status.hardwareState == "starting") {
-                if let configured=savedConfiguration.hardware.boards.first(where:{$0.id==status.id}),let location=status.deviceLocation ?? configured.deviceLocation,!devices.contains(where:{$0.location==location}) {
-                    devices.append(DiscoveredDevice(name:configured.name,location:location,serial:configured.serial))
+                let configured=(savedConfiguration.hardware.boards + savedConfiguration.hardware.rememberedBoards).first(where:{$0.id==status.id})
+                let serial=status.serial ?? configured?.serial
+                if let location=status.deviceLocation ?? configured?.deviceLocation,
+                   !devices.contains(where:{ device in if let serial { return device.serial == serial }; return device.location == location }) {
+                    devices.append(DiscoveredDevice(name:status.name,location:location,serial:serial))
                 }
             }
             discoveredDevices=devices

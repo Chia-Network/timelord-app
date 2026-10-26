@@ -224,6 +224,9 @@ public enum LivePresentation {
         var boards: [BoardSnapshot]
         if let live {
             boards = live.boards.filter { board in
+                // Fresh supervised owners are stronger presence evidence than
+                // enumeration, which can hide metadata for open USB interfaces.
+                if board.hardwareState == "connected" || (board.hardwareState == "starting" && board.connectedClients > 0) { return true }
                 guard let detectedDevices else {return true}
                 let configured=configuration?.hardware.boards.first(where:{$0.id==board.id})
                 let location=board.deviceLocation ?? configured?.deviceLocation

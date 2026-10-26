@@ -404,6 +404,45 @@ extension PresentationTests {
         let unplugged=LivePresentation.snapshot(status:nil,configuration:config,detectedDevices:[],now:now)
         XCTAssertTrue(unplugged.boards.isEmpty)
     }
+    func testSupervisedBoardsRemainVisibleWhenUSBDiscoveryOnlySeesOneBoard() throws {
+        func status(states: [String], clients: [Int]) throws -> ServiceStatus {
+            let boards: [[String: Any]] = states.enumerated().map { index, state in
+                ["id":"board-\(index)", "name":"ASIC \(index)", "serial":"serial-\(index)",
+                 "device_location":index + 1, "assigned_chains":[Chain.allCases[index].rawValue],
+                 "connected_clients":clients[index], "hardware_state":state,
+                 "latest_proof_unix":1000000, "profile":"Automatic"]
+            }
+            let data: [String: Any] = ["api_version":1, "service_pid":42,
+                "timelord_state":"running", "message":"", "production_enabled":true,
+                "started_unix":999000, "timestamp_unix":1000000, "latest_proof_unix":1000000,
+                "proofs_delivered":7, "tuning_paused":false, "connected_client_count":clients.reduce(0,+),
+                "full_node":["host":"localhost", "state":"ready"], "boards":boards]
+            let decoder=JSONDecoder();decoder.keyDecodingStrategy = .convertFromSnakeCase
+            return try decoder.decode(ServiceStatus.self,from:JSONSerialization.data(withJSONObject:data))
+        }
+        let discovered=[DiscoveredDevice(name:"ASIC 0",location:1,serial:"serial-0")]
+        let healthy=try status(states:["connected","connected","connected"],clients:[1,1,1])
+        // Hotplug can leave discovery/configuration with only one active entry,
+        // while the service already owns all three recovered boards.
+        var config=AppConfiguration()
+        var board=ConfiguredBoard(id:"board-0",name:"ASIC 0",port:18110,location:1)
+        board.serial="serial-0";config.hardware.boards=[board]
+        let snapshot=LivePresentation.snapshot(status:healthy,configuration:config,detectedDevices:discovered,now:now)
+        XCTAssertEqual(snapshot.boards.map(\.id),["board-0","board-1","board-2"])
+        XCTAssertEqual(snapshot.boards.map(\.state),[.active,.active,.active])
+
+        let idle=try status(states:["connected","connected","connected"],clients:[1,1,0])
+        XCTAssertEqual(LivePresentation.snapshot(status:idle,detectedDevices:[],now:now).boards.count,3,
+                       "An idle ICC owner's USB metadata can also be hidden")
+        let starting=try status(states:["starting","starting","starting"],clients:[1,0,0])
+        XCTAssertEqual(LivePresentation.snapshot(status:starting,detectedDevices:[],now:now).boards.map(\.id),["board-0"])
+        let absent=try status(states:["fault","reconnecting","starting"],clients:[0,0,0])
+        XCTAssertTrue(LivePresentation.snapshot(status:absent,detectedDevices:[],now:now).boards.isEmpty,
+                      "Configured or unavailable clients alone are not presence evidence")
+        XCTAssertTrue(LivePresentation.snapshot(status:healthy,detectedDevices:[],now:now.addingTimeInterval(15)).boards.isEmpty,
+                      "Stale status cannot preserve board presence")
+    }
+
     private func operationalStatus(production: Bool = true, latest: Double = 1_000_000, state: String = "running", message: String = "Producing verified proofs.") throws -> ServiceStatus {
         let object: [String: Any] = ["api_version":1,"service_pid":42,"service_state":"ready","timelord_state":state,"message":message,"production_enabled":production,"started_unix":999000,"timestamp_unix":1000000,"latest_proof_unix":latest,"proofs_delivered":7,"tuning_paused":false,
             "full_node":["host":"localhost","port":8444,"network":"mainnet","state":"ready"],
