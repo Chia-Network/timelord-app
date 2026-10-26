@@ -40,10 +40,12 @@ background threads may still be running. Serial identity survives USB-port chang
 detected boards; one/two/three boards receive 3 / 2+1 / 1+1+1 engines. The service
 polls USB every five seconds and requires three consistent inventories before
 replacing the layout. Enumeration errors leave the existing layout intact; fresh
-supervised owner telemetry covers metadata omitted by open FTDI interfaces.
-An idle chain needs no leased proof socket. Presence uses the native owner's
-60-second sensor deadline, rather than a separate shorter topology threshold;
-faulted owners and expired telemetry do not mask unplugged hardware. Old scheduler,
+supervised owners cover metadata omitted by open FTDI interfaces. An idle chain
+needs no leased proof socket. Client health and USB presence are separate: a
+known-present board stays in the layout during transport or sensor recovery. Only
+a successful inventory taken after its native owner has closed can confirm that
+its serial is absent. The 60-second sensor watchdog still stops and retries the
+affected client; latched safety faults remain excluded from presence fallback. Old scheduler,
 client listeners and native owners stop before new ones start, while the status
 HTTP listener stays available. Zero boards waits for reconnection. Each layout
 selects its own engine-count/mask tuning profile, and safety faults remain latched

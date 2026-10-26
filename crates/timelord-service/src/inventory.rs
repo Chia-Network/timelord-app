@@ -418,17 +418,19 @@ fn preserve_managed_boards(
     runtime: &crate::runtime::RuntimeState,
     now: u64,
 ) {
-    // D2XX can omit metadata for interfaces owned by a native client. An idle
-    // chain may have no leased socket, but that does not release its USB owner.
-    // Defer to the owner's health interval instead of a separate 15-second
-    // topology deadline. Its watchdog detects exit/IO failure and stale sensors.
+    // Open FTDI handles can hide their metadata even while a socket or sensor
+    // watchdog is recovering the client. Health is not physical absence. Keep
+    // a known-present board until its supervisor has closed the native owner
+    // and obtained a successful inventory that actually omits that serial.
     for board in &config.hardware.boards {
         if let Some(state) = runtime.boards.get(&board.id)
-            && state.state == "connected"
             && !state.latched_fault
-            && state.temperature_unix > 0
-            && now.saturating_sub(state.temperature_unix)
-                <= crate::hardware::TEMPERATURE_TIMEOUT_SECONDS
+            && (state.usb_present == Some(true)
+                || (state.usb_present.is_none()
+                    && state.state == "connected"
+                    && state.temperature_unix > 0
+                    && now.saturating_sub(state.temperature_unix)
+                        <= crate::hardware::TEMPERATURE_TIMEOUT_SECONDS))
             && !devices.iter().any(|d| {
                 d.serial == board.serial && d.serial.is_some()
                     || Some(d.location) == state.device_location.or(board.device_location)
@@ -568,6 +570,7 @@ mod tests {
             "b2".into(),
             crate::runtime::HardwareState {
                 state: "connected".into(),
+                usb_present: Some(true),
                 temperature_unix: 1000,
                 device_location: Some(3),
                 ..Default::default()
@@ -576,7 +579,7 @@ mod tests {
         let mut topology = TopologyChange::default();
         let instant = std::time::Instant::now();
         // No socket or recent raw IPS is required for an idle, supervised owner.
-        for elapsed in [0, 10, 20, 30, 45, 59, 60] {
+        for elapsed in [0, 10, 20, 30, 45, 59, 60, 90, 300] {
             let mut detected = devices(&[0, 1]);
             preserve_managed_boards(&config, &mut detected, &runtime, 1000 + elapsed);
             let next = connected_plan(config.clone(), detected).unwrap();
@@ -589,6 +592,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn transport_and_sensor_recovery_do_not_become_false_usb_removals() {
+        let config = configured();
+        for state in ["connected", "fault", "reconnecting", "starting"] {
+            let mut runtime = crate::runtime::RuntimeState::default();
+            runtime.boards.insert(
+                "b2".into(),
+                crate::runtime::HardwareState {
+                    state: state.into(),
+                    usb_present: Some(true),
+                    temperature_unix: 1000,
+                    ..Default::default()
+                },
+            );
+            let mut detected = devices(&[0, 1]);
+            preserve_managed_boards(&config, &mut detected, &runtime, 2000);
+            assert_eq!(
+                connected_plan(config.clone(), detected)
+                    .unwrap()
+                    .hardware
+                    .boards
+                    .len(),
+                3
+            );
+        }
+    }
+
+    #[test]
+    fn closed_owner_confirmed_absence_wins_over_old_socket_or_telemetry() {
+        let config = configured();
+        let mut runtime = crate::runtime::RuntimeState::default();
+        runtime.boards.insert(
+            "b2".into(),
+            crate::runtime::HardwareState {
+                state: "connected".into(),
+                usb_present: Some(false),
+                temperature_unix: 1000,
+                ..Default::default()
+            },
+        );
+        let mut detected = devices(&[0, 1]);
+        preserve_managed_boards(&config, &mut detected, &runtime, 1001);
+        assert_eq!(
+            connected_plan(config, detected)
+                .unwrap()
+                .hardware
+                .boards
+                .len(),
+            2
+        );
+    }
     #[test]
     fn absent_faulted_or_stale_owner_does_not_hide_an_unplugged_board() {
         let config = configured();

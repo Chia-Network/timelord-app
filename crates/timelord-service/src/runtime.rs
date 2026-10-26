@@ -68,6 +68,9 @@ pub struct HardwareState {
     pub started_unix: u64,
     #[serde(skip)]
     pub latched_fault: bool,
+    // Set only by discovery while this board's native owner is closed.
+    #[serde(skip)]
+    pub usb_present: Option<bool>,
     #[serde(skip)]
     pub fault_reason: Option<String>,
     pub raw_speeds: Vec<RawSpeed>,

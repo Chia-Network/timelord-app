@@ -793,6 +793,13 @@ async fn supervise_board(
             result = async {
                 if board.serial.is_some() {
                     let devices = crate::inventory::discover(&shared.config).await?;
+                    // This owner's old process has exited, so its own open FTDI
+                    // handle cannot be hiding metadata. Only this observation
+                    // may declare an already-managed board absent.
+                    let matches = devices.iter().filter(|d| d.serial == board.serial).count();
+                    shared.runtime.lock().expect("runtime").boards.get_mut(&board.id).expect("board").usb_present = match matches {
+                        0 => Some(false), 1 => Some(true), _ => None,
+                    };
                     board.device_location = Some(crate::inventory::board_location(&board, &devices)?);
                 }
                 shared.runtime.lock().expect("runtime").boards.get_mut(&board.id).expect("board").device_location = board.device_location;
