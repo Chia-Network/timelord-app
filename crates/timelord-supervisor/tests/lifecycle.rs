@@ -1,0 +1,323 @@
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
+use timelord_supervisor::{Control, Intent, Mode, Paths, Status, request};
+use tokio::{
+    process::{Child, Command},
+    time::sleep,
+};
+
+static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+struct Fixture(PathBuf);
+impl Fixture {
+    fn new() -> Self {
+        let path = Path::new("/tmp").join(format!(
+            "tl-sup-{}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+    fn config(&self) -> PathBuf {
+        self.0.join("config.toml")
+    }
+    fn helper(&self, body: &str) -> PathBuf {
+        let path = self.0.join("worker");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho $$ >> '{}'\n{body}\n",
+                self.0.join("pids").display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+    fn supervisor(&self, helper: &Path) -> Child {
+        Command::new(env!("CARGO_BIN_EXE_timelord-supervisor"))
+            .arg("run")
+            .arg("--config")
+            .arg(self.config())
+            .arg("--worker")
+            .arg(helper)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    }
+    async fn status(&self, predicate: impl Fn(&Status) -> bool) -> Status {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Ok(status) = request(&self.config(), Control::Status, None).await
+                    && predicate(&status)
+                {
+                    break status;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("supervisor did not reach requested fixture state")
+    }
+    async fn terminate(&self, mut child: Child) {
+        unsafe {
+            libc::kill(child.id().unwrap() as i32, libc::SIGTERM);
+        }
+        let exit = tokio::time::timeout(Duration::from_secs(4), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(exit.success());
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if let Ok(pids) = fs::read_to_string(self.0.join("pids")) {
+            for pid in pids
+                .lines()
+                .filter_map(|p| p.parse::<i32>().ok())
+                .filter(|p| *p > 1)
+            {
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                };
+            }
+        }
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[tokio::test]
+async fn explicit_pause_survives_supervisor_restart_and_resume_uses_one_owner() {
+    let fixture = Fixture::new();
+    let helper = fixture.helper("exec /bin/sleep 60");
+    let first = fixture.supervisor(&helper);
+    let running = fixture.status(|s| s.worker_pid.is_some()).await;
+    assert_eq!(running.mode, Mode::Running);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !fixture.0.join("pids").exists() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // A second supervisor cannot steal the socket or start another worker.
+    let mut duplicate = fixture.supervisor(&helper);
+    assert!(!duplicate.wait().await.unwrap().success());
+    let paused = request(&fixture.config(), Control::Pause, Some(running.revision))
+        .await
+        .unwrap();
+    assert_eq!(paused.mode, Mode::Paused);
+    assert!(paused.worker_pid.is_none());
+    let old = running.worker_pid.unwrap();
+    assert_eq!(unsafe { libc::kill(old as i32, 0) }, -1);
+    fixture.terminate(first).await;
+    let second = fixture.supervisor(&helper);
+    fixture.status(|s| s.mode == Mode::Paused).await;
+    sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        fs::read_to_string(fixture.0.join("pids"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    // Stale control commands must not overwrite an operator's newer decision.
+    assert!(
+        request(&fixture.config(), Control::Resume, Some(running.revision))
+            .await
+            .is_err()
+    );
+    request(&fixture.config(), Control::Resume, Some(paused.revision))
+        .await
+        .unwrap();
+    let resumed = fixture.status(|s| s.worker_pid.is_some()).await;
+    assert_ne!(resumed.worker_pid, Some(old));
+    request(&fixture.config(), Control::Pause, None)
+        .await
+        .unwrap();
+    fixture.terminate(second).await;
+}
+
+#[tokio::test]
+async fn crash_is_replaced_without_gui_and_pause_cancels_backoff() {
+    let fixture = Fixture::new();
+    let marker = fixture.0.join("first");
+    let helper = fixture.helper(&format!(
+        "if [ ! -e '{}' ]; then touch '{}'; exit 17; fi\nexec /bin/sleep 60",
+        marker.display(),
+        marker.display()
+    ));
+    let child = fixture.supervisor(&helper);
+    let replaced = fixture
+        .status(|s| s.worker_generation >= 2 && s.worker_pid.is_some())
+        .await;
+    assert_eq!(replaced.restarts, 1);
+    request(&fixture.config(), Control::Pause, None)
+        .await
+        .unwrap();
+    fixture.terminate(child).await;
+    // A permanently crashing worker stays recoverable rather than exhausting
+    // retries; an explicit pause suppresses the pending next attempt.
+    let helper = fixture.helper("exit 19");
+    let paths = Paths::for_config(&fixture.config()).unwrap();
+    paths.save_intent(&Intent::default()).unwrap();
+    let child = fixture.supervisor(&helper);
+    fixture
+        .status(|s| s.restarts >= 1 && s.worker_pid.is_none())
+        .await;
+    request(&fixture.config(), Control::Pause, None)
+        .await
+        .unwrap();
+    let starts = fs::read_to_string(fixture.0.join("pids"))
+        .unwrap()
+        .lines()
+        .count();
+    sleep(Duration::from_millis(1300)).await;
+    assert_eq!(
+        starts,
+        fs::read_to_string(fixture.0.join("pids"))
+            .unwrap()
+            .lines()
+            .count()
+    );
+    fixture.terminate(child).await;
+}
+
+#[tokio::test]
+async fn corrupt_intent_never_silently_resumes_and_failed_save_preserves_pause() {
+    let fixture = Fixture::new();
+    let helper = fixture.helper("exec /bin/sleep 60");
+    let paths = Paths::for_config(&fixture.config()).unwrap();
+    paths
+        .save_intent(&Intent {
+            mode: Mode::Paused,
+            ..Default::default()
+        })
+        .unwrap();
+    fs::write(&paths.intent, b"corrupt").unwrap();
+    let child = fixture.supervisor(&helper);
+    let failed = fixture.status(|s| s.phase == "state_error").await;
+    assert_eq!(failed.mode, Mode::Paused);
+    assert!(failed.worker_pid.is_none());
+    assert_eq!(fs::read(&paths.intent).unwrap(), b"corrupt");
+    // A human's explicit resume can replace corrupt state; passive startup cannot.
+    request(&fixture.config(), Control::Resume, None)
+        .await
+        .unwrap();
+    fixture.status(|s| s.worker_pid.is_some()).await;
+    request(&fixture.config(), Control::Pause, None)
+        .await
+        .unwrap();
+    let saved = fs::read(&paths.intent).unwrap();
+    fs::write(
+        paths
+            .directory
+            .join(format!("intent-{}.tmp", std::process::id())),
+        b"occupied",
+    )
+    .unwrap();
+    assert!(paths.save_intent(&Intent::default()).is_err());
+    assert_eq!(fs::read(&paths.intent).unwrap(), saved);
+    fixture.terminate(child).await;
+}
+
+#[tokio::test]
+async fn requested_run_survives_shutdown_and_worker_family_is_reaped_before_replacement() {
+    let fixture = Fixture::new();
+    let helper = fixture.helper(&format!(
+        "/bin/sleep 60 &\necho $! > '{}'\nwait",
+        fixture.0.join("descendant").display()
+    ));
+    let child = fixture.supervisor(&helper);
+    fixture.status(|s| s.worker_pid.is_some()).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !fixture.0.join("descendant").exists() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let descendant: i32 = fs::read_to_string(fixture.0.join("descendant"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    request(&fixture.config(), Control::Reload, None)
+        .await
+        .unwrap();
+    // The old group was signalled before its leader's PID was reaped. A
+    // descendant may briefly remain a zombie until launchd/init reaps it, but
+    // it must have received SIGKILL and cannot retain a USB owner indefinitely.
+    fixture
+        .status(|s| s.worker_generation >= 2 && s.worker_pid.is_some())
+        .await;
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = fs::read_to_string(format!("/proc/{descendant}/stat")) {
+        assert!(stat.split_whitespace().nth(2) == Some("Z"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let result = std::process::Command::new("ps")
+            .args(["-p", &descendant.to_string(), "-o", "stat="])
+            .output()
+            .unwrap();
+        assert!(
+            !result.status.success()
+                || String::from_utf8_lossy(&result.stdout)
+                    .trim()
+                    .starts_with('Z')
+        );
+    }
+    fixture.terminate(child).await;
+    let next = fixture.supervisor(&helper);
+    assert_eq!(
+        fixture.status(|s| s.worker_pid.is_some()).await.mode,
+        Mode::Running
+    );
+    request(&fixture.config(), Control::Pause, None)
+        .await
+        .unwrap();
+    fixture.terminate(next).await;
+}
+
+#[test]
+fn intent_and_owner_paths_reject_links_and_insecure_files() {
+    use std::os::unix::fs::symlink;
+    use timelord_supervisor::InstanceLock;
+    let fixture = Fixture::new();
+    let paths = Paths::for_config(&fixture.config()).unwrap();
+    symlink(fixture.0.join("missing"), &paths.intent).unwrap();
+    assert!(
+        paths.load_intent().is_err(),
+        "a broken symlink is not a fresh installation"
+    );
+    fs::remove_file(&paths.intent).unwrap();
+    paths
+        .save_intent(&Intent {
+            mode: Mode::Paused,
+            ..Default::default()
+        })
+        .unwrap();
+    fs::set_permissions(&paths.intent, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(paths.load_intent().is_err());
+    symlink(&paths.intent, &paths.lock).unwrap();
+    assert!(InstanceLock::acquire(&paths.lock).is_err());
+    fs::remove_file(&paths.lock).unwrap();
+    let owner = InstanceLock::acquire(&paths.lock).unwrap();
+    assert!(InstanceLock::acquire(&paths.lock).is_err());
+    drop(owner);
+    assert!(InstanceLock::acquire(&paths.lock).is_ok());
+}

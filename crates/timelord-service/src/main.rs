@@ -61,6 +61,8 @@ enum Command {
     Serve {
         #[arg(long)]
         config: PathBuf,
+        #[arg(long, hide = true)]
+        supervised: bool,
     },
     /// Read configuration as JSON for the native interface.
     Configuration {
@@ -308,7 +310,16 @@ async fn main() -> Result<()> {
                 serde_json::to_string_pretty(&assignment::resolve(&value)?)?
             );
         }
-        Command::Serve { config } => {
+        Command::Serve { config, supervised } => {
+            // Install the async termination handler before the lifetime thread
+            // can signal us, including while configuration/USB startup awaits.
+            let _termination =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            if supervised {
+                timelord_supervisor::watch_parent()?;
+            }
+            let paths = timelord_supervisor::Paths::for_config(&config)?;
+            let _owner = timelord_supervisor::InstanceLock::acquire(&paths.worker_lock)?;
             let mut value = load(&config)?;
             value.service.control_socket = Some(automatic::socket_path(&config, &value));
             value.hardware.automatic_state.get_or_insert(

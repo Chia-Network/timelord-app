@@ -220,3 +220,55 @@ fn helper_reports_real_socket_state_without_claiming_productivity() {
         serde_json::from_slice(&std::fs::read(checkpoint).unwrap()).unwrap();
     assert_eq!(flushed["observations"][0]["id"], 50);
 }
+
+#[test]
+fn supervised_worker_exits_when_its_supervisor_lifetime_pipe_closes() {
+    use std::os::unix::process::CommandExt;
+    let directory = PathBuf::from(format!(
+        "/tmp/tl-parent-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let config = directory.join("config.toml");
+    std::fs::write(
+        &config,
+        format!("[service]\nstatus_listen='127.0.0.1:{port}'\n"),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_timelord-service"))
+        .args(["serve", "--supervised", "--config"])
+        .arg(&config)
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let lifetime = child.stdin.take().unwrap();
+    let mut fixture = Fixture { child, directory };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while status(port).is_none() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(lifetime);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(exit) = fixture.child.try_wait().unwrap() {
+            assert!(exit.success());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker did not stop on supervisor EOF"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
