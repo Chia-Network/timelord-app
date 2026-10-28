@@ -217,7 +217,7 @@ impl Worker {
         #[cfg(not(target_os = "macos"))]
         let pid = unsafe { info.si_pid() };
         // Darwin can report a stop notification even with WEXITED. A stopped
-        // process is not a reaped/crashed owner; leave it to the progress deadline.
+        // process is not an exited owner; retain its process-group identity.
         Ok(pid != 0
             && matches!(
                 info.si_code,
