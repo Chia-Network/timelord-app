@@ -52,6 +52,7 @@ pub enum Action {
     Save,
 }
 pub struct Input {
+    pub exploration_allowed: bool,
     pub healthy: bool,
     pub recoveries: u64,
     pub score: Option<f64>,
@@ -260,6 +261,23 @@ impl Policy {
         self.baseline = None;
         Some(Action::Set(target, reason.into()))
     }
+    /// Yield the experiment lease to recovery. Keep the live point unchanged,
+    /// but require a new full observation before it can become learned evidence.
+    pub fn interrupt_trial(&mut self, now: u64) {
+        if !self.trial {
+            return;
+        }
+        self.trial = false;
+        self.retest_trial = false;
+        self.baseline = None;
+        self.best = self.point;
+        self.epoch = now;
+        self.last_tick = now;
+        self.window_started = now;
+        self.window_recoveries = 0;
+        self.degraded_windows = 0;
+        self.status.active_seconds = 0;
+    }
     pub fn observe(&mut self, now: u64, input: Input) -> Option<Action> {
         self.status.retest_seconds_remaining = self.retest_remaining();
         let clock_reversed = now < self.last_tick;
@@ -400,6 +418,12 @@ impl Policy {
             self.status.message =
                 "Saved observed performance baseline; recoveries are permitted".into();
             return Some(Action::Save);
+        }
+        if !input.exploration_allowed {
+            self.status.state = "monitoring".into();
+            self.status.message =
+                "Holding settings while another board recovers or is being evaluated".into();
+            return None;
         }
         if self.retest_remaining().is_some()
             && input
@@ -687,6 +711,7 @@ mod tests {
     }
     fn input() -> Input {
         Input {
+            exploration_allowed: true,
             healthy: true,
             recoveries: 0,
             score: Some(950000.),
@@ -737,6 +762,38 @@ mod tests {
         );
         assert!(p.is_retest());
         p.applied(target, now, reason);
+    }
+    #[test]
+    fn recovery_yields_a_trial_without_lowering_a_healthy_clock_or_learning_it_early() {
+        let mut p = capped_retest_policy();
+        start_retest(&mut p, 1);
+        let current = p.point;
+        p.interrupt_trial(2);
+        assert_eq!(p.point, current);
+        assert!(!p.in_trial());
+        assert!(p.baseline.is_none());
+        assert_eq!(p.status.active_seconds, 0);
+        for now in 3..=31 {
+            let mut i = input();
+            i.exploration_allowed = false;
+            assert!(p.observe(now, i).is_none());
+        }
+        let mut i = input();
+        i.exploration_allowed = false;
+        assert!(matches!(p.observe(32, i), Some(Action::Save)));
+        for now in 33..=400 {
+            let mut i = input();
+            i.exploration_allowed = false;
+            assert!(p.observe(now, i).is_none());
+        }
+        assert_eq!(p.point, current);
+        assert!(!p.in_trial());
+        let mut i = input();
+        i.exploration_allowed = false;
+        i.temperature = Some(54.5);
+        assert!(
+            matches!(p.observe(401,i),Some(Action::Set(point,_)) if point.frequency_mhz<current.frequency_mhz)
+        );
     }
     #[test]
     fn retests_only_after_healthy_cool_work_and_honors_disable_and_limits() {

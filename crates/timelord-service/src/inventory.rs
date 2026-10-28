@@ -410,7 +410,25 @@ pub async fn live_configuration(shared: &crate::Shared) -> Result<Config> {
         return Ok(shared.config.clone());
     }
     let _initialization = crate::hardware::INITIALIZATION.lock().await;
+    let progress = shared.runtime.lock().expect("runtime").progress.clone();
+    let _discovery = progress
+        .as_ref()
+        .map(|p| p.begin(8, 0, 0, timelord_supervisor::progress::Stage::Discovery));
     let mut devices = discover(&shared.config).await?;
+    {
+        let mut state = shared.runtime.lock().expect("runtime");
+        for board in &shared.config.hardware.boards {
+            if let Some(hardware) = state.boards.get_mut(&board.id)
+                && hardware.state == "admitted"
+            {
+                hardware.usb_present = Some(
+                    devices
+                        .iter()
+                        .any(|d| d.serial.is_some() && d.serial == board.serial),
+                );
+            }
+        }
+    }
     preserve_managed_boards(
         &shared.config,
         &mut devices,
@@ -432,7 +450,7 @@ fn preserve_managed_boards(
     // and obtained a successful inventory that actually omits that serial.
     for board in &config.hardware.boards {
         if let Some(state) = runtime.boards.get(&board.id)
-            && !state.latched_fault
+            && (!state.latched_fault || state.state == "checking")
             && (state.usb_present == Some(true)
                 || (state.usb_present.is_none()
                     && state.state == "connected"

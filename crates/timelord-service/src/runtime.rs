@@ -64,6 +64,10 @@ pub struct HardwareState {
     #[serde(skip)]
     pub native_initialized: bool,
     #[serde(skip)]
+    pub quiesced: bool,
+    #[serde(skip)]
+    pub unavailable_since_unix: Option<u64>,
+    #[serde(skip)]
     pub verified_generation: Option<u64>,
     #[serde(skip)]
     pub verified_slots: std::collections::BTreeSet<u8>,
@@ -86,6 +90,8 @@ pub struct HardwareState {
     pub state: String,
     pub recoveries: u64,
     pub temperature_unix: u64,
+    #[serde(skip)]
+    pub temperature_samples: u64,
     pub automatic: Option<crate::automatic::Status>,
 }
 impl HardwareState {
@@ -107,6 +113,9 @@ impl HardwareState {
     }
 }
 pub struct RuntimeState {
+    pub experiments: Arc<crate::experiments::Gate>,
+    pub safety: Option<Arc<crate::safety::Store>>,
+    pub progress: Option<Arc<timelord_supervisor::progress::Progress>>,
     pub metrics: Option<Arc<crate::observability::Metrics>>,
     pub metric_epoch: u64,
     pub pending: [u32; 3],
@@ -130,6 +139,9 @@ pub struct RuntimeState {
 impl Default for RuntimeState {
     fn default() -> Self {
         Self {
+            experiments: Default::default(),
+            safety: None,
+            progress: None,
             metrics: None,
             metric_epoch: 0,
             pending: [0; 3],

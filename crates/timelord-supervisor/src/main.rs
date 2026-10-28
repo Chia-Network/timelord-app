@@ -225,7 +225,11 @@ impl Worker {
             ))
     }
     async fn stop(mut self) -> Result<std::process::ExitStatus> {
-        self.signal(libc::SIGTERM);
+        // Let the coordinator close native control channels and drain proof
+        // work first. The group-wide hard stop remains the bounded fallback.
+        unsafe {
+            libc::kill(self.group, libc::SIGTERM);
+        }
         let deadline = Instant::now() + Duration::from_secs(10);
         while !self.exited()? && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;

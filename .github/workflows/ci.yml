@@ -69,7 +69,7 @@ jobs:
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-
       - name: Build pinned chiavdf client
-        run: bash scripts/build-native-control.sh
+        run: bash scripts/build-native.sh
       - name: Assemble and verify developer app
         run: |
           test "$(uname -m)" = arm64

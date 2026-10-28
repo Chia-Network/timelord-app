@@ -83,14 +83,14 @@ For Homebrew dependencies:
 ```sh
 brew install cmake gmp boost
 bash scripts/check.sh
-bash scripts/build-native-control.sh
+bash scripts/build-native.sh
 bash scripts/bundle-dev.sh
 open build/Timelord.app
 ```
 
 The native build downloads a pinned public chiavdf revision and its FTDI SDK into
-ignored `build/` directories, stages the small live-control integration, and builds
-the client without touching hardware. Dependency pins, notices and integration
+ignored `build/` directories and builds the unchanged native source without
+touching hardware. Dependency pins, notices and integration
 details are under [integrations/](integrations/chiavdf/README.md). FTDI libraries
 retain their vendor distribution terms.
 

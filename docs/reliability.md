@@ -73,6 +73,12 @@ see docs/observability.md for current deadline semantics and limitations.
 - Validate native EOF/termination quiescing, driver deadlines, and independent
   board thermal-protection behavior. Do not assume software can stop hung hardware.
 
+Current PR 3 progress: durable per-serial safety state, exclusive owner leases,
+opened-handle native identity checks, isolated verified admission, confirmed EOF
+retirement, usable-capacity reconciliation and coordinated tuning/admission are
+implemented. Emulator and fake-native tests exercise these software boundaries.
+Physical USB/thermal/boot qualification remains a separate deployment gate.
+
 ## 4. Operational hardening
 
 - Bound logs, queues, subprocess output, history and memory growth. Disk/logging

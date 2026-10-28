@@ -88,6 +88,7 @@ struct Active {
 }
 struct Lane {
     board: String,
+    serial: Option<String>,
     active: Mutex<Option<Active>>,
     arithmetic: Arc<tokio::sync::Semaphore>,
     started_once: std::sync::atomic::AtomicBool,
@@ -105,6 +106,7 @@ impl std::fmt::Display for AsicFailure {
 }
 impl std::error::Error for AsicFailure {}
 pub struct AsicBackend {
+    progress_offset: usize,
     lanes: Vec<(Chain, Lane)>,
     pools: HashMap<String, Mutex<mpsc::Receiver<Lease>>>,
     runtime: Arc<SyncMutex<crate::runtime::RuntimeState>>,
@@ -129,6 +131,12 @@ impl AsicBackend {
                 (
                     a.chain,
                     Lane {
+                        serial: config
+                            .hardware
+                            .boards
+                            .iter()
+                            .find(|b| b.id == a.board_id)
+                            .and_then(|b| b.serial.clone()),
                         board: a.board_id,
                         active: Mutex::new(None),
                         arithmetic: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -139,12 +147,22 @@ impl AsicBackend {
             .collect();
         Ok((
             Self {
+                progress_offset: 0,
                 lanes,
                 pools,
                 runtime,
             },
             offers,
         ))
+    }
+    pub fn self_test(
+        config: &Config,
+        assignments: &[Assignment],
+        runtime: Arc<SyncMutex<crate::runtime::RuntimeState>>,
+    ) -> Result<(Self, HashMap<String, mpsc::Sender<Lease>>)> {
+        let (mut backend, offers) = Self::new(config, assignments, runtime)?;
+        backend.progress_offset = 10;
+        Ok((backend, offers))
     }
     pub fn observe_duration(&self, chain: Chain, stage: &str, duration: Duration) {
         if let Some(metrics) = &self.runtime.lock().expect("runtime").metrics {
@@ -204,11 +222,19 @@ impl AsicBackend {
                         (
                             b.generation,
                             b.latched_fault
-                                || ["fault", "thermal_stop", "reconnecting"]
-                                    .contains(&b.state.as_str()),
+                                || (state.safety.is_some() && !b.native_initialized)
+                                || [
+                                    "fault",
+                                    "thermal_stop",
+                                    "reconnecting",
+                                    "quarantined",
+                                    "checking",
+                                    "admitted",
+                                ]
+                                .contains(&b.state.as_str()),
                         )
                     })
-                    .unwrap_or((0, false))
+                    .unwrap_or((0, state.safety.is_some()))
             };
             if unavailable {
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -275,6 +301,15 @@ impl AsicBackend {
                     } else {
                         "Waiting for ASIC recovery.".into()
                     };
+                    let safety = state.safety.clone();
+                    drop(state);
+                    if verification
+                        && let (Some(safety), Some(serial)) = (safety, &lane.serial)
+                        && let Err(error) =
+                            safety.quarantine(serial, crate::safety::Reason::InvalidProof)
+                    {
+                        tracing::error!(%error,board=%lane.board,"Invalid-proof quarantine could not be checkpointed; active owner marker remains conservative");
+                    }
                     tracing::warn!(board=%lane.board, %error, verification, "ASIC proof lane unavailable");
                 }
             }
@@ -302,18 +337,26 @@ impl AsicBackend {
             .find(|(c, _)| *c == chain)
             .context("No board assigned to chain")?
             .1;
-        let (metrics, epoch) = {
+        let (metrics, epoch, process_progress) = {
             let state = self.runtime.lock().expect("runtime");
-            (state.metrics.clone(), state.metric_epoch)
+            (
+                state.metrics.clone(),
+                state.metric_epoch,
+                state
+                    .progress
+                    .clone()
+                    .or_else(|| state.metrics.as_ref().map(|m| m.progress.clone())),
+            )
         };
         let mut owner = lane.active.lock().await;
-        let lane_index = match chain {
-            Chain::Challenge => 0,
-            Chain::Reward => 1,
-            Chain::InfusedChallenge => 2,
-        };
-        let progress = metrics.as_ref().map(|m| {
-            m.progress.begin(
+        let lane_index = self.progress_offset
+            + match chain {
+                Chain::Challenge => 0,
+                Chain::Reward => 1,
+                Chain::InfusedChallenge => 2,
+            };
+        let progress = process_progress.as_ref().map(|p| {
+            p.begin(
                 lane_index,
                 work.generation,
                 work.iterations,
@@ -342,9 +385,13 @@ impl AsicBackend {
         {
             // The permit and stage live in the actual blocking closure. Cancelling
             // an async request cannot hide stuck GMP work or queue more of it.
-            let permit = lane.arithmetic.clone().acquire_owned().await?;
-            let arithmetic = metrics.as_ref().map(|m| {
-                m.progress.begin(
+            let semaphore = process_progress
+                .as_ref()
+                .map(|p| p.arithmetic(4 + lane_index))
+                .unwrap_or_else(|| lane.arithmetic.clone());
+            let permit = semaphore.acquire_owned().await?;
+            let arithmetic = process_progress.as_ref().map(|p| {
+                p.begin(
                     4 + lane_index,
                     work.generation,
                     work.iterations,
@@ -479,9 +526,13 @@ impl AsicBackend {
             p.stage(Stage::Verifying);
         }
         let verification_started = Instant::now();
-        let permit = lane.arithmetic.clone().acquire_owned().await?;
-        let arithmetic = metrics.as_ref().map(|m| {
-            m.progress.begin(
+        let semaphore = process_progress
+            .as_ref()
+            .map(|p| p.arithmetic(4 + lane_index))
+            .unwrap_or_else(|| lane.arithmetic.clone());
+        let permit = semaphore.acquire_owned().await?;
+        let arithmetic = process_progress.as_ref().map(|p| {
+            p.begin(
                 4 + lane_index,
                 work.generation,
                 work.iterations,

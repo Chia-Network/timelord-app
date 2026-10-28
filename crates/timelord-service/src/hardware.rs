@@ -1,4 +1,5 @@
 //! Supervise only explicitly configured native clients. Initialization is sequential.
+mod admission;
 use crate::{
     Shared,
     automatic::{self, Action, Point, Policy},
@@ -29,6 +30,10 @@ pub fn arguments(board: &BoardConfig, engines: usize) -> Result<Vec<String>> {
         board.client_port.to_string(),
         engines.to_string(),
     ];
+    if let Some(serial) = &board.serial {
+        arguments.extend(["--expected-serial".into(), serial.clone()]);
+    }
+    arguments.push("--raw-speed".into());
     let (frequency, voltage) = board.operating_point();
     arguments.extend([
         "--vdf-threads".into(),
@@ -43,9 +48,9 @@ pub fn arguments(board: &BoardConfig, engines: usize) -> Result<Vec<String>> {
         "--voltage".into(),
         voltage.to_string(),
     ]);
-    if board.profile == ProfileMode::Automatic {
-        arguments.push("--live-control".into());
-    }
+    // Manual profiles retain their requested setting but need the same inherited
+    // controller-lifetime and hardware-readback guard as Automatic profiles.
+    arguments.push("--live-control".into());
     Ok(arguments)
 }
 // Versioned native telemetry distinguishes a new rate baseline from real idle.
@@ -89,6 +94,29 @@ async fn terminate(child: &mut Child) {
         let _ = child.wait().await;
     }
 }
+// Discard bounded chunks while retaining just enough tail for a split final
+// shutdown record. No subprocess output is collected into an unbounded buffer.
+async fn drain_shutdown(source: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<bool> {
+    let mut buffer = [0u8; 1024];
+    let mut tail = String::new();
+    let mut confirmed = false;
+    loop {
+        let count = source.read(&mut buffer).await?;
+        if count == 0 {
+            return Ok(confirmed);
+        }
+        tail.push_str(&String::from_utf8_lossy(&buffer[..count]));
+        confirmed |= tail.contains("Hardware shutdown: engines_paused=1 safe_point_restored=1\n");
+        if tail.len() > 128 {
+            let mut start = tail.len() - 128;
+            while !tail.is_char_boundary(start) {
+                start += 1;
+            }
+            tail.drain(..start);
+        }
+    }
+}
+
 // Drain stderr even while control is awaiting its acknowledgement. A recovery
 // flood must not fill the pipe and block the USB owner before it reads TLSET.
 pub(crate) static INITIALIZATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -97,6 +125,7 @@ struct ClientLog {
     lines: tokio::io::Lines<BufReader<tokio::process::ChildStderr>>,
     ready: Option<oneshot::Sender<()>>,
     initialization: Option<tokio::sync::MutexGuard<'static, ()>>,
+    preparing: Option<timelord_supervisor::progress::Guard>,
     last_temperature: tokio::time::Instant,
     recent: std::collections::VecDeque<String>,
 }
@@ -106,6 +135,7 @@ impl ClientLog {
             lines: BufReader::new(stderr).lines(),
             ready: Some(ready),
             initialization: None,
+            preparing: None,
             last_temperature: tokio::time::Instant::now(),
             recent: Default::default(),
         }
@@ -148,10 +178,14 @@ impl ClientLog {
             self.last_temperature = tokio::time::Instant::now();
             let hardware = state.boards.entry(board.id.clone()).or_default();
             hardware.temperature_unix = crate::unix_now();
+            hardware.temperature_samples = hardware.temperature_samples.saturating_add(1);
             hardware.temperature_c = Some(temp);
             hardware.frequency_mhz = Some(freq);
             if hardware.state == "starting" || hardware.state == "connected" {
                 hardware.state = "connected".into();
+            }
+            if hardware.native_initialized && temp < board.temperature_limit_c {
+                hardware.unavailable_since_unix = None;
             }
             if temp >= board.temperature_limit_c {
                 let first = !hardware.latched_fault;
@@ -163,6 +197,13 @@ impl ClientLog {
                         "thermal_stops_total",
                         &[&crate::observability::board(&shared.config, &board.id)],
                     );
+                }
+                let safety = state.safety.clone();
+                drop(state);
+                if let (Some(safety), Some(serial)) = (safety, &board.serial)
+                    && let Err(error) = safety.quarantine(serial, crate::safety::Reason::Thermal)
+                {
+                    tracing::error!(%error,board=%board.name,"Thermal quarantine could not be checkpointed");
                 }
                 bail!("ASIC reached its configured temperature limit");
             }
@@ -195,6 +236,7 @@ impl ClientLog {
                 .or_default()
                 .native_initialized = true;
             self.initialization.take();
+            self.preparing.take();
             if let Some(ready) = self.ready.take() {
                 let _ = ready.send(());
             }
@@ -202,7 +244,9 @@ impl ClientLog {
         Ok(recovery)
     }
 }
-struct AutomaticOwner {
+struct NativeOwner {
+    experiment: Option<tokio::sync::OwnedSemaphorePermit>,
+    automatic: bool,
     policy: Policy,
     input: tokio::process::ChildStdin,
     output: BufReader<tokio::process::ChildStdout>,
@@ -214,22 +258,75 @@ struct AutomaticOwner {
     raw_window: crate::assignment::RawWindow,
     last_record_unix: u64,
 }
-impl AutomaticOwner {
+fn force_safe(shared: &Shared, board: &BoardConfig) -> bool {
+    let safety = shared.runtime.lock().expect("runtime").safety.clone();
+    safety
+        .zip(board.serial.as_ref())
+        .and_then(|(store, serial)| store.board(serial))
+        .is_some_and(|b| b.force_safe)
+}
+fn startup_point(
+    shared: &Shared,
+    board: &BoardConfig,
+    engines: usize,
+    hash: &str,
+    host: &str,
+) -> Result<Point> {
+    if force_safe(shared, board) {
+        return Ok(admission::qualification(shared, board, engines)?.point);
+    }
+    automatic::initial(&shared.config, board, engines, hash, host)
+}
+impl NativeOwner {
     async fn new(shared: &Shared, board: &BoardConfig, child: &mut Child) -> Result<Self> {
         let engines = shared
             .assignments
             .iter()
             .filter(|a| a.board_id == board.id)
             .count();
-        let hash = automatic::fingerprint(&shared.config)?;
-        let host = automatic::host();
-        let point = automatic::initial(&shared.config, board, engines, &hash, &host)?;
+        let automatic = board.profile == ProfileMode::Automatic;
+        let hash = if automatic {
+            automatic::fingerprint(&shared.config)?
+        } else {
+            String::new()
+        };
+        let host = if automatic {
+            automatic::host()
+        } else {
+            String::new()
+        };
+        let point = if automatic {
+            startup_point(shared, board, engines, &hash, &host)?
+        } else {
+            let (frequency_mhz, voltage_v) = board.operating_point();
+            Point {
+                frequency_mhz,
+                voltage_v,
+            }
+        };
+        let settings = if automatic {
+            board.automatic.clone()
+        } else {
+            timelord_core::AutomaticConfig {
+                min_frequency_mhz: 200.,
+                min_voltage_v: 0.7,
+                start_frequency_mhz: point.frequency_mhz,
+                start_voltage_v: point.voltage_v,
+                ..Default::default()
+            }
+        };
         let mut owner = Self {
+            experiment: None,
+            automatic,
             policy: Policy::new(
-                board.automatic.clone(),
+                settings,
                 point,
                 crate::unix_now(),
-                supported_frequencies(&shared.config).await?,
+                if automatic {
+                    supported_frequencies(&shared.config).await?
+                } else {
+                    vec![point.frequency_mhz]
+                },
             ),
             input: child.stdin.take().context("Native control input missing")?,
             output: BufReader::new(
@@ -239,18 +336,24 @@ impl AutomaticOwner {
                     .context("Native control output missing")?,
             ),
             sequence: 0,
-            serial: board
-                .serial
-                .clone()
-                .context("Automatic tuning needs a persistent board serial")?,
+            serial: if automatic {
+                board
+                    .serial
+                    .clone()
+                    .context("Automatic tuning needs a persistent board serial")?
+            } else {
+                board.serial.clone().unwrap_or_default()
+            },
             engines,
             hash,
             host,
             raw_window: Default::default(),
             last_record_unix: crate::unix_now(),
         };
-        if let Some(entry) =
-            automatic::learned(&shared.config, board, engines, &owner.hash, &owner.host)?
+        if automatic
+            && !force_safe(shared, board)
+            && let Some(entry) =
+                automatic::learned(&shared.config, board, engines, &owner.hash, &owner.host)?
         {
             owner.policy.restore(&entry);
         }
@@ -262,13 +365,41 @@ impl AutomaticOwner {
         );
         Ok(owner)
     }
+    async fn stop(self, child: &mut Child, log: ClientLog) -> bool {
+        let Self {
+            input, mut output, ..
+        } = self;
+        drop(input); // EOF asks the USB owner to quiesce before proof threads drain.
+        let ClientLog {
+            lines,
+            initialization,
+            ..
+        } = log;
+        let _initialization = initialization;
+        let mut stderr = lines.into_inner();
+        let retired = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut sink = tokio::io::sink();
+            let (exit, _, confirmed) = tokio::join!(
+                child.wait(),
+                tokio::io::copy(&mut output, &mut sink),
+                drain_shutdown(&mut stderr)
+            );
+            exit.is_ok() && confirmed.unwrap_or(false)
+        })
+        .await;
+        if let Ok(confirmed) = retired {
+            return confirmed;
+        }
+        terminate(child).await;
+        false
+    }
     async fn change(&mut self, target: Point, seconds: u64) -> Result<Point> {
         if !self
             .policy
             .settings
             .contains(target.frequency_mhz, target.voltage_v)
         {
-            bail!("Automatic request exceeds configured limits");
+            bail!("Native request exceeds configured limits");
         }
         self.sequence += 1;
         let sequence = self.sequence;
@@ -371,7 +502,14 @@ impl AutomaticOwner {
                     None
                 },
             },
-        )
+        )?;
+        if clean >= board.automatic.healthy_seconds && !self.policy.in_trial() {
+            let safety = shared.runtime.lock().expect("runtime").safety.clone();
+            if let Some(store) = safety {
+                store.healthy_profile_saved(&self.serial)?;
+            }
+        }
+        Ok(())
     }
     async fn tick(
         &mut self,
@@ -379,7 +517,18 @@ impl AutomaticOwner {
         board: &BoardConfig,
         log: &mut ClientLog,
     ) -> Result<()> {
+        if !self.automatic {
+            return Ok(());
+        }
         let now = crate::unix_now();
+        let gate = shared.runtime.lock().expect("runtime").experiments.clone();
+        if gate.admission_pending() {
+            self.policy.interrupt_trial(now);
+            self.experiment.take();
+        }
+        if self.experiment.is_none() {
+            self.experiment = gate.trial();
+        }
         let input = {
             let state = shared.runtime.lock().expect("runtime");
             let hardware = state
@@ -419,6 +568,16 @@ impl AutomaticOwner {
                 self.policy.settings.minimum_proofs_per_chain,
             );
             automatic::Input {
+                exploration_allowed: self.experiment.is_some()
+                    && !gate.admission_pending()
+                    && shared.config.hardware.boards.iter().all(|b| {
+                        state.boards.get(&b.id).is_some_and(|h| {
+                            h.native_initialized
+                                && h.state == "connected"
+                                && !h.latched_fault
+                                && now.saturating_sub(h.temperature_unix) <= 30
+                        })
+                    }),
                 healthy: state.phase == "running"
                     && ["ready", "authenticated"].contains(&state.node.as_str())
                     && latest.is_some_and(|t| now.saturating_sub(t) <= 30)
@@ -446,6 +605,21 @@ impl AutomaticOwner {
                     // Observe has selected a target but point is still the last
                     // accepted setting. Persist its reserved retry wait first.
                     self.record(shared, board, 0)?;
+                }
+                let safety = shared.runtime.lock().expect("runtime").safety.clone();
+                if let Some(store) = safety
+                    && let Err(error) = store.before_open(&self.serial, point)
+                {
+                    tracing::warn!(%error,board=%board.name,"Operating-point journal unavailable");
+                    if point.frequency_mhz > self.policy.point.frequency_mhz
+                        || point.voltage_v > self.policy.point.voltage_v
+                    {
+                        self.policy.interrupt_trial(now);
+                        self.experiment.take();
+                        return Ok(());
+                    }
+                    // Restrictive backoff remains allowed. The persisted older,
+                    // faster point makes a crash conservative, not falsely safe.
                 }
                 tracing::info!(board=%board.name, frequency_mhz=point.frequency_mhz, voltage_v=point.voltage_v, %reason, "Applying automatic setting");
                 let actual = self
@@ -499,6 +673,9 @@ impl AutomaticOwner {
                 }
             }
         }
+        if !self.policy.in_trial() {
+            self.experiment.take();
+        }
         shared
             .runtime
             .lock()
@@ -518,33 +695,27 @@ async fn supervise(
     ready: oneshot::Sender<()>,
     mut shutdown: watch::Receiver<bool>,
     initialization: tokio::sync::MutexGuard<'static, ()>,
+    preparing: Option<timelord_supervisor::progress::Guard>,
 ) -> Result<()> {
-    let automatic = if board.profile == ProfileMode::Automatic {
-        tokio::select! {
-            result=AutomaticOwner::new(&shared,&board,&mut child)=>Some(result),
-            _=shutdown.changed()=>{terminate(&mut child).await;return Ok(());}
-        }
-    } else {
-        None
+    let owner = tokio::select! {
+        result=NativeOwner::new(&shared,&board,&mut child)=>result,
+        _=shutdown.changed()=>{terminate(&mut child).await;return Ok(());}
     };
-    let mut automatic = match automatic {
-        Some(Ok(owner)) => Some(owner),
-        Some(Err(error)) => {
+    let mut owner = match owner {
+        Ok(owner) => owner,
+        Err(error) => {
             terminate(&mut child).await;
             let mut state = shared.runtime.lock().expect("runtime");
-            state.boards.entry(board.id.clone()).or_default().state = "fault".into();
-            state
-                .boards
-                .entry(board.id.clone())
-                .or_default()
-                .fault_reason = Some(error.to_string());
+            let hardware = state.boards.entry(board.id.clone()).or_default();
+            hardware.state = "fault".into();
+            hardware.fault_reason = Some(error.to_string());
             return Err(error);
         }
-        None => None,
     };
     let output = child.stderr.take().context("ASIC client log unavailable")?;
     let mut log = ClientLog::new(output, ready);
     log.initialization = Some(initialization);
+    log.preparing = preparing;
     let mut watchdog = tokio::time::interval(Duration::from_secs(5));
     let result: Result<()> = loop {
         tokio::select! {
@@ -560,17 +731,21 @@ async fn supervise(
                     Err(error) => break Err(error.into()),
                     Ok(None) => {}
                 }
-                if let Some(owner)=&mut automatic && let Err(error)=owner.tick(&shared,&board,&mut log).await {break Err(error);}
+                if let Err(error)=owner.tick(&shared,&board,&mut log).await {break Err(error);}
             }
             result = log.read(&shared, &board) => {
                 let recovery = match result { Ok(recovery) => recovery, Err(error) => break Err(error) };
-                if recovery && let Some(owner)=&mut automatic && let Err(error)=owner.tick(&shared,&board,&mut log).await {break Err(error);}
+                if recovery && let Err(error)=owner.tick(&shared,&board,&mut log).await {break Err(error);}
             }
         }
     };
-    terminate(&mut child).await;
+    let quiesced = owner.stop(&mut child, log).await;
+    if !quiesced {
+        tracing::warn!(board=%board.name,"Native shutdown lacked confirmed quiescence; owner is unclean");
+    }
     let mut state = shared.runtime.lock().expect("runtime");
     let hardware = state.boards.entry(board.id.clone()).or_default();
+    hardware.quiesced = quiesced;
     hardware.raw_speeds.clear();
     if hardware.state != "thermal_stop" {
         hardware.state = if result.is_ok() { "stopped" } else { "fault" }.into();
@@ -747,10 +922,9 @@ async fn launch(shared: &Shared, board: &BoardConfig) -> Result<Child> {
         .filter(|a| a.board_id == board.id)
         .count();
     let mut args = arguments(board, engines)?;
-    let automatic = board.profile == ProfileMode::Automatic;
-    if automatic {
-        let point = automatic::initial(
-            &shared.config,
+    if board.profile == ProfileMode::Automatic {
+        let point = startup_point(
+            shared,
             board,
             engines,
             &automatic::fingerprint(&shared.config)?,
@@ -778,16 +952,8 @@ async fn launch(shared: &Shared, board: &BoardConfig) -> Result<Child> {
             .context("No native client configured")?,
     )
     .args(args)
-    .stdin(if automatic {
-        Stdio::piped()
-    } else {
-        Stdio::null()
-    })
-    .stdout(if automatic {
-        Stdio::piped()
-    } else {
-        Stdio::inherit()
-    })
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
     .stderr(Stdio::piped())
     .kill_on_drop(true)
     .spawn()
@@ -806,22 +972,55 @@ async fn supervise_board(
     mut shutdown: watch::Receiver<bool>,
     mut budget: RestartBackoff,
 ) {
+    let safety = shared.runtime.lock().expect("runtime").safety.clone();
     let mut ready = Some(ready);
     let mut previous_failure = "topology";
     loop {
         if *shutdown.borrow() {
             return;
         }
+        if let (Some(store), Some(serial)) = (&safety, &board.serial)
+            && let Some(record) = store.board(serial)
+            && record.quarantine.is_some()
+        {
+            let point = Point {
+                frequency_mhz: board.frequency_mhz,
+                voltage_v: board.voltage_v,
+            };
+            let manual_invalid = board.profile == ProfileMode::Manual
+                && record.quarantine == Some(crate::safety::Reason::InvalidProof)
+                && record.last_point.is_none_or(|old| old == point);
+            if manual_invalid || record.retry_after_unix > crate::unix_now() {
+                ready.take();
+                {
+                    let mut state = shared.runtime.lock().expect("runtime");
+                    let hardware = state.boards.entry(board.id.clone()).or_default();
+                    hardware.latched_fault = true;
+                    hardware.state = "quarantined".into();
+                    hardware.fault_reason = Some(if manual_invalid {
+                        "Invalid proof: change the Manual operating point or select Automatic before retrying.".into()
+                    } else {
+                        format!(
+                            "Waiting for fresh admission after {:?}",
+                            record.quarantine.unwrap()
+                        )
+                    });
+                }
+                tokio::select! {_=shutdown.changed()=>return,_=tokio::time::sleep(Duration::from_secs(5))=>{}}
+                continue;
+            }
+        }
         {
             let mut state = shared.runtime.lock().expect("runtime");
             let hardware = state.boards.entry(board.id.clone()).or_default();
-            if hardware.latched_fault {
+            if hardware.latched_fault && safety.is_none() {
                 return;
             }
             hardware.generation += 1;
             hardware.started_unix = crate::unix_now();
             hardware.state = "starting".into();
             hardware.native_initialized = false;
+            hardware.quiesced = false;
             hardware.raw_speeds.clear();
             hardware.temperature_unix = 0;
             hardware.temperature_c = None;
@@ -835,6 +1034,22 @@ async fn supervise_board(
             guard = INITIALIZATION.lock() => guard,
             _ = shutdown.changed() => return,
         };
+        let progress = shared.runtime.lock().expect("runtime").progress.clone();
+        let board_index = shared
+            .config
+            .hardware
+            .boards
+            .iter()
+            .position(|b| b.id == board.id)
+            .unwrap_or(0);
+        let mut preparing = progress.as_ref().map(|p| {
+            p.begin(
+                17 + board_index,
+                0,
+                0,
+                timelord_supervisor::progress::Stage::BoardPreparation,
+            )
+        });
         let preparation: Result<()> = tokio::select! {
             result = async {
                 if board.serial.is_some() {
@@ -853,37 +1068,153 @@ async fn supervise_board(
             } => result,
             _ = shutdown.changed() => return,
         };
-        let result = match preparation {
-            Ok(()) => match launch(&shared, &board).await {
-                Ok(child) => {
-                    if let Some(metrics) = &shared.runtime.lock().expect("runtime").metrics {
-                        metrics.client_started(
-                            &crate::observability::board(&shared.config, &board.id),
-                            previous_failure,
-                        );
+        let result: Result<()> = async {
+            preparation?;
+            let mut initialization = initialization;
+            let engines = shared
+                .assignments
+                .iter()
+                .filter(|a| a.board_id == board.id)
+                .count();
+            let _lease = match (&safety, &board.serial) {
+                (Some(store), Some(serial)) => Some(store.lease(serial)?),
+                (Some(_), None) => bail!("Managed ASIC needs a persistent serial identity"),
+                _ => None,
+            };
+            if let (Some(store), Some(serial)) = (&safety, &board.serial) {
+                let prospective = if engines > 0 {
+                    engines
+                } else {
+                    let blocked = unavailable(&shared);
+                    let mut candidate = shared.config.clone();
+                    candidate
+                        .hardware
+                        .boards
+                        .retain(|b| b.id == board.id || !blocked.contains(&b.id));
+                    candidate.hardware.chain_assignments = None;
+                    crate::assignment::resolve(&candidate)?
+                        .iter()
+                        .filter(|a| a.board_id == board.id)
+                        .count()
+                };
+                let q = admission::qualification(&shared, &board, prospective)?;
+                if engines == 0 || store.needs_self_test(serial, &q) {
+                    store.before_open(serial, q.point)?;
+                    {
+                        let mut state = shared.runtime.lock().expect("runtime");
+                        state.boards.entry(board.id.clone()).or_default().state = "checking".into();
+                        state.event(Some(board.id.clone()), "admission_check");
                     }
-                    supervise(
-                        shared.clone(),
-                        board.clone(),
-                        child,
-                        tx,
-                        shutdown.clone(),
+                    let checked = admission::check(
+                        &shared,
+                        &board,
+                        &q,
                         initialization,
+                        admission::Rules::default(),
+                        shutdown.clone(),
+                        preparing,
                     )
-                    .await
+                    .await;
+                    if let Err(error) = checked {
+                        let reason = if error
+                            .downcast_ref::<crate::asic::AsicFailure>()
+                            .is_some_and(|e| e.verification)
+                        {
+                            crate::safety::Reason::InvalidProof
+                        } else if thermal_rejection(&error) {
+                            crate::safety::Reason::Thermal
+                        } else {
+                            crate::safety::Reason::UncleanOwner
+                        };
+                        if let Err(saved) = store.quarantine(serial, reason) {
+                            tracing::error!(%saved,"Admission fault could not be checkpointed");
+                        }
+                        return Err(error);
+                    }
+                    store.qualify(serial, q.clone())?;
+                    {
+                        let mut state = shared.runtime.lock().expect("runtime");
+                        let hardware = state.boards.entry(board.id.clone()).or_default();
+                        hardware.latched_fault = false;
+                        hardware.unavailable_since_unix = None;
+                        hardware.state = "admitted".into();
+                        hardware.usb_present = None;
+                        hardware.fault_reason = None;
+                    }
+                    if engines == 0 {
+                        let _ = tx.send(());
+                        // A new usable-capacity generation will assign this board.
+                        let _ = shutdown.changed().await;
+                        return Ok(());
+                    }
+                    initialization = INITIALIZATION.lock().await;
+                    preparing = progress.as_ref().map(|p| {
+                        p.begin(
+                            17 + board_index,
+                            0,
+                            0,
+                            timelord_supervisor::progress::Stage::BoardPreparation,
+                        )
+                    });
+                    let devices = crate::inventory::discover(&shared.config).await?;
+                    board.device_location =
+                        Some(crate::inventory::board_location(&board, &devices)?);
                 }
-                Err(error) => {
-                    drop(tx);
-                    drop(initialization);
-                    Err(error)
+                if *shutdown.borrow() {
+                    return Ok(());
                 }
-            },
-            Err(error) => {
-                drop(tx);
-                drop(initialization);
-                Err(error)
+                let point = if board.profile == ProfileMode::Automatic {
+                    startup_point(&shared, &board, engines, &q.client_sha256, &q.host)?
+                } else {
+                    let (frequency_mhz, voltage_v) = board.operating_point();
+                    Point {
+                        frequency_mhz,
+                        voltage_v,
+                    }
+                };
+                store.before_open(serial, point)?;
+                let mut state = shared.runtime.lock().expect("runtime");
+                let hardware = state.boards.entry(board.id.clone()).or_default();
+                hardware.state = "starting".into();
+                hardware.native_initialized = false;
+                hardware.quiesced = false;
             }
-        };
+            let child = launch(&shared, &board).await?;
+            if let Some(metrics) = &shared.runtime.lock().expect("runtime").metrics {
+                metrics.client_started(
+                    &crate::observability::board(&shared.config, &board.id),
+                    previous_failure,
+                );
+            }
+            let result = supervise(
+                shared.clone(),
+                board.clone(),
+                child,
+                tx,
+                shutdown.clone(),
+                initialization,
+                preparing,
+            )
+            .await;
+            if let (Some(store), Some(serial)) = (&safety, &board.serial) {
+                let quiesced = shared
+                    .runtime
+                    .lock()
+                    .expect("runtime")
+                    .boards
+                    .get(&board.id)
+                    .is_some_and(|b| b.quiesced);
+                if quiesced {
+                    store.closed(serial)?;
+                } else if let Err(error) =
+                    store.quarantine(serial, crate::safety::Reason::UncleanOwner)
+                {
+                    tracing::error!(%error,"Unclean native owner could not be checkpointed");
+                }
+            }
+            result
+        }
+        .await;
         if *shutdown.borrow() || result.is_ok() {
             return;
         }
@@ -913,6 +1244,9 @@ async fn supervise_board(
             // invalid verified proofs remain latched. Old ambiguous guards fail closed.
             let thermal = thermal_rejection(&error);
             hardware.latched_fault |= thermal;
+            hardware
+                .unavailable_since_unix
+                .get_or_insert(crate::unix_now());
             hardware.state = if thermal || hardware.state == "thermal_stop" {
                 "thermal_stop"
             } else if hardware.latched_fault {
@@ -949,7 +1283,13 @@ async fn supervise_board(
         };
         backend.stop_board(&board.id).await;
         tracing::warn!(board=%board.name, %error, attempt=budget.used, retry_seconds=delay.as_secs(), stop, "ASIC client stopped; other boards remain supervised");
-        if stop {
+        if thermal_rejection(&error)
+            && let (Some(store), Some(serial)) = (&safety, &board.serial)
+            && let Err(saved) = store.quarantine(serial, crate::safety::Reason::Thermal)
+        {
+            tracing::error!(%saved,"Thermal fault could not be checkpointed");
+        }
+        if stop && safety.is_none() {
             return;
         }
         tokio::select! {
@@ -957,6 +1297,36 @@ async fn supervise_board(
             _ = tokio::time::sleep(delay) => {}
         }
     }
+}
+pub(crate) fn unavailable(shared: &Shared) -> std::collections::HashSet<String> {
+    let (boards, safety) = {
+        let state = shared.runtime.lock().expect("runtime");
+        (state.boards.clone(), state.safety.clone())
+    };
+    unavailable_for(&shared.config, &boards, safety.as_deref())
+}
+pub(crate) fn unavailable_for(
+    config: &Config,
+    boards: &std::collections::HashMap<String, HardwareState>,
+    safety: Option<&crate::safety::Store>,
+) -> std::collections::HashSet<String> {
+    config
+        .hardware
+        .boards
+        .iter()
+        .filter(|board| {
+            boards.get(&board.id).is_some_and(|h| {
+                h.latched_fault
+                    || (h.state == "admitted" && h.usb_present != Some(true))
+                    || h.unavailable_since_unix
+                        .is_some_and(|since| crate::unix_now().saturating_sub(since) >= 60)
+            }) || safety
+                .zip(board.serial.as_deref())
+                .and_then(|(store, serial)| store.board(serial))
+                .is_some_and(|b| b.quarantine.is_some())
+        })
+        .map(|b| b.id.clone())
+        .collect()
 }
 pub async fn run(
     shared: Arc<Shared>,
@@ -966,8 +1336,9 @@ pub async fn run(
     validate_automatic(&shared.config, &shared.assignments).await?;
     let mut children = JoinSet::new();
     let (stop, child_shutdown) = watch::channel(false);
+    let managed = shared.runtime.lock().expect("runtime").safety.is_some();
     for board in &shared.config.hardware.boards {
-        if !shared.assignments.iter().any(|a| a.board_id == board.id) {
+        if !shared.assignments.iter().any(|a| a.board_id == board.id) && !managed {
             continue;
         }
         if shared
@@ -977,16 +1348,18 @@ pub async fn run(
             .boards
             .get(&board.id)
             .is_some_and(|b| b.latched_fault)
+            && !managed
         {
             continue;
         }
-        shared.runtime.lock().expect("runtime").boards.insert(
-            board.id.clone(),
-            HardwareState {
-                state: "starting".into(),
-                ..Default::default()
-            },
-        );
+        shared
+            .runtime
+            .lock()
+            .expect("runtime")
+            .boards
+            .entry(board.id.clone())
+            .or_default()
+            .state = "starting".into();
         let (tx, rx) = oneshot::channel();
         children.spawn(supervise_board(
             shared.clone(),
@@ -1126,9 +1499,7 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let mut owner = AutomaticOwner::new(&shared, &board, &mut child)
-            .await
-            .unwrap();
+        let mut owner = NativeOwner::new(&shared, &board, &mut child).await.unwrap();
         assert_eq!(owner.policy.point.frequency_mhz, 1450.);
         assert!(
             owner
@@ -1244,9 +1615,7 @@ done
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let mut owner = AutomaticOwner::new(&shared, &board, &mut child)
-            .await
-            .unwrap();
+        let mut owner = NativeOwner::new(&shared, &board, &mut child).await.unwrap();
         let (ready, _receiver) = oneshot::channel();
         let mut log = ClientLog::new(child.stderr.take().unwrap(), ready);
         let result = owner
@@ -1277,6 +1646,53 @@ done
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[tokio::test]
+    async fn eof_drains_large_native_output_and_reaps_a_confirmed_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tl-eof-drain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("client");
+        std::fs::write(
+            &binary,
+            r#"#!/bin/sh
+while read command version id frequency voltage; do
+ printf 'TLACK 1 %s %s %s\n' "$id" "$frequency" "$voltage"
+done
+n=0
+while [ "$n" -lt 4000 ]; do
+ printf '%s\n' 'pending stdout pending stdout pending stdout pending stdout'
+ printf '%s\n' 'pending stderr pending stderr pending stderr pending stderr' >&2
+ n=$((n + 1))
+done
+printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let board: BoardConfig = toml::from_str(
+            "id='eof'\nname='EOF'\nclient_port=18110\ndevice_location=1\nprofile='manual'",
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.hardware.boards = vec![board.clone()];
+        config.hardware.client_binary = Some(binary);
+        let shared = Shared {
+            assignments: config.assignments().unwrap(),
+            config,
+            clients: Default::default(),
+            runtime: Default::default(),
+            started_unix: crate::unix_now(),
+            service_started_unix: crate::unix_now(),
+        };
+        let mut child = launch(&shared, &board).await.unwrap();
+        let owner = NativeOwner::new(&shared, &board, &mut child).await.unwrap();
+        let (ready, _rx) = oneshot::channel();
+        let log = ClientLog::new(child.stderr.take().unwrap(), ready);
+        assert!(owner.stop(&mut child, log).await);
+        assert!(child.try_wait().unwrap().unwrap().success());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn automatic_and_manual_arguments_share_the_optimized_proof_settings() {
         let mut board: BoardConfig =
@@ -1288,7 +1704,7 @@ done
         board.profile = ProfileMode::Manual;
         board.frequency_mhz = 1540.;
         let manual = arguments(&board, 1).unwrap();
-        assert!(!manual.contains(&"--live-control".into()));
+        assert!(manual.contains(&"--live-control".into()));
         assert!(manual.contains(&"--retain-asic-values".into()));
         assert!(manual.windows(2).any(|w| w == ["--freq", "1540"]));
         assert!(
@@ -1345,7 +1761,7 @@ done
         ));
         std::fs::create_dir(&directory).unwrap();
         let binary = directory.join("hw_vdf_client");
-        std::fs::write(&binary, "#!/bin/sh\ntrap 'exit 0' TERM INT\nprintf '%s\\n' 'ASIC Temp = 40.0 C; Frequency = 1500.0 MHz; freq_idx = 1' 'VDF 0: Connected to timelord, waiting for challenge' 'ASIC Temp = 55.0 C; Frequency = 1500.0 MHz; freq_idx = 1' >&2\nwhile :; do sleep 1; done\n").unwrap();
+        std::fs::write(&binary, "#!/bin/sh\ntrap 'exit 0' TERM INT\nread command version id frequency voltage\nprintf 'TLACK 1 %s %s %s\\n' \"$id\" \"$frequency\" \"$voltage\"\nprintf '%s\\n' 'ASIC Temp = 40.0 C; Frequency = 1500.0 MHz; freq_idx = 1' 'VDF 0: Connected to timelord, waiting for challenge' 'ASIC Temp = 55.0 C; Frequency = 1500.0 MHz; freq_idx = 1' >&2\ncat >/dev/null\nprintf '%s\\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2\n").unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut config: Config = toml::from_str(
             "[[hardware.boards]]\nid='a'\nname='A'\nclient_port=18110\ndevice_location=12305\nprofile='manual'\n",
@@ -1432,8 +1848,14 @@ done
 echo $$ >> "$root/launches-$loc"
 trap 'exit 0' TERM INT
 if [ "$loc" = 2 ] && [ ! -f "$root/reconnected" ]; then echo "ASIC Temp = 0.0 C; Frequency = 1500.0 MHz" >&2; exit 1; fi
+read command version id frequency voltage
+printf 'TLACK 1 %s %s %s\n' "$id" "$frequency" "$voltage"
 printf '%s\n' 'ASIC Temp = 40.0 C; Frequency = 1500.0 MHz; freq_idx = 1' 'VDF 0: Connected to timelord, waiting for challenge' >&2
-while :; do printf '%s\n' 'ASIC Temp = 40.0 C; Frequency = 1500.0 MHz; freq_idx = 1' >&2; sleep .05; done
+while :; do printf '%s\n' 'ASIC Temp = 40.0 C; Frequency = 1500.0 MHz; freq_idx = 1' >&2; sleep .05; done &
+logger=$!
+cat >/dev/null
+kill "$logger"
+printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
 "#).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut config:Config=toml::from_str("[[hardware.boards]]\nid='healthy'\nname='Healthy'\nclient_port=18110\ndevice_location=1\nprofile='manual'\n[[hardware.boards]]\nid='flaky'\nname='Flaky'\nclient_port=18111\ndevice_location=2\nprofile='manual'").unwrap();

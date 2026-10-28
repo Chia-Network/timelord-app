@@ -3,7 +3,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/scripts/macho-load-commands.sh"
-source "$ROOT/scripts/build-native-control.sh"
+source "$ROOT/scripts/build-native.sh"
 
 fail() { printf 'FAIL %s\n' "$1" >&2; exit 1; }
 

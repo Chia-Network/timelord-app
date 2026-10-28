@@ -174,8 +174,10 @@ hardware performance or production network acceptance.
 
 When launched by the boot supervisor, the worker emits a private datagram once per
 second. Reports contain worker PID, supervisor generation, monotonic sequence and
-nine bounded slots: CC/RC/ICC native I/O, scheduler/submission, CC/RC/ICC
-arithmetic, scheduler eligibility, and discovery/topology replacement. Request IDs and scheduler generation fence late cancellation/cleanup.
+twenty bounded slots: production CC/RC/ICC native I/O and arithmetic,
+scheduler/submission and eligibility, discovery/topology replacement, critical
+persistence, separate admission I/O/arithmetic, admission ownership, and per-board
+preparation. Request IDs and scheduler generation fence late cancellation/cleanup.
 No proof payload, credential or unbounded identifier enters this protocol. Replayed
 or previous-worker reports do not refresh liveness. The supervisor CLI includes
 the latest snapshot and its receipt age; process presence is never readiness.
@@ -190,7 +192,10 @@ The native protocol currently reports that combined stage, not a separately
 measured checkpoint-construction stage. Client absence and idle chains have no
 proof deadline. Scheduler eligibility waits receive their actual not-before delay plus 60 seconds
 slack. Discovery has a 15-second stage deadline and topology replacement 60 seconds.
-An essential task exit requests worker replacement even if HTTP remains responsive.
+Critical safety persistence has a 10-second deadline, admission 45 seconds and
+per-board preparation 60 seconds. Waiting to acquire an experiment lease has no
+hardware-work deadline and does not hold the USB initialization lock. An essential
+task exit requests worker replacement even if HTTP remains responsive.
 
 Arithmetic permits and their stage guards live inside the actual blocking job.
 Cancelling its caller neither hides it from supervision nor creates an unbounded

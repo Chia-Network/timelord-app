@@ -7,7 +7,7 @@ cd "$PROJECT_ROOT"
 source "$PROJECT_ROOT/scripts/macho-load-commands.sh"
 [[ "$(uname -s)" == Darwin ]] || { echo 'The Mac app bundle must be built on macOS.' >&2; exit 1; }
 CLIENT="${TIMELORD_ASIC_CLIENT:-$PROJECT_ROOT/build/controlled-native/hw_vdf_client}"
-[[ -x "$CLIENT" ]] || { echo 'Build the native client first: bash scripts/build-native-control.sh' >&2; exit 1; }
+[[ -x "$CLIENT" ]] || { echo 'Build the native client first: bash scripts/build-native.sh' >&2; exit 1; }
 DRIVERS="${CHIAVDF_DRIVERS:-$(dirname "$CLIENT")/hw/libft4222}"
 for name in libft4222.dylib libftd2xx.dylib; do
   [[ -f "$DRIVERS/$name" ]] || { echo "Missing FTDI library: $DRIVERS/$name" >&2; exit 1; }

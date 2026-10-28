@@ -13,8 +13,8 @@ contains configuration validation and chain assignment without I/O.
 `vdf-client-protocol` bounds and decodes native frames without treating them as
 verified proofs. `timelord-service` owns node scheduling, verification, process
 supervision, telemetry and Automatic tuning. The optimized prover and USB driver
-remain in the pinned public chiavdf dependency; only the live-control integration
-is maintained here. The app has no Python, wallet, full node or software-VDF mode.
+remain in the pinned public chiavdf dependency, including its live-control channel;
+no native source overlays are maintained here. The app has no Python, wallet, full node or software-VDF mode.
 
 ## Process ownership
 
@@ -31,7 +31,7 @@ runtime is wedged. Neither mechanism establishes USB hardware quiescence under a
 wedged driver; native and physical fault qualification are separate requirements.
 Exclusive worker locks prevent a second coordinator from starting. Installation
 refuses an existing legacy listener instead of terminating arbitrary processes.
-All configured listeners are bound before work starts, and board initialization is
+Required local listeners are bound before work starts, and board initialization is
 sequential. Worker presence, configured hardware and sockets are not productivity.
 
 Discovery calls only D2XX inventory APIs in a disposable helper process; it sends
@@ -71,7 +71,7 @@ Successive requests retain work within a generation/challenge/input. Resets canc
 pending work, invalidate the generation and drain STOP/ACK before closing the old
 session. Interrupted partial-frame I/O retires its connection rather than reusing
 it. Retired sockets half-close and drain with a deadline to accommodate the native
-client's final STOP write. Node outages cancel work; invalid ASIC results latch a
+client's final STOP write. Node outages cancel work; invalid ASIC results latch and persist a
 hardware fault. No parsed proof is accepted without cryptographic verification.
 
 The pinned scheduler's unfinished-block type predates the optional header MMR root.
@@ -122,3 +122,38 @@ The status API reports `service_started_unix` once per coordinator process and
 `started_unix` once per engine-assignment session. The dashboard shows Service
 uptime with the engine-session age beneath it. Topology replacements still reset
 session proof counters and chart scope, but never the displayed service uptime.
+
+## Durable board admission and capacity recovery
+
+A private safety journal records each serial's active owner before opening USB.
+Confirmed native EOF shutdown clears that marker; forced/unconfirmed shutdown or
+an interrupted worker keeps the board unclean on restart. Thermal and invalid-proof
+quarantine cannot be cleared merely by process replacement. Restrictive updates
+remain in memory even if persistence fails; admission/clearing requires a successful
+atomic checkpoint. Per-serial file locks prevent overlapping native owners.
+
+Admission is an isolated runtime with no node task, public listener, history or
+production metrics. It obtains native readback, fresh cool telemetry and verified
+360-iteration canonical test proofs on every selected engine, then requires confirmed
+native quiescence. It is an initialization check, not a long stability benchmark.
+Thermal faults wait five minutes and require extra cooling; other unclean owners
+wait at least 30 seconds. Automatic verification/thermal faults lower the admission
+frequency by 50 MHz per failed point, within configured limits. Manual invalid
+proofs require an explicit point change or switching to Automatic. Transport errors
+do not lower the operating point. Requested voltage remains capped at 1.0 V.
+
+One exploratory clock trial or admission owns the experiment lease at a time.
+Pending admission makes a trial yield at its next policy tick without lowering the
+healthy live point, and requires a fresh full observation before saving it as
+learned evidence. New upward exploration waits while any detected board is degraded.
+Ordinary recovery/thermal backoff remains available. Admission does not hold the
+USB initialization lock while waiting for a trial to yield.
+
+Automatic layouts reconcile usable, admitted capacity after three consistent polls
+and at least ten seconds. An unavailable board is retained for supervised recovery;
+it is not silently forgotten. Re-admission requires fresh inventory after its test
+owner closes. Layout replacement retires the old scheduler/owners before installing
+the new 1+1+1, 2+1 or 3-engine generation. Strict mappings never redistribute.
+Public native pins include opened-handle serial validation and pausing all engines
+before applying replacement-owner settings. These mechanisms do not prove physical
+quiescence if the USB stack or power circuitry is unresponsive.

@@ -3,6 +3,7 @@ mod assignment;
 mod automatic;
 mod connection;
 mod diagnostics;
+mod experiments;
 mod hardware;
 mod history_store;
 mod inventory;
@@ -10,6 +11,7 @@ mod node_status;
 mod observability;
 mod private_control;
 mod runtime;
+mod safety;
 
 use anyhow::{Context, Result, bail};
 use axum::{Json, Router, extract::State, routing::get};
@@ -329,7 +331,7 @@ async fn main() -> Result<()> {
                     .unwrap_or(Path::new("."))
                     .join("automatic-profiles.json"),
             );
-            serve(value, config.with_extension("history.json")).await?;
+            serve(value, config.with_extension("history.json"), config).await?;
         }
         Command::Tuning { config, paused } => {
             let value = load(&config)?;
@@ -592,8 +594,10 @@ async fn start_run(
     faults: &std::collections::HashMap<String, runtime::HardwareState>,
     service_started_unix: u64,
     metrics: Arc<observability::Metrics>,
+    safety: Option<Arc<safety::Store>>,
 ) -> Result<Run> {
-    let assignments = assignment::resolve(&config)?;
+    let unavailable = hardware::unavailable_for(&config, faults, safety.as_deref());
+    let assignments = assignment::resolve_usable(&config, &unavailable)?;
     hardware::validate_automatic(&config, &assignments).await?;
     tracing::info!(plan=?assignments, "Resolved chain assignments for this run");
     let control = config
@@ -632,6 +636,23 @@ async fn start_run(
         }
     };
     runtime.boards = faults.clone();
+    if let Some(store) = &safety {
+        for board in &config.hardware.boards {
+            if let Some(saved) = board
+                .serial
+                .as_deref()
+                .and_then(|serial| store.board(serial))
+                && let Some(reason) = saved.quarantine
+            {
+                let hardware = runtime.boards.entry(board.id.clone()).or_default();
+                hardware.latched_fault = true;
+                hardware.state = "quarantined".into();
+                hardware.fault_reason = Some(format!("Board admission required after {reason:?}"));
+            }
+        }
+    }
+    runtime.safety = safety;
+    runtime.progress = Some(metrics.progress.clone());
     runtime.metric_epoch = metrics.begin_session();
     metrics.register_boards(&config);
     runtime.metrics = Some(metrics);
@@ -685,7 +706,7 @@ async fn start_run(
             Ok(())
         });
     }
-    if shared.config.hardware.client_binary.is_some() && active {
+    if shared.config.hardware.client_binary.is_some() {
         let backend = backend.clone();
         let shared = shared.clone();
         let shutdown = receiver.clone();
@@ -736,7 +757,7 @@ async fn observation_exit(
     tracing::error!(?result, "Observability server exited unexpectedly");
 }
 
-async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
+async fn serve(config: Config, history_path: PathBuf, config_path: PathBuf) -> Result<()> {
     let service_started_unix = unix_now();
     // The status listener outlives each topology. No UI or external supervisor
     // is required to restart the service after a USB change.
@@ -753,6 +774,13 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
         None
     };
     let metrics = observability::Metrics::new(config.node.network)?;
+    let safety = if config.hardware.client_binary.is_some() {
+        Some(Arc::new(
+            safety::Store::open(&config_path)?.monitored(metrics.progress.clone()),
+        ))
+    } else {
+        None
+    };
     let config = inventory::connected_configuration(config).await?;
     let mut faults = std::collections::HashMap::new();
     let mut run = start_run(
@@ -761,6 +789,7 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
         &faults,
         service_started_unix,
         metrics.clone(),
+        safety.clone(),
     )
     .await?;
     let (current, state) = watch::channel(run.shared.clone());
@@ -807,23 +836,34 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
     let mut poll = tokio::time::interval(Duration::from_secs(5));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut topology = inventory::TopologyChange::default();
+    let mut capacity = assignment::CapacityChange::default();
+    let mut inventory_task: Option<tokio::task::JoinHandle<Result<Config>>> = None;
     let result = loop {
         let candidate = tokio::select! {
             _ = &mut signal => break Ok(()),
             error = essential_exit(&mut run.tasks, &metrics), if !run.tasks.is_empty() => break Err(error),
             _ = observation_exit(&mut observation_server, &metrics), if observation_server.is_some() => continue,
             result = &mut server => break result.context("Status task failed")?.context("Status server failed"),
+            result=async{inventory_task.as_mut().expect("inventory").await}, if inventory_task.is_some()=>{
+                inventory_task.take();
+                result.context("USB reconciliation task failed")?
+            }
             _ = poll.tick() => {
-                let _discovery = metrics.progress.begin(8,0,0,timelord_supervisor::progress::Stage::Discovery);
-                tokio::select! {
-                    _ = &mut signal => break Ok(()),
-                    result = inventory::live_configuration(&run.shared) => result,
+                if inventory_task.is_none() {
+                    let shared=run.shared.clone();
+                    inventory_task=Some(tokio::spawn(async move{inventory::live_configuration(&shared).await}));
                 }
+                continue;
             }
         };
-        let Some(mut config) = topology.observe(&run.shared.config, candidate) else {
+        let next = topology.observe(&run.shared.config, candidate);
+        let unavailable = hardware::unavailable(&run.shared);
+        let capacity_changed =
+            capacity.observe(&run.shared.assignments, &run.shared.config, &unavailable);
+        if next.is_none() && !capacity_changed {
             continue;
-        };
+        }
+        let mut config = next.unwrap_or_else(|| run.shared.config.clone());
         let _topology = metrics.progress.begin(
             8,
             0,
@@ -831,7 +871,7 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
             timelord_supervisor::progress::Stage::TopologyChange,
         );
         // Validate the replacement before interrupting healthy work.
-        let plan = assignment::resolve(&config)?;
+        let plan = assignment::resolve_usable(&config, &unavailable)?;
         if let Err(error) = hardware::validate_automatic(&config, &plan).await {
             tracing::warn!(%error, "Topology replacement rejected; retaining current owners");
             continue;
@@ -857,28 +897,28 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
         let previous = run.shared.clone();
         run.stop().await?;
         // Collect after shutdown too: verification can finish while tasks drain.
-        faults.extend(
-            previous
-                .runtime
-                .lock()
-                .expect("runtime")
-                .boards
-                .iter()
-                .filter(|(_, b)| b.latched_fault)
-                .map(|(id, b)| {
-                    let mut fault = b.clone();
-                    fault.raw_speeds.clear();
-                    fault.temperature_c = None;
-                    fault.temperature_unix = 0;
-                    (id.clone(), fault)
-                }),
-        );
+        faults = previous
+            .runtime
+            .lock()
+            .expect("runtime")
+            .boards
+            .iter()
+            .filter(|(_, b)| b.latched_fault || b.unavailable_since_unix.is_some())
+            .map(|(id, b)| {
+                let mut fault = b.clone();
+                fault.raw_speeds.clear();
+                fault.temperature_c = None;
+                fault.temperature_unix = 0;
+                (id.clone(), fault)
+            })
+            .collect();
         run = start_run(
             config,
             history_path.clone(),
             &faults,
             service_started_unix,
             metrics.clone(),
+            safety.clone(),
         )
         .await?;
         current.send_replace(run.shared.clone());
@@ -893,6 +933,9 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
         metrics.progress.fail();
     }
     run.stop().await?;
+    if let Some(inventory) = inventory_task {
+        let _ = inventory.await;
+    }
     let _ = http_stop.send(true);
     if !server.is_finished() {
         server.await.context("Status task failed")??;
@@ -1017,6 +1060,7 @@ mod tests {
             &faults,
             unix_now() - 3600,
             metrics.clone(),
+            None,
         )
         .await
         .unwrap();
@@ -1081,6 +1125,7 @@ mod tests {
                 &faults,
                 service_started_unix,
                 metrics.clone(),
+                None,
             )
             .await
             .unwrap();

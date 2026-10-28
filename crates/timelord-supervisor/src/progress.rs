@@ -1,5 +1,6 @@
 //! Bounded work snapshots. No wall clock, proof bytes, board names or credentials.
 use serde::{Deserialize, Serialize};
+pub const SLOTS: usize = 20;
 use std::{
     sync::{
         Arc, Mutex,
@@ -21,6 +22,9 @@ pub enum Stage {
     Eligibility { wait_seconds: u64 },
     Discovery,
     TopologyChange,
+    Persistence,
+    Admission,
+    BoardPreparation,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Work {
@@ -35,6 +39,9 @@ impl Work {
             Stage::WaitingForClient => return None, // External capacity outage; native recovery owns it.
             Stage::Preparing => 30,
             Stage::Discovery => 15,
+            Stage::Persistence => 10,
+            Stage::Admission => 45,
+            Stage::BoardPreparation => 60,
             Stage::TopologyChange => 60,
             Stage::Eligibility { wait_seconds } => wait_seconds.saturating_add(60),
             Stage::Handshake | Stage::Submitting => 15,
@@ -55,17 +62,31 @@ pub struct Snapshot {
     pub failed: bool,
     #[serde(default)]
     pub ready: bool,
-    /// CC/RC/ICC I/O, scheduler, CC/RC/ICC arithmetic, eligibility, discovery/topology.
-    pub work: [Option<Work>; 9],
+    /// Production I/O/math, scheduler/eligibility, discovery/persistence, isolated probe I/O/math.
+    pub work: [Option<Work>; SLOTS],
 }
-#[derive(Default)]
 pub struct Progress {
     next: AtomicU64,
     failed: AtomicBool,
     ready: AtomicBool,
-    work: Mutex<[Option<Work>; 9]>,
+    work: Mutex<[Option<Work>; SLOTS]>,
+    arithmetic: [Arc<tokio::sync::Semaphore>; SLOTS],
+}
+impl Default for Progress {
+    fn default() -> Self {
+        Self {
+            next: AtomicU64::new(0),
+            failed: AtomicBool::new(false),
+            ready: AtomicBool::new(false),
+            work: Mutex::new([None; SLOTS]),
+            arithmetic: std::array::from_fn(|_| Arc::new(tokio::sync::Semaphore::new(1))),
+        }
+    }
 }
 impl Progress {
+    pub fn arithmetic(&self, lane: usize) -> Arc<tokio::sync::Semaphore> {
+        self.arithmetic[lane].clone()
+    }
     pub fn fail(&self) {
         self.failed.store(true, Ordering::Relaxed);
     }
@@ -76,7 +97,7 @@ impl Progress {
         iterations: u64,
         stage: Stage,
     ) -> Guard {
-        assert!(lane < 9);
+        assert!(lane < SLOTS);
         let id = self.next.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         self.work.lock().expect("progress")[lane] = Some(Work {
             id,
@@ -130,7 +151,7 @@ pub struct Watchdog {
     last: Option<Instant>,
     sequence: Option<u64>,
     failed: bool,
-    stages: [Option<(Work, Instant)>; 9],
+    stages: [Option<(Work, Instant)>; SLOTS],
 }
 impl Watchdog {
     pub fn new(now: Instant) -> Self {
@@ -139,7 +160,7 @@ impl Watchdog {
             last: None,
             sequence: None,
             failed: false,
-            stages: [None; 9],
+            stages: [None; SLOTS],
         }
     }
     pub fn observe(&mut self, snapshot: Snapshot, now: Instant) -> bool {
@@ -248,28 +269,20 @@ impl Drop for Reporter {
 mod tests {
     use super::*;
     fn snapshot(sequence: u64, stage: Stage, iterations: u64) -> Snapshot {
+        let mut work = [None; SLOTS];
+        work[0] = Some(Work {
+            id: 1,
+            generation: 1,
+            iterations,
+            stage,
+        });
         Snapshot {
             worker_pid: 1,
             generation: 1,
             sequence,
             failed: false,
             ready: false,
-            work: [
-                Some(Work {
-                    id: 1,
-                    generation: 1,
-                    iterations,
-                    stage,
-                }),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ],
+            work,
         }
     }
     #[test]
@@ -384,7 +397,7 @@ mod tests {
                 sequence: 1,
                 failed: false,
                 ready: false,
-                work: [None; 9],
+                work: [None; SLOTS],
             },
             now,
         );
