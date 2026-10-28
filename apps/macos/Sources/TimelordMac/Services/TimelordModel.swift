@@ -284,8 +284,8 @@ final class TimelordModel: ObservableObject {
             }
             discoveredDevices=devices
             if errorMessage==discoveryError {errorMessage=nil};discoveryError=nil
-            savedConfiguration.hardware=BoardDiscovery.reconcile(devices,hardware:savedConfiguration.hardware)
-            configuration.hardware=BoardDiscovery.reconcile(devices,hardware:configuration.hardware)
+            savedConfiguration.hardware=BoardDiscovery.reconcile(devices,hardware:savedConfiguration.hardware,service:savedConfiguration.service)
+            configuration.hardware=BoardDiscovery.reconcile(devices,hardware:configuration.hardware,service:configuration.service)
             // The service owns debounced topology changes, including headless
             // deployments. Discovery must not ask users to restart it manually.
             updateSnapshot()

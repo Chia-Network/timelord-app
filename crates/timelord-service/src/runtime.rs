@@ -626,17 +626,12 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                     }
                     _ => None,
                 };
-                let infusion = matches!(&output, Output::InfusionPoint(_));
                 let kind = match &output {
                     Output::SignagePoint(_) => "signage",
                     Output::InfusionPoint(_) => "infusion",
                     Output::EndOfSubSlot(_) => "end_of_sub_slot",
                 };
-                shared
-                    .runtime
-                    .lock()
-                    .expect("runtime")
-                    .scheduler_initialized = scheduler.initialized();
+                let infusion = matches!(&output, Output::InfusionPoint(_));
                 let message = match output {
                     Output::SignagePoint(value) => {
                         tracing::info!(index=value.index_from_challenge, cc=%value.challenge_chain_sp_vdf.output.hash()?, rc=%value.reward_chain_sp_vdf.output.hash()?, cc_proof=%proof_digest(&value.challenge_chain_sp_proof)?, rc_proof=%proof_digest(&value.reward_chain_sp_proof)?, "Submitting verified signage point");
@@ -654,11 +649,6 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                 if infusion {
                     infusion_submitted_at = Some(Instant::now());
                 }
-                shared
-                    .runtime
-                    .lock()
-                    .expect("runtime")
-                    .scheduler_initialized = scheduler.initialized();
                 shared
                     .runtime
                     .lock()
@@ -698,9 +688,21 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                         match message.msg_type {
                             ProtocolMessageTypes::NewPeakTimelord => {
                                 let peak: dg_xch_core::protocols::timelord::NewPeakTimelord=decode_exact(message.data.as_slice())?;
-                                if scheduler.set_peak(peak.clone())? {
+                                let metrics=shared.runtime.lock().expect("runtime").metrics.clone();
+                                if let Some(metrics)=&metrics {metrics.stamp("last_peak_received_timestamp_seconds",&[]);}
+                                let accepted=match scheduler.set_peak(peak.clone()) {
+                                    Ok(accepted)=>accepted,
+                                    Err(error)=>{if let Some(metrics)=&metrics {metrics.inc("peak_updates_total",&["rejected"]);}return Err(error.into());}
+                                };
+                                if let Some(metrics)=&metrics {metrics.inc("peak_updates_total",&[if accepted {"accepted"} else {"ignored"}]);}
+                                if accepted {
+                                    {
+                                        let mut state=shared.runtime.lock().expect("runtime");
+                                        state.scheduler_initialized=scheduler.initialized();
+                                        state.scheduler_height=Some(peak.reward_chain_block.height);
+                                        state.scheduler_deficit=Some(peak.deficit);
+                                    }
                                     infusion_submitted_at = None;
-        shared.runtime.lock().expect("runtime").scheduler_initialized = scheduler.initialized();
                                     let work=infused_from_peak(&peak,scheduler.generation(),bits,minimum_deficit)?;
                                     prime_infused(&mut primers,backend.clone(),work);
                                 }

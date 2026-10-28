@@ -722,6 +722,20 @@ async fn essential_exit(
     anyhow::anyhow!("Essential service task exited unexpectedly: {task:?}")
 }
 
+async fn observation_exit(
+    server: &mut Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+    metrics: &observability::Metrics,
+) {
+    let result = server.as_mut().expect("observer").await;
+    // Remove the completed handle so it cannot be polled again. A scrape
+    // listener failure must not interrupt proof work or topology supervision.
+    server.take();
+    metrics
+        .failed
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    tracing::error!(?result, "Observability server exited unexpectedly");
+}
+
 async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
     let service_started_unix = unix_now();
     // The status listener outlives each topology. No UI or external supervisor
@@ -797,10 +811,7 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
         let candidate = tokio::select! {
             _ = &mut signal => break Ok(()),
             error = essential_exit(&mut run.tasks, &metrics), if !run.tasks.is_empty() => break Err(error),
-            result = async { observation_server.as_mut().expect("observer").await }, if observation_server.is_some() => {
-                metrics.failed.store(true,std::sync::atomic::Ordering::Relaxed);
-                break result.context("Observability task failed")?.context("Observability server failed");
-            }
+            _ = observation_exit(&mut observation_server, &metrics), if observation_server.is_some() => continue,
             result = &mut server => break result.context("Status task failed")?.context("Status server failed"),
             _ = poll.tick() => {
                 let _discovery = metrics.progress.begin(8,0,0,timelord_supervisor::progress::Stage::Discovery);
@@ -1112,6 +1123,55 @@ mod tests {
         // Creating a replacement runtime cannot clear the process health latch.
         metrics.begin_session();
         assert!(!metrics.healthy());
+    }
+    #[tokio::test]
+    async fn observability_failures_leave_client_service_running() {
+        for failure in ["io", "panic", "early_success"] {
+            let metrics = observability::Metrics::new(Network::Mainnet).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let shared = Arc::new(Shared {
+                config: Config::default(),
+                assignments: vec![],
+                clients: Arc::new(Mutex::new(BTreeSet::new())),
+                runtime: Default::default(),
+                started_unix: unix_now(),
+                service_started_unix: unix_now(),
+            });
+            let (stop, rx) = watch::channel(false);
+            let mut client =
+                tokio::spawn(client_listener(listener, "a".into(), 1, shared, rx, None));
+            let mut observer = Some(tokio::spawn(async move {
+                match failure {
+                    "io" => Err(std::io::Error::other("fixture listener failure")),
+                    "panic" => panic!("fixture listener panic"),
+                    _ => Ok(()),
+                }
+            }));
+            tokio::select! {
+                _ = observation_exit(&mut observer, &metrics) => {},
+                result = &mut client => panic!("Client service stopped: {result:?}"),
+            }
+            assert!(observer.is_none());
+            assert!(!metrics.healthy());
+            metrics.begin_session();
+            assert!(!metrics.healthy());
+            // The independent client listener still handles protocol traffic.
+            let mut socket = TcpStream::connect(address).await.unwrap();
+            socket.write_all(b"STOP").await.unwrap();
+            let mut ack = [0; 3];
+            tokio::time::timeout(Duration::from_secs(2), socket.read_exact(&mut ack))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&ack, b"ACK");
+            stop.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), client)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
     }
     #[tokio::test]
     async fn idle_clients_stop_cleanly_and_release_their_slot() {

@@ -307,8 +307,16 @@ pub(crate) fn connected_plan(mut config: Config, devices: Vec<Device>) -> Result
         if config.hardware.boards.len() == 3 {
             break;
         }
-        let port = (18110..=18112)
-            .find(|p| !config.hardware.boards.iter().any(|b| b.client_port == *p))
+        let port = (18110..=u16::MAX)
+            .find(|p| {
+                *p != config.service.status_listen.port()
+                    && *p != config.service.supervisor_observability_listen.port()
+                    && !config
+                        .service
+                        .observability_listen
+                        .is_some_and(|a| a.port() == *p)
+                    && !config.hardware.boards.iter().any(|b| b.client_port == *p)
+            })
             .context("No board port available")?;
         let mut board: timelord_core::BoardConfig = toml::from_str(&format!(
             "id='usb-{}'\nname='ASIC {}'\nclient_port={port}\ndevice_location={}\nprofile='automatic'",
@@ -466,6 +474,33 @@ mod tests {
                 serial: Some(format!("serial-{i}")),
             })
             .collect()
+    }
+    #[test]
+    fn automatic_ports_skip_http_listeners_across_hotplug() {
+        let mut config = Config::default();
+        config.service.status_listen = "127.0.0.1:18111".parse().unwrap();
+        config.service.observability_listen = Some("[::]:18110".parse().unwrap());
+        config.service.supervisor_observability_listen = "127.0.0.1:18112".parse().unwrap();
+        config.validate().unwrap();
+        for present in [&[0, 1, 2][..], &[], &[0], &[0, 1, 2]] {
+            config = connected_plan(config, devices(present)).unwrap();
+            config.validate().unwrap();
+            assert_eq!(config.hardware.boards.len(), present.len());
+            let ports: std::collections::BTreeSet<_> = config
+                .hardware
+                .boards
+                .iter()
+                .map(|b| b.client_port)
+                .collect();
+            assert_eq!(ports.len(), present.len());
+            assert!(!ports.contains(&18110));
+            assert!(!ports.contains(&18111));
+            assert!(!ports.contains(&18112));
+            assert_eq!(
+                config.assignments().unwrap().len(),
+                if present.is_empty() { 0 } else { 3 }
+            );
+        }
     }
     #[test]
     fn automatic_topology_survives_three_one_zero_two_three_and_remembers_settings() {
