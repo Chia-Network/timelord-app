@@ -256,3 +256,48 @@ tests:
         severity: warning
       exp_annotations:
         summary: Pending VDF work has no verified progress
+
+- name: durable Pause suppresses worker scrape alerts while supervisor remains monitored
+  interval: 30s
+  input_series:
+  - series: up{job="timelord-app",instance="fixture:9258",network="mainnet",region="msp",instance_name="mac-01"}
+    values: 0+0x20
+  - series: up{job="timelord-supervisor",instance="fixture:9259",network="mainnet",region="msp",instance_name="mac-01"}
+    values: 1+0x20
+  - series: chia_timelord_supervisor_desired_running{job="timelord-supervisor",instance="fixture:9259",network="mainnet",region="msp",instance_name="mac-01"}
+    values: 0+0x20
+  - series: chia_timelord_supervisor_worker_up{job="timelord-supervisor",instance="fixture:9259",network="mainnet",region="msp",instance_name="mac-01"}
+    values: 0+0x20
+  - series: chia_timelord_supervisor_healthy{job="timelord-supervisor",instance="fixture:9259",network="mainnet",region="msp",instance_name="mac-01"}
+    values: 1+0x20
+  alert_rule_test:
+  - eval_time: 10m
+    alertname: TimelordScrapeFailed
+    exp_alerts: []
+  - eval_time: 10m
+    alertname: TimelordSupervisorScrapeFailed
+    exp_alerts: []
+  - eval_time: 10m
+    alertname: TimelordSupervisorUnhealthy
+    exp_alerts: []
+  - eval_time: 10m
+    alertname: TimelordWorkerUnavailable
+    exp_alerts: []
+- name: desired Run with no worker is an availability failure
+  interval: 30s
+  input_series:
+  - series: chia_timelord_supervisor_desired_running{job="timelord-supervisor",instance="fixture:9259",network="mainnet"}
+    values: 1+0x10
+  - series: chia_timelord_supervisor_worker_up{job="timelord-supervisor",instance="fixture:9259",network="mainnet"}
+    values: 0+0x10
+  alert_rule_test:
+  - eval_time: 3m
+    alertname: TimelordWorkerUnavailable
+    exp_alerts:
+    - exp_labels:
+        job: timelord-supervisor
+        instance: fixture:9259
+        network: mainnet
+        severity: warning
+      exp_annotations:
+        summary: Timelord is requested to run but has no worker

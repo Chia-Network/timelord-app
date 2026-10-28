@@ -31,18 +31,17 @@ final class TimelordModel: ObservableObject {
     private var lastNodeSyncFetch = Date.distantPast
     private var lastHistoryFetch = Date.distantPast
     private var pausedByUser = false
-    private var automaticStartPending = true
     private var quitting = false
     private var monitoring: Task<Void, Never>?
     private let monitoringEnabled: Bool
 
-    var ownsService: Bool { controller.ownsService }
+    var canControlService: Bool { controller.canControlService }
     var configURL: URL { controller.configURL }
     var logsURL: URL { controller.logsURL }
     var statusURL: URL { liveClient.endpoint }
-    var quitLabel: String { liveStatus != nil && !ownsService ? "Quit interface" : "Stop and Quit" }
-    var canStartService: Bool { !quitting && !ownsService && liveStatus == nil && !starting }
-    var canInspectConnections: Bool { !ownsService && liveStatus == nil && !starting }
+    var quitLabel: String { "Quit interface" }
+    var canStartService: Bool { !quitting && canControlService && !controller.desiredRunning && !starting }
+    var canInspectConnections: Bool { !controller.desiredRunning && liveStatus == nil && !starting }
 
     init(controller suppliedController: ServiceController? = nil, initialConfiguration: AppConfiguration? = nil, monitoringEnabled: Bool = true) {
         let controller = suppliedController ?? ServiceController(); self.controller = controller
@@ -83,37 +82,24 @@ final class TimelordModel: ObservableObject {
                 useSavedStatusEndpoint()
             } catch { errorMessage = error.localizedDescription }
         }
+        await controller.refresh()
+        pausedByUser = controller.supervisor?.mode == .paused && controller.supervisor?.phase != "state_error"
         await refreshNodeSync()
-        var serviceAbsent = false
         do {
+            if canControlService && controller.processID == nil { throw ConfigurationError.message(controller.errorMessage ?? (pausedByUser ? "Timelord is paused." : "Background service is recovering.")) }
             let result = try await liveClient.fetch(expectedPID: controller.processID)
             if liveStatus?.servicePid != result.servicePid || liveStatus?.startedUnix != result.startedUnix { history = nil; lastHistoryFetch = .distantPast }
             liveStatus = result
-            automaticStartPending = false // Observe an existing service without taking ownership.
             if Date().timeIntervalSince(lastHistoryFetch) >= 15 {
                 do { history = try await liveClient.history(expectedPID: result.servicePid); lastHistoryFetch = Date() }
                 catch { /* Keep the previous history with its original coverage end. */ }
             }
             updateSnapshot()
         } catch {
-            // A refused connection proves the status listener is absent. An invalid,
-            // stale or timed-out response may belong to another running service.
-            serviceAbsent = (error as? URLError)?.code == .cannotConnectToHost
-            let hadService = liveStatus != nil || ownsService; liveStatus = nil; history = nil
+            let hadService = liveStatus != nil || canControlService; liveStatus = nil; history = nil
             snapshot = LivePresentation.snapshot(status: nil, configuration: configurationLoaded ? savedConfiguration : nil, detectedDevices: discoveredDevices, nodeSync: nodeSync, paused: pausedByUser, starting: starting, error: hadService && !pausedByUser ? error.localizedDescription : controller.errorMessage)
         }
         if !operationInProgress && !starting && Date().timeIntervalSince(lastDiscovery)>15 { await refreshDevices() }
-        considerAutomaticStart(serviceAbsent: serviceAbsent)
-    }
-
-    /// One startup attempt per app launch, once setup and hardware discovery are ready.
-    func considerAutomaticStart(serviceAbsent: Bool) {
-        guard !quitting, automaticStartPending, savedConfiguration.service.startAutomatically,
-              serviceAbsent, configurationLoaded, !pausedByUser, canStartService,
-              !operationInProgress, sheet == nil, !hasUnsavedSettings,
-              savedConfiguration.node.hasIdentity,
-              savedConfiguration.hardware.clientBinary != nil, !discoveredDevices.isEmpty else { return }
-        startService()
     }
 
     private func refreshNodeSync() async {
@@ -125,16 +111,16 @@ final class TimelordModel: ObservableObject {
         }
     }
 
-    var canPause: Bool { ownsService }
+    var canPause: Bool { canControlService && controller.desiredRunning && !starting }
     var runControlTitle: String { starting ? "Starting…" : canPause ? "Pause" : "Run" }
     func toggleRun() {
-        if ownsService { stopService() }
-        else if canStartService && savedConfiguration.node.hasIdentity && savedConfiguration.hardware.clientBinary != nil && !discoveredDevices.isEmpty { startService() }
+        if canPause { stopService() }
+        else if canStartService { startService() }
         else { primaryAction() }
     }
 
     var primaryActionTitle: String {
-        if ownsService && snapshot.phase != .temperatureLimit && snapshot.phase != .serviceUnavailable { return "Pause" }
+        if canPause && snapshot.phase != .temperatureLimit && snapshot.phase != .serviceUnavailable { return "Pause" }
         switch snapshot.phase {
         case .running: return "Details"
         case .paused: return "Resume"
@@ -146,11 +132,11 @@ final class TimelordModel: ObservableObject {
         case .setupRequired:
             if !savedConfiguration.node.hasIdentity { return "Connect node" }
             if savedConfiguration.hardware.boards.isEmpty || savedConfiguration.hardware.clientBinary == nil { return "Set up boards" }
-            return "Start Timelord"
+            return canControlService ? "Start Timelord" : "Enable background service"
         }
     }
     func primaryAction() {
-        if ownsService && snapshot.phase != .temperatureLimit && snapshot.phase != .serviceUnavailable { stopService(); return }
+        if canPause && snapshot.phase != .temperatureLimit && snapshot.phase != .serviceUnavailable { stopService(); return }
         if snapshot.phase == .paused { startService(); return }
         switch snapshot.phase {
         case .boardMissing, .waitingForProofs: sheet = .boards
@@ -159,7 +145,8 @@ final class TimelordModel: ObservableObject {
         case .setupRequired:
             if !savedConfiguration.node.hasIdentity { sheet = .node }
             else if savedConfiguration.hardware.boards.isEmpty || savedConfiguration.hardware.clientBinary == nil { sheet = .boards }
-            else { startService() }
+            else if canControlService { startService() }
+            else { sheet = .settings }
         default: sheet = .node
         }
     }
@@ -171,7 +158,7 @@ final class TimelordModel: ObservableObject {
         }
     }
     func toggleTuning() async {
-        guard ownsService, !operationInProgress, let pid = controller.processID else { return }
+        guard canControlService, !operationInProgress, let pid = controller.processID else { return }
         operationInProgress = true; defer { operationInProgress = false }
         do {
             let response = try await configurationClient.tuning(paused: !snapshot.tuningPaused)
@@ -180,29 +167,44 @@ final class TimelordModel: ObservableObject {
         } catch { errorMessage = error.localizedDescription }
     }
     func startService() {
-        guard canStartService else { return }; automaticStartPending = false; starting = true; pausedByUser = false; errorMessage = nil
+        guard canStartService else { return }
+        starting = true; errorMessage = nil
         Task {
-            await refreshDevices()
             defer { starting = false }
             guard !quitting else { return }
-            do {
-                guard !discoveredDevices.isEmpty else { throw ConfigurationError.message("Connect an ASIC board to start.") }
-                try await configurationClient.save(savedConfiguration)
-                guard !quitting else { return }
-                useSavedStatusEndpoint()
-                try controller.start(); configurationNeedsRestart = false
-            } catch {errorMessage=error.localizedDescription}
-            starting = false; if monitoringEnabled { await refresh() }
+            do { try await controller.start() }
+            catch { errorMessage = error.localizedDescription }
+            starting = false
+            if monitoringEnabled { await refresh() }
         }
     }
     func stopService() {
-        guard ownsService else { return }; automaticStartPending = false; pausedByUser = true; controller.stop()
+        guard canPause else { return }
+        starting = true; errorMessage = nil
+        Task {
+            defer { starting = false }
+            do { try await controller.stop() }
+            catch { errorMessage = error.localizedDescription }
+            starting = false
+            if monitoringEnabled { await refresh() }
+        }
     }
     func restartService() async {
-        guard ownsService else { return }
-        controller.stop()
-        while controller.ownsService { try? await Task.sleep(nanoseconds: 100_000_000) }
-        liveStatus = nil; startService()
+        guard canControlService, !starting else { return }
+        starting = true; defer { starting = false }
+        do {
+            try await controller.reload()
+            liveStatus = nil; history = nil
+            configurationNeedsRestart = false; useSavedStatusEndpoint()
+        } catch { errorMessage = error.localizedDescription }
+    }
+    func installBackgroundService() async {
+        guard !quitting, !starting, !operationInProgress else { return }
+        await saveConfiguration()
+        guard errorMessage == nil, !quitting else { return }
+        operationInProgress = true; defer { operationInProgress = false }
+        do { try await controller.install(); await refresh() }
+        catch { errorMessage = error.localizedDescription }
     }
     var hasUnsavedSettings: Bool { configuration != savedConfiguration }
     private var hasRuntimeSettingsChanges: Bool {
@@ -211,31 +213,31 @@ final class TimelordModel: ObservableObject {
         return runtimeConfiguration != savedConfiguration
     }
     var settingsDoneTitle: String {
-        ownsService && (hasRuntimeSettingsChanges || configurationNeedsRestart) ? "Save & Restart" : "Done"
+        canControlService && (hasRuntimeSettingsChanges || configurationNeedsRestart) ? "Save & Restart" : "Done"
     }
     var canFinishSettings: Bool {
         configurationLoaded && !operationInProgress && !starting
     }
     var settingsCompletionHint: String {
-        if ownsService {
+        if canControlService {
             return hasRuntimeSettingsChanges || configurationNeedsRestart
                 ? "Save & Restart applies your changes and briefly restarts Timelord."
                 : "Your settings are saved. Timelord keeps running."
         }
         if liveStatus != nil { return "Done saves your changes. Restart the externally managed service to apply them." }
-        if configuration.service.startAutomatically && automaticStartPending && !pausedByUser {
-            return "Done saves your changes. Timelord starts automatically when your node is configured and boards are connected."
-        }
-        return "Done saves your changes. Press Run on the dashboard to start proofs and Automatic tuning."
+        return "Timelord runs independently of this interface. Enable the background service to start at boot."
     }
     /// A settings sheet only dismisses after validation and persistence succeed.
     func finishSettings() async -> Bool {
         guard canFinishSettings else { return false }
-        if hasUnsavedSettings || (!ownsService && liveStatus == nil) {
+        if hasUnsavedSettings || (!canControlService && liveStatus == nil) {
             await saveConfiguration()
             guard errorMessage == nil else { return false }
         }
-        if configurationNeedsRestart && ownsService { await restartService() }
+        if configurationNeedsRestart && canControlService {
+            await restartService()
+            guard !configurationNeedsRestart else { return false }
+        }
         return true
     }
     func saveConfiguration() async {
@@ -246,7 +248,7 @@ final class TimelordModel: ObservableObject {
             try await configurationClient.save(updated)
             savedConfiguration = updated
             nodeSync = nil; lastNodeSyncFetch = .distantPast
-            configurationNeedsRestart = configurationNeedsRestart || ((ownsService || liveStatus != nil) && runtimeChanged)
+            configurationNeedsRestart = configurationNeedsRestart || ((canControlService || liveStatus != nil) && runtimeChanged)
             errorMessage = nil; configurationLoaded = true
             connectionResult = configurationNeedsRestart ? "Saved. Restart Timelord to apply these settings." : "Settings saved."
             if !configurationNeedsRestart { useSavedStatusEndpoint() }
@@ -271,10 +273,13 @@ final class TimelordModel: ObservableObject {
         do {
             var devices=try await configurationClient.devices()
             // Open D2XX interfaces can hide their enumeration metadata. A fresh
-            // service-owned connection is additional evidence for that board.
-            for status in liveStatus?.boards ?? [] where status.connectedClients>0 && ["connected","starting"].contains(status.hardwareState) {
-                if let configured=savedConfiguration.hardware.boards.first(where:{$0.id==status.id}),let location=status.deviceLocation ?? configured.deviceLocation,!devices.contains(where:{$0.location==location}) {
-                    devices.append(DiscoveredDevice(name:configured.name,location:location,serial:configured.serial))
+            // supervised USB owner remains presence evidence when its chain is idle.
+            for status in liveStatus?.boards ?? [] where status.hardwareState == "connected" || (status.connectedClients>0 && status.hardwareState == "starting") {
+                let configured=(savedConfiguration.hardware.boards + savedConfiguration.hardware.rememberedBoards).first(where:{$0.id==status.id})
+                let serial=status.serial ?? configured?.serial
+                if let location=status.deviceLocation ?? configured?.deviceLocation,
+                   !devices.contains(where:{ device in if let serial { return device.serial == serial }; return device.location == location }) {
+                    devices.append(DiscoveredDevice(name:status.name,location:location,serial:serial))
                 }
             }
             discoveredDevices=devices
@@ -300,7 +305,7 @@ final class TimelordModel: ObservableObject {
             }
             configuration = try await configurationClient.load(); savedConfiguration = configuration; configurationLoaded = true; errorMessage = nil
             nodeSync = nil; lastNodeSyncFetch = .distantPast
-            configurationNeedsRestart = ownsService || liveStatus != nil
+            configurationNeedsRestart = canControlService || liveStatus != nil
             connectionResult = "Connection imported. Test the connection when you’re ready."
             updateSnapshot()
         } catch { errorMessage = error.localizedDescription }
@@ -323,12 +328,10 @@ final class TimelordModel: ObservableObject {
 
     func prepareForTermination() async {
         quitting = true
-        automaticStartPending = false
         monitoring?.cancel(); monitoring = nil
         controller.onChange = nil
-        await controller.stopAndWait()
-        // A startup awaiting USB discovery or a config write must observe quitting
-        // before it can launch a helper, even if termination arrived mid-start.
+        // An intent transaction already sent must complete, but interface exit
+        // never sends Pause or terminates the independent supervisor.
         while starting { try? await Task.sleep(nanoseconds: 100_000_000) }
     }
 }

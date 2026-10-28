@@ -13,5 +13,18 @@ scrape_configs:
           instance_name: timelord-mac-01
           network: mainnet
     # The application also supplies network. Keep target and service in agreement.
+  - job_name: timelord-supervisor
+    honor_labels: true
+    scrape_interval: 30s
+    scrape_timeout: 5s
+    static_configs:
+      - targets: [timelord-host:9259]
+        labels:
+          application: timelord-app
+          component: timelord
+          region: msp
+          instance_name: timelord-mac-01
+          network: mainnet
+    # Set service.supervisor_observability_listen to a reachable address explicitly.
 rule_files:
   - alerts.yml

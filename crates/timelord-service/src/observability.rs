@@ -76,6 +76,7 @@ struct Last {
     chains: [Option<f64>; 3],
 }
 pub struct Metrics {
+    pub progress: Arc<timelord_supervisor::progress::Progress>,
     registry: Registry,
     counters: BTreeMap<&'static str, IntCounterVec>,
     timestamps: BTreeMap<&'static str, IntGaugeVec>,
@@ -172,6 +173,7 @@ impl Metrics {
         registry.register(Box::new(proof_duration.clone()))?;
         registry.register(Box::new(submission_duration.clone()))?;
         let metrics = Arc::new(Self {
+            progress: Arc::default(),
             registry,
             counters,
             timestamps,
@@ -373,6 +375,11 @@ fn board_usable(h: &crate::runtime::HardwareState, managed: bool, now: u64) -> b
         } else {
             h.verified_generation == Some(h.generation)
         }
+}
+pub fn ready(shared: &Shared, metrics: &Metrics) -> bool {
+    metrics.healthy()
+        && !metrics.reconfiguring.load(Ordering::Relaxed)
+        && snapshot(shared, crate::unix_now()).1.ready
 }
 fn snapshot(shared: &Shared, now: u64) -> (Samples, Readiness, u64) {
     // Same lock order as /v1/status; no chart history is traversed or copied.
@@ -730,6 +737,7 @@ mod tests {
             ]))),
             runtime: Arc::new(Mutex::new(runtime)),
             started_unix: now,
+            service_started_unix: now,
         });
         let (_, current) = watch::channel(shared.clone());
         let http = HttpState {
@@ -843,6 +851,7 @@ mod tests {
             clients: shared.clients.clone(),
             runtime: shared.runtime.clone(),
             started_unix: shared.started_unix,
+            service_started_unix: shared.service_started_unix,
         });
         let (_, current) = watch::channel(shared.clone());
         http.current = current;
@@ -1090,6 +1099,7 @@ mod tests {
             ]))),
             runtime: shared.runtime.clone(),
             started_unix: now,
+            service_started_unix: now,
         };
         let body = metrics.render(&moved, now).unwrap();
         assert_eq!(
@@ -1117,6 +1127,7 @@ mod tests {
             clients: Default::default(),
             runtime: moved.runtime.clone(),
             started_unix: now,
+            service_started_unix: now,
         };
         let body = metrics.render(&removed, now).unwrap();
         assert!(!body.contains("chia_timelord_chain_assignment{"));

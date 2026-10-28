@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 prometheus = { version = "0.13.4", default-features = false }
+timelord-supervisor = { path = "../timelord-supervisor" }
 timelord-core = { path = "../timelord-core" }
 vdf-client-protocol = { path = "../vdf-client-protocol" }
 anyhow.workspace = true

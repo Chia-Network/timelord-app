@@ -30,6 +30,7 @@ public struct NodeRPCConfiguration: Codable, Sendable, Equatable {
 public struct ServiceConfiguration: Codable, Sendable, Equatable {
     public var statusListen = "127.0.0.1:9257"
     public var observabilityListen: String?
+    public var supervisorObservabilityListen = "127.0.0.1:9259"
     public var controlSocket: String?
     public var tuningPaused = false
     public var startAutomatically = true

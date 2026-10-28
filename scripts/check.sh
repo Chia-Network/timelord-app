@@ -14,7 +14,8 @@ promtool check metrics < build/observability.prom
 promtool check rules monitoring/alerts.yml
 promtool test rules monitoring/alerts.test.yml
 if [[ "$(uname -s)" == Darwin ]]; then
-  cargo build --locked -p timelord-service
+  cargo build --locked -p timelord-service -p timelord-supervisor
+  bash scripts/installer-inputs-test.sh
   swift build --package-path apps/macos --scratch-path build/swift
   swift test --package-path apps/macos --scratch-path build/swift
 fi

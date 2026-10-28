@@ -15,6 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 use timelord_core::{Assignment, Chain, Config};
+use timelord_supervisor::progress::Stage;
 use tokio::{
     io::AsyncWriteExt,
     net::TcpStream,
@@ -88,6 +89,7 @@ struct Active {
 struct Lane {
     board: String,
     active: Mutex<Option<Active>>,
+    arithmetic: Arc<tokio::sync::Semaphore>,
     started_once: std::sync::atomic::AtomicBool,
 }
 #[derive(Debug)]
@@ -129,6 +131,7 @@ impl AsicBackend {
                     Lane {
                         board: a.board_id,
                         active: Mutex::new(None),
+                        arithmetic: Arc::new(tokio::sync::Semaphore::new(1)),
                         started_once: std::sync::atomic::AtomicBool::new(false),
                     },
                 )
@@ -304,6 +307,19 @@ impl AsicBackend {
             (state.metrics.clone(), state.metric_epoch)
         };
         let mut owner = lane.active.lock().await;
+        let lane_index = match chain {
+            Chain::Challenge => 0,
+            Chain::Reward => 1,
+            Chain::InfusedChallenge => 2,
+        };
+        let progress = metrics.as_ref().map(|m| {
+            m.progress.begin(
+                lane_index,
+                work.generation,
+                work.iterations,
+                Stage::Preparing,
+            )
+        });
         // Take ownership during I/O. Cancellation retires the socket instead of
         // leaving a partially consumed frame in a reusable session.
         let generation = self
@@ -320,22 +336,36 @@ impl AsicBackend {
         let changed_input = active
             .as_ref()
             .is_some_and(|s| !same_challenge(&s.key, &work));
-        let discriminant = active
+        let discriminant = if active
             .as_ref()
             .is_none_or(|s| !same_challenge(&s.key, &work))
-            .then(|| {
-                let seed = work.challenge.const_bytes().to_vec();
-                let bits = work.discriminant_bits;
-                let metrics = metrics.clone();
-                tokio::task::spawn_blocking(move || {
-                    let started = Instant::now();
-                    let result = create_discriminant_bytes(&seed, bits);
-                    if let Some(metrics) = metrics {
-                        metrics.duration(chain, "discriminant", started.elapsed());
-                    }
-                    result
-                })
+        {
+            // The permit and stage live in the actual blocking closure. Cancelling
+            // an async request cannot hide stuck GMP work or queue more of it.
+            let permit = lane.arithmetic.clone().acquire_owned().await?;
+            let arithmetic = metrics.as_ref().map(|m| {
+                m.progress.begin(
+                    4 + lane_index,
+                    work.generation,
+                    work.iterations,
+                    Stage::Preparing,
+                )
             });
+            let seed = work.challenge.const_bytes().to_vec();
+            let bits = work.discriminant_bits;
+            let metrics = metrics.clone();
+            Some(tokio::task::spawn_blocking(move || {
+                let (_permit, _arithmetic) = (permit, arithmetic);
+                let started = Instant::now();
+                let result = create_discriminant_bytes(&seed, bits);
+                if let Some(metrics) = metrics {
+                    metrics.duration(chain, "discriminant", started.elapsed());
+                }
+                result
+            }))
+        } else {
+            None
+        };
         if active
             .as_ref()
             .is_some_and(|s| !same_challenge(&s.key, &work))
@@ -346,6 +376,9 @@ impl AsicBackend {
         let mut active = match active {
             Some(session) => session,
             None => {
+                if let Some(p) = &progress {
+                    p.stage(Stage::WaitingForClient);
+                }
                 let waiting = Instant::now();
                 let mut pool = self
                     .pools
@@ -377,11 +410,17 @@ impl AsicBackend {
                 // Match Python timelord: start the IPS clock when assigning the
                 // client, even if discriminant preparation is already running.
                 let estimated_started = Instant::now();
+                if let Some(p) = &progress {
+                    p.stage(Stage::Preparing);
+                }
                 let magnitude = discriminant
                     .expect("A new session needs a discriminant")
                     .await??;
                 let decimal = format!("-{}", num_bigint::BigUint::from_bytes_be(&magnitude));
                 let started = Instant::now();
+                if let Some(p) = &progress {
+                    p.stage(Stage::Handshake);
+                }
                 lease
                     .socket
                     .write_all(&encode_initial(&decimal, &work.input.data.const_bytes())?)
@@ -419,6 +458,9 @@ impl AsicBackend {
                 }
             }
         };
+        if let Some(p) = &progress {
+            p.stage(Stage::NativeWork);
+        }
         request(&mut active.lease.socket, work.iterations).await?;
         let proof = tokio::time::timeout(
             Duration::from_secs(3600),
@@ -433,8 +475,24 @@ impl AsicBackend {
         // Publish only after the proof has passed verification.
         let ips = estimated_ips(work.iterations, active.estimated_started.elapsed());
         let checked = work.clone();
+        if let Some(p) = &progress {
+            p.stage(Stage::Verifying);
+        }
         let verification_started = Instant::now();
-        let verification = tokio::task::spawn_blocking(move || verify(&checked, *proof)).await?;
+        let permit = lane.arithmetic.clone().acquire_owned().await?;
+        let arithmetic = metrics.as_ref().map(|m| {
+            m.progress.begin(
+                4 + lane_index,
+                work.generation,
+                work.iterations,
+                Stage::Verifying,
+            )
+        });
+        let verification = tokio::task::spawn_blocking(move || {
+            let (_permit, _arithmetic) = (permit, arithmetic);
+            verify(&checked, *proof)
+        })
+        .await?;
         if let Some(metrics) = &metrics {
             metrics.duration(chain, "verification", verification_started.elapsed());
         }

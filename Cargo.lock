@@ -2593,6 +2593,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "timelord-core",
+ "timelord-supervisor",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
@@ -2603,6 +2604,19 @@ dependencies = [
  "vdf-client-protocol",
  "x509-cert",
  "yaml-rust2",
+]
+
+[[package]]
+name = "timelord-supervisor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

@@ -4,7 +4,7 @@ groups:
     rules:
       - alert: TimelordScrapeFailed
         expr: |
-          up{job="timelord-app"} == 0
+          (up{job="timelord-app"} == 0) unless on(network, region, instance_name) chia_timelord_supervisor_desired_running == 0
         for: 2m
         labels:
           severity: critical
@@ -74,3 +74,26 @@ groups:
           severity: warning
         annotations:
           summary: Pending VDF work has no verified progress
+
+      - alert: TimelordSupervisorScrapeFailed
+        expr: up{job="timelord-supervisor"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Timelord boot supervisor cannot be scraped
+      - alert: TimelordSupervisorUnhealthy
+        expr: chia_timelord_supervisor_healthy == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: Timelord boot supervisor is not making progress
+      - alert: TimelordWorkerUnavailable
+        expr: |
+          (chia_timelord_supervisor_desired_running == 1) and on(job, instance, network) chia_timelord_supervisor_worker_up == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Timelord is requested to run but has no worker

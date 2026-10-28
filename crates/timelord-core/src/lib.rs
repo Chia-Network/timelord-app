@@ -77,6 +77,7 @@ pub enum Network {
 pub struct ServiceConfig {
     pub status_listen: SocketAddr,
     pub observability_listen: Option<SocketAddr>,
+    pub supervisor_observability_listen: SocketAddr,
     pub control_socket: Option<PathBuf>,
     pub tuning_paused: bool,
     pub start_automatically: bool,
@@ -87,6 +88,7 @@ impl Default for ServiceConfig {
         Self {
             status_listen: SocketAddr::from(([127, 0, 0, 1], 9257)),
             observability_listen: None,
+            supervisor_observability_listen: SocketAddr::from(([127, 0, 0, 1], 9259)),
             control_socket: None,
             tuning_paused: false,
             start_automatically: true,
@@ -323,8 +325,21 @@ impl Config {
                     .into(),
             );
         }
+        let supervisor = self.service.supervisor_observability_listen;
+        if supervisor.port() == 0
+            || supervisor.port() == self.service.status_listen.port()
+            || self
+                .service
+                .observability_listen
+                .is_some_and(|a| a.port() == supervisor.port())
+        {
+            return Err(
+                "Supervisor observability must use a nonzero port distinct from worker endpoints"
+                    .into(),
+            );
+        }
         let mut ids = HashSet::new();
-        let mut ports = HashSet::from([self.service.status_listen.port()]);
+        let mut ports = HashSet::from([self.service.status_listen.port(), supervisor.port()]);
         if let Some(address) = self.service.observability_listen {
             ports.insert(address.port());
         }

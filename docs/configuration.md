@@ -22,6 +22,9 @@ ca_certificate = "identity/ca.crt"
 status_listen = "127.0.0.1:9257"
 # Optional read-only deployment endpoints; disabled when omitted.
 # observability_listen = "0.0.0.0:9258"
+# Persistent supervisor listener; re-register after changing it.
+supervisor_observability_listen = "127.0.0.1:9259"
+# Legacy app-launch preference; durable supervisor Run/Pause is authoritative.
 start_automatically = true
 tuning_paused = false
 
@@ -50,7 +53,10 @@ one, and three boards run one each. Automatic layouts rebalance while the servic
 runs, after three agreeing five-second discovery polls. This briefly stops proof
 work and reconnects the node with the new layout; it does not restart the app or
 status endpoint. No boards leaves the service waiting for hardware. USB discovery
-errors do not trigger redistribution. A changed layout uses its separately learned
+errors do not trigger redistribution. Idle chains with supervised native owners
+remain in the layout even when open FTDI metadata and proof sockets are absent;
+the native owner's sensor/exit watchdog determines when that evidence expires.
+A changed layout uses its separately learned
 engine-count/mask profile, or its configured Automatic starting frequency/voltage
 if no matching profile exists. A high single-engine clock is never reused as a
 three-engine learned setting. Thermal and invalid-proof faults stay latched.

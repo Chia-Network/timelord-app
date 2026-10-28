@@ -62,6 +62,8 @@ enum Command {
     Serve {
         #[arg(long)]
         config: PathBuf,
+        #[arg(long, hide = true)]
+        supervised: bool,
     },
     /// Read configuration as JSON for the native interface.
     Configuration {
@@ -103,6 +105,12 @@ enum Command {
     Devices {
         #[arg(long)]
         config: PathBuf,
+    },
+    /// Internal disposable driver process; never loads D2XX into the service.
+    #[command(hide = true)]
+    UsbInventory {
+        #[arg(long)]
+        driver_library: PathBuf,
     },
     /// Run a bounded, isolated three-chain ASIC proof check without a full node.
     CheckHardware {
@@ -272,6 +280,12 @@ async fn main() -> Result<()> {
             "{}",
             serde_json::to_string(&inventory::discover(&load(&config)?).await?)?
         ),
+        Command::UsbInventory { driver_library } => {
+            println!(
+                "{}",
+                serde_json::to_string(&inventory::native(&driver_library)?)?
+            );
+        }
         Command::CheckHardware { config } => {
             println!(
                 "{}",
@@ -297,7 +311,16 @@ async fn main() -> Result<()> {
                 serde_json::to_string_pretty(&assignment::resolve(&value)?)?
             );
         }
-        Command::Serve { config } => {
+        Command::Serve { config, supervised } => {
+            // Install the async termination handler before the lifetime thread
+            // can signal us, including while configuration/USB startup awaits.
+            let _termination =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            if supervised {
+                timelord_supervisor::watch_parent()?;
+            }
+            let paths = timelord_supervisor::Paths::for_config(&config)?;
+            let _owner = timelord_supervisor::InstanceLock::acquire(&paths.worker_lock)?;
             let mut value = load(&config)?;
             value.service.control_socket = Some(automatic::socket_path(&config, &value));
             value.hardware.automatic_state.get_or_insert(
@@ -352,6 +375,7 @@ struct Shared {
     clients: Arc<Mutex<BTreeSet<(String, u8)>>>,
     runtime: Arc<Mutex<runtime::RuntimeState>>,
     started_unix: u64,
+    service_started_unix: u64,
 }
 
 #[derive(Serialize)]
@@ -363,6 +387,7 @@ struct Status {
     message: String,
     production_enabled: bool,
     started_unix: u64,
+    service_started_unix: u64,
     timestamp_unix: u64,
     full_node: NodeStatus,
     boards: Vec<BoardStatus>,
@@ -427,6 +452,7 @@ async fn status(State(http): State<observability::HttpState>) -> Json<Status> {
         message: runtime.message.clone(),
         production_enabled: shared.config.node.certificate.is_some(),
         started_unix: shared.started_unix,
+        service_started_unix: shared.service_started_unix,
         timestamp_unix: unix_now(),
         full_node: NodeStatus {
             host: shared.config.node.host.clone(),
@@ -564,6 +590,7 @@ async fn start_run(
     config: Config,
     history_path: PathBuf,
     faults: &std::collections::HashMap<String, runtime::HardwareState>,
+    service_started_unix: u64,
     metrics: Arc<observability::Metrics>,
 ) -> Result<Run> {
     let assignments = assignment::resolve(&config)?;
@@ -624,6 +651,7 @@ async fn start_run(
         clients: Arc::new(Mutex::new(BTreeSet::new())),
         runtime,
         started_unix,
+        service_started_unix,
     });
     let (shutdown, receiver) = watch::channel(false);
     let mut tasks = JoinSet::new();
@@ -662,10 +690,9 @@ async fn start_run(
         let shared = shared.clone();
         let shutdown = receiver.clone();
         tasks.spawn(async move {
-            if let Err(error) = hardware::run(shared, backend, shutdown).await {
-                tracing::warn!(%error, "ASIC supervision stopped");
-            }
-            Ok(())
+            hardware::run(shared, backend, shutdown)
+                .await
+                .context("ASIC supervision stopped")
         });
     }
     if let Some(control) = control {
@@ -682,15 +709,21 @@ async fn start_run(
     })
 }
 
-async fn essential_exit(tasks: &mut JoinSet<Result<()>>, metrics: &observability::Metrics) {
+async fn essential_exit(
+    tasks: &mut JoinSet<Result<()>>,
+    metrics: &observability::Metrics,
+) -> anyhow::Error {
     let task = tasks.join_next().await;
     metrics
         .failed
         .store(true, std::sync::atomic::Ordering::Relaxed);
+    metrics.progress.fail();
     tracing::error!(?task, "Essential service task exited unexpectedly");
+    anyhow::anyhow!("Essential service task exited unexpectedly: {task:?}")
 }
 
 async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
+    let service_started_unix = unix_now();
     // The status listener outlives each topology. No UI or external supervisor
     // is required to restart the service after a USB change.
     let http = TcpListener::bind(config.service.status_listen)
@@ -708,8 +741,21 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
     let metrics = observability::Metrics::new(config.node.network)?;
     let config = inventory::connected_configuration(config).await?;
     let mut faults = std::collections::HashMap::new();
-    let mut run = start_run(config, history_path.clone(), &faults, metrics.clone()).await?;
+    let mut run = start_run(
+        config,
+        history_path.clone(),
+        &faults,
+        service_started_unix,
+        metrics.clone(),
+    )
+    .await?;
     let (current, state) = watch::channel(run.shared.clone());
+    let report_state = state.clone();
+    let report_metrics = metrics.clone();
+    let _reporter = timelord_supervisor::progress::Reporter::with_readiness(
+        metrics.progress.clone(),
+        move || observability::ready(&report_state.borrow(), &report_metrics),
+    )?;
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/status", get(status))
@@ -750,13 +796,14 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
     let result = loop {
         let candidate = tokio::select! {
             _ = &mut signal => break Ok(()),
-            _ = essential_exit(&mut run.tasks, &metrics), if !run.tasks.is_empty() => continue,
+            error = essential_exit(&mut run.tasks, &metrics), if !run.tasks.is_empty() => break Err(error),
             result = async { observation_server.as_mut().expect("observer").await }, if observation_server.is_some() => {
                 metrics.failed.store(true,std::sync::atomic::Ordering::Relaxed);
                 break result.context("Observability task failed")?.context("Observability server failed");
             }
             result = &mut server => break result.context("Status task failed")?.context("Status server failed"),
             _ = poll.tick() => {
+                let _discovery = metrics.progress.begin(8,0,0,timelord_supervisor::progress::Stage::Discovery);
                 tokio::select! {
                     _ = &mut signal => break Ok(()),
                     result = inventory::live_configuration(&run.shared) => result,
@@ -766,6 +813,12 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
         let Some(mut config) = topology.observe(&run.shared.config, candidate) else {
             continue;
         };
+        let _topology = metrics.progress.begin(
+            8,
+            0,
+            0,
+            timelord_supervisor::progress::Stage::TopologyChange,
+        );
         // Validate the replacement before interrupting healthy work.
         let plan = assignment::resolve(&config)?;
         if let Err(error) = hardware::validate_automatic(&config, &plan).await {
@@ -809,7 +862,14 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
                     (id.clone(), fault)
                 }),
         );
-        run = start_run(config, history_path.clone(), &faults, metrics.clone()).await?;
+        run = start_run(
+            config,
+            history_path.clone(),
+            &faults,
+            service_started_unix,
+            metrics.clone(),
+        )
+        .await?;
         current.send_replace(run.shared.clone());
         metrics
             .reconfiguring
@@ -818,6 +878,9 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
     metrics
         .stopping
         .store(true, std::sync::atomic::Ordering::Relaxed);
+    if result.is_err() {
+        metrics.progress.fail();
+    }
     run.stop().await?;
     let _ = http_stop.send(true);
     if !server.is_finished() {
@@ -937,9 +1000,16 @@ mod tests {
             },
         );
         drop(reserved);
-        let mut run = start_run(config, dir.join("history.json"), &faults, metrics.clone())
-            .await
-            .unwrap();
+        let mut run = start_run(
+            config,
+            dir.join("history.json"),
+            &faults,
+            unix_now() - 3600,
+            metrics.clone(),
+        )
+        .await
+        .unwrap();
+        let service_started_unix = run.shared.service_started_unix;
         let (current, state) = watch::channel(run.shared.clone());
         let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = http.local_addr().unwrap();
@@ -994,9 +1064,15 @@ mod tests {
                 );
             }
             assert!(!dir.join("control.sock").exists());
-            run = start_run(next, dir.join("history.json"), &faults, metrics.clone())
-                .await
-                .unwrap();
+            run = start_run(
+                next,
+                dir.join("history.json"),
+                &faults,
+                service_started_unix,
+                metrics.clone(),
+            )
+            .await
+            .unwrap();
             current.send_replace(run.shared.clone());
             assert_eq!(metrics.counter("topology_changes_total", &[]), 1);
             assert!(run.shared.runtime.lock().unwrap().boards["b2"].latched_fault);
@@ -1018,6 +1094,8 @@ mod tests {
             assert_eq!(value["boards"].as_array().unwrap().len(), indices.len());
             assert_eq!(value["connected_client_count"], 0);
             assert_eq!(value["proofs_delivered"], 0);
+            assert_eq!(value["service_started_unix"], service_started_unix);
+            assert!(value["started_unix"].as_u64().unwrap() >= service_started_unix + 3600);
         }
         run.stop().await.unwrap();
         server.abort();
@@ -1045,6 +1123,7 @@ mod tests {
             clients: Arc::new(Mutex::new(BTreeSet::new())),
             runtime: Default::default(),
             started_unix: unix_now(),
+            service_started_unix: crate::unix_now(),
         });
         let (stop, rx) = watch::channel(false);
         let task = tokio::spawn(client_listener(

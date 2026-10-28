@@ -165,3 +165,55 @@ promtool test rules monitoring/alerts.test.yml
 Fixtures use isolated sockets, generated TLS identities and simulated native
 proofs, never production node/USB state. Offline checks establish contracts, not
 hardware performance or production network acceptance.
+
+## Independent work supervision
+
+When launched by the boot supervisor, the worker emits a private datagram once per
+second. Reports contain worker PID, supervisor generation, monotonic sequence and
+nine bounded slots: CC/RC/ICC native I/O, scheduler/submission, CC/RC/ICC
+arithmetic, scheduler eligibility, and discovery/topology replacement. Request IDs and scheduler generation fence late cancellation/cleanup.
+No proof payload, credential or unbounded identifier enters this protocol. Replayed
+or previous-worker reports do not refresh liveness. The supervisor CLI includes
+the latest snapshot and its receipt age; process presence is never readiness.
+
+The independent supervisor permits 120 seconds for startup, then 30 seconds
+without a fresh worker-runtime report. Stage deadlines are 30 seconds for
+discriminant preparation, 15 for handshake/submission, and 60 for native proof
+verification or scheduler validation. Native computation plus checkpoint delivery
+gets the full iteration target at a conservative 100k IPS plus 60 seconds slack;
+it is not a fixed short-proof deadline and does not trust a held raw-speed gauge.
+The native protocol currently reports that combined stage, not a separately
+measured checkpoint-construction stage. Client absence and idle chains have no
+proof deadline. Scheduler eligibility waits receive their actual not-before delay plus 60 seconds
+slack. Discovery has a 15-second stage deadline and topology replacement 60 seconds.
+An essential task exit requests worker replacement even if HTTP remains responsive.
+
+Arithmetic permits and their stage guards live inside the actual blocking job.
+Cancelling its caller neither hides it from supervision nor creates an unbounded
+queue of replacements. A stage deadline retires/reaps the whole worker process
+group, because aborting a Rust future cannot stop GMP. Ordinary transport/sensor
+repair stays with the existing board supervisor; ordinary recoveries do not by
+themselves trigger this watchdog.
+
+The boot supervisor owns a separate read-only `/healthz`, `/readyz`, `/metrics`
+listener, default `127.0.0.1:9259`, selected by
+`service.supervisor_observability_listen` at registration. It stays available during
+Pause, worker failure and recovery; Run/Pause mutation remains on the private
+same-user socket. Health checks supervisor-loop liveness. Readiness additionally
+requires requested Run, a fresh identity-matched report and the worker's managed
+hardware/node readiness; process presence alone cannot make it ready. Monitor
+both endpoints: supervisor metrics describe desired state, worker presence,
+readiness, restart count and progress age; worker metrics describe verified work.
+No held IPS gauge is invented while the worker is absent.
+
+The supervisor retains its latest 32 recovery records in bounded status output.
+PID/generation/sequence checks reject previous owners and replayed progress.
+Worker metric counters reset when a worker is replaced; supervisor restart
+counters reset when the supervisor is replaced.
+
+Set a reachable supervisor listen address explicitly for remote scraping and
+re-register after changing its port/network; ordinary worker reload preserves
+registration. Configure the same `network`, `region` and `instance_name` target
+labels for both endpoints. The alert examples suppress worker scrape failures
+for an explicit durable Pause but continue to monitor the supervisor; an absent
+supervisor series never suppresses a legacy worker scrape alert.
