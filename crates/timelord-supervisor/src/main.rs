@@ -183,7 +183,13 @@ impl Worker {
         let pid = info.si_pid;
         #[cfg(not(target_os = "macos"))]
         let pid = unsafe { info.si_pid() };
-        Ok(pid != 0)
+        // Darwin can report a stop notification even with WEXITED. A stopped
+        // process is not an exited owner; retain its process-group identity.
+        Ok(pid != 0
+            && matches!(
+                info.si_code,
+                libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+            ))
     }
     async fn stop(mut self) -> Result<std::process::ExitStatus> {
         self.signal(libc::SIGTERM);
