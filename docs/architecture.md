@@ -157,3 +157,7 @@ the new 1+1+1, 2+1 or 3-engine generation. Strict mappings never redistribute.
 Public native pins include opened-handle serial validation and pausing all engines
 before applying replacement-owner settings. These mechanisms do not prove physical
 quiescence if the USB stack or power circuitry is unresponsive.
+
+Thermal/invalid-proof handlers retire the native owner before fault-journal I/O.
+The previously persisted active-owner marker covers a crash or failed fault write;
+unknown/unclean quarantine also requires the extra cooling margin on admission.

@@ -178,7 +178,7 @@ pub(super) async fn check(
             .clone()
             .zip(board.serial.as_ref())
             .and_then(|(store, serial)| store.board(serial))
-            .is_some_and(|b| b.quarantine == Some(crate::safety::Reason::Thermal));
+            .is_some_and(|b| b.quarantine.is_some());
         let cool_limit = if thermal {
             (board.temperature_limit_c - 5.).min(50.)
         } else {

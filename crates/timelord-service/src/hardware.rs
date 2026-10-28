@@ -198,13 +198,8 @@ impl ClientLog {
                         &[&crate::observability::board(&shared.config, &board.id)],
                     );
                 }
-                let safety = state.safety.clone();
+                // Retire the native owner before attempting fault persistence.
                 drop(state);
-                if let (Some(safety), Some(serial)) = (safety, &board.serial)
-                    && let Err(error) = safety.quarantine(serial, crate::safety::Reason::Thermal)
-                {
-                    tracing::error!(%error,board=%board.name,"Thermal quarantine could not be checkpointed");
-                }
                 bail!("ASIC reached its configured temperature limit");
             }
         }
@@ -961,9 +956,48 @@ async fn launch(shared: &Shared, board: &BoardConfig) -> Result<Child> {
 }
 fn thermal_rejection(error: &anyhow::Error) -> bool {
     let reason = error.to_string();
-    reason.contains(": temperature_limit") || reason.contains(": temperature_guard")
+    reason.contains(": temperature_limit")
+        || reason.contains(": temperature_guard")
+        || reason.contains("configured temperature limit")
 }
 
+fn checkpoint_retired(
+    shared: &Shared,
+    board: &BoardConfig,
+    store: &crate::safety::Store,
+    serial: &str,
+) -> Result<()> {
+    let (quiesced, latched, thermal) = {
+        let state = shared.runtime.lock().expect("runtime");
+        let hardware = state
+            .boards
+            .get(&board.id)
+            .context("Retired board missing")?;
+        (
+            hardware.quiesced,
+            hardware.latched_fault,
+            hardware.state == "thermal_stop",
+        )
+    };
+    if latched {
+        store.quarantine(
+            serial,
+            if thermal {
+                crate::safety::Reason::Thermal
+            } else {
+                crate::safety::Reason::InvalidProof
+            },
+        )?;
+        if quiesced {
+            store.closed(serial)?;
+        }
+    } else if quiesced {
+        store.closed(serial)?;
+    } else {
+        store.quarantine(serial, crate::safety::Reason::UncleanOwner)?;
+    }
+    Ok(())
+}
 async fn supervise_board(
     shared: Arc<Shared>,
     backend: Arc<crate::asic::AsicBackend>,
@@ -1197,20 +1231,7 @@ async fn supervise_board(
             )
             .await;
             if let (Some(store), Some(serial)) = (&safety, &board.serial) {
-                let quiesced = shared
-                    .runtime
-                    .lock()
-                    .expect("runtime")
-                    .boards
-                    .get(&board.id)
-                    .is_some_and(|b| b.quiesced);
-                if quiesced {
-                    store.closed(serial)?;
-                } else if let Err(error) =
-                    store.quarantine(serial, crate::safety::Reason::UncleanOwner)
-                {
-                    tracing::error!(%error,"Unclean native owner could not be checkpointed");
-                }
+                checkpoint_retired(&shared, &board, store, serial)?;
             }
             result
         }
@@ -1691,6 +1712,83 @@ printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
         assert!(owner.stop(&mut child, log).await);
         assert!(child.try_wait().unwrap().unwrap().success());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn thermal_shutdown_does_not_wait_for_the_safety_journal() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tl-thermal-journal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("client");
+        std::fs::write(&binary,r#"#!/bin/sh
+while read command version id frequency voltage; do
+ printf 'TLACK 1 %s %s %s\n' "$id" "$frequency" "$voltage"
+ printf '%s\n' 'Connected to timelord, waiting for challenge' 'ASIC Temp = 60 C; Frequency = 1450 MHz' >&2
+done
+printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
+"#).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let board:BoardConfig=toml::from_str("id='hot'\nname='Hot'\nserial='fixture'\nclient_port=18110\ndevice_location=1\nprofile='manual'").unwrap();
+        let mut config = Config::default();
+        config.hardware.client_binary = Some(binary);
+        config.hardware.boards = vec![board.clone()];
+        let store = Arc::new(crate::safety::Store::open(&dir.join("config.toml")).unwrap());
+        store
+            .before_open(
+                "fixture",
+                Point {
+                    frequency_mhz: 1450.,
+                    voltage_v: 1.,
+                },
+            )
+            .unwrap();
+        let runtime = crate::runtime::RuntimeState {
+            safety: Some(store.clone()),
+            ..Default::default()
+        };
+        let shared = Arc::new(Shared {
+            assignments: config.assignments().unwrap(),
+            config,
+            clients: Default::default(),
+            runtime: Arc::new(std::sync::Mutex::new(runtime)),
+            started_unix: crate::unix_now(),
+            service_started_unix: crate::unix_now(),
+        });
+        let initialization = INITIALIZATION.lock().await;
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let (release, done) = std::sync::mpsc::channel();
+        let held = store.clone();
+        let holder = std::thread::spawn(move || held.held_fixture(entered, done));
+        waiting.recv().unwrap();
+        let before = tokio::time::Instant::now();
+        let child = launch(&shared, &board).await.unwrap();
+        let (ready, _ready) = oneshot::channel();
+        let (_stop, rx) = watch::channel(false);
+        let result = supervise(
+            shared.clone(),
+            board.clone(),
+            child,
+            ready,
+            rx,
+            initialization,
+            None,
+        )
+        .await;
+        let elapsed = before.elapsed();
+        let _ = release.send(());
+        holder.join().unwrap();
+        let quiesced = shared.runtime.lock().unwrap().boards[&board.id].quiesced;
+        checkpoint_retired(&shared, &board, &store, "fixture").unwrap();
+        let record = store.board("fixture").unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(result.is_err());
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "thermal stop waited {elapsed:?} for journal"
+        );
+        assert!(quiesced);
+        assert_eq!(record.quarantine, Some(crate::safety::Reason::Thermal));
+        assert!(!record.owner_active);
     }
 
     #[test]

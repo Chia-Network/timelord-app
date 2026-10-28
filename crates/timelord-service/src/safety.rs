@@ -168,6 +168,16 @@ impl Store {
             progress: None,
         })
     }
+    #[cfg(test)]
+    pub fn held_fixture(
+        &self,
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        let _guard = self.state.lock().expect("fixture safety");
+        let _ = entered.send(());
+        let _ = release.recv_timeout(std::time::Duration::from_secs(2));
+    }
     pub fn monitored(
         mut self,
         progress: std::sync::Arc<timelord_supervisor::progress::Progress>,

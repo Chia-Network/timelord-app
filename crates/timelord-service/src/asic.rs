@@ -88,7 +88,6 @@ struct Active {
 }
 struct Lane {
     board: String,
-    serial: Option<String>,
     active: Mutex<Option<Active>>,
     arithmetic: Arc<tokio::sync::Semaphore>,
     started_once: std::sync::atomic::AtomicBool,
@@ -131,12 +130,6 @@ impl AsicBackend {
                 (
                     a.chain,
                     Lane {
-                        serial: config
-                            .hardware
-                            .boards
-                            .iter()
-                            .find(|b| b.id == a.board_id)
-                            .and_then(|b| b.serial.clone()),
                         board: a.board_id,
                         active: Mutex::new(None),
                         arithmetic: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -301,15 +294,10 @@ impl AsicBackend {
                     } else {
                         "Waiting for ASIC recovery.".into()
                     };
-                    let safety = state.safety.clone();
+                    // The owner supervisor quiesces before checkpointing this
+                    // restriction. Its durable active-owner marker covers a crash
+                    // or failed fault write; proof verification never waits on disk.
                     drop(state);
-                    if verification
-                        && let (Some(safety), Some(serial)) = (safety, &lane.serial)
-                        && let Err(error) =
-                            safety.quarantine(serial, crate::safety::Reason::InvalidProof)
-                    {
-                        tracing::error!(%error,board=%lane.board,"Invalid-proof quarantine could not be checkpointed; active owner marker remains conservative");
-                    }
                     tracing::warn!(board=%lane.board, %error, verification, "ASIC proof lane unavailable");
                 }
             }
