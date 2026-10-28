@@ -420,3 +420,25 @@ async fn abrupt_supervisor_death_cannot_leave_a_wedged_worker_running() {
     .await
     .expect("orphan worker exceeded its independent shutdown deadline");
 }
+
+#[test]
+fn concurrent_first_status_and_start_create_private_state_atomically() {
+    let fixture = Fixture::new();
+    let config = fixture.config();
+    std::thread::scope(|scope| {
+        let mut threads = vec![];
+        for _ in 0..32 {
+            let config = &config;
+            threads.push(scope.spawn(move || {
+                let paths = Paths::for_config(config).unwrap();
+                assert_eq!(
+                    fs::metadata(paths.directory).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+    });
+}

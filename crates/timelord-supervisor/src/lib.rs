@@ -5,7 +5,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     os::unix::{
-        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
         io::AsRawFd,
     },
     path::{Path, PathBuf},
@@ -101,8 +101,8 @@ impl Paths {
             .file_name()
             .context("Configuration needs a filename")?;
         let state = directory.join(format!(".{}-supervisor", stem.to_string_lossy()));
-        match fs::create_dir(&state) {
-            Ok(()) => fs::set_permissions(&state, fs::Permissions::from_mode(0o700))?,
+        match fs::DirBuilder::new().mode(0o700).create(&state) {
+            Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e.into()),
         }

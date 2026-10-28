@@ -20,6 +20,7 @@ ca_certificate = "identity/ca.crt"
 
 [service]
 status_listen = "127.0.0.1:9257"
+# Legacy app-launch preference; durable supervisor Run/Pause is authoritative.
 start_automatically = true
 tuning_paused = false
 

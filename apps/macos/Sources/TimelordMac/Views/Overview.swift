@@ -13,7 +13,7 @@ struct Overview: View {
                     Label(model.runControlTitle, systemImage: model.canPause ? "pause.fill" : "play.fill")
                 }
                 .labelStyle(.titleAndIcon)
-                .disabled(model.starting || (model.snapshot.serviceAvailable && !model.ownsService))
+                .disabled(model.starting || (model.snapshot.serviceAvailable && !model.canControlService))
                 .help(model.canPause ? "Pause Timelord" : "Run Timelord")
             }
             ToolbarItem(placement: .automatic) { Button { model.sheet = .settings } label: { Label("Settings", systemImage: "gearshape") } }
@@ -52,7 +52,7 @@ struct Overview: View {
                 Spacer()
                 if model.snapshot.automaticActive {
                     Button(model.snapshot.tuningPaused ? "Resume tuning" : "Pause tuning") { Task { await model.toggleTuning() } }
-                        .controlSize(.small).disabled(!model.ownsService || model.operationInProgress)
+                        .controlSize(.small).disabled(!model.canControlService || model.operationInProgress)
                         .help("Holds or resumes Automatic tuning while proof production continues")
                 }
                 Text("Chain assignments").font(.caption).foregroundStyle(.secondary)

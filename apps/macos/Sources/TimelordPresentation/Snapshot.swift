@@ -284,9 +284,7 @@ public enum LivePresentation {
         }
         return AppSnapshot(phase: phase,
             explanation: error ?? faultReason ?? (paused ? "Timelord is paused. Resume when you’re ready." : live?.message ?? (configuration?.node.hasIdentity == true && configuration?.hardware.clientBinary != nil && !boards.isEmpty
-                ? (configuration?.service.startAutomatically == true
-                    ? "Timelord starts automatically when the app opens, once setup and connected boards are ready."
-                    : (boards.contains(where: { $0.isAutomatic }) ? "Press Run to start producing proofs. Automatic tuning learns while Timelord runs." : "Press Run to start producing proofs."))
+                ? "Enable the background service in Settings to run Timelord independently of this interface."
                 : "Connect a full node and plug in your ASIC boards to get started.")),
             node: ConnectionSnapshot(title: nodeTitle, detail: nodeDetail, tone: nodeTone, height: freshSync?.height),
             timelord: ConnectionSnapshot(title: phase == .serviceUnavailable ? "Stopped" : productive ? "Running" : live != nil ? "Ready" : "Stopped", detail: "On this Mac", tone: phase == .serviceUnavailable ? .critical : productive ? .positive : .neutral),

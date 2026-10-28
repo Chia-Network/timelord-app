@@ -11,8 +11,9 @@ no parent, sibling, or private chiavdf checkout is required.
 ## Use
 
 Connect one to three ASIC boards and select your node's Chia folder or import an
-administrator-provided connection bundle. Timelord starts automatically when setup
-is ready. One board runs three engines; two boards run two plus one; three boards
+administrator-provided connection bundle. Install the app in `/Applications`, then
+choose **Enable background service…** in Settings and approve the macOS prompt.
+Timelord then starts at boot without opening the interface. One board runs three engines; two boards run two plus one; three boards
 run one engine each. A board running a single engine uses physical engine 1
 (zero-based); two-engine boards use engines 0 and 1, and three-engine boards use
 all three. Only detected boards appear.
@@ -26,12 +27,18 @@ recoveries while delivered performance remains acceptable, holds stable voltage,
 and backs off for sustained recovery-related IPS loss or thermal pressure. The
 recovery evaluation thresholds are configurable in the [configuration guide](docs/configuration.md).
 
-Done saves settings. Changes to a running service use **Save & Restart**. Settings
-includes **Run Timelord when the app opens**, enabled by default. Pause holds until
-Run is selected or the app is reopened. Closing the window keeps the menu bar and
-service running. Quit from the app, menu bar, Dock, or system logout waits for the
-app’s owned service to stop its ASIC clients and save chart history. An externally
-started service is observed without taking ownership.
+Done saves settings. Changes to a supervised service use **Save & Restart**.
+**Pause** is durable: neither reopening the interface nor rebooting resumes it.
+Press **Run** to resume. Quitting the interface, closing its window, screen locking
+and logging out do not request Pause or stop the background supervisor. The old
+`start_automatically` app-launch preference has no effect on supervised intent.
+An older manually started coordinator can be observed but must be paused before
+installing background supervision; the installer refuses competing ownership.
+
+The supervisor runs under the installing user's non-root account, owns durable
+Run/Pause intent and replaces crashed workers with capped retries. It has no USB,
+node or proof-arithmetic dependencies. See [deployment](docs/deployment.md) for
+installation, SSH control, migration and remaining physical qualification gates.
 
 USB disconnects and unreadable sensor data stop only the affected client. The
 service retries after 1, 5, then at most every 30 seconds without exhausting a
@@ -44,9 +51,9 @@ This briefly restarts the proof session and native clients, while the status API
 stays available. Each layout uses its own learned tuning profile. Explicit
 serial-pinned chain assignments retain their mapping instead.
 
-While its owned service runs, the app prevents idle system sleep and App Nap;
-the display can still sleep and the screen can lock. Pause/exit releases the
-activity after the service exits. Explicit system sleep is not prevented.
+Sleep protection is being moved from the interface to the persistent service as
+part of operational hardening. Until that is qualified, configure deployment Macs
+to stay awake; display sleep and screen locking are separate from system sleep.
 
 The dashboard shows node sync/height, per-chain proof history, temperature and
 Automatic tuning status. The headline IPS is the last-hour arithmetic mean of

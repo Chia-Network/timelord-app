@@ -25,8 +25,10 @@ canary deployment are separate from the offline implementation gates.
 Current foundation: the Rust supervisor and worker lifetime/ownership changes are
 implemented. Boot-registration generation, the non-root installer and bundle
 integration are implemented with a fixture-only plan check; no system job has
-been installed in development. GUI migration and abrupt-parent coverage remain
-required before PR 1 is ready for review.
+been installed in development. GUI Run/Pause/reload now use the independent
+supervisor, and GUI quit leaves it running. Abrupt-parent coverage exercises a
+wedged worker that ignores SIGTERM and must be killed by the lifetime-pipe guard.
+Physical installation, boot/logout and hardware qualification remain separate gates.
 
 ## 2. Work-aware supervision and observability
 

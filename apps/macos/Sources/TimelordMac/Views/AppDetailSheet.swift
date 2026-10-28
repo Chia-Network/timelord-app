@@ -22,9 +22,9 @@ struct AppDetailSheet: View {
                     LabeledContent("Boards", value: "\(model.snapshot.boards.count)")
                     HStack {
                         Button("Start Timelord") { model.startService() }.disabled(!model.canStartService)
-                        Button("Pause") { model.stopService() }.disabled(!model.ownsService)
+                        Button("Pause") { model.stopService() }.disabled(!model.canPause)
                     }
-                    if model.configurationNeedsRestart { Button("Apply settings and restart") { Task { await model.restartService() } }.disabled(!model.ownsService) }
+                    if model.configurationNeedsRestart { Button("Apply settings and restart") { Task { await model.restartService() } }.disabled(!model.canControlService) }
                     OperationFeedback(model: model)
                 }.padding(24)
             }.frame(width: 620).background(Color(nsColor: .windowBackgroundColor))
@@ -160,9 +160,10 @@ struct SettingsSheet: View {
                 }
                 Section("Appearance") { Text("Follows your Mac’s appearance.").foregroundStyle(.secondary) }
                 Section("Startup and background") {
-                    Toggle("Run Timelord when the app opens", isOn: Binding(get: { model.configuration.service.startAutomatically }, set: { model.configuration.service.startAutomatically = $0 }))
-                    Text("Starts when your node is configured and ASIC boards are connected. Pause keeps Timelord stopped until you press Run or reopen the app.").font(.caption).foregroundStyle(.secondary)
-                    Text("Closing the window keeps Timelord in the menu bar.").foregroundStyle(.secondary)
+                    Text("Timelord starts at boot and keeps running when this interface is closed. Pause persists until you press Run.").font(.caption).foregroundStyle(.secondary)
+                    Button("Enable background service…") { Task { await model.installBackgroundService() } }
+                        .disabled(model.starting || model.operationInProgress)
+                    Text("Requires administrator approval. Install the app in /Applications first.").font(.caption).foregroundStyle(.secondary)
                 }
                 Section {
                     DisclosureGroup("Administrator") {
@@ -172,7 +173,7 @@ struct SettingsSheet: View {
                             Button("View log") { model.openLog() }
                             Button("Copy diagnostics") { model.copyDiagnostics() }
                         }
-                        if model.configurationNeedsRestart { Button("Apply settings and restart") { Task { await model.restartService() } }.disabled(!model.ownsService) }
+                        if model.configurationNeedsRestart { Button("Apply settings and restart") { Task { await model.restartService() } }.disabled(!model.canControlService) }
                     }
                     OperationFeedback(model: model)
                 }

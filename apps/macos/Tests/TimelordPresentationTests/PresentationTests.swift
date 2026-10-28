@@ -351,11 +351,10 @@ extension PresentationTests {
         config.hardware = BoardDiscovery.reconcile([device], hardware: config.hardware)
         let ready = LivePresentation.snapshot(status: nil, configuration: config, detectedDevices: [device], now: now)
         XCTAssertEqual(ready.runningTitle, "Ready to run")
-        XCTAssertTrue(ready.explanation.contains("Press Run"))
-        XCTAssertTrue(ready.explanation.contains("Automatic tuning"))
+        XCTAssertTrue(ready.explanation.contains("Enable the background service"))
         config.service.startAutomatically = true
         let automaticStart = LivePresentation.snapshot(status: nil, configuration: config, detectedDevices: [device], now: now)
-        XCTAssertTrue(automaticStart.explanation.contains("starts automatically"))
+        XCTAssertEqual(automaticStart.explanation, ready.explanation, "Legacy app-start preference cannot override durable intent")
         XCTAssertNil(ready.proofsToday)
         let paused = LivePresentation.snapshot(status: nil, configuration: config, detectedDevices: [device], paused: true, now: now)
         XCTAssertEqual(paused.runningTitle, "Paused")
