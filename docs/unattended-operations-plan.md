@@ -85,15 +85,14 @@ promise physical shutdown of a board whose USB driver or host has failed.
    finer checkpoint progress is a possible later native protocol addition.
 3. **Board containment and capacity recovery:** serial leases, durable safety
    journal, isolated admission checks, native EOF quiescence and usable-capacity
-   reconciliation. Current work is in the isolated reliability checkout and is not
-   yet a finished app PR. Native support PRs 474 and 475 cover opened-handle serial
-   validation and pausing every engine before new-owner settings. Finish fault
-   fixtures, documentation and full checks before
-   treating this stage as complete.
+   reconciliation. Review: app PR 11, stacked on PR 8. Native support PRs 474 and
+   475 cover opened-handle serial
+   validation and pausing every engine before new-owner settings. Offline fault
+   fixtures and native dependency checks cover these software boundaries.
 4. **Operational hardening:** persistent sleep assertion, bounded non-blocking logs
    and native output, validated last-good configuration, headless credentials,
-   bounded diagnostics and upgrade/rollback procedure. This stage is pending; do
-   not infer these guarantees from the presence of the supervisor.
+   bounded diagnostics and upgrade/rollback procedure. The fourth review change
+   implements these software boundaries; production qualification remains separate.
 
 Keep each stage reviewable with explicit dependency pins and focused tests. Native
 support changes remain in chiavdf rather than copied app overlays. No live M6

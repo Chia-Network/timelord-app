@@ -136,8 +136,9 @@ Admission is an isolated runtime with no node task, public listener, history or
 production metrics. It obtains native readback, fresh cool telemetry and verified
 360-iteration canonical test proofs on every selected engine, then requires confirmed
 native quiescence. It is an initialization check, not a long stability benchmark.
-Thermal faults wait five minutes and require extra cooling; other unclean owners
-wait at least 30 seconds. Automatic verification/thermal faults lower the admission
+Thermal faults wait five minutes; other unclean owners wait at least 30 seconds.
+All quarantined admission requires fresh extra cooling, including unknown faults
+whose detailed journal write may have failed. Automatic verification/thermal faults lower the admission
 frequency by 50 MHz per failed point, within configured limits. Manual invalid
 proofs require an explicit point change or switching to Automatic. Transport errors
 do not lower the operating point. Requested voltage remains capped at 1.0 V.
@@ -158,6 +159,13 @@ Public native pins include opened-handle serial validation and pausing all engin
 before applying replacement-owner settings. These mechanisms do not prove physical
 quiescence if the USB stack or power circuitry is unresponsive.
 
-Thermal/invalid-proof handlers retire the native owner before fault-journal I/O.
+Fault detection quiesces the native owner before fault-journal I/O. Critical
+operating-point writes run off the USB/log control task while telemetry continues
+to drain; safety reads never hold a mutex across filesystem I/O. Optional learning
+and config checkpoints share one retained background job/permit. Delayed optional
+I/O is visible but cannot accumulate jobs or trigger proof-worker replacement on
+its own. Critical owner/safety writes retain their independent deadline. Delayed
+saves from an older owner cannot relax a newer owner's safety state.
+
 The previously persisted active-owner marker covers a crash or failed fault write;
-unknown/unclean quarantine also requires the extra cooling margin on admission.
+unknown/unclean quarantine also requires extra cooling on admission.

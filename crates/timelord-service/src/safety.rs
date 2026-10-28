@@ -5,20 +5,18 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    fs::{self, OpenOptions},
+    io::Read,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Mutex,
 };
 use timelord_supervisor::{InstanceLock, Paths};
 
 const MAX_BYTES: u64 = 65536;
 const MAX_BOARDS: usize = 64;
-static NEXT: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {
@@ -67,6 +65,8 @@ impl Qualification {
 #[serde(deny_unknown_fields)]
 pub struct Board {
     pub owner_active: bool,
+    #[serde(default)]
+    pub owner_epoch: u64,
     pub quarantine: Option<Reason>,
     pub force_safe: bool,
     pub qualification: Option<Qualification>,
@@ -91,9 +91,9 @@ impl Default for Saved {
     }
 }
 pub struct Store {
-    directory: PathBuf,
     path: PathBuf,
     state: Mutex<Saved>,
+    update_order: Mutex<()>,
     progress: Option<std::sync::Arc<timelord_supervisor::progress::Progress>>,
 }
 fn serial_valid(serial: &str) -> bool {
@@ -165,9 +165,9 @@ impl Store {
             }
         }
         Ok(Self {
-            directory: paths.directory,
             path,
             state: Mutex::new(state),
+            update_order: Mutex::new(()),
             progress: None,
         })
     }
@@ -222,22 +222,22 @@ impl Store {
     }
     fn update(&self, serial: &str, relaxing: bool, change: impl FnOnce(&mut Board)) -> Result<()> {
         ensure!(serial_valid(serial), "Invalid persistent board serial");
-        let mut state = self.state.lock().expect("safety");
+        let _order = self.update_order.lock().expect("safety writer");
+        let mut next = self.state.lock().expect("safety").clone();
         ensure!(
-            state.boards.contains_key(serial) || state.boards.len() < MAX_BOARDS,
+            next.boards.contains_key(serial) || next.boards.len() < MAX_BOARDS,
             "Board safety registry is full"
         );
-        let mut next = state.clone();
         let board = next.boards.entry(serial.into()).or_default();
         change(board);
         board.updated_unix = crate::unix_now();
         // Restriction survives a write failure in memory. Admission and clearing
         // an owner/fallback cannot take effect until persistence succeeds.
         if !relaxing {
-            *state = next.clone();
+            *self.state.lock().expect("safety") = next.clone();
         }
         self.save(&next)?;
-        *state = next;
+        *self.state.lock().expect("safety") = next;
         Ok(())
     }
     pub fn needs_self_test(&self, serial: &str, q: &Qualification) -> bool {
@@ -255,6 +255,7 @@ impl Store {
         );
         self.update(serial, false, |b| {
             b.owner_active = true;
+            b.owner_epoch = b.owner_epoch.saturating_add(1);
             b.last_point = Some(point);
         })
     }
@@ -293,8 +294,12 @@ impl Store {
             b.retry_after_unix = 0;
         })
     }
-    pub fn healthy_profile_saved(&self, serial: &str) -> Result<()> {
-        self.update(serial, true, |b| b.force_safe = false)
+    pub fn healthy_profile_saved(&self, serial: &str, epoch: u64) -> Result<()> {
+        self.update(serial, true, |b| {
+            if b.owner_active && b.owner_epoch == epoch && b.quarantine.is_none() {
+                b.force_safe = false;
+            }
+        })
     }
     fn save(&self, state: &Saved) -> Result<()> {
         let _stage = self
@@ -306,28 +311,7 @@ impl Store {
             bytes.len() as u64 <= MAX_BYTES,
             "Board safety state exceeds limit"
         );
-        let temporary = self.directory.join(format!(
-            "board-safety-{}-{}.tmp",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&temporary)?;
-        let result = (|| {
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            fs::rename(&temporary, &self.path)?;
-            File::open(&self.directory)?.sync_all()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(temporary);
-        }
-        result
+        timelord_supervisor::atomic::write(&self.path, &bytes)
     }
 }
 
@@ -335,6 +319,7 @@ impl Store {
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::atomic::Ordering;
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
@@ -391,7 +376,11 @@ mod tests {
         let clean = Store::open(&f.config()).unwrap();
         assert!(clean.board("A").unwrap().quarantine.is_none());
         assert!(clean.board("A").unwrap().force_safe);
-        clean.healthy_profile_saved("A").unwrap();
+        clean.before_open("A", qualification().point).unwrap();
+        clean
+            .healthy_profile_saved("A", clean.board("A").unwrap().owner_epoch)
+            .unwrap();
+        clean.closed("A").unwrap();
         assert!(
             !Store::open(&f.config())
                 .unwrap()
@@ -399,6 +388,26 @@ mod tests {
                 .unwrap()
                 .force_safe
         );
+    }
+    #[test]
+    fn a_late_profile_save_cannot_clear_a_newer_owners_safety_fallback() {
+        let f = Fixture::new();
+        let store = Store::open(&f.config()).unwrap();
+        let q = qualification();
+        store.qualify("A", q.clone()).unwrap();
+        store.before_open("A", q.point).unwrap();
+        let old = store.board("A").unwrap().owner_epoch;
+        store.quarantine("A", Reason::InvalidProof).unwrap();
+        store.healthy_profile_saved("A", old).unwrap();
+        assert!(store.board("A").unwrap().force_safe);
+        store.qualify("A", q.clone()).unwrap();
+        store.before_open("A", q.point).unwrap();
+        store.healthy_profile_saved("A", old).unwrap();
+        assert!(store.board("A").unwrap().force_safe);
+        store
+            .healthy_profile_saved("A", store.board("A").unwrap().owner_epoch)
+            .unwrap();
+        assert!(!store.board("A").unwrap().force_safe);
     }
     #[test]
     fn repeated_bad_points_lower_admission_but_transport_faults_do_not() {
@@ -474,8 +483,9 @@ mod tests {
         let store = Store::open(&f.config()).unwrap();
         store.before_open("A", qualification().point).unwrap();
         let old = f.0.join("saved-directory");
-        fs::rename(&store.directory, &old).unwrap();
-        fs::write(&store.directory, b"not a directory").unwrap();
+        let directory = store.path.parent().unwrap().to_owned();
+        fs::rename(&directory, &old).unwrap();
+        fs::write(&directory, b"not a directory").unwrap();
         assert!(store.quarantine("A", Reason::InvalidProof).is_err());
         assert!(store.qualify("A", qualification()).is_err());
         assert_eq!(
@@ -484,8 +494,8 @@ mod tests {
         );
         assert!(store.closed("A").is_err());
         assert!(store.board("A").unwrap().owner_active);
-        fs::remove_file(&store.directory).unwrap();
-        fs::rename(old, &store.directory).unwrap();
+        fs::remove_file(&directory).unwrap();
+        fs::rename(old, &directory).unwrap();
         let recovered = Store::open(&f.config()).unwrap();
         assert_eq!(
             recovered.board("A").unwrap().quarantine,

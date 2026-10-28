@@ -64,6 +64,11 @@ enum Action {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Bounded status and file metadata; excludes configuration, keys and log contents.
+    Diagnostics {
+        #[arg(long)]
+        config: PathBuf,
+    },
     Pause {
         #[arg(long)]
         config: PathBuf,
@@ -121,6 +126,19 @@ async fn main() -> Result<()> {
                 worker.unwrap_or(std::env::current_exe()?.with_file_name("timelord-service"));
             run(Paths::for_config(&config)?, helper, monitor_listen, network).await
         }
+        Action::Diagnostics { config } => {
+            let paths = Paths::for_config(&config)?;
+            let result = timelord_supervisor::request(&config, Control::Status, None).await;
+            let files=[("configuration",paths.config.clone()),("last_good",paths.directory.join("last-good.toml")),("worker_log",paths.directory.join("worker.log")),("safety",paths.directory.join("board-safety.json"))].map(|(name,path)|{
+                let meta=fs::symlink_metadata(path).ok();
+                serde_json::json!({"name":name,"present":meta.is_some(),"regular_file":meta.as_ref().is_some_and(|m|m.is_file()),"bytes":meta.map(|m|m.len())})
+            });
+            println!(
+                "{}",
+                serde_json::json!({"schema_version":1,"version":env!("CARGO_PKG_VERSION"),"supervisor_available":result.is_ok(),"status":result.ok(),"files":files})
+            );
+            Ok(())
+        }
         action => {
             let (config, command, revision) = match action {
                 Action::Status { config } => (config, Control::Status, None),
@@ -136,7 +154,10 @@ async fn main() -> Result<()> {
                     config,
                     expected_revision,
                 } => (config, Control::Reload, expected_revision),
-                Action::Run { .. } | Action::LaunchdPlist { .. } | Action::CheckOwner { .. } => {
+                Action::Run { .. }
+                | Action::LaunchdPlist { .. }
+                | Action::CheckOwner { .. }
+                | Action::Diagnostics { .. } => {
                     unreachable!()
                 }
             };
@@ -165,13 +186,20 @@ impl Drop for SocketGuard {
     }
 }
 struct Worker {
+    log_tasks: Vec<tokio::task::JoinHandle<()>>,
     child: Child,
     group: i32,
     watchdog: timelord_supervisor::progress::Watchdog,
 }
 impl Worker {
-    fn spawn(helper: &Path, config: &Path, progress: &Path, generation: u64) -> Result<Self> {
-        let child = Command::new(helper)
+    fn spawn(
+        helper: &Path,
+        config: &Path,
+        progress: &Path,
+        generation: u64,
+        log: &timelord_supervisor::logging::Writer,
+    ) -> Result<Self> {
+        let mut child = Command::new(helper)
             .arg("serve")
             .arg("--supervised")
             .arg("--config")
@@ -179,14 +207,32 @@ impl Worker {
             .env("TIMELORD_SUPERVISOR_PROGRESS", progress)
             .env("TIMELORD_SUPERVISOR_GENERATION", generation.to_string())
             .stdin(Stdio::piped())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .process_group(0)
             .kill_on_drop(true)
             .spawn()
             .context("Starting timelord worker")?;
         let group = child.id().context("Worker has no process id")? as i32;
+        async fn pump(
+            mut source: impl tokio::io::AsyncRead + Unpin,
+            mut target: timelord_supervisor::logging::Writer,
+        ) {
+            use std::io::Write;
+            let mut bytes = [0u8; 4096];
+            while let Ok(size) = source.read(&mut bytes).await {
+                if size == 0 {
+                    break;
+                }
+                let _ = target.write_all(&bytes[..size]);
+            }
+        }
+        let log_tasks = vec![
+            tokio::spawn(pump(child.stdout.take().expect("stdout"), log.clone())),
+            tokio::spawn(pump(child.stderr.take().expect("stderr"), log.clone())),
+        ];
         Ok(Self {
+            log_tasks,
             child,
             group,
             watchdog: timelord_supervisor::progress::Watchdog::new(std::time::Instant::now()),
@@ -198,13 +244,16 @@ impl Worker {
         };
     }
     fn exited(&self) -> Result<bool> {
+        Self::group_exited(self.group)
+    }
+    fn group_exited(group: i32) -> Result<bool> {
         // Observe exit without reaping. Keeping the leader's PID reserved until
         // descendants are terminated prevents signaling a reused process group.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         let result = unsafe {
             libc::waitid(
                 libc::P_PID,
-                self.group as libc::id_t,
+                group as libc::id_t,
                 &mut info,
                 libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
             )
@@ -239,15 +288,65 @@ impl Worker {
             .await
             .context("Worker did not exit after SIGKILL")??;
         self.group = 0;
+        for task in &mut self.log_tasks {
+            if tokio::time::timeout(Duration::from_secs(1), &mut *task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
+        }
         Ok(result)
     }
 }
 impl Drop for Worker {
     fn drop(&mut self) {
+        for task in &self.log_tasks {
+            task.abort();
+        }
         if self.group > 0 {
             self.signal(libc::SIGKILL);
         }
     }
+}
+async fn validate_before_reload(helper: &Path, config: &Path) -> Result<()> {
+    let child = Command::new(helper)
+        .arg("validate")
+        .arg("--supervised")
+        .arg("--config")
+        .arg(config)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .context("Starting configuration validation")?;
+    let group = child.id().context("Validator has no PID")? as i32;
+    let mut owner = Worker {
+        child,
+        group,
+        log_tasks: Vec::new(),
+        watchdog: timelord_supervisor::progress::Watchdog::new(std::time::Instant::now()),
+    };
+    let completed = tokio::time::timeout(Duration::from_secs(5), async {
+        while !owner.exited()? {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+    owner.signal(libc::SIGKILL);
+    let status = tokio::time::timeout(Duration::from_secs(3), owner.child.wait())
+        .await
+        .context("Configuration validator did not retire")??;
+    owner.group = 0;
+    completed.context("Configuration validation timed out; running worker retained")??;
+    ensure!(
+        status.success(),
+        "Configuration validation failed; running worker retained. Run timelord-service validate --config to inspect the requested file."
+    );
+    Ok(())
 }
 struct Envelope {
     request: Request,
@@ -294,6 +393,8 @@ async fn run(
     network: String,
 ) -> Result<()> {
     let _owner = InstanceLock::acquire(&paths.lock)?;
+    let log = timelord_supervisor::logging::Writer::rotating(paths.directory.join("worker.log"));
+    let mut power = timelord_supervisor::power::Assertion::default();
     if let Ok(meta) = fs::symlink_metadata(&paths.socket) {
         ensure!(
             meta.file_type().is_socket() && meta.uid() == unsafe { libc::geteuid() },
@@ -321,7 +422,7 @@ async fn run(
         path: progress_path.clone(),
         inode: fs::symlink_metadata(&progress_path)?.ino(),
     };
-    let mut buffer = [0u8; 4096];
+    let mut buffer = [0u8; 8192];
     let loaded = paths.load_intent();
     let (mut intent, error) = match loaded {
         Ok(intent) => (intent, None),
@@ -333,7 +434,11 @@ async fn run(
             Some(format!("{error:#}")),
         ),
     };
+    power.set(intent.mode == Mode::Running);
     let state = Arc::new(Mutex::new(Status {
+        logging: log.stats(),
+        sleep_inhibited: power.active(),
+        sleep_error: power.error.clone(),
         api_version: 1,
         supervisor_pid: std::process::id(),
         worker_pid: None,
@@ -358,9 +463,13 @@ async fn run(
             .await
             .context("Binding supervisor monitoring")?;
         let app = monitor::routes(state.clone(), tick.clone(), network);
-        Some(tokio::spawn(
-            async move { axum::serve(listener, app).await },
-        ))
+        Some(tokio::spawn(async move {
+            axum::serve(
+                timelord_supervisor::http::Listener::new(listener),
+                timelord_supervisor::http::protect(app),
+            )
+            .await
+        }))
     } else {
         None
     };
@@ -418,6 +527,7 @@ async fn run(
                         },
                         Control::Reload|Control::Status=>{},
                     }
+                    if matches!(envelope.request.command,Control::Reload) {validate_before_reload(&helper,&paths.config).await?;}
                     if intent.mode==Mode::Paused || matches!(envelope.request.command,Control::Reload) {
                         state.lock().expect("status").phase="stopping".into();
                         if let Some(child)=worker.take() {child.stop().await?;}
@@ -425,12 +535,16 @@ async fn run(
                         status.phase=if intent.mode==Mode::Paused {"paused"} else {"starting"}.into();
                         next=Instant::now();
                     }
+                    power.set(intent.mode==Mode::Running);
+                    {let mut status=state.lock().expect("status");status.sleep_inhibited=power.active();status.sleep_error=power.error.clone();}
                     Ok(())
                 }.await;
                 let error=update.err().map(|e|format!("{e:#}"));
                 let _=envelope.reply.send(Response {status:state.lock().expect("status").clone(),error});
             },
             _=timer.tick()=>{
+                power.set(intent.mode==Mode::Running);
+                {let mut status=state.lock().expect("status");status.logging=log.stats();status.sleep_inhibited=power.active();status.sleep_error=power.error.clone();}
                 *tick.lock().expect("supervisor tick")=std::time::Instant::now();
                 let watchdog_failure=worker.as_ref().and_then(|w|w.watchdog.failure(std::time::Instant::now()));
                 state.lock().expect("status").progress_age_seconds=worker.as_ref().and_then(|w|w.watchdog.age(std::time::Instant::now()));
@@ -447,7 +561,7 @@ async fn run(
                 }
                 if worker.is_none() && intent.mode==Mode::Running && Instant::now()>=next {
                     let generation = state.lock().expect("status").worker_generation+1;
-                    match Worker::spawn(&helper,&paths.config,&progress_path,generation) {
+                    match Worker::spawn(&helper,&paths.config,&progress_path,generation,&log) {
                         Ok(child)=>{
                             let mut status=state.lock().expect("status");status.worker_pid=child.child.id();status.worker_generation+=1;status.progress=None;status.progress_age_seconds=None;
                             // Process presence is not proof of productive work.

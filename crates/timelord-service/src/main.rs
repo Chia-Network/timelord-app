@@ -1,6 +1,8 @@
 mod asic;
 mod assignment;
 mod automatic;
+mod bounded_lines;
+mod config_checkpoint;
 mod connection;
 mod diagnostics;
 mod experiments;
@@ -9,6 +11,8 @@ mod history_store;
 mod inventory;
 mod node_status;
 mod observability;
+#[cfg(test)]
+mod operations_tests;
 mod private_control;
 mod runtime;
 mod safety;
@@ -54,6 +58,8 @@ enum Command {
     Validate {
         #[arg(long)]
         config: PathBuf,
+        #[arg(long, hide = true)]
+        supervised: bool,
     },
     /// Print the configured chain plan, without touching hardware.
     Plan {
@@ -134,9 +140,12 @@ enum Command {
 }
 
 fn load(path: &Path) -> Result<Config> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("Reading {}", path.display()))?;
-    let mut config: Config = toml::from_str(&text).context("Parsing configuration")?;
+    let text = config_checkpoint::bounded_text(path, false)
+        .with_context(|| format!("Reading {}", path.display()))?;
+    parse_config(path, &text)
+}
+fn parse_config(path: &Path, text: &str) -> Result<Config> {
+    let mut config: Config = toml::from_str(text).context("Parsing configuration")?;
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -179,36 +188,19 @@ fn save(path: &Path, config: &Config) -> Result<()> {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(".timelord-config-{}.tmp", std::process::id()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let result = (|| -> Result<()> {
-        use std::io::Write;
-        let mut file = options.open(&temporary)?;
-        file.write_all(toml::to_string_pretty(config)?.as_bytes())?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
+    timelord_supervisor::atomic::write(path, toml::to_string_pretty(config)?.as_bytes())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let diagnostic_log = timelord_supervisor::logging::Writer::stderr();
+    let tracing_log = diagnostic_log.clone();
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
-        .with_writer(std::io::stderr)
+        .with_writer(move || tracing_log.clone())
         .init();
     match Cli::parse().command {
         Command::Init { config } => {
@@ -294,7 +286,10 @@ async fn main() -> Result<()> {
                 serde_json::to_string_pretty(&diagnostics::check(load(&config)?).await?)?
             );
         }
-        Command::Validate { config } => {
+        Command::Validate { config, supervised } => {
+            if supervised {
+                timelord_supervisor::watch_parent()?;
+            }
             load(&config)?;
             println!(
                 "Configuration valid. This does not establish node authentication or hardware readiness."
@@ -323,7 +318,7 @@ async fn main() -> Result<()> {
             }
             let paths = timelord_supervisor::Paths::for_config(&config)?;
             let _owner = timelord_supervisor::InstanceLock::acquire(&paths.worker_lock)?;
-            let mut value = load(&config)?;
+            let (mut value, fallback) = config_checkpoint::load_running(&config)?;
             value.service.control_socket = Some(automatic::socket_path(&config, &value));
             value.hardware.automatic_state.get_or_insert(
                 config
@@ -331,16 +326,25 @@ async fn main() -> Result<()> {
                     .unwrap_or(Path::new("."))
                     .join("automatic-profiles.json"),
             );
-            serve(value, config.with_extension("history.json"), config).await?;
+            serve(
+                value,
+                config.with_extension("history.json"),
+                config,
+                fallback,
+            )
+            .await?;
         }
         Command::Tuning { config, paused } => {
-            let value = load(&config)?;
+            let value = config_checkpoint::load_running(&config)?.0;
             let result =
                 private_control::request(&automatic::socket_path(&config, &value), paused).await?;
             println!("{}", serde_json::to_string(&result)?);
         }
         Command::Status { config } => {
-            let address = load(&config)?.service.status_listen;
+            let address = config_checkpoint::load_running(&config)?
+                .0
+                .service
+                .status_listen;
             let response = tokio::time::timeout(Duration::from_secs(3), async {
                 let mut socket = TcpStream::connect(address).await?;
                 socket
@@ -382,6 +386,8 @@ struct Shared {
 
 #[derive(Serialize)]
 struct Status {
+    diagnostic_logging: timelord_supervisor::logging::Stats,
+    configuration_fallback: bool,
     api_version: u32,
     service_pid: u32,
     service_state: &'static str,
@@ -447,6 +453,8 @@ async fn status(State(http): State<observability::HttpState>) -> Json<Status> {
     let clients = shared.clients.lock().expect("client state lock");
     let runtime = shared.runtime.lock().expect("runtime");
     Json(Status {
+        diagnostic_logging: timelord_supervisor::logging::Writer::stderr_stats(),
+        configuration_fallback: http.metrics.progress.using_last_good(),
         api_version: 1,
         service_pid: std::process::id(),
         service_state: "ready",
@@ -757,7 +765,13 @@ async fn observation_exit(
     tracing::error!(?result, "Observability server exited unexpectedly");
 }
 
-async fn serve(config: Config, history_path: PathBuf, config_path: PathBuf) -> Result<()> {
+async fn serve(
+    config: Config,
+    history_path: PathBuf,
+    config_path: PathBuf,
+    fallback: bool,
+) -> Result<()> {
+    let requested_config = config.clone();
     let service_started_unix = unix_now();
     // The status listener outlives each topology. No UI or external supervisor
     // is required to restart the service after a USB change.
@@ -774,6 +788,7 @@ async fn serve(config: Config, history_path: PathBuf, config_path: PathBuf) -> R
         None
     };
     let metrics = observability::Metrics::new(config.node.network)?;
+    metrics.progress.configuration(fallback);
     let safety = if config.hardware.client_binary.is_some() {
         Some(Arc::new(
             safety::Store::open(&config_path)?.monitored(metrics.progress.clone()),
@@ -809,13 +824,23 @@ async fn serve(config: Config, history_path: PathBuf, config_path: PathBuf) -> R
             metrics: metrics.clone(),
         });
     let (http_stop, mut stopped) = watch::channel(false);
+    let mut checkpoint = Some(tokio::spawn(config_checkpoint::record(
+        requested_config,
+        config_path,
+        state.clone(),
+        metrics.clone(),
+        stopped.clone(),
+    )));
     let observation_stopped = stopped.clone();
     let mut server = tokio::spawn(async move {
-        axum::serve(http, app)
-            .with_graceful_shutdown(async move {
-                let _ = stopped.changed().await;
-            })
-            .await
+        axum::serve(
+            timelord_supervisor::http::Listener::new(http),
+            timelord_supervisor::http::protect(app),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = stopped.changed().await;
+        })
+        .await
     });
     let mut observation_server = observer.map(|listener| {
         let mut stopped = observation_stopped.clone();
@@ -824,11 +849,14 @@ async fn serve(config: Config, history_path: PathBuf, config_path: PathBuf) -> R
             metrics: metrics.clone(),
         });
         tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    let _ = stopped.changed().await;
-                })
-                .await
+            axum::serve(
+                timelord_supervisor::http::Listener::new(listener),
+                timelord_supervisor::http::protect(app),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = stopped.changed().await;
+            })
+            .await
         })
     });
     let signal = shutdown_signal();
@@ -841,6 +869,10 @@ async fn serve(config: Config, history_path: PathBuf, config_path: PathBuf) -> R
     let result = loop {
         let candidate = tokio::select! {
             _ = &mut signal => break Ok(()),
+            result=async {checkpoint.as_mut().expect("checkpoint").await},if checkpoint.is_some()=>{
+                match result {Ok(Ok(()))=>{},Ok(Err(error))=>tracing::warn!(%error,"Configuration checkpoint stopped"),Err(error)=>tracing::warn!(%error,"Configuration checkpoint task failed")}
+                checkpoint=None;continue;
+            },
             error = essential_exit(&mut run.tasks, &metrics), if !run.tasks.is_empty() => break Err(error),
             _ = observation_exit(&mut observation_server, &metrics), if observation_server.is_some() => continue,
             result = &mut server => break result.context("Status task failed")?.context("Status server failed"),
@@ -937,6 +969,9 @@ async fn serve(config: Config, history_path: PathBuf, config_path: PathBuf) -> R
         let _ = inventory.await;
     }
     let _ = http_stop.send(true);
+    if let Some(checkpoint) = checkpoint {
+        let _ = checkpoint.await;
+    }
     if !server.is_finished() {
         server.await.context("Status task failed")??;
     }

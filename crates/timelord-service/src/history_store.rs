@@ -7,7 +7,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -139,32 +139,12 @@ impl Store {
     pub fn save(&self, saved: &Snapshot) -> Result<()> {
         let parent = self.path.parent().unwrap_or(Path::new("."));
         fs::create_dir_all(parent)?;
-        let temporary = self
-            .path
-            .with_extension(format!("history-{}.tmp", std::process::id()));
-        let result = (|| -> Result<()> {
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&temporary)?;
-            let bytes = serde_json::to_vec(saved)?;
-            ensure!(
-                bytes.len() as u64 <= MAX_BYTES,
-                "History checkpoint is too large"
-            );
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            fs::rename(&temporary, &self.path)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
+        let bytes = serde_json::to_vec(saved)?;
+        ensure!(
+            bytes.len() as u64 <= MAX_BYTES,
+            "History checkpoint is too large"
+        );
+        timelord_supervisor::atomic::write(&self.path, &bytes)
     }
 }
 
@@ -418,10 +398,8 @@ mod tests {
         let saved = store.snapshot(&RuntimeState::default(), 1000, 1050);
         store.save(&saved).unwrap();
         let before = fs::read(&store.path).unwrap();
-        let temporary = store
-            .path
-            .with_extension(format!("history-{}.tmp", std::process::id()));
-        fs::write(temporary, "interrupted temporary file").unwrap();
+        let temporary = timelord_supervisor::atomic::pending(&store.path).unwrap();
+        fs::create_dir(temporary).unwrap();
         assert!(store.save(&saved).is_err());
         assert_eq!(fs::read(&store.path).unwrap(), before);
         fs::write(&store.path, b"truncated {").unwrap();

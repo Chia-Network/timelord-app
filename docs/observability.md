@@ -174,10 +174,10 @@ hardware performance or production network acceptance.
 
 When launched by the boot supervisor, the worker emits a private datagram once per
 second. Reports contain worker PID, supervisor generation, monotonic sequence and
-twenty bounded slots: production CC/RC/ICC native I/O and arithmetic,
+twenty-one bounded slots: production CC/RC/ICC native I/O and arithmetic,
 scheduler/submission and eligibility, discovery/topology replacement, critical
 persistence, separate admission I/O/arithmetic, admission ownership, and per-board
-preparation. Request IDs and scheduler generation fence late cancellation/cleanup.
+preparation, and one bounded optional persistence job. Request IDs and scheduler generation fence late cancellation/cleanup.
 No proof payload, credential or unbounded identifier enters this protocol. Replayed
 or previous-worker reports do not refresh liveness. The supervisor CLI includes
 the latest snapshot and its receipt age; process presence is never readiness.
@@ -193,7 +193,9 @@ measured checkpoint-construction stage. Client absence and idle chains have no
 proof deadline. Scheduler eligibility waits receive their actual not-before delay plus 60 seconds
 slack. Discovery has a 15-second stage deadline and topology replacement 60 seconds.
 Critical safety persistence has a 10-second deadline, admission 45 seconds and
-per-board preparation 60 seconds. Waiting to acquire an experiment lease has no
+per-board preparation 60 seconds. One optional persistence job can remain visible
+without a proof deadline: it holds its permit so delayed disk I/O cannot accumulate
+replacement jobs or restart useful proofs. Waiting to acquire an experiment lease has no
 hardware-work deadline and does not hold the USB initialization lock. An essential
 task exit requests worker replacement even if HTTP remains responsive.
 
@@ -226,3 +228,22 @@ registration. Configure the same `network`, `region` and `instance_name` target
 labels for both endpoints. The alert examples suppress worker scrape failures
 for an explicit durable Pause but continue to monitor the supervisor; an absent
 supervisor series never suppresses a legacy worker scrape alert.
+
+## Operational diagnostics
+
+Supervisor metrics also expose `sleep_inhibited`, `log_dropped_bytes_total`,
+`log_write_errors_total`, `using_last_good_configuration` and
+`configuration_checkpointed`. Sleep prevention belongs to the supervisor while
+requested Run, including dependency outages; Pause releases it. Logging is
+best-effort and non-blocking. Its failures warn rather than stop useful proofs.
+A config checkpoint is promoted only after current readiness and a verified node
+submission. Fallback use remains explicit; restored charts do not qualify it.
+The example rules warn on lost diagnostics, fallback configuration and missing
+sleep inhibition while Run is requested.
+
+Read-only HTTP listeners cap each endpoint at 64 live connections and 60 seconds
+per connection. Handler work is bounded to five seconds, with 16 small responses
+and four retained history responses at a time. Response permits remain held until
+the body is consumed or dropped, so slow readers cannot accumulate history copies.
+Excess requests receive 503 or are disconnected at the connection limit. The GUI
+and scraper can reconnect normally. Local mutation remains on private Unix sockets.

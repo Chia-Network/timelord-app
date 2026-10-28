@@ -97,3 +97,25 @@ groups:
           severity: warning
         annotations:
           summary: Timelord is requested to run but has no worker
+      - alert: TimelordDiagnosticLogsLost
+        expr: increase(chia_timelord_supervisor_log_dropped_bytes_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Timelord diagnostic logging is dropping data
+      - alert: TimelordUsingLastGoodConfiguration
+        expr: chia_timelord_supervisor_using_last_good_configuration == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Timelord is running its last-good configuration
+      - alert: TimelordSleepPreventionUnavailable
+        expr: |
+          (chia_timelord_supervisor_desired_running == 1) and on(job, instance, network) chia_timelord_supervisor_sleep_inhibited == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Timelord cannot prevent idle system sleep

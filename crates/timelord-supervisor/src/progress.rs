@@ -1,6 +1,6 @@
 //! Bounded work snapshots. No wall clock, proof bytes, board names or credentials.
 use serde::{Deserialize, Serialize};
-pub const SLOTS: usize = 20;
+pub const SLOTS: usize = 21;
 use std::{
     sync::{
         Arc, Mutex,
@@ -23,6 +23,7 @@ pub enum Stage {
     Discovery,
     TopologyChange,
     Persistence,
+    OptionalPersistence,
     Admission,
     BoardPreparation,
 }
@@ -36,7 +37,7 @@ pub struct Work {
 impl Work {
     fn allowance(self) -> Option<Duration> {
         let seconds = match self.stage {
-            Stage::WaitingForClient => return None, // External capacity outage; native recovery owns it.
+            Stage::WaitingForClient | Stage::OptionalPersistence => return None, // External capacity outage; native recovery owns it.
             Stage::Preparing => 30,
             Stage::Discovery => 15,
             Stage::Persistence => 10,
@@ -55,6 +56,10 @@ impl Work {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub configuration_fallback: bool,
+    #[serde(default)]
+    pub configuration_checkpointed: bool,
     pub worker_pid: u32,
     pub generation: u64,
     pub sequence: u64,
@@ -66,6 +71,8 @@ pub struct Snapshot {
     pub work: [Option<Work>; SLOTS],
 }
 pub struct Progress {
+    configuration_fallback: AtomicBool,
+    configuration_checkpointed: AtomicBool,
     next: AtomicU64,
     failed: AtomicBool,
     ready: AtomicBool,
@@ -75,6 +82,8 @@ pub struct Progress {
 impl Default for Progress {
     fn default() -> Self {
         Self {
+            configuration_fallback: AtomicBool::new(false),
+            configuration_checkpointed: AtomicBool::new(false),
             next: AtomicU64::new(0),
             failed: AtomicBool::new(false),
             ready: AtomicBool::new(false),
@@ -84,6 +93,17 @@ impl Default for Progress {
     }
 }
 impl Progress {
+    pub fn using_last_good(&self) -> bool {
+        self.configuration_fallback.load(Ordering::Relaxed)
+    }
+    pub fn configuration(&self, fallback: bool) {
+        self.configuration_fallback
+            .store(fallback, Ordering::Relaxed);
+    }
+    pub fn checkpointed(&self) {
+        self.configuration_checkpointed
+            .store(true, Ordering::Relaxed);
+    }
     pub fn arithmetic(&self, lane: usize) -> Arc<tokio::sync::Semaphore> {
         self.arithmetic[lane].clone()
     }
@@ -114,6 +134,8 @@ impl Progress {
     pub fn snapshot(&self, generation: u64, sequence: u64) -> Option<Snapshot> {
         let work = *self.work.try_lock().ok()?;
         Some(Snapshot {
+            configuration_fallback: self.configuration_fallback.load(Ordering::Relaxed),
+            configuration_checkpointed: self.configuration_checkpointed.load(Ordering::Relaxed),
             worker_pid: std::process::id(),
             generation,
             sequence,
@@ -282,6 +304,8 @@ mod tests {
             sequence,
             failed: false,
             ready: false,
+            configuration_fallback: false,
+            configuration_checkpointed: false,
             work,
         }
     }
@@ -299,6 +323,35 @@ mod tests {
             later + Duration::from_secs(86400),
         );
         assert!(watch.failure(later + Duration::from_secs(86400)).is_none());
+    }
+    #[test]
+    fn bounded_optional_io_stays_visible_without_restarting_useful_work() {
+        let now = Instant::now();
+        let mut watch = Watchdog::new(now);
+        watch.observe(snapshot(1, Stage::OptionalPersistence, 0), now);
+        watch.observe(
+            snapshot(2, Stage::OptionalPersistence, 0),
+            now + Duration::from_secs(86400),
+        );
+        assert!(watch.failure(now + Duration::from_secs(86400)).is_none());
+        let report = Snapshot {
+            worker_pid: u32::MAX,
+            generation: u64::MAX,
+            sequence: u64::MAX,
+            failed: false,
+            ready: false,
+            configuration_fallback: true,
+            configuration_checkpointed: true,
+            work: [Some(Work {
+                id: u64::MAX,
+                generation: u64::MAX,
+                iterations: u64::MAX,
+                stage: Stage::Eligibility {
+                    wait_seconds: u64::MAX,
+                },
+            }); SLOTS],
+        };
+        assert!(serde_json::to_vec(&report).unwrap().len() < 8192);
     }
     #[test]
     fn healthy_heartbeat_cannot_hide_stuck_verification_and_replays_do_not_extend_liveness() {
@@ -397,6 +450,8 @@ mod tests {
                 sequence: 1,
                 failed: false,
                 ready: false,
+                configuration_fallback: false,
+                configuration_checkpointed: false,
                 work: [None; SLOTS],
             },
             now,

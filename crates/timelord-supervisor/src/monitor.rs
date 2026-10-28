@@ -68,6 +68,41 @@ async fn metrics(State(m): State<Monitor>) -> impl IntoResponse {
             u64::from(ready(&status) && healthy),
         ),
         ("worker_restarts_total", "counter", status.restarts),
+        (
+            "log_dropped_bytes_total",
+            "counter",
+            status.logging.dropped_bytes,
+        ),
+        (
+            "log_write_errors_total",
+            "counter",
+            status.logging.write_errors,
+        ),
+        (
+            "sleep_inhibited",
+            "gauge",
+            u64::from(status.sleep_inhibited),
+        ),
+        (
+            "using_last_good_configuration",
+            "gauge",
+            u64::from(
+                status
+                    .progress
+                    .as_ref()
+                    .is_some_and(|p| p.configuration_fallback),
+            ),
+        ),
+        (
+            "configuration_checkpointed",
+            "gauge",
+            u64::from(
+                status
+                    .progress
+                    .as_ref()
+                    .is_some_and(|p| p.configuration_checkpointed),
+            ),
+        ),
         ("healthy", "gauge", u64::from(healthy)),
     ] {
         body.push_str(&format!("# HELP chia_timelord_supervisor_{name} Supervisor {name}\n# TYPE chia_timelord_supervisor_{name} {kind}\nchia_timelord_supervisor_{name}{{network=\"{}\"}} {value}\n",m.network));

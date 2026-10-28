@@ -122,7 +122,7 @@ async fn drain_shutdown(source: &mut (impl tokio::io::AsyncRead + Unpin)) -> Res
 pub(crate) static INITIALIZATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct ClientLog {
-    lines: tokio::io::Lines<BufReader<tokio::process::ChildStderr>>,
+    lines: crate::bounded_lines::Lines<BufReader<tokio::process::ChildStderr>>,
     ready: Option<oneshot::Sender<()>>,
     initialization: Option<tokio::sync::MutexGuard<'static, ()>>,
     preparing: Option<timelord_supervisor::progress::Guard>,
@@ -132,7 +132,7 @@ struct ClientLog {
 impl ClientLog {
     fn new(stderr: tokio::process::ChildStderr, ready: oneshot::Sender<()>) -> Self {
         Self {
-            lines: BufReader::new(stderr).lines(),
+            lines: crate::bounded_lines::Lines::new(BufReader::new(stderr)),
             ready: Some(ready),
             initialization: None,
             preparing: None,
@@ -147,7 +147,7 @@ impl ClientLog {
                 self.recent.iter().cloned().collect::<Vec<_>>().join(" | ")
             );
         };
-        self.recent.push_back(line.clone());
+        self.recent.push_back(line.chars().take(512).collect());
         if self.recent.len() > 8 {
             self.recent.pop_front();
         }
@@ -198,7 +198,8 @@ impl ClientLog {
                         &[&crate::observability::board(&shared.config, &board.id)],
                     );
                 }
-                // Retire the native owner before attempting fault persistence.
+                // Return to the owner immediately. Journal I/O happens only
+                // after native retirement, never ahead of thermal shutdown.
                 drop(state);
                 bail!("ASIC reached its configured temperature limit");
             }
@@ -238,6 +239,45 @@ impl ClientLog {
         }
         Ok(recovery)
     }
+}
+async fn while_logging(
+    pending: impl std::future::Future<Output = Result<()>>,
+    shared: &Shared,
+    board: &BoardConfig,
+    log: &mut ClientLog,
+) -> Result<Option<anyhow::Error>> {
+    tokio::pin!(pending);
+    loop {
+        tokio::select! {
+            result=&mut pending=>return Ok(result.err()),
+            result=log.read(shared,board)=>{result?;},
+        }
+    }
+}
+async fn journal_point(
+    shared: &Shared,
+    board: &BoardConfig,
+    point: Point,
+    log: &mut ClientLog,
+) -> Result<Option<anyhow::Error>> {
+    let safety = shared.runtime.lock().expect("runtime").safety.clone();
+    let Some(store) = safety else { return Ok(None) };
+    let serial = board
+        .serial
+        .clone()
+        .context("Managed board identity missing")?;
+    let job = tokio::task::spawn_blocking(move || store.before_open(&serial, point));
+    while_logging(
+        async move {
+            tokio::time::timeout(Duration::from_secs(2), job)
+                .await
+                .context("Operating-point journal delayed; current point held")??
+        },
+        shared,
+        board,
+        log,
+    )
+    .await
 }
 struct NativeOwner {
     experiment: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -469,42 +509,82 @@ impl NativeOwner {
             }
         }
     }
-    fn record(&mut self, shared: &Shared, board: &BoardConfig, clean: u64) -> Result<()> {
+    async fn record(&mut self, shared: &Shared, board: &BoardConfig, clean: u64) -> Result<()> {
+        static IO: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
         let path = shared
             .config
             .hardware
             .automatic_state
             .as_ref()
-            .context("Automatic state path missing")?;
+            .context("Automatic state path missing")?
+            .clone();
         self.last_record_unix = crate::unix_now();
-        automatic::save(
-            path,
-            automatic::Learned {
-                serial: self.serial.clone(),
-                engines: self.engines,
-                engine_mask: timelord_core::engine_mask(self.engines),
-                host: self.host.clone(),
-                client_sha256: self.hash.clone(),
-                point: self.policy.point,
-                active_seconds: clean,
-                updated_unix: crate::unix_now(),
-                ceiling_mhz: self.policy.learned_limits().0,
-                cooldown_seconds: self.policy.learned_limits().1,
-                retest: Some(self.policy.retest_state()),
-                performance: if clean >= board.automatic.healthy_seconds {
-                    self.raw_window.performance()
-                } else {
-                    None
-                },
+        let entry = automatic::Learned {
+            serial: self.serial.clone(),
+            engines: self.engines,
+            engine_mask: timelord_core::engine_mask(self.engines),
+            host: self.host.clone(),
+            client_sha256: self.hash.clone(),
+            point: self.policy.point,
+            active_seconds: clean,
+            updated_unix: crate::unix_now(),
+            ceiling_mhz: self.policy.learned_limits().0,
+            cooldown_seconds: self.policy.learned_limits().1,
+            retest: Some(self.policy.retest_state()),
+            performance: if clean >= board.automatic.healthy_seconds {
+                self.raw_window.performance()
+            } else {
+                None
             },
-        )?;
-        if clean >= board.automatic.healthy_seconds && !self.policy.in_trial() {
-            let safety = shared.runtime.lock().expect("runtime").safety.clone();
-            if let Some(store) = safety {
-                store.healthy_profile_saved(&self.serial)?;
+        };
+        let (safety, progress) = {
+            let state = shared.runtime.lock().expect("runtime");
+            (state.safety.clone(), state.progress.clone())
+        };
+        let epoch = safety
+            .as_ref()
+            .and_then(|s| s.board(&self.serial))
+            .map(|b| b.owner_epoch);
+        let clear_safe = clean >= board.automatic.healthy_seconds && !self.policy.in_trial();
+        let serial = self.serial.clone();
+        let gate = progress
+            .as_ref()
+            .map(|p| p.arithmetic(20))
+            .unwrap_or_else(|| IO.clone());
+        let permit = tokio::time::timeout(Duration::from_secs(2), gate.acquire_owned())
+            .await
+            .context("Another diagnostic checkpoint is pending")??;
+        let stage = progress.as_ref().map(|p| {
+            p.begin(
+                20,
+                0,
+                0,
+                timelord_supervisor::progress::Stage::OptionalPersistence,
+            )
+        });
+        let job = tokio::task::spawn_blocking(move || {
+            let (_permit, _stage) = (permit, stage);
+            automatic::save(&path, entry)?;
+            if clear_safe && let (Some(store), Some(epoch)) = (safety, epoch) {
+                store.healthy_profile_saved(&serial, epoch)?;
             }
-        }
-        Ok(())
+            Ok::<_, anyhow::Error>(())
+        });
+        // The actual optional job remains visible and retains its one permit
+        // after a caller timeout. No replacement jobs accumulate behind it.
+        tokio::time::timeout(Duration::from_secs(2), job)
+            .await
+            .context("Automatic checkpoint delayed; hardware point held")??
+    }
+    async fn record_with_logs(
+        &mut self,
+        shared: &Shared,
+        board: &BoardConfig,
+        clean: u64,
+        log: &mut ClientLog,
+    ) -> Result<Option<anyhow::Error>> {
+        while_logging(self.record(shared, board, clean), shared, board, log).await
     }
     async fn tick(
         &mut self,
@@ -586,25 +666,35 @@ impl NativeOwner {
         };
         let healthy = input.healthy && !input.paused;
         match self.policy.observe(now, input) {
-            Some(Action::Save) => self.record(
-                shared,
-                board,
-                self.policy
-                    .status
-                    .active_seconds
-                    .max(self.policy.settings.healthy_seconds),
-            )?,
+            Some(Action::Save) => {
+                if let Some(error) = self
+                    .record_with_logs(
+                        shared,
+                        board,
+                        self.policy
+                            .status
+                            .active_seconds
+                            .max(self.policy.settings.healthy_seconds),
+                        log,
+                    )
+                    .await?
+                {
+                    tracing::warn!(%error,"Automatic profile checkpoint unavailable; proof work continues");
+                }
+            }
             Some(Action::Set(point, reason)) => {
                 let persist = !self.policy.in_trial();
                 if self.policy.is_retest() {
                     // Observe has selected a target but point is still the last
                     // accepted setting. Persist its reserved retry wait first.
-                    self.record(shared, board, 0)?;
+                    if let Some(error) = self.record_with_logs(shared, board, 0, log).await? {
+                        tracing::warn!(%error,"Retest reservation unavailable; current point held");
+                        self.policy.interrupt_trial(now);
+                        self.experiment.take();
+                        return Ok(());
+                    }
                 }
-                let safety = shared.runtime.lock().expect("runtime").safety.clone();
-                if let Some(store) = safety
-                    && let Err(error) = store.before_open(&self.serial, point)
-                {
+                if let Some(error) = journal_point(shared, board, point, log).await? {
                     tracing::warn!(%error,board=%board.name,"Operating-point journal unavailable");
                     if point.frequency_mhz > self.policy.point.frequency_mhz
                         || point.voltage_v > self.policy.point.voltage_v
@@ -643,8 +733,9 @@ impl NativeOwner {
                 );
                 // Save rollback limits/cooldown, never an outstanding experiment.
                 // Zero clean seconds keeps the resumed point explicitly provisional.
-                if persist {
-                    self.record(shared, board, 0)?;
+                if persist && let Some(error) = self.record_with_logs(shared, board, 0, log).await?
+                {
+                    tracing::warn!(%error,"Backoff profile checkpoint unavailable; proof work continues");
                 }
                 self.raw_window = Default::default();
                 let mut state = shared.runtime.lock().expect("runtime");
@@ -663,8 +754,11 @@ impl NativeOwner {
                     && now.saturating_sub(self.last_record_unix) >= 300
                     && (self.raw_window.performance().is_some()
                         || self.policy.retest_remaining().is_some())
+                    && let Some(error) = self
+                        .record_with_logs(shared, board, self.policy.status.active_seconds, log)
+                        .await?
                 {
-                    self.record(shared, board, self.policy.status.active_seconds)?;
+                    tracing::warn!(%error,"Profile refresh unavailable; proof work continues");
                 }
             }
         }
@@ -1789,6 +1883,98 @@ printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
         assert!(quiesced);
         assert_eq!(record.quarantine, Some(crate::safety::Reason::Thermal));
         assert!(!record.owner_active);
+    }
+
+    #[tokio::test]
+    async fn optional_save_failure_keeps_the_owner_and_pending_io_still_reads_thermal_faults() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tl-optional-io-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("client");
+        std::fs::write(
+            &binary,
+            r#"#!/bin/sh
+if [ "$1" = --control-frequencies ]; then echo '[1450,1460]'; exit 0; fi
+while read command version id frequency voltage; do
+ printf 'TLACK 1 %s %s %s\n' "$id" "$frequency" "$voltage"
+ if [ "$id" = 2 ]; then printf '%s\n' 'ASIC Temp = 60 C; Frequency = 1450 MHz' >&2; fi
+done
+printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let board:BoardConfig=toml::from_str("id='io'\nname='IO'\nserial='fixture'\nclient_port=18110\ndevice_location=1\nprofile='automatic'").unwrap();
+        let mut config = Config::default();
+        config.hardware.client_binary = Some(binary);
+        config.hardware.boards = vec![board.clone()];
+        config.hardware.automatic_state = Some(dir.join("cache.json"));
+        let progress = Arc::new(timelord_supervisor::progress::Progress::default());
+        let runtime = crate::runtime::RuntimeState {
+            progress: Some(progress.clone()),
+            ..Default::default()
+        };
+        let mut shared = Shared {
+            assignments: config.assignments().unwrap(),
+            config,
+            clients: Default::default(),
+            runtime: Arc::new(std::sync::Mutex::new(runtime)),
+            started_unix: crate::unix_now(),
+            service_started_unix: crate::unix_now(),
+        };
+        let mut child = launch(&shared, &board).await.unwrap();
+        let mut owner = NativeOwner::new(&shared, &board, &mut child).await.unwrap();
+        let bad = dir.join("not-a-cache");
+        std::fs::create_dir(&bad).unwrap();
+        shared.config.hardware.automatic_state = Some(bad);
+        let now = crate::unix_now();
+        owner.policy.epoch = now - 30;
+        owner.policy.status.active_seconds = board.automatic.healthy_seconds;
+        {
+            let mut state = shared.runtime.lock().unwrap();
+            state.phase = "running".into();
+            state.node = "authenticated".into();
+            state.boards.insert(
+                board.id.clone(),
+                HardwareState {
+                    native_initialized: true,
+                    state: "connected".into(),
+                    temperature_c: Some(40.),
+                    temperature_unix: now,
+                    ..Default::default()
+                },
+            );
+            for chain in timelord_core::Chain::ALL {
+                for _ in 0..board.automatic.minimum_proofs_per_chain {
+                    state.observations.push(crate::runtime::Observation {
+                        id: 1,
+                        chain,
+                        timestamp_unix: now,
+                        work_started_unix: now - 10,
+                        ips: 1_000_000.,
+                    });
+                }
+            }
+        }
+        let (ready, _rx) = oneshot::channel();
+        let mut log = ClientLog::new(child.stderr.take().unwrap(), ready);
+        let point = owner.policy.point;
+        owner.tick(&shared, &board, &mut log).await.unwrap();
+        assert_eq!(owner.policy.point, point);
+        assert!(child.try_wait().unwrap().is_none());
+        let held = progress.arithmetic(20).acquire_owned().await.unwrap();
+        owner.change(point, 1).await.unwrap();
+        let before = tokio::time::Instant::now();
+        let result = owner.record_with_logs(&shared, &board, 0, &mut log).await;
+        let elapsed = before.elapsed();
+        drop(held);
+        let quiesced = owner.stop(&mut child, log).await;
+        let thermal = shared.runtime.lock().unwrap().boards[&board.id].latched_fault;
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(result.is_err());
+        assert!(elapsed < Duration::from_secs(1));
+        assert!(thermal);
+        assert!(quiesced);
     }
 
     #[test]

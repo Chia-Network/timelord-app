@@ -301,3 +301,45 @@ tests:
         severity: warning
       exp_annotations:
         summary: Timelord is requested to run but has no worker
+- name: operational failures are visible while useful proof work continues
+  interval: 1m
+  input_series:
+  - series: chia_timelord_supervisor_log_dropped_bytes_total{job="timelord-supervisor",instance="fixture:9259",network="mainnet"}
+    values: 0+1024x20
+  - series: chia_timelord_supervisor_using_last_good_configuration{job="timelord-supervisor",instance="fixture:9259",network="mainnet"}
+    values: 1+0x20
+  - series: chia_timelord_supervisor_desired_running{job="timelord-supervisor",instance="fixture:9259",network="mainnet"}
+    values: 1+0x20
+  - series: chia_timelord_supervisor_sleep_inhibited{job="timelord-supervisor",instance="fixture:9259",network="mainnet"}
+    values: 0+0x20
+  alert_rule_test:
+  - eval_time: 10m
+    alertname: TimelordDiagnosticLogsLost
+    exp_alerts:
+    - exp_labels: {job: timelord-supervisor, instance: 'fixture:9259', network: mainnet, severity: warning}
+      exp_annotations: {summary: Timelord diagnostic logging is dropping data}
+  - eval_time: 10m
+    alertname: TimelordUsingLastGoodConfiguration
+    exp_alerts:
+    - exp_labels: {job: timelord-supervisor, instance: 'fixture:9259', network: mainnet, severity: warning}
+      exp_annotations: {summary: Timelord is running its last-good configuration}
+  - eval_time: 10m
+    alertname: TimelordSleepPreventionUnavailable
+    exp_alerts:
+    - exp_labels: {job: timelord-supervisor, instance: 'fixture:9259', network: mainnet, severity: warning}
+      exp_annotations: {summary: Timelord cannot prevent idle system sleep}
+- name: explicit pause releases sleep inhibition without an operational alarm
+  interval: 1m
+  input_series:
+  - series: chia_timelord_supervisor_log_dropped_bytes_total{job="timelord-supervisor",instance="fixture:9259",network="mainnet"}
+    values: 0+0x20
+  - series: chia_timelord_supervisor_using_last_good_configuration{job="timelord-supervisor",instance="fixture:9259",network="mainnet"}
+    values: 0+0x20
+  - series: chia_timelord_supervisor_desired_running{job="timelord-supervisor",instance="fixture:9259",network="mainnet"}
+    values: 0+0x20
+  - series: chia_timelord_supervisor_sleep_inhibited{job="timelord-supervisor",instance="fixture:9259",network="mainnet"}
+    values: 0+0x20
+  alert_rule_test:
+  - {eval_time: 10m, alertname: TimelordDiagnosticLogsLost, exp_alerts: []}
+  - {eval_time: 10m, alertname: TimelordUsingLastGoodConfiguration, exp_alerts: []}
+  - {eval_time: 10m, alertname: TimelordSleepPreventionUnavailable, exp_alerts: []}
