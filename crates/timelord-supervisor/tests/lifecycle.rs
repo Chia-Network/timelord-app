@@ -356,3 +356,67 @@ fn launchd_plan_is_boot_scoped_non_root_and_escapes_paths() {
             .is_err()
     );
 }
+
+#[test]
+fn parent_guard_fixture() {
+    let Ok(marker) = std::env::var("TIMELORD_PARENT_FIXTURE_MARKER") else {
+        return;
+    };
+    // Deliberately ignore graceful shutdown to exercise the independent hard
+    // deadline, as if the worker's async/blocking computation pool were wedged.
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+    }
+    timelord_supervisor::watch_parent().unwrap();
+    fs::write(marker, b"ready").unwrap();
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+#[tokio::test]
+async fn abrupt_supervisor_death_cannot_leave_a_wedged_worker_running() {
+    let fixture = Fixture::new();
+    let marker = fixture.0.join("guard-ready");
+    let test_exe = std::env::current_exe().unwrap();
+    let helper = fixture.helper(&format!(
+        "TIMELORD_PARENT_FIXTURE_MARKER='{}' exec '{}' --exact parent_guard_fixture --nocapture",
+        marker.display(),
+        test_exe.display()
+    ));
+    let mut child = fixture.supervisor(&helper);
+    let status = fixture.status(|s| s.worker_pid.is_some()).await;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while !marker.exists() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    unsafe {
+        libc::kill(child.id().unwrap() as i32, libc::SIGKILL);
+    }
+    child.wait().await.unwrap();
+    let worker = status.worker_pid.unwrap();
+    tokio::time::timeout(Duration::from_secs(35), async {
+        loop {
+            if unsafe { libc::kill(worker as i32, 0) } == -1 {
+                break;
+            }
+            let result = std::process::Command::new("ps")
+                .args(["-p", &worker.to_string(), "-o", "stat="])
+                .output()
+                .unwrap();
+            if !result.status.success()
+                || String::from_utf8_lossy(&result.stdout)
+                    .trim()
+                    .starts_with('Z')
+            {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("orphan worker exceeded its independent shutdown deadline");
+}
