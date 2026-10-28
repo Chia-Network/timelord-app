@@ -199,7 +199,23 @@ impl Store {
             "Managed ASIC requires a printable persistent serial"
         );
         let name = format!("usb-{:x}.lock", Sha256::digest(serial.as_bytes()));
-        InstanceLock::acquire(&self.directory.join(name))
+        // USB ownership is shared across configurations, not just generations
+        // of one worker. Keep a stable per-UID host lock namespace.
+        let root = Path::new("/tmp")
+            .canonicalize()?
+            .join(format!("timelord-usb-{}", unsafe { libc::geteuid() }));
+        use std::os::unix::fs::DirBuilderExt;
+        match fs::DirBuilder::new().mode(0o700).create(&root) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+        let meta = fs::symlink_metadata(&root)?;
+        ensure!(
+            meta.is_dir() && meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o077 == 0,
+            "ASIC ownership directory must be private and owned"
+        );
+        InstanceLock::acquire(&root.join(name))
     }
     fn update(&self, serial: &str, relaxing: bool, change: impl FnOnce(&mut Board)) -> Result<()> {
         ensure!(serial_valid(serial), "Invalid persistent board serial");
@@ -432,11 +448,16 @@ mod tests {
     fn admission_is_serial_scoped_and_exclusive_and_corruption_is_not_defaulted() {
         let f = Fixture::new();
         let store = Store::open(&f.config()).unwrap();
-        let lease = store.lease("A").unwrap();
-        assert!(store.lease("A").is_err());
-        assert!(store.lease("B").is_ok());
+        let serial = format!("fixture{:x}", std::process::id());
+        let separate = format!("other{:x}", std::process::id());
+        let other = Fixture::new();
+        let second = Store::open(&other.config()).unwrap();
+        let lease = store.lease(&serial).unwrap();
+        assert!(store.lease(&serial).is_err());
+        assert!(second.lease(&serial).is_err());
+        assert!(second.lease(&separate).is_ok());
         drop(lease);
-        assert!(store.lease("A").is_ok());
+        assert!(second.lease(&serial).is_ok());
         store.quarantine("A", Reason::Thermal).unwrap();
         assert!(store.board("B").is_none());
         fs::write(&store.path, b"malformed").unwrap();
