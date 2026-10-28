@@ -362,6 +362,21 @@ extension PresentationTests {
         XCTAssertEqual(hardware.boards[0].profileName,"Automatic")
         XCTAssertNotEqual(hardware.boards[0].id,first.id)
     }
+    func testAutomaticPortsSkipHTTPListenersAcrossHotplug() {
+        var config=AppConfiguration()
+        config.service.statusListen="127.0.0.1:18111"
+        config.service.observabilityListen="[::]:18110"
+        let devices=(0..<3).map {DiscoveredDevice(name:"ASIC",location:4113+$0,serial:"serial-\($0)")}
+        // Also repair remembered client ports when HTTP configuration changes.
+        config.hardware=BoardDiscovery.reconcile(devices,hardware:config.hardware)
+        for count in [3,0,1,3] {
+            config.hardware=BoardDiscovery.reconcile(Array(devices.prefix(count)),hardware:config.hardware,service:config.service)
+            let ports=Set(config.hardware.boards.map(\.clientPort))
+            XCTAssertEqual(ports.count,count)
+            XCTAssertFalse(ports.contains(18110))
+            XCTAssertFalse(ports.contains(18111))
+        }
+    }
     func testAutomaticEngineAssignmentsAndNoConfiguredGhostCards() {
         var config=AppConfiguration()
         let devices=(0..<3).map {DiscoveredDevice(name:"ASIC",location:4113+$0,serial:"serial-\($0)")}

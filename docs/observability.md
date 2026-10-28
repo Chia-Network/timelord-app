@@ -15,6 +15,10 @@ an authenticated reverse proxy for remote access. The deployment listener expose
 only the three endpoints below; status, history and controls remain local. It has
 no built-in authentication or TLS. All listener ports must be distinct, including
 ASIC client ports. An occupied listener causes startup to fail with its bind error.
+Automatic USB assignment chooses unused client ports starting at 18110, skipping
+both HTTP listener ports. If those overlap the usual 18110–18112 range, board
+ports can extend above 18112. An unexpected deployment listener exit latches
+health as failed on the local status endpoint while proof work continues.
 
 | Endpoint | Response |
 | --- | --- |
