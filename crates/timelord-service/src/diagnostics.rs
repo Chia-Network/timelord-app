@@ -59,6 +59,7 @@ pub async fn check(mut config: Config) -> Result<Vec<CheckedProof>> {
         clients: Arc::new(Mutex::new(BTreeSet::new())),
         runtime,
         started_unix: unix_now(),
+        service_started_unix: crate::unix_now(),
     });
     let (stop, shutdown) = watch::channel(false);
     let mut listeners_tasks = JoinSet::new();

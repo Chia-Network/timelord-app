@@ -159,6 +159,7 @@ mod tests {
             clients: Default::default(),
             runtime: Default::default(),
             started_unix: crate::unix_now(),
+            service_started_unix: crate::unix_now(),
         });
         shared.runtime.lock().unwrap().phase = "running".into();
         let (stop, shutdown) = watch::channel(false);

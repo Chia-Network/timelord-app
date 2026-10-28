@@ -1,11 +1,14 @@
 //! Read-only D2XX enumeration. Never opens a USB handle or initializes an ASIC.
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
-#[cfg(target_os = "macos")]
+use serde::{Deserialize, Serialize};
 use std::path::Path;
+#[cfg(any(target_os = "macos", test))]
+use std::{process::Stdio, time::Duration};
 use timelord_core::Config;
+#[cfg(any(target_os = "macos", test))]
+use tokio::{io::AsyncReadExt, process::Command};
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Device {
     pub name: String,
     pub location: u32,
@@ -13,7 +16,7 @@ pub struct Device {
 }
 
 #[cfg(target_os = "macos")]
-fn native(path: &Path) -> Result<Vec<Device>> {
+pub fn native(path: &Path) -> Result<Vec<Device>> {
     use std::ffi::{CString, c_char, c_void};
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -26,30 +29,19 @@ fn native(path: &Path) -> Result<Vec<Device>> {
         description: [c_char; 64],
         handle: *mut c_void,
     }
-    struct Library(*mut c_void);
-    impl Drop for Library {
-        fn drop(&mut self) {
-            unsafe {
-                if !self.0.is_null() {
-                    libc::dlclose(self.0);
-                }
-            }
-        }
-    }
     let path = CString::new(path.as_os_str().as_encoded_bytes())?;
     // D2XX ABI from the distributed macOS ftd2xx.h/WinTypes.h: DWORD/ULONG
     // are unsigned 32-bit, with a pointer-sized handle. Only enumeration exports
     // are resolved; neither FT_Open nor any control/write export is called.
     unsafe {
-        let library = Library(libc::dlopen(
-            path.as_ptr(),
-            libc::RTLD_NOW | libc::RTLD_LOCAL,
-        ));
-        if library.0.is_null() {
+        // Only the disposable probe process enters this function. Leave the
+        // driver loaded until process exit; it owns background USB threads.
+        let library = libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+        if library.is_null() {
             bail!("Could not load the native client's D2XX library");
         }
-        let create = libc::dlsym(library.0, c"FT_CreateDeviceInfoList".as_ptr());
-        let get = libc::dlsym(library.0, c"FT_GetDeviceInfoList".as_ptr());
+        let create = libc::dlsym(library, c"FT_CreateDeviceInfoList".as_ptr());
+        let get = libc::dlsym(library, c"FT_GetDeviceInfoList".as_ptr());
         if create.is_null() || get.is_null() {
             bail!("D2XX enumeration exports are missing");
         }
@@ -117,17 +109,79 @@ fn driver_path(config: &Config, helper: &Path) -> std::path::PathBuf {
         .join("../Frameworks/libftd2xx.dylib")
 }
 
+#[cfg(not(target_os = "macos"))]
+pub fn native(_path: &Path) -> Result<Vec<Device>> {
+    bail!("Native USB discovery requires macOS")
+}
+
+/// Never load D2XX into the long-lived proof service. A timed-out blocking
+/// thread cannot be cancelled and may keep using the driver after timeout.
+#[cfg(any(target_os = "macos", test))]
+async fn probe(helper: &Path, driver: &Path, timeout: Duration) -> Result<Vec<Device>> {
+    let mut child = Command::new(helper)
+        .arg("usb-inventory")
+        .arg("--driver-library")
+        .arg(driver)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("Starting isolated USB discovery")?;
+    let stdout = child.stdout.take().context("Discovery stdout missing")?;
+    let stderr = child.stderr.take().context("Discovery stderr missing")?;
+    async fn read(
+        source: impl tokio::io::AsyncRead + Unpin,
+        limit: u64,
+    ) -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        source.take(limit + 1).read_to_end(&mut bytes).await?;
+        if bytes.len() as u64 > limit {
+            return Err(std::io::Error::other(
+                "USB discovery helper output exceeded its limit",
+            ));
+        }
+        Ok(bytes)
+    }
+    let result = tokio::time::timeout(timeout, async {
+        tokio::try_join!(child.wait(), read(stdout, 256 * 1024), read(stderr, 4096))
+    })
+    .await;
+    match result {
+        Ok(Ok((status, output, diagnostics))) => {
+            if !status.success() {
+                bail!(
+                    "USB discovery helper stopped ({status}): {}",
+                    String::from_utf8_lossy(&diagnostics)
+                );
+            }
+            let devices: Vec<Device> =
+                serde_json::from_slice(&output).context("Invalid USB discovery response")?;
+            if devices.len() > 256 {
+                bail!("USB discovery returned too many devices");
+            }
+            Ok(devices)
+        }
+        result => {
+            // Do not accumulate stuck driver threads or orphan probe processes.
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            match result {
+                Err(_) => bail!("USB enumeration timed out; discovery helper terminated"),
+                Ok(Err(error)) => Err(error).context("Reading USB discovery response"),
+                Ok(Ok(_)) => unreachable!(),
+            }
+        }
+    }
+}
+
 pub async fn discover(config: &Config) -> Result<Vec<Device>> {
     #[cfg(target_os = "macos")]
     {
-        let path = driver_path(config, &std::env::current_exe()?);
+        let helper = std::env::current_exe()?;
+        let path = driver_path(config, &helper);
         if path.is_file() {
-            return tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                tokio::task::spawn_blocking(move || native(&path)),
-            )
-            .await
-            .context("USB enumeration timed out")??;
+            return probe(&helper, &path, Duration::from_secs(10)).await;
         }
     }
     bail!("Select the packaged D2XX library to enumerate ASIC serial identities")
@@ -356,36 +410,47 @@ pub async fn live_configuration(shared: &crate::Shared) -> Result<Config> {
     }
     let _initialization = crate::hardware::INITIALIZATION.lock().await;
     let mut devices = discover(&shared.config).await?;
-    {
-        // Keep the same lock order as the status handler.
-        let clients = shared.clients.lock().expect("clients");
-        let runtime = shared.runtime.lock().expect("runtime");
-        // Open FTDI interfaces can omit metadata. Require recent hardware
-        // telemetry as well as a live socket; an old connection is not presence.
-        for board in &shared.config.hardware.boards {
-            if runtime.boards.get(&board.id).is_some_and(|state| {
-                state.state == "connected"
-                    && state.temperature_unix.saturating_add(15) >= crate::unix_now()
-            }) && clients.iter().any(|(id, _)| id == &board.id)
-                && !devices.iter().any(|d| {
-                    d.serial == board.serial && d.serial.is_some()
-                        || Some(d.location) == board.device_location
-                })
-                && let Some(location) = runtime
-                    .boards
-                    .get(&board.id)
-                    .and_then(|b| b.device_location)
-                    .or(board.device_location)
-            {
-                devices.push(Device {
-                    name: board.name.clone(),
-                    serial: board.serial.clone(),
-                    location,
-                });
-            }
+    preserve_managed_boards(
+        &shared.config,
+        &mut devices,
+        &shared.runtime.lock().expect("runtime"),
+        crate::unix_now(),
+    );
+    connected_plan(shared.config.clone(), devices)
+}
+
+fn preserve_managed_boards(
+    config: &Config,
+    devices: &mut Vec<Device>,
+    runtime: &crate::runtime::RuntimeState,
+    now: u64,
+) {
+    // Open FTDI handles can hide their metadata even while a socket or sensor
+    // watchdog is recovering the client. Health is not physical absence. Keep
+    // a known-present board until its supervisor has closed the native owner
+    // and obtained a successful inventory that actually omits that serial.
+    for board in &config.hardware.boards {
+        if let Some(state) = runtime.boards.get(&board.id)
+            && !state.latched_fault
+            && (state.usb_present == Some(true)
+                || (state.usb_present.is_none()
+                    && state.state == "connected"
+                    && state.temperature_unix > 0
+                    && now.saturating_sub(state.temperature_unix)
+                        <= crate::hardware::TEMPERATURE_TIMEOUT_SECONDS))
+            && !devices.iter().any(|d| {
+                d.serial == board.serial && d.serial.is_some()
+                    || Some(d.location) == state.device_location.or(board.device_location)
+            })
+            && let Some(location) = state.device_location.or(board.device_location)
+        {
+            devices.push(Device {
+                name: board.name.clone(),
+                serial: board.serial.clone(),
+                location,
+            });
         }
     }
-    connected_plan(shared.config.clone(), devices)
 }
 
 #[cfg(test)]
@@ -530,6 +595,121 @@ mod tests {
         assert!(connected_plan(configured(), devices(&[0, 0])).is_err());
     }
     #[test]
+    fn idle_owner_without_socket_keeps_three_board_layout_through_metadata_gaps() {
+        let config = configured();
+        let mut runtime = crate::runtime::RuntimeState::default();
+        runtime.boards.insert(
+            "b2".into(),
+            crate::runtime::HardwareState {
+                state: "connected".into(),
+                usb_present: Some(true),
+                temperature_unix: 1000,
+                device_location: Some(3),
+                ..Default::default()
+            },
+        );
+        let mut topology = TopologyChange::default();
+        let instant = std::time::Instant::now();
+        // No socket or recent raw IPS is required for an idle, supervised owner.
+        for elapsed in [0, 10, 20, 30, 45, 59, 60, 90, 300] {
+            let mut detected = devices(&[0, 1]);
+            preserve_managed_boards(&config, &mut detected, &runtime, 1000 + elapsed);
+            let next = connected_plan(config.clone(), detected).unwrap();
+            assert_eq!(next.hardware.boards.len(), 3);
+            assert!(
+                topology
+                    .observe_at(&config, Ok(next), instant + Duration::from_secs(elapsed))
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn transport_and_sensor_recovery_do_not_become_false_usb_removals() {
+        let config = configured();
+        for state in ["connected", "fault", "reconnecting", "starting"] {
+            let mut runtime = crate::runtime::RuntimeState::default();
+            runtime.boards.insert(
+                "b2".into(),
+                crate::runtime::HardwareState {
+                    state: state.into(),
+                    usb_present: Some(true),
+                    temperature_unix: 1000,
+                    ..Default::default()
+                },
+            );
+            let mut detected = devices(&[0, 1]);
+            preserve_managed_boards(&config, &mut detected, &runtime, 2000);
+            assert_eq!(
+                connected_plan(config.clone(), detected)
+                    .unwrap()
+                    .hardware
+                    .boards
+                    .len(),
+                3
+            );
+        }
+    }
+
+    #[test]
+    fn closed_owner_confirmed_absence_wins_over_old_socket_or_telemetry() {
+        let config = configured();
+        let mut runtime = crate::runtime::RuntimeState::default();
+        runtime.boards.insert(
+            "b2".into(),
+            crate::runtime::HardwareState {
+                state: "connected".into(),
+                usb_present: Some(false),
+                temperature_unix: 1000,
+                ..Default::default()
+            },
+        );
+        let mut detected = devices(&[0, 1]);
+        preserve_managed_boards(&config, &mut detected, &runtime, 1001);
+        assert_eq!(
+            connected_plan(config, detected)
+                .unwrap()
+                .hardware
+                .boards
+                .len(),
+            2
+        );
+    }
+    #[test]
+    fn absent_faulted_or_stale_owner_does_not_hide_an_unplugged_board() {
+        let config = configured();
+        for (state, latched, age) in [
+            ("reconnecting", false, 1),
+            ("fault", false, 1),
+            ("starting", false, 1),
+            ("connected", true, 1),
+            ("connected", false, 61),
+        ] {
+            let mut runtime = crate::runtime::RuntimeState::default();
+            runtime.boards.insert(
+                "b2".into(),
+                crate::runtime::HardwareState {
+                    state: state.into(),
+                    latched_fault: latched,
+                    temperature_unix: 1000,
+                    ..Default::default()
+                },
+            );
+            let mut detected = devices(&[0, 1]);
+            preserve_managed_boards(&config, &mut detected, &runtime, 1000 + age);
+            let next = connected_plan(config.clone(), detected).unwrap();
+            assert_eq!(next.hardware.boards.len(), 2);
+            assert_eq!(
+                next.assignments()
+                    .unwrap()
+                    .iter()
+                    .filter(|a| a.board_id == "b0")
+                    .count(),
+                2
+            );
+        }
+    }
+    #[test]
     fn explicit_mapping_keeps_absent_board_while_refreshing_connected_locations() {
         let mut config = Config::default();
         config.hardware.boards = (0..3).map(|i| toml::from_str(&format!(
@@ -578,5 +758,100 @@ mod tests {
         };
         assert_eq!(board_location(&board, &[other, moved.clone()]).unwrap(), 9);
         assert!(board_location(&board, &[moved.clone(), moved]).is_err());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod probe_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Fixture(std::path::PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "usb-probe-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn helper(&self, name: &str, body: &str) -> std::path::PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            path
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn crashed_or_malformed_probe_does_not_prevent_the_next_inventory() {
+        let fixture = Fixture::new();
+        for body in ["kill -KILL $$", "printf 'not JSON'", "printf '[1]'"] {
+            let helper = fixture.helper("bad", body);
+            assert!(
+                probe(&helper, Path::new("unused"), Duration::from_secs(2))
+                    .await
+                    .is_err()
+            );
+        }
+        let helper = fixture.helper(
+            "good",
+            r#"test "$1" = usb-inventory && test "$2" = --driver-library && test "$3" = unused || exit 71
+printf '%s' '[{"name":"Chia VDF A","location":4113,"serial":"test"}]'"#,
+        );
+        let found = probe(&helper, Path::new("unused"), Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(found[0].serial.as_deref(), Some("test"));
+        assert_eq!(found[0].location, 4113);
+    }
+
+    #[tokio::test]
+    async fn repeated_timeouts_kill_and_reap_the_driver_process() {
+        let fixture = Fixture::new();
+        for i in 0..3 {
+            let pidfile = fixture.0.join(format!("pid-{i}"));
+            let helper = fixture.helper(
+                &format!("hang-{i}"),
+                &format!("echo $$ > '{}'; exec /bin/sleep 30", pidfile.display()),
+            );
+            let error = probe(&helper, Path::new("unused"), Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("timed out"), "{error:#}");
+            let pid: i32 = std::fs::read_to_string(pidfile)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_probe_output_is_bounded_and_terminated() {
+        let fixture = Fixture::new();
+        let helper = fixture.helper("flood", "exec /usr/bin/yes oversized");
+        let error = probe(&helper, Path::new("unused"), Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("exceeded its limit"),
+            "{error:#}"
+        );
     }
 }

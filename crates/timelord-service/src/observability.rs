@@ -730,6 +730,7 @@ mod tests {
             ]))),
             runtime: Arc::new(Mutex::new(runtime)),
             started_unix: now,
+            service_started_unix: now,
         });
         let (_, current) = watch::channel(shared.clone());
         let http = HttpState {
@@ -843,6 +844,7 @@ mod tests {
             clients: shared.clients.clone(),
             runtime: shared.runtime.clone(),
             started_unix: shared.started_unix,
+            service_started_unix: shared.service_started_unix,
         });
         let (_, current) = watch::channel(shared.clone());
         http.current = current;
@@ -1090,6 +1092,7 @@ mod tests {
             ]))),
             runtime: shared.runtime.clone(),
             started_unix: now,
+            service_started_unix: now,
         };
         let body = metrics.render(&moved, now).unwrap();
         assert_eq!(
@@ -1117,6 +1120,7 @@ mod tests {
             clients: Default::default(),
             runtime: moved.runtime.clone(),
             started_unix: now,
+            service_started_unix: now,
         };
         let body = metrics.render(&removed, now).unwrap();
         assert!(!body.contains("chia_timelord_chain_assignment{"));

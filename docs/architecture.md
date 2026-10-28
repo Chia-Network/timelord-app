@@ -30,12 +30,22 @@ It makes one startup attempt per app launch and respects Pause, unsaved settings
 and shutdown. Starting at macOS login and crash-independent launch-agent ownership
 are outside the current implementation.
 
-Discovery resolves D2XX enumeration exports only: it never opens or initializes
-an ASIC. Serial identity survives USB-port changes. The active plan includes only
+Discovery calls only D2XX inventory APIs in a disposable helper process; it sends
+no engine, voltage or clock commands. The proof service never loads the USB driver.
+A ten-second timeout kills and reaps a stuck helper instead of leaving a blocking
+thread running. Helper crashes, invalid JSON and bounded-output failures are
+inventory errors, not an empty inventory or a reason to stop healthy boards.
+The driver stays loaded until its helper exits, avoiding unload while its USB
+background threads may still be running. Serial identity survives USB-port changes. The active plan includes only
 detected boards; one/two/three boards receive 3 / 2+1 / 1+1+1 engines. The service
 polls USB every five seconds and requires three consistent inventories before
 replacing the layout. Enumeration errors leave the existing layout intact; fresh
-client telemetry covers metadata omitted by open FTDI interfaces. Old scheduler,
+supervised owners cover metadata omitted by open FTDI interfaces. An idle chain
+needs no leased proof socket. Client health and USB presence are separate: a
+known-present board stays in the layout during transport or sensor recovery. Only
+a successful inventory taken after its native owner has closed can confirm that
+its serial is absent. The 60-second sensor watchdog still stops and retries the
+affected client; latched safety faults remain excluded from presence fallback. Old scheduler,
 client listeners and native owners stop before new ones start, while the status
 HTTP listener stays available. Zero boards waits for reconnection. Each layout
 selects its own engine-count/mask tuning profile, and safety faults remain latched
@@ -103,3 +113,8 @@ Tests use canonical C++ proof fixtures, generated TLS identities, local peers an
 owned fake processes. Presentation scenarios compile only in the test target.
 Hardware/consensus acceptance, physical live transitions and clean-machine
 installation remain separate validation work; see README for current limits.
+
+The status API reports `service_started_unix` once per coordinator process and
+`started_unix` once per engine-assignment session. The dashboard shows Service
+uptime with the engine-session age beneath it. Topology replacements still reset
+session proof counters and chart scope, but never the displayed service uptime.

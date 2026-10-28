@@ -554,7 +554,7 @@ async fn supervise(
                     && (hardware.latched_fault || hardware.state == "fault") {
                     break Err(anyhow::anyhow!(hardware.fault_reason.clone().unwrap_or_else(|| "ASIC needs attention".into())));
                 }
-                if log.last_temperature.elapsed() > Duration::from_secs(60) { break Err(anyhow::anyhow!("ASIC temperature telemetry stopped")); }
+                if log.last_temperature.elapsed() > Duration::from_secs(TEMPERATURE_TIMEOUT_SECONDS) { break Err(anyhow::anyhow!("ASIC temperature telemetry stopped")); }
                 match child.try_wait() {
                     Ok(Some(exit)) => break Err(anyhow::anyhow!("ASIC client exited: {exit}")),
                     Err(error) => break Err(error.into()),
@@ -687,6 +687,8 @@ pub async fn validate_automatic(
     }
     Ok(())
 }
+
+pub(crate) const TEMPERATURE_TIMEOUT_SECONDS: u64 = 60;
 
 const RESTART_DELAYS: [u64; 3] = [1, 5, 30];
 struct RestartBackoff {
@@ -837,6 +839,13 @@ async fn supervise_board(
             result = async {
                 if board.serial.is_some() {
                     let devices = crate::inventory::discover(&shared.config).await?;
+                    // This owner's old process has exited, so its own open FTDI
+                    // handle cannot be hiding metadata. Only this observation
+                    // may declare an already-managed board absent.
+                    let matches = devices.iter().filter(|d| d.serial == board.serial).count();
+                    shared.runtime.lock().expect("runtime").boards.get_mut(&board.id).expect("board").usb_present = match matches {
+                        0 => Some(false), 1 => Some(true), _ => None,
+                    };
                     board.device_location = Some(crate::inventory::board_location(&board, &devices)?);
                 }
                 shared.runtime.lock().expect("runtime").boards.get_mut(&board.id).expect("board").device_location = board.device_location;
@@ -1108,6 +1117,7 @@ mod tests {
             clients: Default::default(),
             runtime: Default::default(),
             started_unix: crate::unix_now(),
+            service_started_unix: crate::unix_now(),
         };
         let mut child = Command::new(binary)
             .stdin(Stdio::piped())
@@ -1224,6 +1234,7 @@ done
             clients: Default::default(),
             runtime: Default::default(),
             started_unix: crate::unix_now(),
+            service_started_unix: crate::unix_now(),
         };
         let mut child = Command::new(binary)
             .stdin(Stdio::piped())
@@ -1346,6 +1357,7 @@ done
             clients: Arc::new(std::sync::Mutex::new(Default::default())),
             runtime: Default::default(),
             started_unix: crate::unix_now(),
+            service_started_unix: crate::unix_now(),
         });
         let (stop, receiver) = watch::channel(false);
         let (backend, _offers) = crate::asic::AsicBackend::new(
@@ -1431,6 +1443,7 @@ while :; do printf '%s\n' 'ASIC Temp = 40.0 C; Frequency = 1500.0 MHz; freq_idx 
             clients: Default::default(),
             runtime: Default::default(),
             started_unix: crate::unix_now(),
+            service_started_unix: crate::unix_now(),
         });
         let (backend, _offers) = crate::asic::AsicBackend::new(
             &shared.config,

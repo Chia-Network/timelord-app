@@ -74,6 +74,9 @@ pub struct HardwareState {
     pub started_unix: u64,
     #[serde(skip)]
     pub latched_fault: bool,
+    // Set only by discovery while this board's native owner is closed.
+    #[serde(skip)]
+    pub usb_present: Option<bool>,
     #[serde(skip)]
     pub fault_reason: Option<String>,
     pub raw_speeds: Vec<RawSpeed>,
@@ -466,6 +469,27 @@ async fn execute(backend: Arc<AsicBackend>, plan: WorkPlan) -> Result<Completed>
         speeds,
     })
 }
+// The upstream scheduler asks for resynchronization five seconds after an
+// infusion. Give node validation time to finish without disconnecting or asking
+// the expired scheduler for more work based on the old peak.
+const INFUSION_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(60);
+fn waiting_for_infusion_confirmation(
+    scheduler_expired: bool,
+    submitted_at: Option<Instant>,
+    now: Instant,
+) -> Result<bool> {
+    if !scheduler_expired {
+        return Ok(false);
+    }
+    if submitted_at
+        .is_none_or(|sent| now.saturating_duration_since(sent) >= INFUSION_CONFIRMATION_TIMEOUT)
+    {
+        bail!(
+            "Node has not confirmed the infusion within 60 seconds; reconnecting for chain state"
+        );
+    }
+    Ok(true)
+}
 async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
     {
         let mut state = shared.runtime.lock().expect("runtime");
@@ -510,11 +534,18 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
     let mut last_message = Instant::now();
     let connected = Instant::now();
+    let mut infusion_submitted_at = None;
     loop {
-        if scheduler.needs_resync() {
-            bail!("Node has not confirmed the infusion; reconnecting for chain state");
-        }
-        let next = scheduler.next_plan()?;
+        let awaiting_confirmation = waiting_for_infusion_confirmation(
+            scheduler.needs_resync(),
+            infusion_submitted_at,
+            Instant::now(),
+        )?;
+        let next = if awaiting_confirmation {
+            None
+        } else {
+            scheduler.next_plan()?
+        };
         shared
             .runtime
             .lock()
@@ -572,6 +603,7 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                     Output::InfusionPoint(_) => "infusion",
                     Output::EndOfSubSlot(_) => "end_of_sub_slot",
                 };
+                let infusion = matches!(&output, Output::InfusionPoint(_));
                 let message = match output {
                     Output::SignagePoint(value) => {
                         tracing::info!(index=value.index_from_challenge, cc=%value.challenge_chain_sp_vdf.output.hash()?, rc=%value.reward_chain_sp_vdf.output.hash()?, cc_proof=%proof_digest(&value.challenge_chain_sp_proof)?, rc_proof=%proof_digest(&value.reward_chain_sp_proof)?, "Submitting verified signage point");
@@ -586,6 +618,9 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                     }
                 };
                 submit(&shared, kind, send(&mut socket, message)).await?;
+                if infusion {
+                    infusion_submitted_at = Some(Instant::now());
+                }
                 shared
                     .runtime
                     .lock()
@@ -634,6 +669,7 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                                         state.scheduler_height=Some(peak.reward_chain_block.height);
                                         state.scheduler_deficit=Some(peak.deficit);
                                     }
+                                    infusion_submitted_at = None;
                                     let work=infused_from_peak(&peak,scheduler.generation(),bits,minimum_deficit)?;
                                     prime_infused(&mut primers,backend.clone(),work);
                                 }
@@ -692,6 +728,46 @@ mod tests {
     use std::{fs, path::PathBuf};
     use tokio::net::TcpListener;
     struct Files(PathBuf);
+    #[test]
+    fn busy_node_confirmation_keeps_the_connection_and_withholds_stale_work() {
+        let sent = Instant::now();
+        for seconds in [5, 10, 25, 32, 59] {
+            assert!(
+                waiting_for_infusion_confirmation(
+                    true,
+                    Some(sent),
+                    sent + Duration::from_secs(seconds),
+                )
+                .unwrap(),
+                "Expired scheduler must remain blocked while node validation finishes"
+            );
+        }
+        for seconds in [60, 90] {
+            assert!(
+                waiting_for_infusion_confirmation(
+                    true,
+                    Some(sent),
+                    sent + Duration::from_secs(seconds),
+                )
+                .is_err(),
+                "Repeated node messages must not extend the submission deadline"
+            );
+        }
+        assert!(waiting_for_infusion_confirmation(true, None, sent).is_err());
+        // An accepted peak clears the scheduler's wait and permits fresh work.
+        assert!(!waiting_for_infusion_confirmation(false, None, sent).unwrap());
+        assert!(
+            !waiting_for_infusion_confirmation(false, Some(sent), sent + Duration::from_secs(90))
+                .unwrap()
+        );
+        // A later successful infusion submission gets its own bounded window.
+        let later = sent + Duration::from_secs(100);
+        assert!(
+            waiting_for_infusion_confirmation(true, Some(later), later + Duration::from_secs(5))
+                .unwrap()
+        );
+    }
+
     #[test]
     fn current_unfinished_envelope_is_exact_and_does_not_silently_ignore_mmr() {
         let current = include_bytes!("../tests/fixtures/unfinished-block.bin");
@@ -871,6 +947,7 @@ mod tests {
                 clients: Default::default(),
                 runtime,
                 started_unix: unix_now(),
+                service_started_unix: crate::unix_now(),
             });
             let session = tokio::spawn(session(shared, Arc::new(backend)));
             let result = tokio::time::timeout(Duration::from_secs(3), task).await;
@@ -905,6 +982,7 @@ mod tests {
                 ..Default::default()
             })),
             started_unix: unix_now(),
+            service_started_unix: unix_now(),
         };
         assert!(
             submit(&shared, "signage", async { bail!("fixture send failed") })
