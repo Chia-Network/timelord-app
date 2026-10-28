@@ -23,8 +23,10 @@ canary deployment are separate from the offline implementation gates.
 - Status describes process state honestly; worker existence is not productivity.
 
 Current foundation: the Rust supervisor and worker lifetime/ownership changes are
-implemented. GUI migration, boot installation, packaging and abrupt-parent coverage
-remain required before PR 1 is ready for review.
+implemented. Boot-registration generation, the non-root installer and bundle
+integration are implemented with a fixture-only plan check; no system job has
+been installed in development. GUI migration and abrupt-parent coverage remain
+required before PR 1 is ready for review.
 
 ## 2. Work-aware supervision and observability
 

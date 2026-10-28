@@ -31,6 +31,20 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Print the system LaunchDaemon registration without installing anything.
+    LaunchdPlist {
+        #[arg(long)]
+        app: PathBuf,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        user: String,
+    },
+    /// Refuse migration while an existing coordinator holds its ownership lock.
+    CheckOwner {
+        #[arg(long)]
+        config: PathBuf,
+    },
     Run {
         #[arg(long)]
         config: PathBuf,
@@ -63,6 +77,19 @@ enum Action {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
+        Action::LaunchdPlist { app, config, user } => {
+            print!(
+                "{}",
+                timelord_supervisor::launchd_plist(&app, &config, &user)?
+            );
+            Ok(())
+        }
+        Action::CheckOwner { config } => {
+            let paths = Paths::for_config(&config)?;
+            let _owner = InstanceLock::acquire(&paths.worker_lock)?;
+            println!("{}", serde_json::json!({"available":true}));
+            Ok(())
+        }
         Action::Run { config, worker } => {
             let helper =
                 worker.unwrap_or(std::env::current_exe()?.with_file_name("timelord-service"));
@@ -83,7 +110,9 @@ async fn main() -> Result<()> {
                     config,
                     expected_revision,
                 } => (config, Control::Reload, expected_revision),
-                Action::Run { .. } => unreachable!(),
+                Action::Run { .. } | Action::LaunchdPlist { .. } | Action::CheckOwner { .. } => {
+                    unreachable!()
+                }
             };
             println!(
                 "{}",

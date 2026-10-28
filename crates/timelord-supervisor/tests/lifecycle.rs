@@ -321,3 +321,38 @@ fn intent_and_owner_paths_reject_links_and_insecure_files() {
     drop(owner);
     assert!(InstanceLock::acquire(&paths.lock).is_ok());
 }
+
+#[test]
+fn launchd_plan_is_boot_scoped_non_root_and_escapes_paths() {
+    let xml = timelord_supervisor::launchd_plist(
+        Path::new("/Applications/My & Timelord.app"),
+        Path::new("/Users/operator/A 'config'.toml"),
+        "operator",
+    )
+    .unwrap();
+    assert!(xml.contains("<key>UserName</key><string>operator</string>"));
+    assert!(xml.contains("<key>KeepAlive</key><true/>"));
+    assert!(xml.contains("My &amp; Timelord.app"));
+    assert!(xml.contains("A &apos;config&apos;.toml"));
+    assert!(xml.contains("<key>ProcessType</key><string>Interactive</string>"));
+    assert!(
+        timelord_supervisor::launchd_plist(
+            Path::new("/Applications/Timelord.app"),
+            Path::new("/config"),
+            "root"
+        )
+        .is_err()
+    );
+    assert!(
+        timelord_supervisor::launchd_plist(
+            Path::new("relative.app"),
+            Path::new("/config"),
+            "operator"
+        )
+        .is_err()
+    );
+    assert!(
+        timelord_supervisor::launchd_plist(Path::new("/app"), Path::new("/config"), "bad<key>")
+            .is_err()
+    );
+}

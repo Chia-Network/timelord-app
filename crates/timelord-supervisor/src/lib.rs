@@ -289,3 +289,66 @@ pub fn watch_parent() -> Result<()> {
         })?;
     Ok(())
 }
+
+/// Generate a system-domain job without installing or loading it. The installer
+/// validates the selected account's numeric UID before performing privileged work.
+pub fn launchd_plist(app: &Path, config: &Path, user: &str) -> Result<String> {
+    ensure!(
+        app.is_absolute() && config.is_absolute(),
+        "App and configuration paths must be absolute"
+    );
+    ensure!(
+        !user.is_empty()
+            && user != "root"
+            && user
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+            && !user.starts_with('-'),
+        "Select a non-root deployment account"
+    );
+    fn xml(value: &str) -> Result<String> {
+        ensure!(
+            value.chars().all(|c| !c.is_control()),
+            "Control characters are not allowed in launchd paths"
+        );
+        Ok(value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;"))
+    }
+    let helper = xml(app
+        .join("Contents/Helpers/timelord-supervisor")
+        .to_str()
+        .context("App path must be UTF-8")?)?;
+    let config_text = xml(config
+        .to_str()
+        .context("Configuration path must be UTF-8")?)?;
+    let log = xml(config
+        .parent()
+        .context("Configuration needs a parent")?
+        .join("supervisor.log")
+        .to_str()
+        .context("Log path must be UTF-8")?)?;
+    Ok(format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>net.chia.timelord.supervisor</string>
+<key>AssociatedBundleIdentifiers</key><string>net.chia.timelord.mac</string>
+<key>UserName</key><string>{user}</string>
+<key>ProgramArguments</key><array><string>{helper}</string><string>run</string><string>--config</string><string>{config_text}</string></array>
+<key>WorkingDirectory</key><string>/</string>
+<key>RunAtLoad</key><true/>
+<key>KeepAlive</key><true/>
+<key>ThrottleInterval</key><integer>10</integer>
+<key>ExitTimeOut</key><integer>20</integer>
+<key>AbandonProcessGroup</key><false/>
+<key>ProcessType</key><string>Interactive</string>
+<key>StandardOutPath</key><string>{log}</string>
+<key>StandardErrorPath</key><string>{log}</string>
+</dict></plist>
+"#
+    ))
+}
