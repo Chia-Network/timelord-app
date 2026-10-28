@@ -67,6 +67,8 @@ impl Qualification {
 #[serde(deny_unknown_fields)]
 pub struct Board {
     pub owner_active: bool,
+    #[serde(default)]
+    pub owner_epoch: u64,
     pub quarantine: Option<Reason>,
     pub force_safe: bool,
     pub qualification: Option<Qualification>,
@@ -255,6 +257,7 @@ impl Store {
         );
         self.update(serial, false, |b| {
             b.owner_active = true;
+            b.owner_epoch = b.owner_epoch.saturating_add(1);
             b.last_point = Some(point);
         })
     }
