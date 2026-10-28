@@ -159,6 +159,9 @@ impl Store {
                 board.force_safe = true;
                 board.qualification = None;
                 board.owner_active = false;
+                board.retry_after_unix = board
+                    .retry_after_unix
+                    .max(crate::unix_now().saturating_add(30));
             }
         }
         Ok(Self {
@@ -372,6 +375,7 @@ mod tests {
         let recovered = Store::open(&f.config()).unwrap();
         let board = recovered.board("A").unwrap();
         assert_eq!(board.quarantine, Some(Reason::UncleanOwner));
+        assert!(board.retry_after_unix >= crate::unix_now() + 29);
         assert!(board.force_safe);
         assert!(board.qualification.is_none());
         recovered.quarantine("A", Reason::InvalidProof).unwrap();
