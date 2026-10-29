@@ -71,8 +71,22 @@ impl Tuning {
         } else {
             None
         };
+        let stage = shared
+            .runtime
+            .lock()
+            .expect("runtime")
+            .progress
+            .as_ref()
+            .map(|p| {
+                p.begin(
+                    20,
+                    0,
+                    0,
+                    timelord_supervisor::progress::Stage::OptionalPersistence,
+                )
+            });
         Ok(tokio::task::spawn_blocking(move || {
-            let _permit = permit;
+            let (_permit, _stage) = (permit, stage);
             automatic::save(&path, entry)?;
             if let Some((store, token, serial)) = health
                 && let Err(error) = store.healthy_profile_saved(&serial, token)
