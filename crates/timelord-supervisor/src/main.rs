@@ -6,7 +6,6 @@ use std::{
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, Mutex},
     time::Duration,
 };
 use timelord_supervisor::{
@@ -16,7 +15,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixDatagram, UnixListener, UnixStream},
     process::{Child, Command},
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     task::JoinSet,
     time::Instant,
 };
@@ -201,6 +200,7 @@ struct Worker {
     group: i32,
     watchdog: timelord_supervisor::progress::Watchdog,
     started: Instant,
+    progress: Option<(timelord_supervisor::progress::Snapshot, std::time::Instant)>,
 }
 impl Worker {
     fn spawn(
@@ -248,6 +248,7 @@ impl Worker {
             group,
             watchdog: timelord_supervisor::progress::Watchdog::new(std::time::Instant::now()),
             started: Instant::now(),
+            progress: None,
         })
     }
     fn signal(&self, signal: i32) {
@@ -339,6 +340,7 @@ async fn validate_before_reload(helper: &Path, config: &Path) -> Result<()> {
         child,
         group,
         log_tasks: Vec::new(),
+        progress: None,
         started: Instant::now(),
         watchdog: timelord_supervisor::progress::Watchdog::new(std::time::Instant::now()),
     };
@@ -365,7 +367,40 @@ struct Envelope {
     request: Request,
     reply: oneshot::Sender<Response>,
 }
-type Snapshot = Arc<Mutex<Status>>;
+/// Monotonic receipt/publication times stay internal; public JSON remains stable.
+#[derive(Clone)]
+struct Published {
+    status: Status,
+    published_at: std::time::Instant,
+    progress_received_at: Option<std::time::Instant>,
+}
+impl Published {
+    fn status_at(&self, now: std::time::Instant) -> Status {
+        let mut status = self.status.clone();
+        status.progress_age_seconds = self
+            .progress_received_at
+            .map(|received| now.saturating_duration_since(received).as_secs());
+        status
+    }
+    fn healthy(&self, now: std::time::Instant) -> bool {
+        now.saturating_duration_since(self.published_at) <= Duration::from_secs(30)
+    }
+    fn ready(&self, now: std::time::Instant) -> bool {
+        self.healthy(now)
+            && self.progress_received_at.is_some_and(|received| {
+                now.saturating_duration_since(received) <= Duration::from_secs(3)
+            })
+            && self.status.mode == Mode::Running
+            && self.status.phase == "worker_started"
+            && self.status.progress.as_ref().is_some_and(|progress| {
+                Some(progress.worker_pid) == self.status.worker_pid
+                    && progress.generation == self.status.worker_generation
+                    && progress.ready
+                    && !progress.failed
+            })
+    }
+}
+type Snapshot = watch::Receiver<Published>;
 async fn handle(mut socket: UnixStream, state: Snapshot, tx: mpsc::Sender<Envelope>) -> Result<()> {
     peer_is_owner(&socket)?;
     let mut line = String::new();
@@ -381,7 +416,7 @@ async fn handle(mut socket: UnixStream, state: Snapshot, tx: mpsc::Sender<Envelo
     let request: Request = serde_json::from_str(&line)?;
     let response = if matches!(request.command, Control::Status) {
         Response {
-            status: state.lock().expect("status").clone(),
+            status: state.borrow().status_at(std::time::Instant::now()),
             error: None,
         }
     } else {
@@ -394,10 +429,307 @@ async fn handle(mut socket: UnixStream, state: Snapshot, tx: mpsc::Sender<Envelo
     socket.write_all(b"\n").await?;
     Ok(())
 }
+async fn accept_controls(
+    listener: UnixListener,
+    current: Snapshot,
+    tx: mpsc::Sender<Envelope>,
+) -> Result<()> {
+    let mut handlers = JoinSet::new();
+    loop {
+        tokio::select! {
+            Some(_) = handlers.join_next(), if !handlers.is_empty() => {},
+            accepted = listener.accept() => {
+                let (socket, _) = accepted?;
+                if handlers.len() < 16 {
+                    let (current, tx) = (current.clone(), tx.clone());
+                    handlers.spawn(async move { let _ = handle(socket, current, tx).await; });
+                }
+            }
+        }
+    }
+}
 async fn signal() {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("SIGTERM handler");
     tokio::select! {_=tokio::signal::ctrl_c()=>{},_=terminate.recv()=>{}}
+}
+/// The loop owns every lifecycle transition. Readers receive immutable projections
+/// rather than independently mutable mode, PID and phase fields.
+enum Lifecycle {
+    Paused,
+    StateError(String),
+    Starting,
+    Running(Box<Worker>),
+    Stopping { pid: u32 },
+    Backoff { next: Instant, error: String },
+}
+struct SupervisorState {
+    intent: Intent,
+    lifecycle: Lifecycle,
+    generation: u64,
+    restarts: u64,
+    failures: usize,
+    power: timelord_supervisor::power::Assertion,
+    recoveries: Vec<timelord_supervisor::Recovery>,
+    log: timelord_supervisor::logging::Writer,
+}
+impl SupervisorState {
+    fn new(loaded: Result<Intent>, log: timelord_supervisor::logging::Writer) -> Self {
+        let (intent, lifecycle) = match loaded {
+            Ok(intent) => {
+                let lifecycle = if intent.mode == Mode::Paused {
+                    Lifecycle::Paused
+                } else {
+                    Lifecycle::Starting
+                };
+                (intent, lifecycle)
+            }
+            Err(error) => (
+                Intent {
+                    mode: Mode::Paused,
+                    ..Default::default()
+                },
+                Lifecycle::StateError(format!("{error:#}")),
+            ),
+        };
+        Self {
+            intent,
+            lifecycle,
+            generation: 0,
+            restarts: 0,
+            failures: 0,
+            power: Default::default(),
+            recoveries: Vec::new(),
+            log,
+        }
+    }
+    fn snapshot(&self) -> Status {
+        let (phase, worker_pid, error) = match &self.lifecycle {
+            Lifecycle::Paused => ("paused", None, None),
+            Lifecycle::StateError(error) => ("state_error", None, Some(error.clone())),
+            Lifecycle::Starting => ("starting", None, None),
+            Lifecycle::Running(worker) => ("worker_started", Some(worker.group as u32), None),
+            Lifecycle::Stopping { pid } => ("stopping", Some(*pid), None),
+            Lifecycle::Backoff { error, .. } => ("recovering", None, Some(error.clone())),
+        };
+        let progress = match &self.lifecycle {
+            Lifecycle::Running(worker) => worker.progress.as_ref(),
+            _ => None,
+        };
+        Status {
+            logging: self.log.stats(),
+            sleep_inhibited: self.power.active(),
+            sleep_error: self.power.error.clone(),
+            api_version: 1,
+            supervisor_pid: std::process::id(),
+            worker_pid,
+            mode: self.intent.mode,
+            revision: self.intent.revision,
+            worker_generation: self.generation,
+            restarts: self.restarts,
+            phase: phase.into(),
+            error,
+            progress: progress.map(|(snapshot, _)| snapshot.clone()),
+            progress_age_seconds: progress.map(|(_, received)| received.elapsed().as_secs()),
+            recoveries: self.recoveries.clone(),
+        }
+    }
+    fn published(&self) -> Published {
+        Published {
+            status: self.snapshot(),
+            published_at: std::time::Instant::now(),
+            progress_received_at: match &self.lifecycle {
+                Lifecycle::Running(worker) => {
+                    worker.progress.as_ref().map(|(_, received)| *received)
+                }
+                _ => None,
+            },
+        }
+    }
+    fn observe(&mut self, snapshot: timelord_supervisor::progress::Snapshot) {
+        if let Lifecycle::Running(worker) = &mut self.lifecycle
+            && snapshot.worker_pid == worker.group as u32
+            && snapshot.generation == self.generation
+        {
+            let now = std::time::Instant::now();
+            if worker.watchdog.observe(snapshot.clone(), now) {
+                worker.progress = Some((snapshot, now));
+            }
+        }
+    }
+    fn needs_power(&self) -> bool {
+        self.intent.mode == Mode::Running
+            || matches!(
+                self.lifecycle,
+                Lifecycle::Running(_) | Lifecycle::Stopping { .. }
+            )
+    }
+    fn publish(&mut self, snapshots: &watch::Sender<Published>) {
+        // Keep the machine awake through backoff and until a paused worker has
+        // actually stopped. Interface lifetime has no part in this ownership.
+        let previous = self.power.error.clone();
+        self.power.set(self.needs_power());
+        if self.power.error != previous
+            && let Some(error) = &self.power.error
+        {
+            use std::io::Write;
+            let _ = writeln!(&mut self.log, "{error}");
+        }
+        snapshots.send_replace(self.published());
+    }
+    async fn retire(
+        &mut self,
+        snapshots: &watch::Sender<Published>,
+    ) -> Result<Option<(Duration, std::process::ExitStatus)>> {
+        if !matches!(self.lifecycle, Lifecycle::Running(_)) {
+            return Ok(None);
+        }
+        let Lifecycle::Running(worker) =
+            std::mem::replace(&mut self.lifecycle, Lifecycle::Starting)
+        else {
+            unreachable!()
+        };
+        let elapsed = worker.started.elapsed();
+        self.lifecycle = Lifecycle::Stopping {
+            pid: worker.group as u32,
+        };
+        self.publish(snapshots);
+        let exit = match (*worker).stop().await {
+            Ok(exit) => exit,
+            Err(error) => {
+                self.lifecycle = Lifecycle::Backoff {
+                    next: Instant::now() + Duration::from_secs(120),
+                    error: format!("Worker cleanup failed: {error:#}"),
+                };
+                self.publish(snapshots);
+                return Err(error);
+            }
+        };
+        self.lifecycle = if self.intent.mode == Mode::Paused {
+            Lifecycle::Paused
+        } else {
+            Lifecycle::Starting
+        };
+        self.publish(snapshots);
+        Ok(Some((elapsed, exit)))
+    }
+    async fn control(
+        &mut self,
+        paths: &Paths,
+        helper: &Path,
+        request: Request,
+        snapshots: &watch::Sender<Published>,
+    ) -> Result<()> {
+        if let Some(revision) = request.expected_revision {
+            ensure!(
+                revision == self.intent.revision,
+                "Run/Pause state changed; read the current revision"
+            );
+        }
+        match request.command {
+            Control::Pause | Control::Resume => {
+                let mode = if matches!(request.command, Control::Pause) {
+                    Mode::Paused
+                } else {
+                    Mode::Running
+                };
+                if mode != self.intent.mode || matches!(self.lifecycle, Lifecycle::StateError(_)) {
+                    let updated = Intent {
+                        mode,
+                        revision: self
+                            .intent
+                            .revision
+                            .checked_add(1)
+                            .context("Intent revision exhausted")?,
+                        schema_version: 1,
+                    };
+                    paths.save_intent(&updated)?;
+                    self.intent = updated;
+                }
+                if mode == Mode::Paused {
+                    self.retire(snapshots).await?;
+                    self.lifecycle = Lifecycle::Paused;
+                } else if matches!(self.lifecycle, Lifecycle::Paused | Lifecycle::StateError(_)) {
+                    self.lifecycle = Lifecycle::Starting;
+                }
+            }
+            Control::Reload => {
+                validate_before_reload(helper, &paths.config).await?;
+                self.retire(snapshots).await?;
+                if !matches!(self.lifecycle, Lifecycle::StateError(_)) {
+                    self.lifecycle = if self.intent.mode == Mode::Paused {
+                        Lifecycle::Paused
+                    } else {
+                        Lifecycle::Starting
+                    };
+                }
+            }
+            Control::Status => {}
+        }
+        self.publish(snapshots);
+        Ok(())
+    }
+    async fn tick(
+        &mut self,
+        helper: &Path,
+        config: &Path,
+        progress_path: &Path,
+        snapshots: &watch::Sender<Published>,
+    ) -> Result<()> {
+        let watchdog_failure = match &self.lifecycle {
+            Lifecycle::Running(worker) => worker.watchdog.failure(std::time::Instant::now()),
+            _ => None,
+        };
+        if watchdog_failure.is_some()
+            || matches!(&self.lifecycle, Lifecycle::Running(worker) if worker.exited()?)
+        {
+            let previous_pid = self.snapshot().worker_pid;
+            let (elapsed, exit) = self.retire(snapshots).await?.expect("failed worker");
+            let delay = retry_delay(&mut self.failures, Some(elapsed));
+            self.restarts += 1;
+            let reason = watchdog_failure.unwrap_or_else(|| format!("Worker exited: {exit}"));
+            self.recoveries.push(timelord_supervisor::Recovery {
+                timestamp_unix: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                worker_pid: previous_pid,
+                reason: reason.chars().take(512).collect(),
+            });
+            if self.recoveries.len() > 32 {
+                self.recoveries.remove(0);
+            }
+            self.lifecycle = Lifecycle::Backoff {
+                next: Instant::now() + Duration::from_secs(delay),
+                error: format!("{reason}; retry in {delay}s"),
+            };
+        }
+        let ready = matches!(self.lifecycle, Lifecycle::Starting)
+            || matches!(self.lifecycle, Lifecycle::Backoff { next, .. } if Instant::now() >= next);
+        if self.intent.mode == Mode::Running && ready {
+            self.lifecycle = match Worker::spawn(
+                helper,
+                config,
+                progress_path,
+                self.generation + 1,
+                &self.log,
+            ) {
+                Ok(worker) => {
+                    self.generation += 1;
+                    Lifecycle::Running(Box::new(worker))
+                }
+                Err(error) => {
+                    let delay = retry_delay(&mut self.failures, None);
+                    Lifecycle::Backoff {
+                        next: Instant::now() + Duration::from_secs(delay),
+                        error: format!("{error:#}"),
+                    }
+                }
+            };
+        }
+        self.publish(snapshots);
+        Ok(())
+    }
 }
 async fn run(
     paths: Paths,
@@ -406,8 +738,6 @@ async fn run(
     network: String,
 ) -> Result<()> {
     let _owner = InstanceLock::acquire(&paths.lock)?;
-    let log = timelord_supervisor::logging::Writer::rotating(paths.directory.join("worker.log"));
-    let mut power = timelord_supervisor::power::Assertion::default();
     if let Ok(meta) = fs::symlink_metadata(&paths.socket) {
         ensure!(
             meta.file_type().is_socket() && meta.uid() == unsafe { libc::geteuid() },
@@ -436,46 +766,15 @@ async fn run(
         inode: fs::symlink_metadata(&progress_path)?.ino(),
     };
     let mut buffer = [0u8; 8192];
-    let loaded = paths.load_intent();
-    let (mut intent, error) = match loaded {
-        Ok(intent) => (intent, None),
-        Err(error) => (
-            Intent {
-                mode: Mode::Paused,
-                ..Default::default()
-            },
-            Some(format!("{error:#}")),
-        ),
-    };
-    power.set(intent.mode == Mode::Running);
-    let state = Arc::new(Mutex::new(Status {
-        logging: log.stats(),
-        sleep_inhibited: power.active(),
-        sleep_error: power.error.clone(),
-        api_version: 1,
-        supervisor_pid: std::process::id(),
-        worker_pid: None,
-        mode: intent.mode,
-        revision: intent.revision,
-        worker_generation: 0,
-        restarts: 0,
-        phase: if error.is_some() {
-            "state_error"
-        } else {
-            "starting"
-        }
-        .into(),
-        error,
-        progress: None,
-        progress_age_seconds: None,
-        recoveries: Vec::new(),
-    }));
-    let tick = Arc::new(Mutex::new(std::time::Instant::now()));
+    let log = timelord_supervisor::logging::Writer::rotating(paths.directory.join("worker.log"));
+    let mut state = SupervisorState::new(paths.load_intent(), log);
+    let (snapshots, current) = watch::channel(state.published());
+    state.publish(&snapshots);
     let mut monitor = if let Some(address) = monitor_listen {
         let listener = tokio::net::TcpListener::bind(address)
             .await
             .context("Binding supervisor monitoring")?;
-        let app = monitor::routes(state.clone(), tick.clone(), network);
+        let app = monitor::routes(current.clone(), network);
         Some(tokio::spawn(async move {
             axum::serve(
                 timelord_supervisor::http::Listener::new(listener),
@@ -487,127 +786,104 @@ async fn run(
         None
     };
     let (tx, mut rx) = mpsc::channel::<Envelope>(16);
-    let mut handlers = JoinSet::new();
-    let mut worker: Option<Worker> = None;
-    let mut next = Instant::now();
-    let mut failures = 0usize;
+    // Accept status readers independently of graceful worker cleanup.
+    let mut controls = tokio::spawn(accept_controls(listener, current, tx));
     let mut timer = tokio::time::interval(Duration::from_millis(100));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let stop = signal();
     tokio::pin!(stop);
-    let result: Result<()>=async {loop {
-        tokio::select! {
-            _=&mut stop=>break,
-            result=async {monitor.as_mut().expect("monitor").await}, if monitor.is_some()=>{
-                result.context("Supervisor monitoring task failed")??;
-                anyhow::bail!("Supervisor monitoring exited unexpectedly");
-            },
-            Some(_) = handlers.join_next(), if !handlers.is_empty()=>{},
-            accepted=listener.accept()=>{
-                let(socket,_)=accepted?;
-                if handlers.len()<16 {
-                    let(state,tx)=(state.clone(),tx.clone());
-                    handlers.spawn(async move { let _=handle(socket,state,tx).await; });
-                }
-            },
-            received=progress.recv(&mut buffer)=>{
-                let size=received.context("Reading worker progress")?;
-                let generation=state.lock().expect("status").worker_generation;
-                if size < buffer.len()
-                    && let Ok(snapshot)=serde_json::from_slice::<timelord_supervisor::progress::Snapshot>(&buffer[..size])
-                    && let Some(child)=&mut worker
-                    && Some(snapshot.worker_pid)==child.child.id()
-                    && snapshot.generation==generation
-                    && child.watchdog.observe(snapshot.clone(),std::time::Instant::now()) {
-                    state.lock().expect("status").progress=Some(snapshot);
-                }
-            },
-            Some(envelope)=rx.recv()=>{
-                let update: Result<()>=async {
-                    if let Some(revision)=envelope.request.expected_revision {
-                        ensure!(revision==intent.revision,"Run/Pause state changed; read the current revision");
+    let result: Result<()> = async {
+        loop {
+            tokio::select! {
+                _ = &mut stop => break,
+                result = async { monitor.as_mut().expect("monitor").await }, if monitor.is_some() => {
+                    result.context("Supervisor monitoring task failed")??;
+                    anyhow::bail!("Supervisor monitoring exited unexpectedly");
+                },
+                received = progress.recv(&mut buffer) => {
+                    let size = received.context("Reading worker progress")?;
+                    if size < buffer.len()
+                        && let Ok(report) = serde_json::from_slice::<timelord_supervisor::progress::Snapshot>(&buffer[..size]) {
+                        state.observe(report);
+                        state.publish(&snapshots);
                     }
-                    match envelope.request.command {
-                        Control::Pause|Control::Resume=>{
-                            let mode=if matches!(envelope.request.command,Control::Pause) {Mode::Paused} else {Mode::Running};
-                            if mode!=intent.mode || state.lock().expect("status").error.is_some() {
-                                let updated=Intent {mode,revision:intent.revision.checked_add(1).context("Intent revision exhausted")?,schema_version:1};
-                                paths.save_intent(&updated)?;
-                                intent=updated;
-                            }
-                            let mut status=state.lock().expect("status");
-                            status.mode=intent.mode;status.revision=intent.revision;status.error=None;
-                        },
-                        Control::Reload|Control::Status=>{},
-                    }
-                    if matches!(envelope.request.command,Control::Reload) {validate_before_reload(&helper,&paths.config).await?;}
-                    if intent.mode==Mode::Paused || matches!(envelope.request.command,Control::Reload) {
-                        state.lock().expect("status").phase="stopping".into();
-                        if let Some(child)=worker.take() {child.stop().await?;}
-                        let mut status=state.lock().expect("status");status.worker_pid=None;status.progress=None;status.progress_age_seconds=None;
-                        status.phase=if intent.mode==Mode::Paused {"paused"} else {"starting"}.into();
-                        next=Instant::now();
-                    }
-                    power.set(intent.mode==Mode::Running);
-                    {let mut status=state.lock().expect("status");status.sleep_inhibited=power.active();status.sleep_error=power.error.clone();}
-                    Ok(())
-                }.await;
-                let error=update.err().map(|e|format!("{e:#}"));
-                let _=envelope.reply.send(Response {status:state.lock().expect("status").clone(),error});
-            },
-            _=timer.tick()=>{
-                power.set(intent.mode==Mode::Running);
-                {let mut status=state.lock().expect("status");status.logging=log.stats();status.sleep_inhibited=power.active();status.sleep_error=power.error.clone();}
-                *tick.lock().expect("supervisor tick")=std::time::Instant::now();
-                let watchdog_failure=worker.as_ref().and_then(|w|w.watchdog.failure(std::time::Instant::now()));
-                state.lock().expect("status").progress_age_seconds=worker.as_ref().and_then(|w|w.watchdog.age(std::time::Instant::now()));
-                if watchdog_failure.is_some() || worker.as_ref().map(Worker::exited).transpose()?.unwrap_or(false) {
-                    let previous_pid=worker.as_ref().and_then(|w|w.child.id());
-                    let child=worker.take().expect("worker");
-                    let elapsed=child.started.elapsed();
-                    let exit=child.stop().await?;
-                    let delay=retry_delay(&mut failures,Some(elapsed));
-                    next=Instant::now()+Duration::from_secs(delay);
-                    let mut status=state.lock().expect("status");status.worker_pid=None;status.progress=None;status.progress_age_seconds=None;status.restarts+=1;
-                    let reason=watchdog_failure.unwrap_or_else(||format!("Worker exited: {exit}"));
-                    status.recoveries.push(timelord_supervisor::Recovery {timestamp_unix:std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),worker_pid:previous_pid,reason:reason.chars().take(512).collect()});
-                    if status.recoveries.len()>32 {status.recoveries.remove(0);}
-                    status.phase="recovering".into();status.error=Some(format!("{reason}; retry in {delay}s"));
-                }
-                if worker.is_none() && intent.mode==Mode::Running && Instant::now()>=next {
-                    let generation = state.lock().expect("status").worker_generation+1;
-                    match Worker::spawn(&helper,&paths.config,&progress_path,generation,&log) {
-                        Ok(child)=>{
-                            let mut status=state.lock().expect("status");status.worker_pid=child.child.id();status.worker_generation+=1;status.progress=None;status.progress_age_seconds=None;
-                            // Process presence is not proof of productive work.
-                            status.phase="worker_started".into();status.error=None;worker=Some(child);
-                        },
-                        Err(error)=>{
-                            let delay=retry_delay(&mut failures, None);
-                            next=Instant::now()+Duration::from_secs(delay);
-                            let mut status=state.lock().expect("status");status.phase="recovering".into();status.error=Some(format!("{error:#}"));
-                        },
-                    }
-                }
-            },
+                },
+                result = &mut controls => { result??; break; },
+                Some(envelope) = rx.recv() => {
+                    let error = state.control(&paths, &helper, envelope.request, &snapshots).await
+                        .err().map(|error| format!("{error:#}"));
+                    let _ = envelope.reply.send(Response { status: state.snapshot(), error });
+                },
+                _ = timer.tick() => state.tick(&helper, &paths.config, &progress_path, &snapshots).await?,
+            }
         }
-    } Ok(())}.await;
-    // Shutdown never changes durable intent. launchd/reboot resumes a requested
-    // Run, and never overrides an explicit Pause.
-    if let Some(child) = worker {
-        child.stop().await?;
+        Ok(())
     }
+    .await;
+    // Shutdown never changes durable intent. Retire the family while retaining
+    // its sleep assertion, then RAII releases power protection on loop exit.
+    let cleanup = state.retire(&snapshots).await;
     if let Some(monitor) = monitor {
         monitor.abort();
     }
-    handlers.abort_all();
-    while handlers.join_next().await.is_some() {}
+    controls.abort();
+    // A completed accept task has already been consumed by select above.
+    if !controls.is_finished() {
+        let _ = controls.await;
+    }
+    cleanup?;
     result
 }
 
 #[cfg(test)]
-mod retry_tests {
+mod tests {
     use super::*;
+    #[test]
+    fn initial_status_projects_durable_pause_and_invalid_state() {
+        let paused = SupervisorState::new(
+            Ok(Intent {
+                mode: Mode::Paused,
+                revision: 17,
+                ..Default::default()
+            }),
+            timelord_supervisor::logging::Writer::stderr(),
+        );
+        let status = paused.snapshot();
+        assert_eq!(status.mode, Mode::Paused);
+        assert_eq!(status.phase, "paused");
+        assert_eq!(status.revision, 17);
+        assert_eq!(status.worker_pid, None);
+        assert!(!paused.needs_power());
+        let invalid = SupervisorState::new(
+            Err(anyhow::anyhow!("corrupt fixture")),
+            timelord_supervisor::logging::Writer::stderr(),
+        );
+        assert_eq!(invalid.snapshot().phase, "state_error");
+        assert!(invalid.snapshot().error.is_some());
+        assert!(!invalid.needs_power());
+    }
+    #[test]
+    fn power_follows_requested_run_through_recovery_and_actual_pause_cleanup() {
+        let mut state = SupervisorState::new(
+            Ok(Intent::default()),
+            timelord_supervisor::logging::Writer::stderr(),
+        );
+        assert!(state.needs_power());
+        state.lifecycle = Lifecycle::Backoff {
+            next: Instant::now(),
+            error: "fixture outage".into(),
+        };
+        assert!(state.needs_power());
+        assert_eq!(state.snapshot().phase, "recovering");
+        state.intent.mode = Mode::Paused;
+        state.lifecycle = Lifecycle::Stopping { pid: 123 };
+        assert!(state.needs_power());
+        assert_eq!(state.snapshot().worker_pid, Some(123));
+        assert_eq!(state.snapshot().phase, "stopping");
+        state.lifecycle = Lifecycle::Paused;
+        assert!(!state.needs_power());
+        assert_eq!(state.snapshot().worker_pid, None);
+    }
     #[test]
     fn stable_worker_resets_crash_streak_but_short_crashes_keep_backoff() {
         let mut failures = 0;
