@@ -411,6 +411,7 @@ pub async fn live_configuration(shared: &crate::Shared) -> Result<Config> {
     }
     let _initialization = crate::hardware::INITIALIZATION.lock().await;
     let progress = shared.runtime.lock().expect("runtime").progress.clone();
+
     let _discovery = progress
         .as_ref()
         .map(|p| p.begin(8, 0, 0, timelord_supervisor::progress::Stage::Discovery));
@@ -475,6 +476,39 @@ fn preserve_managed_boards(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn initialization_wait_does_not_arm_discovery_watchdog() {
+        let metrics = crate::observability::Metrics::new(timelord_core::Network::Mainnet).unwrap();
+        let mut config = Config::default();
+        config.hardware.client_binary = Some("/not-present/client".into());
+        config.hardware.driver_library = Some("/not-present/driver".into());
+        let state = crate::runtime::RuntimeState {
+            progress: Some(metrics.progress.clone()),
+            metrics: Some(metrics.clone()),
+            ..Default::default()
+        };
+        let shared = crate::Shared {
+            config,
+            assignments: vec![],
+            clients: Default::default(),
+            runtime: std::sync::Arc::new(std::sync::Mutex::new(state)),
+            started_unix: 0,
+            service_started_unix: 0,
+        };
+        let initialization = crate::hardware::INITIALIZATION.lock().await;
+        let pending = live_configuration(&shared);
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut pending)
+                .await
+                .is_err()
+        );
+        assert!(metrics.progress.snapshot(0, 1).unwrap().work[8].is_none());
+        drop(initialization);
+        assert!(pending.await.is_err());
+        assert!(metrics.progress.snapshot(0, 2).unwrap().work[8].is_none());
+    }
+
     fn configured() -> Config {
         let mut config = Config::default();
         config.hardware.boards = (0..3).map(|i| toml::from_str(&format!(
