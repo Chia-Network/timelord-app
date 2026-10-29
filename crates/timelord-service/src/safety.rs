@@ -746,7 +746,10 @@ mod tests {
         let first = std::thread::spawn(move || first.set_point("A", token, qualification().point));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let id = loop {
-            if let Some(work) = progress.snapshot(0, 1).unwrap().work[9] {
+            if let Some(work) = progress
+                .snapshot(0, 1)
+                .and_then(|snapshot| snapshot.work[9])
+            {
                 break work.id;
             }
             assert!(std::time::Instant::now() < deadline);
