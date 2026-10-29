@@ -279,6 +279,15 @@ impl Store {
         InstanceLock::acquire(&root.join(name))
     }
     fn update(&self, serial: &str, relaxing: bool, change: impl FnOnce(&mut Board)) -> Result<()> {
+        self.update_checkpoint(serial, relaxing, true, change)
+    }
+    fn update_checkpoint(
+        &self,
+        serial: &str,
+        relaxing: bool,
+        critical: bool,
+        change: impl FnOnce(&mut Board),
+    ) -> Result<()> {
         ensure!(serial_valid(serial), "Invalid persistent board serial");
         let _order = self.update_order.lock().expect("safety writer");
         let mut next = self.state.lock().expect("safety").clone();
@@ -294,7 +303,7 @@ impl Store {
         if !relaxing {
             *self.state.lock().expect("safety") = next.clone();
         }
-        self.save(&next)?;
+        self.save(&next, critical)?;
         *self.state.lock().expect("safety") = next;
         Ok(())
     }
@@ -353,16 +362,19 @@ impl Store {
         })
     }
     pub fn healthy_profile_saved(&self, serial: &str, epoch: u64) -> Result<()> {
-        self.update(serial, true, |b| {
+        // The caller retains the optional checkpoint lane for this actual job.
+        // Do not arm or replace the independent critical journal watchdog.
+        self.update_checkpoint(serial, true, false, |b| {
             if b.owner_active && b.owner_epoch == epoch && b.quarantine.is_none() {
                 b.force_safe = false;
             }
         })
     }
-    fn save(&self, state: &Saved) -> Result<()> {
+    fn save(&self, state: &Saved, critical: bool) -> Result<()> {
         let _stage = self
             .progress
             .as_ref()
+            .filter(|_| critical)
             .map(|p| p.begin(9, 0, 0, timelord_supervisor::progress::Stage::Persistence));
         let bytes = serde_json::to_vec(state)?;
         ensure!(
@@ -447,6 +459,24 @@ mod tests {
                 .force_safe
         );
     }
+    #[test]
+    fn optional_healthy_checkpoint_does_not_replace_critical_watchdog_work() {
+        use timelord_supervisor::progress::{Progress, Stage};
+        let f = Fixture::new();
+        let progress = std::sync::Arc::new(Progress::default());
+        let store = Store::open(&f.config())
+            .unwrap()
+            .monitored(progress.clone());
+        store.before_open("A", qualification().point).unwrap();
+        let epoch = store.board("A").unwrap().owner_epoch;
+        let _critical = progress.begin(9, 7, 0, Stage::Persistence);
+        let before = progress.snapshot(7, 1).unwrap().work[9].unwrap().id;
+        store.healthy_profile_saved("A", epoch).unwrap();
+        let after = progress.snapshot(7, 2).unwrap().work[9].unwrap();
+        assert_eq!(after.id, before);
+        assert_eq!(after.stage, Stage::Persistence);
+    }
+
     #[test]
     fn a_late_profile_save_cannot_clear_a_newer_owners_safety_fallback() {
         let f = Fixture::new();
