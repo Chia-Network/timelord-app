@@ -24,6 +24,11 @@ quitting it never sends Pause. Mutating commands use revisions to reject stale
 intent updates. Pause is persisted before acknowledgment and survives reboot.
 Reload retires the worker family without changing desired Run/Pause.
 
+The coordinator has one process-lifetime operational owner for health, lifecycle
+phase and progress supervision. Topology replacements retain that owner and its
+failure latch. HTTP and Prometheus project the same state; the exporter does not
+own service lifecycle decisions.
+
 Each worker owns a process group. Normal replacement terminates descendants before
 reaping the leader; a dedicated lifetime-pipe thread terminates a worker whose
 supervisor disappears and hard-kills its group after 30 seconds even if its async
@@ -126,8 +131,8 @@ session proof counters and chart scope, but never the displayed service uptime.
 ## Durable board admission and capacity recovery
 
 `board_lifecycle.rs` owns each physical serial's runtime transitions. Its private
-state records native readiness/retirement, admission awaiting an inventory epoch,
-and fault restrictions; consumers receive immutable status and capacity projections.
+state records native readiness/retirement, generation-fenced verified-engine
+evidence, admission awaiting an inventory epoch, and fault restrictions; consumers receive immutable status and capacity projections.
 Inventory reports identity observations rather than editing lifecycle flags.
 After old tasks drain, the complete board registry transfers into the replacement
 assignment generation. Rebinding a different serial resets its runtime evidence.
