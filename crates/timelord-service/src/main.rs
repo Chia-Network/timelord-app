@@ -1128,6 +1128,7 @@ mod tests {
     #[tokio::test]
     async fn topology_generations_release_owners_keep_status_and_preserve_faults() {
         let metrics = observability::Metrics::new(Network::Mainnet).unwrap();
+        let process = Arc::new(operational::State::default());
         metrics.topology_changed();
         // All ports and files belong to this fixture; no node, native binary or USB.
         let dir = std::env::temp_dir().join(format!(
@@ -1288,6 +1289,7 @@ mod tests {
     #[tokio::test]
     async fn unexpected_supervisor_exit_is_latched_as_unhealthy() {
         let metrics = observability::Metrics::new(Network::Mainnet).unwrap();
+        let process = Arc::new(operational::State::default());
         let mut tasks = JoinSet::new();
         tasks.spawn(async { Ok(()) });
         essential_exit(&mut tasks, &process).await;
@@ -1300,6 +1302,7 @@ mod tests {
     async fn observability_failures_leave_client_service_running() {
         for failure in ["io", "panic", "early_success"] {
             let metrics = observability::Metrics::new(Network::Mainnet).unwrap();
+            let process = Arc::new(operational::State::default());
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let shared = Arc::new(Shared {

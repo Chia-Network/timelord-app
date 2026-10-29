@@ -878,7 +878,10 @@ mod tests {
             command: Control::Resume,
             expected_revision: None,
         };
-        state.control(&paths, resume(), &snapshots).await.unwrap();
+        state
+            .control(&paths, Path::new("/unused/worker"), resume(), &snapshots)
+            .await
+            .unwrap();
         assert_eq!(state.intent.mode, Mode::Running);
         assert!(matches!(state.lifecycle, Lifecycle::Starting));
         let revision = state.intent.revision;
@@ -886,7 +889,10 @@ mod tests {
             next: Instant::now() + Duration::from_secs(120),
             error: "Worker crashed".into(),
         };
-        state.control(&paths, resume(), &snapshots).await.unwrap();
+        state
+            .control(&paths, Path::new("/unused/worker"), resume(), &snapshots)
+            .await
+            .unwrap();
         assert!(matches!(state.lifecycle, Lifecycle::Backoff { .. }));
         assert_eq!(state.intent.revision, revision);
         std::fs::remove_dir_all(dir).unwrap();

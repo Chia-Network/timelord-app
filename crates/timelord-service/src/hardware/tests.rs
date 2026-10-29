@@ -778,3 +778,35 @@ fn temperature_parser_rejects_nonfinite_measurements() {
         None
     );
 }
+
+#[tokio::test]
+async fn oversized_native_diagnostic_does_not_retire_the_owner_or_hide_following_telemetry() {
+    let board: BoardConfig =
+        toml::from_str("id='large-log'\nname='Large log'\nclient_port=18110\nprofile='manual'")
+            .unwrap();
+    let shared = Shared {
+        config: Config::default(),
+        assignments: vec![],
+        clients: Default::default(),
+        runtime: Default::default(),
+        started_unix: 0,
+        service_started_unix: 0,
+    };
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "printf '%4200s\\n' oversized >&2; printf 'ASIC Temp = 40 C; Frequency = 1450 MHz\\n' >&2; exec /bin/sleep 60"])
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped())
+        .kill_on_drop(true).spawn().unwrap();
+    let (ready, _rx) = oneshot::channel();
+    let mut log = ClientLog::new(child.stderr.take().unwrap(), ready);
+    assert!(!log.read(&shared, &board).await.unwrap());
+    assert!(!log.read(&shared, &board).await.unwrap());
+    assert!(child.try_wait().unwrap().is_none());
+    {
+        let state = shared.runtime.lock().unwrap();
+        let hardware = &state.boards[&board.id];
+        assert_eq!(hardware.temperature_c, Some(40.));
+        assert_eq!(hardware.temperature_samples, 1);
+        assert!(!hardware.lifecycle.status().latched_fault);
+    }
+    child.kill().await.unwrap();
+}

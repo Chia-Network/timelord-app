@@ -186,6 +186,7 @@ mod tests {
         state
             .control(
                 &paths,
+                &helper,
                 timelord_supervisor::Request {
                     command: timelord_supervisor::Control::Pause,
                     expected_revision: None,

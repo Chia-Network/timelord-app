@@ -97,6 +97,10 @@ impl ClientLog {
                 self.recent.iter().cloned().collect::<Vec<_>>().join(" | ")
             );
         };
+        let crate::bounded_lines::Line::Text(line) = line else {
+            tracing::warn!(board=%board.id, "Discarded oversized native log line (over 4096 bytes)");
+            return Ok(false);
+        };
         self.recent.push_back(line.chars().take(512).collect());
         if self.recent.len() > 8 {
             self.recent.pop_front();
