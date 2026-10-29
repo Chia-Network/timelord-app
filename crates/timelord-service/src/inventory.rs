@@ -624,7 +624,7 @@ mod tests {
         hardware.lifecycle.admitted(7);
         confirm_admitted_presence(&mut hardware, board, &devices(&[0]), 7);
         assert!(hardware.lifecycle.capacity(2, true).usable);
-        assert_eq!(hardware.lifecycle.status().admission_inventory_epoch, None);
+        assert_eq!(hardware.lifecycle.admitted_inventory_epoch(), Some(7));
         let epoch = hardware.lifecycle.admitted_inventory_epoch().unwrap();
         confirm_admitted_presence(&mut hardware, board, &[], epoch);
         assert!(!hardware.lifecycle.capacity(3, true).usable);
