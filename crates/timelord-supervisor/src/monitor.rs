@@ -95,7 +95,7 @@ mod tests {
             sequence: 1,
             ready: true,
             failed: false,
-            work: [None; 9],
+            work: [None; timelord_supervisor::progress::SLOTS],
         });
         Published {
             status,
