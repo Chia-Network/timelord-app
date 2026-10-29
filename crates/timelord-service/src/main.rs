@@ -875,6 +875,7 @@ async fn serve(
                 if inventory_task.is_none() {
                     let shared=run.shared.clone();
                     inventory_task=Some(tokio::spawn(async move{inventory::live_configuration(&shared).await}));
+
                 }
                 continue;
             }
