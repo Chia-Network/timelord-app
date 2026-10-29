@@ -840,7 +840,7 @@ async fn serve(
             continue;
         };
         let _topology = metrics.progress.begin(
-            8,
+            timelord_supervisor::progress::Resource::Topology,
             0,
             0,
             timelord_supervisor::progress::Stage::TopologyChange,
@@ -867,7 +867,7 @@ async fn serve(
         metrics
             .reconfiguring
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        metrics.inc("topology_changes_total", &[]);
+        metrics.topology_changed();
         tracing::info!(plan=?plan, "USB topology changed; replacing chain owners");
         let previous = run.shared.clone();
         run.stop().await?;
@@ -1015,7 +1015,7 @@ mod tests {
     #[tokio::test]
     async fn topology_generations_release_owners_keep_status_and_preserve_faults() {
         let metrics = observability::Metrics::new(Network::Mainnet).unwrap();
-        metrics.inc("topology_changes_total", &[]);
+        metrics.topology_changed();
         // All ports and files belong to this fixture; no node, native binary or USB.
         let dir = std::env::temp_dir().join(format!(
             "topology-{}-{}",

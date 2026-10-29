@@ -1,4 +1,5 @@
 //! Supervise only explicitly configured native clients. Initialization is sequential.
+use crate::observability::{OperatingPointReason, RestartReason};
 use crate::{
     Shared,
     automatic::{self, Action, Point, Policy},
@@ -159,10 +160,8 @@ impl ClientLog {
                 hardware.latched_fault = true;
                 state.event(Some(board.id.clone()), "thermal_stop");
                 if first && let Some(metrics) = &state.metrics {
-                    metrics.inc(
-                        "thermal_stops_total",
-                        &[&crate::observability::board(&shared.config, &board.id)],
-                    );
+                    metrics
+                        .thermal_stopped(&crate::observability::board(&shared.config, &board.id));
                 }
                 bail!("ASIC reached its configured temperature limit");
             }
@@ -175,16 +174,10 @@ impl ClientLog {
                 let engine = line
                     .split_once("VDF ")
                     .and_then(|(_, s)| s.split_once(':'))
-                    .and_then(|(n, _)| n.parse::<u8>().ok())
-                    .filter(|n| *n < 3)
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| "unknown".into());
-                metrics.inc(
-                    "asic_recoveries_total",
-                    &[
-                        &crate::observability::board(&shared.config, &board.id),
-                        &engine,
-                    ],
+                    .and_then(|(n, _)| n.parse::<u8>().ok());
+                metrics.asic_recovered(
+                    &crate::observability::board(&shared.config, &board.id),
+                    engine,
                 );
             }
         }
@@ -454,18 +447,15 @@ impl AutomaticOwner {
                     .map_err(|error| anyhow::anyhow!("{}: {error}", board.name))?;
                 if let Some(metrics) = &shared.runtime.lock().expect("runtime").metrics {
                     let kind = if !persist {
-                        "trial"
+                        OperatingPointReason::Trial
                     } else if reason.to_ascii_lowercase().contains("restor") {
-                        "restore"
+                        OperatingPointReason::Restore
                     } else {
-                        "backoff"
+                        OperatingPointReason::Backoff
                     };
-                    metrics.inc(
-                        "operating_point_changes_total",
-                        &[
-                            &crate::observability::board(&shared.config, &board.id),
-                            kind,
-                        ],
+                    metrics.operating_point_changed(
+                        &crate::observability::board(&shared.config, &board.id),
+                        kind,
                     );
                 }
                 self.policy.applied(actual, crate::unix_now(), reason);
@@ -807,7 +797,7 @@ async fn supervise_board(
     mut budget: RestartBackoff,
 ) {
     let mut ready = Some(ready);
-    let mut previous_failure = "topology";
+    let mut previous_failure = RestartReason::Topology;
     loop {
         if *shutdown.borrow() {
             return;
@@ -896,7 +886,7 @@ async fn supervise_board(
                 if thermal_rejection(&error)
                     && !state.boards.get(&board.id).is_some_and(|b| b.latched_fault)
                 {
-                    metrics.inc("thermal_stops_total", &[&label]);
+                    metrics.thermal_stopped(&label);
                 }
             }
         }

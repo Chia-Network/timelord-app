@@ -1,4 +1,5 @@
 //! Persistent native-client sessions. No USB or prover implementation lives here.
+use crate::observability::{ProofStage, SessionReason, proof_lane};
 use anyhow::{Context, Result, bail};
 use dg_xch_core::{
     blockchain::{
@@ -15,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 use timelord_core::{Assignment, Chain, Config};
-use timelord_supervisor::progress::Stage;
+use timelord_supervisor::progress::{Resource, Stage};
 use tokio::{
     io::AsyncWriteExt,
     net::TcpStream,
@@ -146,7 +147,7 @@ impl AsicBackend {
             offers,
         ))
     }
-    pub fn observe_duration(&self, chain: Chain, stage: &str, duration: Duration) {
+    pub fn observe_duration(&self, chain: Chain, stage: ProofStage, duration: Duration) {
         if let Some(metrics) = &self.runtime.lock().expect("runtime").metrics {
             metrics.duration(chain, stage, duration);
         }
@@ -307,14 +308,9 @@ impl AsicBackend {
             (state.metrics.clone(), state.metric_epoch)
         };
         let mut owner = lane.active.lock().await;
-        let lane_index = match chain {
-            Chain::Challenge => 0,
-            Chain::Reward => 1,
-            Chain::InfusedChallenge => 2,
-        };
         let progress = metrics.as_ref().map(|m| {
             m.progress.begin(
-                lane_index,
+                Resource::ProofIo(proof_lane(chain)),
                 work.generation,
                 work.iterations,
                 Stage::Preparing,
@@ -345,7 +341,7 @@ impl AsicBackend {
             let permit = lane.arithmetic.clone().acquire_owned().await?;
             let arithmetic = metrics.as_ref().map(|m| {
                 m.progress.begin(
-                    4 + lane_index,
+                    Resource::Arithmetic(proof_lane(chain)),
                     work.generation,
                     work.iterations,
                     Stage::Preparing,
@@ -359,7 +355,7 @@ impl AsicBackend {
                 let started = Instant::now();
                 let result = create_discriminant_bytes(&seed, bits);
                 if let Some(metrics) = metrics {
-                    metrics.duration(chain, "discriminant", started.elapsed());
+                    metrics.duration(chain, ProofStage::Discriminant, started.elapsed());
                 }
                 result
             }))
@@ -405,7 +401,7 @@ impl AsicBackend {
                 .await
                 .context("Waiting for ASIC client timed out")??;
                 if let Some(metrics) = &metrics {
-                    metrics.duration(chain, "client_wait", waiting.elapsed());
+                    metrics.duration(chain, ProofStage::ClientWait, waiting.elapsed());
                 }
                 // Match Python timelord: start the IPS clock when assigning the
                 // client, even if discriminant preparation is already running.
@@ -439,16 +435,13 @@ impl AsicBackend {
                         .started_once
                         .swap(true, std::sync::atomic::Ordering::Relaxed)
                     {
-                        "initial"
+                        SessionReason::Initial
                     } else if changed_input {
-                        "input_change"
+                        SessionReason::InputChange
                     } else {
-                        "reconnect"
+                        SessionReason::Reconnect
                     };
-                    metrics.inc(
-                        "vdf_sessions_started_total",
-                        &[crate::observability::chain(chain), reason],
-                    );
+                    metrics.session_started(chain, reason);
                 }
                 Active {
                     lease,
@@ -482,7 +475,7 @@ impl AsicBackend {
         let permit = lane.arithmetic.clone().acquire_owned().await?;
         let arithmetic = metrics.as_ref().map(|m| {
             m.progress.begin(
-                4 + lane_index,
+                Resource::Arithmetic(proof_lane(chain)),
                 work.generation,
                 work.iterations,
                 Stage::Verifying,
@@ -494,14 +487,15 @@ impl AsicBackend {
         })
         .await?;
         if let Some(metrics) = &metrics {
-            metrics.duration(chain, "verification", verification_started.elapsed());
+            metrics.duration(
+                chain,
+                ProofStage::Verification,
+                verification_started.elapsed(),
+            );
         }
         let result = verification.map_err(|error| {
             if let Some(metrics) = &metrics {
-                metrics.inc(
-                    "proof_verification_failures_total",
-                    &[crate::observability::chain(chain)],
-                );
+                metrics.verification_failed(chain);
             }
             AsicFailure {
                 board_id: lane.board.clone(),

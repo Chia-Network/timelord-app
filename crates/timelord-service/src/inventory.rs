@@ -418,9 +418,14 @@ pub async fn live_configuration(shared: &crate::Shared) -> Result<Config> {
         .metrics
         .as_ref()
         .map(|m| m.progress.clone());
-    let _discovery = progress
-        .as_ref()
-        .map(|p| p.begin(8, 0, 0, timelord_supervisor::progress::Stage::Discovery));
+    let _discovery = progress.as_ref().map(|p| {
+        p.begin(
+            timelord_supervisor::progress::Resource::Topology,
+            0,
+            0,
+            timelord_supervisor::progress::Stage::Discovery,
+        )
+    });
     let mut devices = discover(&shared.config).await?;
     preserve_managed_boards(
         &shared.config,
