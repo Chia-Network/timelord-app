@@ -313,7 +313,7 @@ async fn main() -> Result<()> {
         Command::Serve { config, supervised } => {
             // Install the async termination handler before the lifetime thread
             // can signal us, including while configuration/USB startup awaits.
-            let _termination =
+            let termination =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
             if supervised {
                 timelord_supervisor::watch_parent()?;
@@ -328,7 +328,12 @@ async fn main() -> Result<()> {
                     .unwrap_or(Path::new("."))
                     .join("automatic-profiles.json"),
             );
-            serve(value, config.with_extension("history.json")).await?;
+            serve(
+                value,
+                config.with_extension("history.json"),
+                shutdown_signal_from(termination),
+            )
+            .await?;
         }
         Command::Tuning { config, paused } => {
             let value = load(&config)?;
@@ -701,16 +706,29 @@ async fn start_run(
     })
 }
 
-async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
+async fn serve(
+    config: Config,
+    history_path: PathBuf,
+    signal: impl std::future::Future<Output = ()>,
+) -> Result<()> {
+    tokio::pin!(signal);
     let service_started_unix = unix_now();
     // The status listener outlives each topology. No UI or external supervisor
     // is required to restart the service after a USB change.
-    let http = TcpListener::bind(config.service.status_listen)
-        .await
-        .context("Binding status endpoint")?;
-    let config = inventory::connected_configuration(config).await?;
     let mut faults = std::collections::HashMap::new();
-    let mut run = start_run(config, history_path.clone(), &faults, service_started_unix).await?;
+    let startup = async {
+        let http = TcpListener::bind(config.service.status_listen)
+            .await
+            .context("Binding status endpoint")?;
+        let config = inventory::connected_configuration(config).await?;
+        let run = start_run(config, history_path.clone(), &faults, service_started_unix).await?;
+        Ok::<_, anyhow::Error>((http, run))
+    };
+    let (http, mut run) = tokio::select! {
+        biased;
+        _ = &mut signal => return Ok(()),
+        result = startup => result?,
+    };
     let (current, state) = watch::channel(run.shared.clone());
     let app = Router::new()
         .route("/health", get(health))
@@ -725,8 +743,6 @@ async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
             })
             .await
     });
-    let signal = shutdown_signal();
-    tokio::pin!(signal);
     let mut poll = tokio::time::interval(Duration::from_secs(5));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut topology = inventory::TopologyChange::default();
@@ -847,21 +863,39 @@ async fn idle_client(mut socket: TcpStream) -> Result<()> {
 }
 
 async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler");
-        tokio::select! {_=tokio::signal::ctrl_c()=>{},_=term.recv()=>{}}
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
+    let term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("SIGTERM handler");
+    shutdown_signal_from(term).await;
+}
+
+async fn shutdown_signal_from(mut term: tokio::signal::unix::Signal) {
+    tokio::select! {_=tokio::signal::ctrl_c()=>{},_=term.recv()=>{}}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn requested_shutdown_prevents_startup_from_binding_or_opening_hardware() {
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::default();
+        config.service.status_listen = occupied.local_addr().unwrap();
+        serve(config, PathBuf::new(), async {}).await.unwrap();
+    }
+    #[tokio::test]
+    async fn startup_sigterm_is_retained_until_shutdown_is_polled() {
+        let term =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+        assert_eq!(
+            unsafe { libc::kill(std::process::id() as i32, libc::SIGTERM) },
+            0
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::timeout(Duration::from_secs(1), shutdown_signal_from(term))
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn topology_generations_release_owners_keep_status_and_preserve_faults() {
         // All ports and files belong to this fixture; no node, native binary or USB.

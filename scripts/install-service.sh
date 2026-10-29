@@ -86,5 +86,15 @@ install -o root -g wheel -m 644 "$STAGE/new.plist" "$STAGE/installed.plist" || e
 mv "$STAGE/installed.plist" "$PLIST" || exit 1
 launchctl enable "system/$LABEL" || exit 1
 launchctl bootstrap system "$PLIST" || exit 1
+# Bootstrap only registers a job. Confirm that this launchd-owned process holds
+# the control plane, rather than accepting a foreground supervisor's response.
+CONFIRMED=false
+for attempt in 1 2 3 4 5; do
+  PID="$(launchctl print "system/$LABEL" 2>/dev/null | awk '/^[[:space:]]*pid = / { print $3; exit }')"
+  REPORTED="$(run_as_owner "$HELPER" status --config "$CONFIG" 2>/dev/null | plutil -extract status.supervisor_pid raw -o - - 2>/dev/null || true)"
+  if [[ "$PID" =~ ^[0-9]+$ && "$REPORTED" == "$PID" ]]; then CONFIRMED=true; break; fi
+  sleep 1
+done
+$CONFIRMED || { echo 'Background supervisor did not acquire ownership; restoring previous registration.' >&2; exit 1; }
 SUCCEEDED=true
 echo 'Installed background supervision. Process presence does not establish proof readiness.'

@@ -86,7 +86,8 @@ async fn main() -> Result<()> {
         }
         Action::CheckOwner { config } => {
             let paths = Paths::for_config(&config)?;
-            let _owner = InstanceLock::acquire(&paths.worker_lock)?;
+            let _supervisor = InstanceLock::acquire(&paths.lock)?;
+            let _worker = InstanceLock::acquire(&paths.worker_lock)?;
             println!("{}", serde_json::json!({"available":true}));
             Ok(())
         }
@@ -138,9 +139,19 @@ impl Drop for SocketGuard {
         }
     }
 }
+fn retry_delay(failures: &mut usize, elapsed: Option<Duration>) -> u64 {
+    if elapsed.is_some_and(|elapsed| elapsed >= Duration::from_secs(60)) {
+        *failures = 0;
+    }
+    let delay = [1, 5, 30, 60, 120][(*failures).min(4)];
+    *failures = failures.saturating_add(1);
+    delay
+}
+
 struct Worker {
     child: Child,
     group: i32,
+    started: Instant,
 }
 impl Worker {
     fn spawn(helper: &Path, config: &Path) -> Result<Self> {
@@ -157,7 +168,11 @@ impl Worker {
             .spawn()
             .context("Starting timelord worker")?;
         let group = child.id().context("Worker has no process id")? as i32;
-        Ok(Self { child, group })
+        Ok(Self {
+            child,
+            group,
+            started: Instant::now(),
+        })
     }
     fn signal(&self, signal: i32) {
         unsafe {
@@ -344,8 +359,10 @@ async fn run(paths: Paths, helper: PathBuf) -> Result<()> {
             },
             _=timer.tick()=>{
                 if worker.as_ref().map(Worker::exited).transpose()?.unwrap_or(false) {
-                    let exit=worker.take().expect("worker").stop().await?;
-                    let delay=[1,5,30,60,120][failures.min(4)]; failures=failures.saturating_add(1);
+                    let child=worker.take().expect("worker");
+                    let elapsed=child.started.elapsed();
+                    let exit=child.stop().await?;
+                    let delay=retry_delay(&mut failures, Some(elapsed));
                     next=Instant::now()+Duration::from_secs(delay);
                     let mut status=state.lock().expect("status");status.worker_pid=None;status.restarts+=1;
                     status.phase="recovering".into();status.error=Some(format!("Worker exited: {exit}; retry in {delay}s"));
@@ -358,7 +375,7 @@ async fn run(paths: Paths, helper: PathBuf) -> Result<()> {
                             status.phase="worker_started".into();status.error=None;worker=Some(child);
                         },
                         Err(error)=>{
-                            let delay=[1,5,30,60,120][failures.min(4)];failures=failures.saturating_add(1);
+                            let delay=retry_delay(&mut failures, None);
                             next=Instant::now()+Duration::from_secs(delay);
                             let mut status=state.lock().expect("status");status.phase="recovering".into();status.error=Some(format!("{error:#}"));
                         },
@@ -375,4 +392,21 @@ async fn run(paths: Paths, helper: PathBuf) -> Result<()> {
     handlers.abort_all();
     while handlers.join_next().await.is_some() {}
     result
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    #[test]
+    fn stable_worker_resets_crash_streak_but_short_crashes_keep_backoff() {
+        let mut failures = 0;
+        for expected in [1, 5, 30, 60, 120, 120] {
+            assert_eq!(
+                retry_delay(&mut failures, Some(Duration::from_secs(1))),
+                expected
+            );
+        }
+        assert_eq!(retry_delay(&mut failures, Some(Duration::from_secs(60))), 1);
+        assert_eq!(retry_delay(&mut failures, None), 5);
+    }
 }
