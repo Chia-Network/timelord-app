@@ -125,6 +125,16 @@ session proof counters and chart scope, but never the displayed service uptime.
 
 ## Durable board admission and capacity recovery
 
+`board_lifecycle.rs` owns each physical serial's runtime transitions. Its private
+state records native readiness/retirement, admission awaiting an inventory epoch,
+and fault restrictions; consumers receive immutable status and capacity projections.
+Inventory reports identity observations rather than editing lifecycle flags.
+After old tasks drain, the complete board registry transfers into the replacement
+assignment generation. Rebinding a different serial resets its runtime evidence.
+The coordinator does not select individual fields to preserve. Native sessions and
+transport live in `hardware/native.rs`; optional Automatic policy lives in
+`hardware/tuning.rs`, so Manual sessions do not construct a tuning policy.
+
 A private safety journal records each serial's active owner before opening USB.
 Confirmed native EOF shutdown clears that marker; forced/unconfirmed shutdown or
 an interrupted worker keeps the board unclean on restart. Thermal and invalid-proof
@@ -171,3 +181,20 @@ The previously persisted active-owner marker covers a crash or failed fault writ
 unknown/unclean quarantine also requires the extra cooling margin on admission.
 
 USB serial leases use the service account's private persistent `~/.timelord-usb-locks` directory, resolved through the account database. Deployment accounts need an owned writable home; `HOME` and temporary-directory cleanup do not select or rotate the namespace.
+
+Critical point changes carry the native session's opaque journal owner token.
+Beginning a native owner advances the epoch once; changing a point cannot create
+an owner, revive a retired one or mutate a successor. The safety writer publishes
+restrictions in memory before disk I/O and commits relaxations only after a durable
+checkpoint. Active point updates run off the async executor while the owner keeps
+draining thermal logs and observing shutdown. Only the actual critical writer owns
+the persistence watchdog, so a queued caller cannot replace its deadline.
+
+Optional learned profiles have one bounded process-wide writer permit retained by
+the actual blocking job across generation replacement. Their wait is bounded and
+still drains native logs; a retest requires confirmed persistence of its retry
+reservation before changing the live point. A failed optional checkpoint retains
+the current owner. Successful healthy profiles enqueue epoch-fenced evidence in
+memory; the next required safety transaction can durably clear the safe restriction.
+They never acquire the critical journal writer. Journal and status JSON schemas
+remain unchanged.

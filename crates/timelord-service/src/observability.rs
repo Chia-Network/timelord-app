@@ -365,15 +365,14 @@ pub struct Readiness {
     pub reason: &'static str,
 }
 fn board_usable(h: &crate::runtime::HardwareState, managed: bool, now: u64) -> bool {
-    !h.latched_fault
+    !h.lifecycle.status().latched_fault
         && if managed {
-            h.state == "connected"
-                && h.native_initialized
+            h.lifecycle.capacity(now, true).exploration_ready
                 && h.temperature_c.is_some_and(f64::is_finite)
                 && h.temperature_unix <= now
                 && now - h.temperature_unix <= 30
         } else {
-            h.verified_generation == Some(h.generation)
+            h.verified_generation == Some(h.lifecycle.status().generation)
         }
 }
 pub fn ready(shared: &Shared, metrics: &Metrics) -> bool {
@@ -487,7 +486,7 @@ fn snapshot(shared: &Shared, now: u64) -> (Samples, Readiness, u64) {
         }
         samples.add("board_up", &["board"], &[label], f64::from(up));
         let state_name = hardware
-            .map(|h| h.state.as_str())
+            .map(|h| h.lifecycle.status().phase.as_str())
             .unwrap_or("not_inspected");
         let state_name = if [
             "starting",
@@ -513,7 +512,9 @@ fn snapshot(shared: &Shared, now: u64) -> (Samples, Readiness, u64) {
             );
         }
         if let Some(h) = hardware {
-            if h.state == "connected" && !h.latched_fault {
+            if h.lifecycle.status().phase == crate::board_lifecycle::Phase::Connected
+                && !h.lifecycle.status().latched_fault
+            {
                 if h.temperature_unix <= now && now - h.temperature_unix <= 30 {
                     if let Some(value) = h.temperature_c.filter(|v| v.is_finite()) {
                         samples.add("board_temperature_celsius", &["board"], &[label], value);
@@ -718,9 +719,13 @@ mod tests {
         runtime.boards.insert(
             "a".into(),
             HardwareState {
-                generation: 1,
-                state: "connected".into(),
-                native_initialized: true,
+                lifecycle: crate::board_lifecycle::BoardLifecycle::fixture(
+                    crate::board_lifecycle::Phase::Connected,
+                    true,
+                    None,
+                    None,
+                    1,
+                ),
                 temperature_c: Some(40.),
                 temperature_unix: now,
                 frequency_mhz: Some(1500.),
@@ -907,7 +912,8 @@ mod tests {
             .boards
             .get_mut("a")
             .unwrap()
-            .generation = 2;
+            .lifecycle
+            .begin_attempt(crate::unix_now());
         assert_eq!(
             response(http.clone(), "/readyz").await.0,
             StatusCode::SERVICE_UNAVAILABLE
@@ -1071,7 +1077,8 @@ mod tests {
             .boards
             .get_mut("a")
             .unwrap()
-            .state = "reconnecting".into();
+            .lifecycle
+            .retry();
         let body = metrics.render(&shared, now).unwrap();
         assert_eq!(value(&body, "chia_timelord_raw_ips", &[]), None);
         assert_eq!(value(&body, "chia_timelord_board_up", &[]), Some(0.));

@@ -88,6 +88,11 @@ Configuration reads are bounded to 1 MiB. Optional profile persistence runs off 
 control loop with a bounded outstanding job; failed retest reservations hold the
 current point, while ordinary persistence errors leave proof production running.
 Critical safety persistence remains conservative and independently supervised.
+Operating-point updates carry a native-session token; a delayed update cannot
+reactivate a retired owner or overwrite its successor. Optional profile saves
+only enqueue healthy evidence in memory. The next required journal transaction
+commits that evidence, so an optional file cannot hold the safety writer. Each
+critical writer retains its watchdog identity while queued writers wait.
 Thermal/invalid-proof detection retires the native owner before fault-journal I/O.
 The RAM safety registry is not locked across filesystem writes, and telemetry keeps
 draining while a clock-change checkpoint is pending. Optional checkpoint jobs may

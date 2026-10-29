@@ -5,18 +5,20 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    fs::{self, OpenOptions},
-    io::Read,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use timelord_supervisor::{InstanceLock, Paths};
 
 const MAX_BYTES: u64 = 65536;
 const MAX_BOARDS: usize = 64;
-#[cfg(test)]
-static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NEXT: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {
@@ -72,7 +74,6 @@ pub struct Board {
     pub qualification: Option<Qualification>,
     pub updated_unix: u64,
     pub retry_after_unix: u64,
-    /// Last write-ahead request; this is not evidence of applied or verified hardware work.
     pub last_point: Option<crate::automatic::Point>,
     #[serde(default)]
     pub admission_frequency_mhz: Option<f64>,
@@ -91,10 +92,14 @@ impl Default for Saved {
         }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnerToken(u64);
+
 pub struct Store {
     path: PathBuf,
     state: Mutex<Saved>,
     update_order: Mutex<()>,
+    healthy: Mutex<BTreeMap<String, OwnerToken>>,
     progress: Option<std::sync::Arc<timelord_supervisor::progress::Progress>>,
 }
 fn serial_valid(serial: &str) -> bool {
@@ -228,6 +233,7 @@ impl Store {
             path,
             state: Mutex::new(state),
             update_order: Mutex::new(()),
+            healthy: Mutex::new(BTreeMap::new()),
             progress: None,
         })
     }
@@ -239,7 +245,7 @@ impl Store {
     ) {
         let _guard = self.state.lock().expect("fixture safety");
         let _ = entered.send(());
-        let _ = release.recv_timeout(std::time::Duration::from_secs(5));
+        let _ = release.recv_timeout(std::time::Duration::from_secs(2));
     }
     pub fn monitored(
         mut self,
@@ -279,40 +285,73 @@ impl Store {
         InstanceLock::acquire(&root.join(name))
     }
     fn update(&self, serial: &str, relaxing: bool, change: impl FnOnce(&mut Board)) -> Result<()> {
-        self.update_checkpoint(serial, relaxing, true, change)
+        self.transition(serial, relaxing, |_| true, change)
+            .map(|_| ())
     }
-    fn update_checkpoint(
+    fn transition(
         &self,
         serial: &str,
         relaxing: bool,
-        critical: bool,
+        accepts: impl FnOnce(&Board) -> bool,
         change: impl FnOnce(&mut Board),
-    ) -> Result<()> {
+    ) -> Result<bool> {
         ensure!(serial_valid(serial), "Invalid persistent board serial");
+        // Only the critical holder owns this watchdog slot. A queued writer
+        // cannot replace its ID and reset a stalled transaction's deadline.
         let _order = self.update_order.lock().expect("safety writer");
+        let _stage = self
+            .progress
+            .as_ref()
+            .map(|p| p.begin(9, 0, 0, timelord_supervisor::progress::Stage::Persistence));
         let mut next = self.state.lock().expect("safety").clone();
         ensure!(
             next.boards.contains_key(serial) || next.boards.len() < MAX_BOARDS,
             "Board safety registry is full"
         );
         let board = next.boards.entry(serial.into()).or_default();
+        if !accepts(board) {
+            return Ok(false);
+        }
+        // Optional learned-profile persistence only supplies evidence. Coalesce
+        // its relaxation into required journal work; it never owns this writer.
+        let healthy = self
+            .healthy
+            .lock()
+            .expect("healthy evidence")
+            .remove(serial);
+        if healthy == Some(OwnerToken(board.owner_epoch))
+            && board.owner_active
+            && board.quarantine.is_none()
+        {
+            board.force_safe = false;
+        }
         change(board);
         board.updated_unix = crate::unix_now();
-        // Restriction survives a write failure in memory. Admission and clearing
-        // an owner/fallback cannot take effect until persistence succeeds.
         if !relaxing {
-            *self.state.lock().expect("safety") = next.clone();
+            // Publish restrictions before I/O, but never publish a coalesced
+            // relaxation unless the complete transaction is durable.
+            let mut restrictive = next.clone();
+            if let Some(old) = self.state.lock().expect("safety").boards.get(serial)
+                && old.force_safe
+            {
+                restrictive
+                    .boards
+                    .get_mut(serial)
+                    .expect("board")
+                    .force_safe = true;
+            }
+            *self.state.lock().expect("safety") = restrictive;
         }
-        self.save(&next, critical)?;
+        self.save(&next)?;
         *self.state.lock().expect("safety") = next;
-        Ok(())
+        Ok(true)
     }
     pub fn needs_self_test(&self, serial: &str, q: &Qualification) -> bool {
         self.board(serial).is_none_or(|b| {
             b.owner_active || b.quarantine.is_some() || b.qualification.as_ref() != Some(q)
         })
     }
-    pub fn before_open(&self, serial: &str, point: crate::automatic::Point) -> Result<()> {
+    pub fn begin_owner(&self, serial: &str, point: crate::automatic::Point) -> Result<OwnerToken> {
         ensure!(
             point.frequency_mhz.is_finite()
                 && (200.0..=2200.0).contains(&point.frequency_mhz)
@@ -320,11 +359,40 @@ impl Store {
                 && (0.7..=1.0).contains(&point.voltage_v),
             "Invalid native operating point"
         );
+        let mut token = OwnerToken(0);
         self.update(serial, false, |b| {
             b.owner_active = true;
-            b.owner_epoch = b.owner_epoch.saturating_add(1);
+            b.owner_epoch = b.owner_epoch.checked_add(1).expect("owner epoch exhausted");
+            token = OwnerToken(b.owner_epoch);
             b.last_point = Some(point);
-        })
+        })?;
+        Ok(token)
+    }
+    pub fn owner_token(&self, serial: &str) -> Option<OwnerToken> {
+        self.board(serial)
+            .filter(|b| b.owner_active)
+            .map(|b| OwnerToken(b.owner_epoch))
+    }
+    /// A point request belongs to one native session and cannot begin another.
+    pub fn set_point(
+        &self,
+        serial: &str,
+        token: OwnerToken,
+        point: crate::automatic::Point,
+    ) -> Result<bool> {
+        ensure!(
+            point.frequency_mhz.is_finite()
+                && (200.0..=2200.0).contains(&point.frequency_mhz)
+                && point.voltage_v.is_finite()
+                && (0.7..=1.0).contains(&point.voltage_v),
+            "Invalid native operating point"
+        );
+        self.transition(
+            serial,
+            false,
+            |b| b.owner_active && b.owner_epoch == token.0 && b.quarantine.is_none(),
+            |b| b.last_point = Some(point),
+        )
     }
     pub fn closed(&self, serial: &str) -> Result<()> {
         self.update(serial, true, |b| b.owner_active = false)
@@ -361,21 +429,17 @@ impl Store {
             b.retry_after_unix = 0;
         })
     }
-    pub fn healthy_profile_saved(&self, serial: &str, epoch: u64) -> Result<()> {
-        // The caller retains the optional checkpoint lane for this actual job.
-        // Do not arm or replace the independent critical journal watchdog.
-        self.update_checkpoint(serial, true, false, |b| {
-            if b.owner_active && b.owner_epoch == epoch && b.quarantine.is_none() {
-                b.force_safe = false;
-            }
-        })
+    pub fn healthy_profile_saved(&self, serial: &str, token: OwnerToken) -> Result<()> {
+        ensure!(serial_valid(serial), "Invalid persistent board serial");
+        let mut pending = self.healthy.lock().expect("healthy evidence");
+        ensure!(
+            pending.contains_key(serial) || pending.len() < MAX_BOARDS,
+            "Healthy evidence registry is full"
+        );
+        pending.insert(serial.into(), token);
+        Ok(())
     }
-    fn save(&self, state: &Saved, critical: bool) -> Result<()> {
-        let _stage = self
-            .progress
-            .as_ref()
-            .filter(|_| critical)
-            .map(|p| p.begin(9, 0, 0, timelord_supervisor::progress::Stage::Persistence));
+    fn save(&self, state: &Saved) -> Result<()> {
         let bytes = serde_json::to_vec(state)?;
         ensure!(
             bytes.len() as u64 <= MAX_BYTES,
@@ -389,7 +453,6 @@ impl Store {
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
-    use std::sync::atomic::Ordering;
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
@@ -426,7 +489,7 @@ mod tests {
     fn fault_and_unclean_ownership_survive_worker_replacement_and_verified_admission_is_explicit() {
         let f = Fixture::new();
         let store = Store::open(&f.config()).unwrap();
-        store.before_open("A", qualification().point).unwrap();
+        store.begin_owner("A", qualification().point).unwrap();
         let recovered = Store::open(&f.config()).unwrap();
         let board = recovered.board("A").unwrap();
         assert_eq!(board.quarantine, Some(Reason::UncleanOwner));
@@ -441,14 +504,14 @@ mod tests {
             Some(Reason::InvalidProof)
         );
         recovered.qualify("A", qualification()).unwrap();
-        recovered.before_open("A", qualification().point).unwrap();
+        recovered.begin_owner("A", qualification().point).unwrap();
         recovered.closed("A").unwrap();
         let clean = Store::open(&f.config()).unwrap();
         assert!(clean.board("A").unwrap().quarantine.is_none());
         assert!(clean.board("A").unwrap().force_safe);
-        clean.before_open("A", qualification().point).unwrap();
+        clean.begin_owner("A", qualification().point).unwrap();
         clean
-            .healthy_profile_saved("A", clean.board("A").unwrap().owner_epoch)
+            .healthy_profile_saved("A", clean.owner_token("A").unwrap())
             .unwrap();
         clean.closed("A").unwrap();
         assert!(
@@ -460,49 +523,11 @@ mod tests {
         );
     }
     #[test]
-    fn optional_healthy_checkpoint_does_not_replace_critical_watchdog_work() {
-        use timelord_supervisor::progress::{Progress, Stage};
-        let f = Fixture::new();
-        let progress = std::sync::Arc::new(Progress::default());
-        let store = Store::open(&f.config())
-            .unwrap()
-            .monitored(progress.clone());
-        store.before_open("A", qualification().point).unwrap();
-        let epoch = store.board("A").unwrap().owner_epoch;
-        let _critical = progress.begin(9, 7, 0, Stage::Persistence);
-        let before = progress.snapshot(7, 1).unwrap().work[9].unwrap().id;
-        store.healthy_profile_saved("A", epoch).unwrap();
-        let after = progress.snapshot(7, 2).unwrap().work[9].unwrap();
-        assert_eq!(after.id, before);
-        assert_eq!(after.stage, Stage::Persistence);
-    }
-
-    #[test]
-    fn a_late_profile_save_cannot_clear_a_newer_owners_safety_fallback() {
-        let f = Fixture::new();
-        let store = Store::open(&f.config()).unwrap();
-        let q = qualification();
-        store.qualify("A", q.clone()).unwrap();
-        store.before_open("A", q.point).unwrap();
-        let old = store.board("A").unwrap().owner_epoch;
-        store.quarantine("A", Reason::InvalidProof).unwrap();
-        store.healthy_profile_saved("A", old).unwrap();
-        assert!(store.board("A").unwrap().force_safe);
-        store.qualify("A", q.clone()).unwrap();
-        store.before_open("A", q.point).unwrap();
-        store.healthy_profile_saved("A", old).unwrap();
-        assert!(store.board("A").unwrap().force_safe);
-        store
-            .healthy_profile_saved("A", store.board("A").unwrap().owner_epoch)
-            .unwrap();
-        assert!(!store.board("A").unwrap().force_safe);
-    }
-    #[test]
     fn repeated_bad_points_lower_admission_but_transport_faults_do_not() {
         let f = Fixture::new();
         let store = Store::open(&f.config()).unwrap();
         let mut point = qualification().point;
-        store.before_open("A", point).unwrap();
+        store.begin_owner("A", point).unwrap();
         store.quarantine("A", Reason::UncleanOwner).unwrap();
         assert!(store.board("A").unwrap().admission_frequency_mhz.is_none());
         store.quarantine("A", Reason::InvalidProof).unwrap();
@@ -511,7 +536,7 @@ mod tests {
             Some(1400.)
         );
         point.frequency_mhz = 1400.;
-        store.before_open("A", point).unwrap();
+        store.begin_owner("A", point).unwrap();
         store.quarantine("A", Reason::InvalidProof).unwrap();
         assert_eq!(
             Store::open(&f.config())
@@ -523,7 +548,7 @@ mod tests {
         );
         assert!(
             store
-                .before_open(
+                .begin_owner(
                     "A",
                     crate::automatic::Point {
                         frequency_mhz: f64::NAN,
@@ -534,7 +559,7 @@ mod tests {
         );
         assert!(
             store
-                .before_open(
+                .begin_owner(
                     "A",
                     crate::automatic::Point {
                         frequency_mhz: 1450.,
@@ -575,7 +600,7 @@ mod tests {
     fn failed_persistence_cannot_clear_quarantine_or_unclean_ownership() {
         let f = Fixture::new();
         let store = Store::open(&f.config()).unwrap();
-        store.before_open("A", qualification().point).unwrap();
+        store.begin_owner("A", qualification().point).unwrap();
         let old = f.0.join("saved-directory");
         let directory = store.path.parent().unwrap().to_owned();
         fs::rename(&directory, &old).unwrap();
@@ -615,5 +640,103 @@ mod tests {
         let mut invalid = qualification();
         invalid.engine_mask = 7;
         assert!(store.qualify("A", invalid).is_err());
+    }
+    #[test]
+    fn optional_healthy_evidence_never_waits_for_the_critical_writer() {
+        let f = Fixture::new();
+        let store = Store::open(&f.config()).unwrap();
+        store.begin_owner("A", qualification().point).unwrap();
+        store.quarantine("A", Reason::UncleanOwner).unwrap();
+        store.qualify("A", qualification()).unwrap();
+        let token = store.begin_owner("A", qualification().point).unwrap();
+        {
+            let _blocked_writer = store.update_order.lock().unwrap();
+            store.healthy_profile_saved("A", token).unwrap();
+            assert!(store.board("A").unwrap().force_safe);
+        }
+        store.closed("A").unwrap();
+        assert!(!store.board("A").unwrap().force_safe);
+    }
+    #[test]
+    fn delayed_point_cannot_revive_a_retired_owner_or_change_its_successor() {
+        let f = Fixture::new();
+        let store = Store::open(&f.config()).unwrap();
+        let point = qualification().point;
+        let old = store.begin_owner("A", point).unwrap();
+        store.closed("A").unwrap();
+        let changed = crate::automatic::Point {
+            frequency_mhz: 1500.,
+            ..point
+        };
+        assert!(!store.set_point("A", old, changed).unwrap());
+        assert!(!store.board("A").unwrap().owner_active);
+        let current = store.begin_owner("A", point).unwrap();
+        assert!(!store.set_point("A", old, changed).unwrap());
+        assert_eq!(store.owner_token("A"), Some(current));
+        assert_eq!(store.board("A").unwrap().last_point, Some(point));
+        assert!(store.set_point("A", current, changed).unwrap());
+        assert_eq!(store.board("A").unwrap().owner_epoch, current.0);
+        store.quarantine("A", Reason::Thermal).unwrap();
+        assert!(!store.set_point("A", current, point).unwrap());
+    }
+    #[test]
+    fn queued_old_point_cannot_modify_a_successor() {
+        let f = Fixture::new();
+        let store = std::sync::Arc::new(Store::open(&f.config()).unwrap());
+        let point = qualification().point;
+        let old = store.begin_owner("A", point).unwrap();
+        let (release, wait) = std::sync::mpsc::channel();
+        let queued = store.clone();
+        let job = std::thread::spawn(move || {
+            wait.recv().unwrap();
+            queued.set_point(
+                "A",
+                old,
+                crate::automatic::Point {
+                    frequency_mhz: 1500.,
+                    ..point
+                },
+            )
+        });
+        store.closed("A").unwrap();
+        let successor = store.begin_owner("A", point).unwrap();
+        release.send(()).unwrap();
+        assert!(!job.join().unwrap().unwrap());
+        assert_eq!(store.owner_token("A"), Some(successor));
+        assert_eq!(store.board("A").unwrap().last_point, Some(point));
+    }
+    #[test]
+    fn queued_writer_cannot_replace_the_critical_holders_watchdog() {
+        let f = Fixture::new();
+        let progress = std::sync::Arc::new(timelord_supervisor::progress::Progress::default());
+        let store = std::sync::Arc::new(
+            Store::open(&f.config())
+                .unwrap()
+                .monitored(progress.clone()),
+        );
+        let token = store.begin_owner("A", qualification().point).unwrap();
+        let held = store.state.lock().unwrap();
+        let first = store.clone();
+        let first = std::thread::spawn(move || first.set_point("A", token, qualification().point));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let id = loop {
+            if let Some(work) = progress.snapshot(0, 1).unwrap().work[9] {
+                break work.id;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        let second = store.clone();
+        let (started, waiting) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            second.set_point("A", token, qualification().point)
+        });
+        waiting.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(progress.snapshot(0, 2).unwrap().work[9].unwrap().id, id);
+        drop(held);
+        assert!(first.join().unwrap().unwrap());
+        assert!(second.join().unwrap().unwrap());
     }
 }
