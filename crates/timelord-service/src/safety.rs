@@ -101,6 +101,65 @@ pub struct Store {
 fn serial_valid(serial: &str) -> bool {
     !serial.is_empty() && serial.len() <= 15 && serial.bytes().all(|b| (33..=126).contains(&b))
 }
+// The account database, rather than HOME/TMPDIR, defines the stable host-wide
+// lease namespace. A user-owned persistent parent prevents other UIDs from
+// precreating it and keeps temporary-directory cleaners away from held inodes.
+fn account_home() -> Result<PathBuf> {
+    use std::{ffi::CStr, os::unix::ffi::OsStrExt};
+    let uid = unsafe { libc::geteuid() };
+    let mut buffer = vec![0u8; 65536];
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result = std::ptr::null_mut();
+    let status = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut entry,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    ensure!(
+        status == 0 && !result.is_null() && !entry.pw_dir.is_null(),
+        "Cannot resolve service account home"
+    );
+    let home = PathBuf::from(std::ffi::OsStr::from_bytes(
+        unsafe { CStr::from_ptr(entry.pw_dir) }.to_bytes(),
+    ));
+    let metadata = fs::symlink_metadata(&home)?;
+    ensure!(
+        home.is_absolute()
+            && metadata.is_dir()
+            && metadata.uid() == uid
+            && metadata.mode() & 0o022 == 0,
+        "Service account home must be owned, persistent and not writable by other users"
+    );
+    Ok(home)
+}
+fn lease_root() -> Result<PathBuf> {
+    #[cfg(not(test))]
+    let home = account_home()?;
+    #[cfg(test)]
+    let home = {
+        static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        ROOT.get_or_init(|| {
+            use std::os::unix::fs::DirBuilderExt;
+            let root = std::env::temp_dir().join(format!(
+                "tl-lease-home-{}-{}",
+                std::process::id(),
+                crate::unix_now()
+            ));
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&root)
+                .expect("test lease home");
+            root
+        })
+        .clone()
+    };
+    Ok(home.join(".timelord-usb-locks"))
+}
+
 impl Store {
     pub fn open(config: &Path) -> Result<Self> {
         let paths = Paths::for_config(config)?;
@@ -206,9 +265,7 @@ impl Store {
         let name = format!("usb-{:x}.lock", Sha256::digest(serial.as_bytes()));
         // USB ownership is shared across configurations, not just generations
         // of one worker. Keep a stable per-UID host lock namespace.
-        let root = Path::new("/tmp")
-            .canonicalize()?
-            .join(format!("timelord-usb-{}", unsafe { libc::geteuid() }));
+        let root = lease_root()?;
         use std::os::unix::fs::DirBuilderExt;
         match fs::DirBuilder::new().mode(0o700).create(&root) {
             Ok(()) => {}
@@ -450,6 +507,12 @@ mod tests {
                 .is_err()
         );
         assert!(store.board("B").is_none());
+    }
+    #[test]
+    fn production_lease_home_is_owned_and_outside_temporary_storage() {
+        let home = account_home().unwrap();
+        assert!(!home.starts_with("/tmp") && !home.starts_with("/private/tmp"));
+        assert!(fs::metadata(home).unwrap().is_dir());
     }
     #[test]
     fn admission_is_serial_scoped_and_exclusive_and_corruption_is_not_defaulted() {

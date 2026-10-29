@@ -757,6 +757,10 @@ async fn observation_exit(
     tracing::error!(?result, "Observability server exited unexpectedly");
 }
 
+fn retain_board_on_reconfiguration(board: &runtime::HardwareState) -> bool {
+    board.latched_fault || board.unavailable_since_unix.is_some() || board.state == "admitted"
+}
+
 async fn serve(config: Config, history_path: PathBuf, config_path: PathBuf) -> Result<()> {
     let service_started_unix = unix_now();
     // The status listener outlives each topology. No UI or external supervisor
@@ -903,7 +907,7 @@ async fn serve(config: Config, history_path: PathBuf, config_path: PathBuf) -> R
             .expect("runtime")
             .boards
             .iter()
-            .filter(|(_, b)| b.latched_fault || b.unavailable_since_unix.is_some())
+            .filter(|(_, b)| retain_board_on_reconfiguration(b))
             .map(|(id, b)| {
                 let mut fault = b.clone();
                 fault.raw_speeds.clear();
@@ -1022,6 +1026,25 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn admitted_board_remains_unavailable_across_reconfiguration_until_fresh_inventory() {
+        let board: timelord_core::BoardConfig =
+            toml::from_str("id='a'\nname='A'\nserial='A'\nclient_port=18110").unwrap();
+        let mut config = Config::default();
+        config.hardware.boards.push(board);
+        let mut hardware = runtime::HardwareState {
+            state: "admitted".into(),
+            usb_present: None,
+            ..Default::default()
+        };
+        assert!(retain_board_on_reconfiguration(&hardware));
+        let mut boards = std::collections::HashMap::from([("a".into(), hardware.clone())]);
+        assert!(hardware::unavailable_for(&config, &boards, None).contains("a"));
+        hardware.usb_present = Some(true);
+        boards.insert("a".into(), hardware);
+        assert!(!hardware::unavailable_for(&config, &boards, None).contains("a"));
+    }
+
     #[tokio::test]
     async fn topology_generations_release_owners_keep_status_and_preserve_faults() {
         let metrics = observability::Metrics::new(Network::Mainnet).unwrap();
