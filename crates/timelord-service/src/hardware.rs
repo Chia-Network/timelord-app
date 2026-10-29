@@ -500,8 +500,10 @@ impl NativeOwner {
         )?;
         if clean >= board.automatic.healthy_seconds && !self.policy.in_trial() {
             let safety = shared.runtime.lock().expect("runtime").safety.clone();
-            if let Some(store) = safety {
-                store.healthy_profile_saved(&self.serial)?;
+            if let Some(store) = safety
+                && let Err(error) = store.healthy_profile_saved(&self.serial)
+            {
+                tracing::warn!(%error, board=%board.name, "Healthy safety checkpoint failed; retaining safe restriction and native owner");
             }
         }
         Ok(())
@@ -1149,6 +1151,12 @@ async fn supervise_board(
                         preparing,
                     )
                     .await;
+                    if matches!(checked, Ok(admission::Outcome::Cancelled)) {
+                        // Admission reports cancellation only after its owner has
+                        // retired with confirmed quiescence (or before any open).
+                        store.closed(serial)?;
+                        return Ok(());
+                    }
                     if let Err(error) = checked {
                         let reason = if error
                             .downcast_ref::<crate::asic::AsicFailure>()
@@ -1664,6 +1672,75 @@ done
             5000
         );
         assert_eq!(log.recent.len(), 8);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn healthy_journal_failure_does_not_fail_profile_record_or_retire_owner() {
+        let dir = std::env::temp_dir().join(format!("tl-healthy-journal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        let store = Arc::new(crate::safety::Store::open(&config_path).unwrap());
+        let point = Point {
+            frequency_mhz: 1450.,
+            voltage_v: 1.,
+        };
+        store.before_open("fixture", point).unwrap();
+        store
+            .quarantine("fixture", crate::safety::Reason::UncleanOwner)
+            .unwrap();
+        let paths = timelord_supervisor::Paths::for_config(&config_path).unwrap();
+        let journal = paths.directory.join("board-safety.json");
+        std::fs::remove_file(&journal).unwrap();
+        std::fs::create_dir(&journal).unwrap(); // Force the atomic rename to fail.
+        let board: BoardConfig =
+            toml::from_str("id='a'\nname='A'\nserial='fixture'\nclient_port=18110").unwrap();
+        let mut config = Config::default();
+        config.hardware.automatic_state = Some(dir.join("learned.json"));
+        let runtime = crate::runtime::RuntimeState {
+            safety: Some(store.clone()),
+            ..Default::default()
+        };
+        let shared = Shared {
+            config,
+            assignments: vec![],
+            clients: Default::default(),
+            runtime: Arc::new(std::sync::Mutex::new(runtime)),
+            started_unix: 0,
+            service_started_unix: 0,
+        };
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut owner = NativeOwner {
+            experiment: None,
+            automatic: true,
+            policy: Policy::new(
+                board.automatic.clone(),
+                point,
+                crate::unix_now(),
+                vec![1450.],
+            ),
+            input: child.stdin.take().unwrap(),
+            output: BufReader::new(child.stdout.take().unwrap()),
+            sequence: 0,
+            serial: "fixture".into(),
+            engines: 1,
+            hash: "a".repeat(64),
+            host: "fixture".into(),
+            raw_window: Default::default(),
+            last_record_unix: 0,
+        };
+        owner
+            .record(&shared, &board, board.automatic.healthy_seconds)
+            .unwrap();
+        assert!(store.board("fixture").unwrap().force_safe);
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(dir.join("learned.json").is_file());
+        child.kill().await.unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 

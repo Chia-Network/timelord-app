@@ -57,6 +57,12 @@ impl Default for Rules {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Outcome {
+    Qualified,
+    Cancelled,
+}
+
 pub(super) async fn check(
     shared: &Shared,
     board: &BoardConfig,
@@ -65,8 +71,10 @@ pub(super) async fn check(
     rules: Rules,
     mut outer_shutdown: watch::Receiver<bool>,
     preparing: Option<timelord_supervisor::progress::Guard>,
-) -> Result<()> {
-    ensure!(!*outer_shutdown.borrow(), "ASIC admission cancelled");
+) -> Result<Outcome> {
+    if *outer_shutdown.borrow() {
+        return Ok(Outcome::Cancelled);
+    }
     // Do not hold the USB initialization lock or its deadline while waiting for
     // a trial to yield. Pending admission prevents any new exploratory raises.
     drop(preparing);
@@ -74,11 +82,11 @@ pub(super) async fn check(
     let gate = shared.runtime.lock().expect("runtime").experiments.clone();
     let _checking = tokio::select! {
         permit=gate.admission()=>permit,
-        _=outer_shutdown.changed()=>bail!("ASIC admission cancelled"),
+        _=outer_shutdown.changed()=>return Ok(Outcome::Cancelled),
     };
     let initialization = tokio::select! {
         guard=INITIALIZATION.lock()=>guard,
-        _=outer_shutdown.changed()=>bail!("ASIC admission cancelled"),
+        _=outer_shutdown.changed()=>return Ok(Outcome::Cancelled),
     };
     let progress = shared.runtime.lock().expect("runtime").progress.clone();
     let _stage = progress
@@ -145,8 +153,8 @@ pub(super) async fn check(
     ));
     if *outer_shutdown.borrow() {
         let _ = stop.send(true);
-        let _ = sockets.await;
-        bail!("ASIC admission cancelled");
+        sockets.await.context("Admission listener failed")??;
+        return Ok(Outcome::Cancelled);
     }
     let child = match launch(&private, &probe).await {
         Ok(child) => child,
@@ -257,8 +265,8 @@ pub(super) async fn check(
         Ok::<_, anyhow::Error>(())
     });
     let outcome = tokio::select! {
-        _=outer_shutdown.changed()=>Err(anyhow::anyhow!("ASIC admission cancelled by service shutdown")),
-        result=checking=>result.context("Offline ASIC admission timed out").and_then(|r|r),
+        _=outer_shutdown.changed()=>Ok(Outcome::Cancelled),
+        result=checking=>result.context("Offline ASIC admission timed out").and_then(|r|r).map(|()| Outcome::Qualified),
     };
     let _ = stop.send(true);
     backend.stop_all().await;
@@ -272,7 +280,7 @@ pub(super) async fn check(
         .and_then(|r| r);
     // Keep the admission watchdog stage until the actual native boundary retires.
     // Never time out an await and leave that owner running untracked.
-    outcome?;
+    let outcome = outcome?;
     listener_result?;
     owner_result?;
     ensure!(
@@ -285,7 +293,15 @@ pub(super) async fn check(
             .is_some_and(|h| h.quiesced),
         "Admission native owner did not confirm hardware quiescence"
     );
-    Ok(())
+    if private.runtime.lock().expect("runtime").failed_proofs != 0 {
+        return Err(crate::asic::AsicFailure {
+            board_id: board.id.clone(),
+            verification: true,
+            message: "Admission proof verification failed".into(),
+        }
+        .into());
+    }
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -358,8 +374,11 @@ mod tests {
             ("bad-proof", true, false),
             ("unclean", false, true),
             ("stale-temperature", false, false),
+            ("cancelled", false, false),
+            ("cancelled-unclean", false, true),
         ] {
             let script = dir.join(variant);
+            let cancelling = variant.starts_with("cancelled");
             let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
             std::fs::write(&script,format!(r#"#!/bin/sh
 export TL_ADMISSION_FIXTURE_PORT="$7" TL_ADMISSION_FIXTURE_ENGINES="$8" TL_ADMISSION_FIXTURE_INVALID={invalid}
@@ -368,6 +387,7 @@ pid=$!
 trap 'kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null' EXIT
 trap 'exit 143' TERM
 printf '%s\n' 'Connected to timelord, waiting for challenge' 'ASIC Temp = 40 C; Frequency = 1450 MHz' >&2
+touch {started}
 while read command version id frequency voltage; do
  printf 'TLACK 1 %s %s %s\n' "$id" "$frequency" "$voltage"
 done
@@ -375,11 +395,11 @@ kill "$pid" 2>/dev/null
 wait "$pid" 2>/dev/null
 {marker}
 exit 0
-"#,invalid=if invalid{1}else{0},exe=quote(exe.to_str().unwrap()),marker=if unconfirmed{""}else{"printf '%s\\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2"})).unwrap();
+"#,invalid=if invalid{1}else{0},exe=quote(exe.to_str().unwrap()),started=quote(script.with_extension("started").to_str().unwrap()),marker=if unconfirmed{""}else{"printf '%s\\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2"})).unwrap();
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
             let mut config = Config::default();
             let board:BoardConfig=toml::from_str("id='probe'\nname='Probe'\nserial='fixture'\nclient_port=18110\ndevice_location=1\nprofile='manual'\nfrequency_mhz=1450.0\nvoltage_v=1.0").unwrap();
-            config.hardware.client_binary = Some(script);
+            config.hardware.client_binary = Some(script.clone());
             config.hardware.boards = vec![board.clone()];
             let shared = Shared {
                 config,
@@ -390,8 +410,8 @@ exit 0
                 service_started_unix: crate::unix_now(),
             };
             let q = qualification(&shared, &board, 3).unwrap();
-            let (_stop, rx) = watch::channel(false);
-            let result = check(
+            let (stop, rx) = watch::channel(false);
+            let checking = check(
                 &shared,
                 &board,
                 &q,
@@ -402,7 +422,9 @@ exit 0
                     } else {
                         Duration::from_secs(8)
                     },
-                    cool_observation: if variant == "stale-temperature" {
+                    cool_observation: if cancelling {
+                        Duration::from_secs(30)
+                    } else if variant == "stale-temperature" {
                         Duration::from_millis(10)
                     } else {
                         Duration::ZERO
@@ -410,8 +432,27 @@ exit 0
                 },
                 rx,
                 None,
-            )
-            .await;
+            );
+            tokio::pin!(checking);
+            let result = if cancelling {
+                tokio::select! {
+                    result = &mut checking => panic!("admission exited before cancellation: {result:?}"),
+                    _ = async {
+                        while !script.with_extension("started").exists() {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    } => {
+                        stop.send(true).unwrap();
+                        checking.await
+                    }
+                }
+            } else {
+                checking.await
+            };
+            if variant == "cancelled" {
+                assert_eq!(result.unwrap(), Outcome::Cancelled);
+                continue;
+            }
             assert_eq!(result.is_ok(), variant == "good", "{variant}: {result:?}");
             if invalid {
                 assert!(
