@@ -76,7 +76,6 @@ pub struct Status<'a> {
     pub fault: Option<Fault>,
     pub fault_reason: Option<&'a str>,
     pub usb_present: Option<bool>,
-    pub admission_inventory_epoch: Option<u64>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capacity {
@@ -155,9 +154,6 @@ impl BoardLifecycle {
                 Some(Inventory::Missing) => Some(false),
                 _ => None,
             },
-            admission_inventory_epoch: self
-                .admission_inventory
-                .filter(|_| self.inventory != Some(Inventory::Present)),
         }
     }
     pub fn capacity(&self, now: u64, managed: bool) -> Capacity {
