@@ -97,7 +97,7 @@ pub struct BoardLifecycle {
     fault_reason: Option<String>,
     unavailable_since: Option<u64>,
     inventory: Option<Inventory>,
-    awaiting_inventory: Option<u64>,
+    admission_inventory: Option<u64>,
 }
 impl Serialize for BoardLifecycle {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -155,12 +155,14 @@ impl BoardLifecycle {
                 Some(Inventory::Missing) => Some(false),
                 _ => None,
             },
-            admission_inventory_epoch: self.awaiting_inventory,
+            admission_inventory_epoch: self
+                .admission_inventory
+                .filter(|_| self.inventory != Some(Inventory::Present)),
         }
     }
     pub fn capacity(&self, now: u64, managed: bool) -> Capacity {
         let usable = self.restriction.is_none()
-            && self.awaiting_inventory.is_none()
+            && (self.admission_inventory.is_none() || self.inventory == Some(Inventory::Present))
             && self
                 .unavailable_since
                 .is_none_or(|since| now.saturating_sub(since) < 60);
@@ -213,6 +215,7 @@ impl BoardLifecycle {
         self.verified_generation == Some(self.generation) && self.verified_slots.contains(&slot)
     }
     pub fn start_native(&mut self) {
+        self.admission_inventory = None;
         self.phase = Phase::Starting;
         self.native = Native::Initializing;
         self.fault_reason = None;
@@ -266,19 +269,25 @@ impl BoardLifecycle {
         self.restriction = None;
         self.fault_reason = None;
         self.unavailable_since = None;
-        self.awaiting_inventory = Some(epoch);
+        self.admission_inventory = Some(epoch);
         self.inventory = None;
+    }
+    /// Keep refreshing an admitted, closed board throughout layout debounce.
+    /// Native startup invalidates the ticket so open-handle omissions are ignored.
+    pub fn admitted_inventory_epoch(&self) -> Option<u64> {
+        if self.native == (Native::Retired { confirmed: true }) {
+            self.admission_inventory
+        } else {
+            None
+        }
     }
     /// epoch=None is a closed-owner discovery made by the current supervisor.
     /// A periodic probe must carry the admission epoch it observed before I/O.
     pub fn inventory(&mut self, epoch: Option<u64>, observed: Inventory) {
-        if epoch.is_some() && epoch != self.awaiting_inventory {
+        if epoch.is_some() && epoch != self.admission_inventory {
             return;
         }
         self.inventory = Some(observed);
-        if observed == Inventory::Present {
-            self.awaiting_inventory = None;
-        }
     }
     pub fn retired(&mut self, confirmed: bool, error: Option<String>, now: u64) {
         self.native = Native::Retired { confirmed };

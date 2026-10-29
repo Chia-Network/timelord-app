@@ -784,10 +784,31 @@ async fn serve(
     tokio::pin!(signal);
     let requested_config = config.clone();
     let service_started_unix = unix_now();
+    let process = Arc::new(operational::State::default());
+    process.progress.configuration(fallback);
+    // Start reporting before discovery or native initialization can wait.
+    let metrics = observability::Metrics::new(config.node.network)?;
+    let initial = Arc::new(Shared {
+        config: config.clone(),
+        assignments: vec![],
+        clients: Default::default(),
+        runtime: Arc::new(Mutex::new(runtime::RuntimeState {
+            metrics: Some(metrics.clone()),
+            process: process.clone(),
+            ..Default::default()
+        })),
+        started_unix: service_started_unix,
+        service_started_unix,
+    });
+    let (current, state) = watch::channel(initial);
+    let report_state = state.clone();
+    let _reporter = timelord_supervisor::progress::Reporter::with_readiness(
+        process.progress.clone(),
+        move || observability::ready(&report_state.borrow()),
+    )?;
     // The status listener outlives each topology. No UI or external supervisor
     // is required to restart the service after a USB change.
     let mut board_states = std::collections::HashMap::new();
-    let process = Arc::new(operational::State::default());
     let startup = async {
         let http = TcpListener::bind(config.service.status_listen)
             .await
@@ -801,8 +822,6 @@ async fn serve(
         } else {
             None
         };
-        let metrics = observability::Metrics::new(config.node.network)?;
-        process.progress.configuration(fallback);
         let safety = if config.hardware.client_binary.is_some() {
             Some(Arc::new(
                 safety::Store::open(&config_path)?.monitored(process.progress.clone()),
@@ -810,7 +829,15 @@ async fn serve(
         } else {
             None
         };
-        let config = inventory::connected_configuration(config).await?;
+        let config = {
+            let _discovery = process.progress.begin(
+                timelord_supervisor::progress::Resource::Topology,
+                0,
+                0,
+                timelord_supervisor::progress::Stage::Discovery,
+            );
+            inventory::connected_configuration(config).await?
+        };
         let run = start_run(
             config,
             history_path.clone(),
@@ -821,20 +848,14 @@ async fn serve(
             safety.clone(),
         )
         .await?;
-        Ok::<_, anyhow::Error>((http, observer, metrics, safety, run))
+        Ok::<_, anyhow::Error>((http, observer, safety, run))
     };
-    let (http, observer, metrics, safety, mut run) = tokio::select! {
+    let (http, observer, safety, mut run) = tokio::select! {
         biased;
         _ = &mut signal => return Ok(()),
         result = startup => result?,
     };
-
-    let (current, state) = watch::channel(run.shared.clone());
-    let report_state = state.clone();
-    let _reporter = timelord_supervisor::progress::Reporter::with_readiness(
-        process.progress.clone(),
-        move || observability::ready(&report_state.borrow()),
-    )?;
+    current.send_replace(run.shared.clone());
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/status", get(status))
@@ -1107,7 +1128,6 @@ mod tests {
     #[tokio::test]
     async fn topology_generations_release_owners_keep_status_and_preserve_faults() {
         let metrics = observability::Metrics::new(Network::Mainnet).unwrap();
-        let process = Arc::new(operational::State::default());
         metrics.topology_changed();
         // All ports and files belong to this fixture; no node, native binary or USB.
         let dir = std::env::temp_dir().join(format!(
@@ -1268,7 +1288,6 @@ mod tests {
     #[tokio::test]
     async fn unexpected_supervisor_exit_is_latched_as_unhealthy() {
         let metrics = observability::Metrics::new(Network::Mainnet).unwrap();
-        let process = Arc::new(operational::State::default());
         let mut tasks = JoinSet::new();
         tasks.spawn(async { Ok(()) });
         essential_exit(&mut tasks, &process).await;
@@ -1281,7 +1300,6 @@ mod tests {
     async fn observability_failures_leave_client_service_running() {
         for failure in ["io", "panic", "early_success"] {
             let metrics = observability::Metrics::new(Network::Mainnet).unwrap();
-            let process = Arc::new(operational::State::default());
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let shared = Arc::new(Shared {

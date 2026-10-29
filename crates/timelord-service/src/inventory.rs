@@ -432,8 +432,7 @@ pub async fn live_configuration(shared: &crate::Shared) -> Result<Config> {
         .iter()
         .filter_map(|(id, h)| {
             h.lifecycle
-                .status()
-                .admission_inventory_epoch
+                .admitted_inventory_epoch()
                 .map(|epoch| (id.clone(), epoch))
         })
         .collect();
@@ -614,6 +613,30 @@ mod tests {
                 serial: Some(format!("serial-{i}")),
             })
             .collect()
+    }
+    #[test]
+    fn admitted_board_unplug_during_debounce_removes_capacity_and_presence_fallback() {
+        let config = configured();
+        let board = &config.hardware.boards[0];
+        let mut state = crate::runtime::RuntimeState::default();
+        let mut hardware = crate::runtime::HardwareState::default();
+        hardware.lifecycle.begin_attempt(1);
+        hardware.lifecycle.admitted(7);
+        confirm_admitted_presence(&mut hardware, board, &devices(&[0]), 7);
+        assert!(hardware.lifecycle.capacity(2, true).usable);
+        assert_eq!(hardware.lifecycle.status().admission_inventory_epoch, None);
+        let epoch = hardware.lifecycle.admitted_inventory_epoch().unwrap();
+        confirm_admitted_presence(&mut hardware, board, &[], epoch);
+        assert!(!hardware.lifecycle.capacity(3, true).usable);
+        assert_eq!(hardware.lifecycle.status().usb_present, Some(false));
+        state.boards.insert(board.id.clone(), hardware);
+        let mut empty = vec![];
+        preserve_managed_boards(&config, &mut empty, &state, 3);
+        assert!(empty.is_empty());
+        let hardware = state.boards.get_mut(&board.id).unwrap();
+        hardware.lifecycle.start_native();
+        confirm_admitted_presence(hardware, board, &devices(&[0]), epoch);
+        assert_eq!(hardware.lifecycle.status().usb_present, Some(false));
     }
     #[test]
     fn automatic_ports_skip_http_listeners_across_hotplug() {

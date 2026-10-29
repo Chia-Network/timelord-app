@@ -388,3 +388,103 @@ fn supervised_worker_exits_when_its_supervisor_lifetime_pipe_closes() {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn supervised_startup_reports_discovery_before_a_slow_driver_returns() {
+    use std::os::unix::net::UnixDatagram;
+    use timelord_supervisor::progress::{Snapshot, Stage};
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = PathBuf::from("/private/tmp")
+        .join(format!("tl-startup-probe-{}-{unique}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    let source = directory.join("fake-driver.c");
+    let driver = directory.join("fake-driver.dylib");
+    // Only these fake enumeration exports are loaded; no USB device is opened.
+    std::fs::write(&source, "#include <stdint.h>\n#include <unistd.h>\nuint32_t FT_CreateDeviceInfoList(uint32_t *n) { sleep(30); *n=0; return 0; }\nuint32_t FT_GetDeviceInfoList(void *nodes, uint32_t *n) { return 0; }\n").unwrap();
+    assert!(
+        Command::new("cc")
+            .arg("-dynamiclib")
+            .arg(&source)
+            .arg("-o")
+            .arg(&driver)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut config = timelord_core::Config::default();
+    config.service.status_listen = reservation.local_addr().unwrap();
+    config.hardware.client_binary = Some("/usr/bin/true".into());
+    config.hardware.driver_library = Some(driver);
+    config.validate().unwrap();
+    let path = directory.join("config.toml");
+    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    let progress_path = directory.join("progress.sock");
+    let progress = UnixDatagram::bind(&progress_path).unwrap();
+    progress
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    drop(reservation);
+    let child = Command::new(env!("CARGO_BIN_EXE_timelord-service"))
+        .args(["serve", "--config"])
+        .arg(&path)
+        .env("TIMELORD_SUPERVISOR_PROGRESS", &progress_path)
+        .env("TIMELORD_SUPERVISOR_GENERATION", "7")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut fixture = Fixture { child, directory };
+    let mut sequence = None;
+    let deadline = Instant::now() + Duration::from_secs(6);
+    let mut bytes = [0u8; 8192];
+    loop {
+        let size = progress
+            .recv(&mut bytes)
+            .expect("missing startup heartbeat");
+        let report: Snapshot = serde_json::from_slice(&bytes[..size]).unwrap();
+        assert_eq!(report.worker_pid, fixture.child.id());
+        assert_eq!(report.generation, 7);
+        assert!(!report.ready);
+        if report
+            .work
+            .iter()
+            .flatten()
+            .any(|work| work.stage == Stage::Discovery)
+        {
+            if let Some(previous) = sequence {
+                assert!(report.sequence > previous);
+                break;
+            }
+            sequence = Some(report.sequence);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "USB startup was not reported as discovery"
+        );
+    }
+    assert!(fixture.child.try_wait().unwrap().is_none());
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-TERM", &fixture.child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(exit) = fixture.child.try_wait().unwrap() {
+            assert!(exit.success());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "startup cancellation did not stop the fixture"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}

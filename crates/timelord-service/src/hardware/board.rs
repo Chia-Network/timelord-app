@@ -1,6 +1,19 @@
 //! One board orchestration: discovery, admission, production lifetime and retry.
 use super::*;
 
+async fn acquire_initialization(
+    shutdown: &mut watch::Receiver<bool>,
+) -> Option<tokio::sync::MutexGuard<'static, ()>> {
+    if *shutdown.borrow() {
+        return None;
+    }
+    tokio::select! {
+        biased;
+        _ = shutdown.changed() => None,
+        guard = INITIALIZATION.lock() => Some(guard),
+    }
+}
+
 const RESTART_DELAYS: [u64; 3] = [1, 5, 30];
 pub(super) struct RestartBackoff {
     pub(super) used: usize,
@@ -183,9 +196,8 @@ pub(super) async fn supervise_board(
         let started_unix = crate::unix_now();
         let tx = ready.take().unwrap_or_else(|| oneshot::channel().0);
         // D2XX enumeration and opening must not race another board's initialization.
-        let initialization = tokio::select! {
-            guard = INITIALIZATION.lock() => guard,
-            _ = shutdown.changed() => return,
+        let Some(initialization) = acquire_initialization(&mut shutdown).await else {
+            return;
         };
         let progress = shared
             .runtime
@@ -309,7 +321,10 @@ pub(super) async fn supervise_board(
                         let _ = shutdown.changed().await;
                         return Ok(());
                     }
-                    initialization = INITIALIZATION.lock().await;
+                    let Some(guard) = acquire_initialization(&mut shutdown).await else {
+                        return Ok(());
+                    };
+                    initialization = guard;
                     preparing = Some(
                         progress.begin(
                             timelord_supervisor::progress::Resource::BoardPreparation(
@@ -321,7 +336,10 @@ pub(super) async fn supervise_board(
                             timelord_supervisor::progress::Stage::BoardPreparation,
                         ),
                     );
-                    locate(&shared, &mut board).await?;
+                    tokio::select! {
+                        result = locate(&shared, &mut board) => result?,
+                        _ = shutdown.changed() => return Ok(()),
+                    }
                 }
                 if *shutdown.borrow() {
                     return Ok(());
@@ -443,5 +461,31 @@ pub(super) async fn supervise_board(
             _ = shutdown.changed() => return,
             _ = tokio::time::sleep(delay) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn admission_reacquire_cancels_without_waiting_for_another_native_owner() {
+        let _held = INITIALIZATION.lock().await;
+        let (stop, mut shutdown) = watch::channel(false);
+        let wait = acquire_initialization(&mut shutdown);
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut wait)
+                .await
+                .is_err()
+        );
+        stop.send(true).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), wait)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut already_stopped = stop.subscribe();
+        assert!(acquire_initialization(&mut already_stopped).await.is_none());
     }
 }

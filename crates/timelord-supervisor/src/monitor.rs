@@ -145,6 +145,59 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn monitor_listener_failure_preserves_the_live_worker_and_controls() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tl-monitor-failure-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let helper = dir.join("worker");
+        std::fs::write(&helper, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = dir.join("config.toml");
+        let progress = dir.join("progress.sock");
+        let log = timelord_supervisor::logging::Writer::stderr();
+        let mut state = SupervisorState::new(Ok(Intent::default()), log.clone());
+        let worker = crate::Worker::spawn(&helper, &config, &progress, 1, &log).unwrap();
+        let pid = worker.group as u32;
+        state.lifecycle = crate::Lifecycle::Running(Box::new(worker));
+        state.generation = 1;
+        let (snapshots, current) = tokio::sync::watch::channel(state.published());
+        let mut listener = Some(tokio::spawn(async {
+            Err(std::io::Error::other("injected scrape listener failure"))
+        }));
+        crate::monitoring_exit(&mut listener, &mut state, &snapshots).await;
+        assert!(listener.is_none());
+        state
+            .tick(&helper, &config, &progress, &snapshots)
+            .await
+            .unwrap();
+        assert_eq!(state.snapshot().worker_pid, Some(pid));
+        assert_eq!(state.generation, 1);
+        assert_eq!(state.intent.mode, timelord_supervisor::Mode::Running);
+        assert!(
+            current
+                .borrow()
+                .status
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("monitoring")
+        );
+        let paths = timelord_supervisor::Paths::for_config(&config).unwrap();
+        state
+            .control(
+                &paths,
+                timelord_supervisor::Request {
+                    command: timelord_supervisor::Control::Pause,
+                    expected_revision: None,
+                },
+                &snapshots,
+            )
+            .await
+            .unwrap();
+        assert!(state.snapshot().worker_pid.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
     async fn http_and_metric_readiness_use_current_progress_and_loop_age() {
         for (progress_age, loop_age, expected_ready, expected_healthy) in [
             (0, 0, true, true),

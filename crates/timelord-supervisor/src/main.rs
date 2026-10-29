@@ -472,6 +472,7 @@ struct SupervisorState {
     power: timelord_supervisor::power::Assertion,
     recoveries: Vec<timelord_supervisor::Recovery>,
     log: timelord_supervisor::logging::Writer,
+    monitor_error: Option<String>,
 }
 impl SupervisorState {
     fn new(loaded: Result<Intent>, log: timelord_supervisor::logging::Writer) -> Self {
@@ -501,6 +502,7 @@ impl SupervisorState {
             power: Default::default(),
             recoveries: Vec::new(),
             log,
+            monitor_error: None,
         }
     }
     fn snapshot(&self) -> Status {
@@ -528,7 +530,7 @@ impl SupervisorState {
             worker_generation: self.generation,
             restarts: self.restarts,
             phase: phase.into(),
-            error,
+            error: error.or_else(|| self.monitor_error.clone()),
             progress: progress.map(|(snapshot, _)| snapshot.clone()),
             progress_age_seconds: progress.map(|(_, received)| received.elapsed().as_secs()),
             recoveries: self.recoveries.clone(),
@@ -633,6 +635,7 @@ impl SupervisorState {
                 } else {
                     Mode::Running
                 };
+                let resuming = mode == Mode::Running && self.intent.mode == Mode::Paused;
                 if mode != self.intent.mode || matches!(self.lifecycle, Lifecycle::StateError(_)) {
                     let updated = Intent {
                         mode,
@@ -649,7 +652,9 @@ impl SupervisorState {
                 if mode == Mode::Paused {
                     self.retire(snapshots).await?;
                     self.lifecycle = Lifecycle::Paused;
-                } else if matches!(self.lifecycle, Lifecycle::Paused | Lifecycle::StateError(_)) {
+                } else if resuming
+                    || matches!(self.lifecycle, Lifecycle::Paused | Lifecycle::StateError(_))
+                {
                     self.lifecycle = Lifecycle::Starting;
                 }
             }
@@ -731,6 +736,23 @@ impl SupervisorState {
         Ok(())
     }
 }
+async fn monitoring_exit(
+    monitor: &mut Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+    state: &mut SupervisorState,
+    snapshots: &watch::Sender<Published>,
+) {
+    let result = monitor.as_mut().expect("monitor").await;
+    monitor.take();
+    state.monitor_error = Some(
+        format!("Supervisor monitoring exited unexpectedly: {result:?}")
+            .chars()
+            .take(512)
+            .collect(),
+    );
+    eprintln!("{}", state.monitor_error.as_deref().expect("monitor error"));
+    state.publish(snapshots);
+}
+
 async fn run(
     paths: Paths,
     helper: PathBuf,
@@ -796,10 +818,7 @@ async fn run(
         loop {
             tokio::select! {
                 _ = &mut stop => break,
-                result = async { monitor.as_mut().expect("monitor").await }, if monitor.is_some() => {
-                    result.context("Supervisor monitoring task failed")??;
-                    anyhow::bail!("Supervisor monitoring exited unexpectedly");
-                },
+                _ = monitoring_exit(&mut monitor, &mut state, &snapshots), if monitor.is_some() => {},
                 received = progress.recv(&mut buffer) => {
                     let size = received.context("Reading worker progress")?;
                     if size < buffer.len()
@@ -838,6 +857,40 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn explicit_resume_clears_failed_pause_backoff_but_repeated_resume_does_not() {
+        let dir = std::env::temp_dir().join(format!("tl-resume-cleanup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = Paths::for_config(&dir.join("config.toml")).unwrap();
+        let mut state = SupervisorState::new(
+            Ok(Intent {
+                mode: Mode::Paused,
+                ..Default::default()
+            }),
+            timelord_supervisor::logging::Writer::stderr(),
+        );
+        state.lifecycle = Lifecycle::Backoff {
+            next: Instant::now() + Duration::from_secs(120),
+            error: "Worker cleanup failed".into(),
+        };
+        let (snapshots, _) = watch::channel(state.published());
+        let resume = || Request {
+            command: Control::Resume,
+            expected_revision: None,
+        };
+        state.control(&paths, resume(), &snapshots).await.unwrap();
+        assert_eq!(state.intent.mode, Mode::Running);
+        assert!(matches!(state.lifecycle, Lifecycle::Starting));
+        let revision = state.intent.revision;
+        state.lifecycle = Lifecycle::Backoff {
+            next: Instant::now() + Duration::from_secs(120),
+            error: "Worker crashed".into(),
+        };
+        state.control(&paths, resume(), &snapshots).await.unwrap();
+        assert!(matches!(state.lifecycle, Lifecycle::Backoff { .. }));
+        assert_eq!(state.intent.revision, revision);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn initial_status_projects_durable_pause_and_invalid_state() {
         let paused = SupervisorState::new(
