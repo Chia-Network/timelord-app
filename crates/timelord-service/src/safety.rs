@@ -5,20 +5,18 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    fs::{self, OpenOptions},
+    io::Read,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Mutex,
 };
 use timelord_supervisor::{InstanceLock, Paths};
 
 const MAX_BYTES: u64 = 65536;
 const MAX_BOARDS: usize = 64;
-static NEXT: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {
@@ -457,6 +455,7 @@ impl Store {
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::atomic::Ordering;
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {

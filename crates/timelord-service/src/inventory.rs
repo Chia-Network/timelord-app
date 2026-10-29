@@ -423,6 +423,20 @@ pub async fn live_configuration(shared: &crate::Shared) -> Result<Config> {
         0,
         timelord_supervisor::progress::Stage::Discovery,
     );
+    // Only confirm admissions that were already pending when this probe began.
+    let pending: std::collections::HashMap<_, _> = shared
+        .runtime
+        .lock()
+        .expect("runtime")
+        .boards
+        .iter()
+        .filter_map(|(id, h)| {
+            h.lifecycle
+                .status()
+                .admission_inventory_epoch
+                .map(|epoch| (id.clone(), epoch))
+        })
+        .collect();
     let mut devices = discover(&shared.config).await?;
     {
         let mut state = shared.runtime.lock().expect("runtime");
