@@ -89,9 +89,14 @@ pub(super) async fn check(
         _=outer_shutdown.changed()=>return Ok(Outcome::Cancelled),
     };
     let progress = shared.runtime.lock().expect("runtime").progress.clone();
-    let _stage = progress
-        .as_ref()
-        .map(|p| p.begin(13, 0, 360, timelord_supervisor::progress::Stage::Admission));
+    let _stage = progress.as_ref().map(|p| {
+        p.begin(
+            timelord_supervisor::progress::Resource::Admission,
+            0,
+            360,
+            timelord_supervisor::progress::Stage::Admission,
+        )
+    });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let mut probe = board.clone();
     probe.client_port = listener.local_addr()?.port();

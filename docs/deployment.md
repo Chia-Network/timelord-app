@@ -27,7 +27,9 @@ sudo /bin/bash /Applications/Timelord.app/Contents/Resources/install-service.sh 
 ```
 
 The same command with `plan` prints and validates inputs without registering a
-job. `remove` unregisters the job but preserves durable Run/Pause state. Updates
+job. `sudo /bin/bash scripts/install-service.sh remove` unregisters the fixed job
+without requiring an intact app or configuration, and preserves durable Run/Pause
+state. Keep a copy of the removal script for recovery. Updates
 must retain the same config path/account so explicit Pause is preserved.
 Configuration, node credentials and parent directories must be accessible to that
 account without a logged-in GUI or unlocked keychain. Avoid removable or network

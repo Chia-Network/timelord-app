@@ -4,7 +4,8 @@ use super::*;
 // The permit lives in the actual blocking closure, across owner generations.
 // A stalled optional file cannot accumulate more blocking jobs or own the
 // critical safety writer. A later healthy observation retries a skipped save.
-static OPTIONAL_CHECKPOINT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+static OPTIONAL_CHECKPOINT: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
 
 enum JournalDecision {
     Durable,
@@ -41,8 +42,13 @@ impl Tuning {
             .automatic_state
             .as_ref()
             .context("Automatic state path missing")?;
-        let permit = OPTIONAL_CHECKPOINT
-            .try_acquire()
+        let progress = shared.runtime.lock().expect("runtime").progress.clone();
+        let gate = progress
+            .as_ref()
+            .map(|p| p.arithmetic(timelord_supervisor::progress::Resource::OptionalCheckpoint))
+            .unwrap_or_else(|| OPTIONAL_CHECKPOINT.clone());
+        let permit = gate
+            .try_acquire_owned()
             .context("Optional checkpoint writer is busy")?;
         self.last_record_unix = crate::unix_now();
         let path = path.clone();
@@ -79,7 +85,7 @@ impl Tuning {
             .as_ref()
             .map(|p| {
                 p.begin(
-                    20,
+                    timelord_supervisor::progress::Resource::OptionalCheckpoint,
                     0,
                     0,
                     timelord_supervisor::progress::Stage::OptionalPersistence,
@@ -285,18 +291,15 @@ impl Tuning {
                     .map_err(|error| anyhow::anyhow!("{}: {error}", board.name))?;
                 if let Some(metrics) = &shared.runtime.lock().expect("runtime").metrics {
                     let kind = if !persist {
-                        "trial"
+                        crate::observability::OperatingPointReason::Trial
                     } else if reason.to_ascii_lowercase().contains("restor") {
-                        "restore"
+                        crate::observability::OperatingPointReason::Restore
                     } else {
-                        "backoff"
+                        crate::observability::OperatingPointReason::Backoff
                     };
-                    metrics.inc(
-                        "operating_point_changes_total",
-                        &[
-                            &crate::observability::board(&shared.config, &board.id),
-                            kind,
-                        ],
+                    metrics.operating_point_changed(
+                        &crate::observability::board(&shared.config, &board.id),
+                        kind,
                     );
                 }
                 self.policy.applied(actual, crate::unix_now(), reason);

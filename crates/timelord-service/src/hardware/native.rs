@@ -143,10 +143,8 @@ impl ClientLog {
                 );
                 state.event(Some(board.id.clone()), "thermal_stop");
                 if first && let Some(metrics) = &state.metrics {
-                    metrics.inc(
-                        "thermal_stops_total",
-                        &[&crate::observability::board(&shared.config, &board.id)],
-                    );
+                    metrics
+                        .thermal_stopped(&crate::observability::board(&shared.config, &board.id));
                 }
                 // Retire the native owner before attempting fault persistence.
                 drop(state);
@@ -161,16 +159,10 @@ impl ClientLog {
                 let engine = line
                     .split_once("VDF ")
                     .and_then(|(_, s)| s.split_once(':'))
-                    .and_then(|(n, _)| n.parse::<u8>().ok())
-                    .filter(|n| *n < 3)
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| "unknown".into());
-                metrics.inc(
-                    "asic_recoveries_total",
-                    &[
-                        &crate::observability::board(&shared.config, &board.id),
-                        &engine,
-                    ],
+                    .and_then(|(n, _)| n.parse::<u8>().ok());
+                metrics.asic_recovered(
+                    &crate::observability::board(&shared.config, &board.id),
+                    engine,
                 );
             }
         }

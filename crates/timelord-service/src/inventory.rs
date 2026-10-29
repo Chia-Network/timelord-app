@@ -412,9 +412,14 @@ pub async fn live_configuration(shared: &crate::Shared) -> Result<Config> {
     let _initialization = crate::hardware::INITIALIZATION.lock().await;
     let progress = shared.runtime.lock().expect("runtime").progress.clone();
 
-    let _discovery = progress
-        .as_ref()
-        .map(|p| p.begin(8, 0, 0, timelord_supervisor::progress::Stage::Discovery));
+    let _discovery = progress.as_ref().map(|p| {
+        p.begin(
+            timelord_supervisor::progress::Resource::Topology,
+            0,
+            0,
+            timelord_supervisor::progress::Stage::Discovery,
+        )
+    });
     // Only confirm admissions that were already pending when this probe began.
     let pending: std::collections::HashMap<_, _> = shared
         .runtime

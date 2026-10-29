@@ -134,7 +134,7 @@ pub(super) async fn supervise_board(
 ) {
     let safety = shared.runtime.lock().expect("runtime").safety.clone();
     let mut ready = Some(ready);
-    let mut previous_failure = "topology";
+    let mut previous_failure = crate::observability::RestartReason::Topology;
     loop {
         if *shutdown.borrow() {
             return;
@@ -197,7 +197,10 @@ pub(super) async fn supervise_board(
             .unwrap_or(0);
         let mut preparing = progress.as_ref().map(|p| {
             p.begin(
-                17 + board_index,
+                timelord_supervisor::progress::Resource::BoardPreparation(
+                    timelord_supervisor::progress::BoardSlot::from_index(board_index)
+                        .expect("at most three configured boards"),
+                ),
                 0,
                 0,
                 timelord_supervisor::progress::Stage::BoardPreparation,
@@ -300,7 +303,10 @@ pub(super) async fn supervise_board(
                     initialization = INITIALIZATION.lock().await;
                     preparing = progress.as_ref().map(|p| {
                         p.begin(
-                            17 + board_index,
+                            timelord_supervisor::progress::Resource::BoardPreparation(
+                                timelord_supervisor::progress::BoardSlot::from_index(board_index)
+                                    .expect("at most three configured boards"),
+                            ),
                             0,
                             0,
                             timelord_supervisor::progress::Stage::BoardPreparation,
@@ -363,7 +369,7 @@ pub(super) async fn supervise_board(
                         .get(&board.id)
                         .is_some_and(|b| b.lifecycle.status().latched_fault)
                 {
-                    metrics.inc("thermal_stops_total", &[&label]);
+                    metrics.thermal_stopped(&label);
                 }
             }
         }

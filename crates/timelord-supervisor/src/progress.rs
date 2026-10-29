@@ -9,6 +9,77 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Resource ownership is typed internally; only this module knows wire-slot positions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProofLane {
+    Challenge,
+    Reward,
+    InfusedChallenge,
+}
+impl ProofLane {
+    fn index(self) -> usize {
+        match self {
+            Self::Challenge => 0,
+            Self::Reward => 1,
+            Self::InfusedChallenge => 2,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoardSlot {
+    First,
+    Second,
+    Third,
+}
+impl BoardSlot {
+    pub fn from_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::First),
+            1 => Some(Self::Second),
+            2 => Some(Self::Third),
+            _ => None,
+        }
+    }
+    fn index(self) -> usize {
+        match self {
+            Self::First => 0,
+            Self::Second => 1,
+            Self::Third => 2,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resource {
+    ProofIo(ProofLane),
+    Scheduler,
+    Arithmetic(ProofLane),
+    Eligibility,
+    Topology,
+    Persistence,
+    AdmissionIo(ProofLane),
+    Admission,
+    AdmissionArithmetic(ProofLane),
+    BoardPreparation(BoardSlot),
+    OptionalCheckpoint,
+}
+impl Resource {
+    fn index(self) -> usize {
+        match self {
+            Self::ProofIo(chain) => chain.index(),
+            Self::Scheduler => 3,
+            Self::Arithmetic(chain) => 4 + chain.index(),
+            Self::Eligibility => 7,
+            Self::Topology => 8,
+            Self::Persistence => 9,
+            Self::AdmissionIo(chain) => 10 + chain.index(),
+            Self::Admission => 13,
+            Self::AdmissionArithmetic(chain) => 14 + chain.index(),
+            Self::BoardPreparation(board) => 17 + board.index(),
+            Self::OptionalCheckpoint => 20,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
@@ -104,20 +175,20 @@ impl Progress {
         self.configuration_checkpointed
             .store(true, Ordering::Relaxed);
     }
-    pub fn arithmetic(&self, lane: usize) -> Arc<tokio::sync::Semaphore> {
-        self.arithmetic[lane].clone()
+    pub fn arithmetic(&self, resource: Resource) -> Arc<tokio::sync::Semaphore> {
+        self.arithmetic[resource.index()].clone()
     }
     pub fn fail(&self) {
         self.failed.store(true, Ordering::Relaxed);
     }
     pub fn begin(
         self: &Arc<Self>,
-        lane: usize,
+        resource: Resource,
         generation: u64,
         iterations: u64,
         stage: Stage,
     ) -> Guard {
-        assert!(lane < SLOTS);
+        let lane = resource.index();
         let id = self.next.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         self.work.lock().expect("progress")[lane] = Some(Work {
             id,
@@ -420,8 +491,18 @@ mod tests {
     #[test]
     fn cancellation_and_replacement_cannot_clear_each_others_stage() {
         let progress = Arc::new(Progress::default());
-        let old = progress.begin(0, 1, 1, Stage::Verifying);
-        let new = progress.begin(0, 2, 20, Stage::Preparing);
+        let old = progress.begin(
+            Resource::ProofIo(ProofLane::Challenge),
+            1,
+            1,
+            Stage::Verifying,
+        );
+        let new = progress.begin(
+            Resource::ProofIo(ProofLane::Challenge),
+            2,
+            20,
+            Stage::Preparing,
+        );
         old.stage(Stage::NativeWork);
         drop(old);
         assert_eq!(
@@ -438,6 +519,62 @@ mod tests {
                 .all(Option::is_none)
         );
     }
+    #[test]
+    fn typed_resources_preserve_wire_slots_and_stage_changes_keep_request_identity() {
+        let progress = Arc::new(Progress::default());
+        let resources = [
+            Resource::ProofIo(ProofLane::Challenge),
+            Resource::ProofIo(ProofLane::Reward),
+            Resource::ProofIo(ProofLane::InfusedChallenge),
+            Resource::Scheduler,
+            Resource::Arithmetic(ProofLane::Challenge),
+            Resource::Arithmetic(ProofLane::Reward),
+            Resource::Arithmetic(ProofLane::InfusedChallenge),
+            Resource::Eligibility,
+            Resource::Topology,
+            Resource::Persistence,
+            Resource::AdmissionIo(ProofLane::Challenge),
+            Resource::AdmissionIo(ProofLane::Reward),
+            Resource::AdmissionIo(ProofLane::InfusedChallenge),
+            Resource::Admission,
+            Resource::AdmissionArithmetic(ProofLane::Challenge),
+            Resource::AdmissionArithmetic(ProofLane::Reward),
+            Resource::AdmissionArithmetic(ProofLane::InfusedChallenge),
+            Resource::BoardPreparation(BoardSlot::First),
+            Resource::BoardPreparation(BoardSlot::Second),
+            Resource::BoardPreparation(BoardSlot::Third),
+            Resource::OptionalCheckpoint,
+        ];
+        let guards: Vec<_> = resources
+            .into_iter()
+            .map(|resource| progress.begin(resource, 7, 42, Stage::Preparing))
+            .collect();
+        let before = progress.snapshot(9, 1).unwrap();
+        for (slot, work) in before.work.iter().enumerate() {
+            assert_eq!(work.unwrap().id, slot as u64 + 1);
+        }
+        guards[3].stage(Stage::Submitting);
+        let after = progress.snapshot(9, 2).unwrap();
+        let work = after.work[3].unwrap();
+        assert_eq!(work.id, before.work[3].unwrap().id);
+        assert_eq!(work.generation, 7);
+        assert_eq!(work.iterations, 42);
+        assert_eq!(work.stage, Stage::Submitting);
+        // Resource enums remain an internal API; the bounded wire contract stays positional.
+        let wire = serde_json::to_value(&after).unwrap();
+        assert_eq!(wire["work"].as_array().unwrap().len(), SLOTS);
+        assert_eq!(wire["work"][3]["stage"], "submitting");
+        drop(guards);
+        assert!(
+            progress
+                .snapshot(9, 3)
+                .unwrap()
+                .work
+                .iter()
+                .all(Option::is_none)
+        );
+    }
+
     #[test]
     fn missing_startup_and_runtime_heartbeats_trigger_replacement() {
         let now = Instant::now();

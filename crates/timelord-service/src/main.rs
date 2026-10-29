@@ -919,7 +919,7 @@ async fn serve(
         }
         let mut config = next.unwrap_or_else(|| run.shared.config.clone());
         let _topology = metrics.progress.begin(
-            8,
+            timelord_supervisor::progress::Resource::Topology,
             0,
             0,
             timelord_supervisor::progress::Stage::TopologyChange,
@@ -946,7 +946,7 @@ async fn serve(
         metrics
             .reconfiguring
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        metrics.inc("topology_changes_total", &[]);
+        metrics.topology_changed();
         tracing::info!(plan=?plan, "USB topology changed; replacing chain owners");
         let previous = run.shared.clone();
         run.stop().await?;
@@ -1013,7 +1013,7 @@ async fn client_listener(
                             let mut runtime = shared.runtime.lock().expect("runtime");
                             let hardware = runtime.boards.entry(id.clone()).or_default();
                             // Reusing a slot must never reuse its predecessor's verified readiness.
-                            hardware.verified_slots.remove(&slot);
+                            hardware.lifecycle.forget_slot(slot);
                             hardware.lifecycle.status().generation
                         };
                         let lease = asic::Lease { socket, board: id.clone(), slot, generation, clients: shared.clients.clone() };
@@ -1113,7 +1113,7 @@ mod tests {
     #[tokio::test]
     async fn topology_generations_release_owners_keep_status_and_preserve_faults() {
         let metrics = observability::Metrics::new(Network::Mainnet).unwrap();
-        metrics.inc("topology_changes_total", &[]);
+        metrics.topology_changed();
         // All ports and files belong to this fixture; no node, native binary or USB.
         let dir = std::env::temp_dir().join(format!(
             "topology-{}-{}",

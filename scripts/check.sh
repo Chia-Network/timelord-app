@@ -4,6 +4,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 bash scripts/bundle-inputs-test.sh
 bash scripts/release-inputs-test.sh
+bash scripts/installer-remove-test.sh
 mkdir -p build
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings

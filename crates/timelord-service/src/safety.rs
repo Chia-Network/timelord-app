@@ -299,10 +299,14 @@ impl Store {
         // Only the critical holder owns this watchdog slot. A queued writer
         // cannot replace its ID and reset a stalled transaction's deadline.
         let _order = self.update_order.lock().expect("safety writer");
-        let _stage = self
-            .progress
-            .as_ref()
-            .map(|p| p.begin(9, 0, 0, timelord_supervisor::progress::Stage::Persistence));
+        let _stage = self.progress.as_ref().map(|p| {
+            p.begin(
+                timelord_supervisor::progress::Resource::Persistence,
+                0,
+                0,
+                timelord_supervisor::progress::Stage::Persistence,
+            )
+        });
         let mut next = self.state.lock().expect("safety").clone();
         ensure!(
             next.boards.contains_key(serial) || next.boards.len() < MAX_BOARDS,

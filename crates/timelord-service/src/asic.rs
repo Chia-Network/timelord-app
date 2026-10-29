@@ -1,4 +1,5 @@
 //! Persistent native-client sessions. No USB or prover implementation lives here.
+use crate::observability::{ProofStage, SessionReason, proof_lane};
 use anyhow::{Context, Result, bail};
 use dg_xch_core::{
     blockchain::{
@@ -15,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 use timelord_core::{Assignment, Chain, Config};
-use timelord_supervisor::progress::Stage;
+use timelord_supervisor::progress::{Resource, Stage};
 use tokio::{
     io::AsyncWriteExt,
     net::TcpStream,
@@ -104,8 +105,27 @@ impl std::fmt::Display for AsicFailure {
     }
 }
 impl std::error::Error for AsicFailure {}
+#[derive(Clone, Copy)]
+enum ProofPurpose {
+    Production,
+    Admission,
+}
+impl ProofPurpose {
+    fn io(self, chain: Chain) -> Resource {
+        match self {
+            Self::Production => Resource::ProofIo(proof_lane(chain)),
+            Self::Admission => Resource::AdmissionIo(proof_lane(chain)),
+        }
+    }
+    fn arithmetic(self, chain: Chain) -> Resource {
+        match self {
+            Self::Production => Resource::Arithmetic(proof_lane(chain)),
+            Self::Admission => Resource::AdmissionArithmetic(proof_lane(chain)),
+        }
+    }
+}
 pub struct AsicBackend {
-    progress_offset: usize,
+    purpose: ProofPurpose,
     lanes: Vec<(Chain, Lane)>,
     pools: HashMap<String, Mutex<mpsc::Receiver<Lease>>>,
     runtime: Arc<SyncMutex<crate::runtime::RuntimeState>>,
@@ -140,7 +160,7 @@ impl AsicBackend {
             .collect();
         Ok((
             Self {
-                progress_offset: 0,
+                purpose: ProofPurpose::Production,
                 lanes,
                 pools,
                 runtime,
@@ -154,10 +174,10 @@ impl AsicBackend {
         runtime: Arc<SyncMutex<crate::runtime::RuntimeState>>,
     ) -> Result<(Self, HashMap<String, mpsc::Sender<Lease>>)> {
         let (mut backend, offers) = Self::new(config, assignments, runtime)?;
-        backend.progress_offset = 10;
+        backend.purpose = ProofPurpose::Admission;
         Ok((backend, offers))
     }
-    pub fn observe_duration(&self, chain: Chain, stage: &str, duration: Duration) {
+    pub fn observe_duration(&self, chain: Chain, stage: ProofStage, duration: Duration) {
         if let Some(metrics) = &self.runtime.lock().expect("runtime").metrics {
             metrics.duration(chain, stage, duration);
         }
@@ -333,15 +353,9 @@ impl AsicBackend {
             )
         };
         let mut owner = lane.active.lock().await;
-        let lane_index = self.progress_offset
-            + match chain {
-                Chain::Challenge => 0,
-                Chain::Reward => 1,
-                Chain::InfusedChallenge => 2,
-            };
         let progress = process_progress.as_ref().map(|p| {
             p.begin(
-                lane_index,
+                self.purpose.io(chain),
                 work.generation,
                 work.iterations,
                 Stage::Preparing,
@@ -371,12 +385,12 @@ impl AsicBackend {
             // an async request cannot hide stuck GMP work or queue more of it.
             let semaphore = process_progress
                 .as_ref()
-                .map(|p| p.arithmetic(4 + lane_index))
+                .map(|p| p.arithmetic(self.purpose.arithmetic(chain)))
                 .unwrap_or_else(|| lane.arithmetic.clone());
             let permit = semaphore.acquire_owned().await?;
             let arithmetic = process_progress.as_ref().map(|p| {
                 p.begin(
-                    4 + lane_index,
+                    self.purpose.arithmetic(chain),
                     work.generation,
                     work.iterations,
                     Stage::Preparing,
@@ -390,7 +404,7 @@ impl AsicBackend {
                 let started = Instant::now();
                 let result = create_discriminant_bytes(&seed, bits);
                 if let Some(metrics) = metrics {
-                    metrics.duration(chain, "discriminant", started.elapsed());
+                    metrics.duration(chain, ProofStage::Discriminant, started.elapsed());
                 }
                 result
             }))
@@ -436,7 +450,7 @@ impl AsicBackend {
                 .await
                 .context("Waiting for ASIC client timed out")??;
                 if let Some(metrics) = &metrics {
-                    metrics.duration(chain, "client_wait", waiting.elapsed());
+                    metrics.duration(chain, ProofStage::ClientWait, waiting.elapsed());
                 }
                 // Match Python timelord: start the IPS clock when assigning the
                 // client, even if discriminant preparation is already running.
@@ -470,16 +484,13 @@ impl AsicBackend {
                         .started_once
                         .swap(true, std::sync::atomic::Ordering::Relaxed)
                     {
-                        "initial"
+                        SessionReason::Initial
                     } else if changed_input {
-                        "input_change"
+                        SessionReason::InputChange
                     } else {
-                        "reconnect"
+                        SessionReason::Reconnect
                     };
-                    metrics.inc(
-                        "vdf_sessions_started_total",
-                        &[crate::observability::chain(chain), reason],
-                    );
+                    metrics.session_started(chain, reason);
                 }
                 Active {
                     lease,
@@ -512,12 +523,12 @@ impl AsicBackend {
         let verification_started = Instant::now();
         let semaphore = process_progress
             .as_ref()
-            .map(|p| p.arithmetic(4 + lane_index))
+            .map(|p| p.arithmetic(self.purpose.arithmetic(chain)))
             .unwrap_or_else(|| lane.arithmetic.clone());
         let permit = semaphore.acquire_owned().await?;
         let arithmetic = process_progress.as_ref().map(|p| {
             p.begin(
-                4 + lane_index,
+                self.purpose.arithmetic(chain),
                 work.generation,
                 work.iterations,
                 Stage::Verifying,
@@ -529,14 +540,15 @@ impl AsicBackend {
         })
         .await?;
         if let Some(metrics) = &metrics {
-            metrics.duration(chain, "verification", verification_started.elapsed());
+            metrics.duration(
+                chain,
+                ProofStage::Verification,
+                verification_started.elapsed(),
+            );
         }
         let result = verification.map_err(|error| {
             if let Some(metrics) = &metrics {
-                metrics.inc(
-                    "proof_verification_failures_total",
-                    &[crate::observability::chain(chain)],
-                );
+                metrics.verification_failed(chain);
             }
             AsicFailure {
                 board_id: lane.board.clone(),
@@ -547,8 +559,9 @@ impl AsicBackend {
         {
             let mut state = self.runtime.lock().expect("runtime");
             let hardware = state.boards.entry(lane.board.clone()).or_default();
-            hardware.verified_generation = Some(active.lease.generation);
-            hardware.verified_slots.insert(active.lease.slot);
+            hardware
+                .lifecycle
+                .verified(active.lease.generation, active.lease.slot);
         }
         let timing = ProofTiming {
             iterations: work.iterations,

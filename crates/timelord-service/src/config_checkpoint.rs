@@ -79,7 +79,7 @@ pub async fn record(
         if !sent || !observability::ready(&shared, &metrics) {
             continue;
         }
-        let permit = tokio::select! {p=metrics.progress.arithmetic(20).acquire_owned()=>p?,_=shutdown.changed()=>return Ok(())};
+        let permit = tokio::select! {p=metrics.progress.arithmetic(timelord_supervisor::progress::Resource::OptionalCheckpoint).acquire_owned()=>p?,_=shutdown.changed()=>return Ok(())};
         let stage = metrics.progress.begin(
             20,
             0,
