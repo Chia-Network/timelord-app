@@ -42,20 +42,26 @@ impl axum::serve::Listener for Listener {
     type Io = Connection;
     type Addr = std::net::SocketAddr;
     async fn accept(&mut self) -> (Connection, Self::Addr) {
+        // Await capacity before accepting. Dropping a stream and immediately
+        // retrying a ready backlog can otherwise monopolize the runtime.
+        let slot = self
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("listener slots remain open");
         loop {
             match self.inner.accept().await {
                 Ok((inner, address)) => {
-                    if let Ok(slot) = self.slots.clone().try_acquire_owned() {
-                        let _ = inner.set_nodelay(true);
-                        return (
-                            Connection {
-                                inner,
-                                _slot: slot,
-                                deadline: Box::pin(tokio::time::sleep(Duration::from_secs(60))),
-                            },
-                            address,
-                        );
-                    }
+                    let _ = inner.set_nodelay(true);
+                    return (
+                        Connection {
+                            inner,
+                            _slot: slot,
+                            deadline: Box::pin(tokio::time::sleep(Duration::from_secs(60))),
+                        },
+                        address,
+                    );
                 }
                 Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
             }
@@ -148,7 +154,7 @@ mod tests {
     use axum::serve::Listener as _;
     use tokio::io::AsyncReadExt;
     #[tokio::test]
-    async fn idle_connections_expire_and_rejecting_excess_connections_does_not_lose_capacity() {
+    async fn idle_connections_expire_and_excess_connections_wait_without_spinning() {
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = tcp.local_addr().unwrap();
         let slots = Arc::new(Semaphore::new(1));
@@ -166,12 +172,10 @@ mod tests {
                 .is_err()
         );
         let mut bytes = [0; 1];
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), excess.read(&mut bytes))
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), excess.read(&mut bytes))
                 .await
-                .unwrap()
-                .unwrap(),
-            0
+                .is_err()
         );
         accepted.deadline = Box::pin(tokio::time::sleep(Duration::from_millis(20)));
         assert_eq!(
@@ -180,7 +184,10 @@ mod tests {
         );
         drop(accepted);
         assert_eq!(slots.available_permits(), 1);
-        let _new_client = TcpStream::connect(addr).await.unwrap();
-        let (_new, _) = listener.accept().await;
+        let (mut queued, _) = listener.accept().await;
+        use tokio::io::AsyncWriteExt;
+        excess.write_all(b"x").await.unwrap();
+        queued.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(bytes, [b'x']);
     }
 }

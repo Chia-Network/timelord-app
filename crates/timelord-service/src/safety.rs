@@ -72,6 +72,7 @@ pub struct Board {
     pub qualification: Option<Qualification>,
     pub updated_unix: u64,
     pub retry_after_unix: u64,
+    /// Last write-ahead request; this is not evidence of applied or verified hardware work.
     pub last_point: Option<crate::automatic::Point>,
     #[serde(default)]
     pub admission_frequency_mhz: Option<f64>,
@@ -179,7 +180,7 @@ impl Store {
     ) {
         let _guard = self.state.lock().expect("fixture safety");
         let _ = entered.send(());
-        let _ = release.recv_timeout(std::time::Duration::from_secs(2));
+        let _ = release.recv_timeout(std::time::Duration::from_secs(5));
     }
     pub fn monitored(
         mut self,

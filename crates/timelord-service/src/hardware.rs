@@ -266,13 +266,35 @@ async fn journal_point(
         .serial
         .clone()
         .context("Managed board identity missing")?;
-    let job = tokio::task::spawn_blocking(move || store.before_open(&serial, point));
+    static JOURNALS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+    let progress = shared.runtime.lock().expect("runtime").progress.clone();
+    let gate = progress
+        .as_ref()
+        .map(|p| p.arithmetic(9))
+        .unwrap_or_else(|| JOURNALS.clone());
+    let permit = match gate.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return Ok(Some(anyhow::anyhow!(
+                "An operating-point journal is still pending; current point held"
+            )));
+        }
+    };
+    let stage = progress
+        .as_ref()
+        .map(|p| p.begin(9, 0, 0, timelord_supervisor::progress::Stage::Persistence));
+    let job = tokio::task::spawn_blocking(move || {
+        // Keep the real job and its watchdog stage/permit alive even if a log
+        // fault cancels its caller. Never queue a replacement behind it.
+        let (_permit, _stage) = (permit, stage);
+        store.before_open(&serial, point)
+    });
+    // This is write-ahead safety state, not an optional learned profile. Await
+    // the actual result while draining thermal/USB logs; a caller timeout must
+    // not report "held" and then let a detached write change the journal.
     while_logging(
-        async move {
-            tokio::time::timeout(Duration::from_secs(2), job)
-                .await
-                .context("Operating-point journal delayed; current point held")??
-        },
+        async move { job.await.context("Operating-point journal task failed")? },
         shared,
         board,
         log,
@@ -1883,6 +1905,70 @@ printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
         assert!(quiesced);
         assert_eq!(record.quarantine, Some(crate::safety::Reason::Thermal));
         assert!(!record.owner_active);
+    }
+
+    #[tokio::test]
+    async fn operating_point_journal_waits_for_the_actual_writer_and_retains_its_slot() {
+        let dir = std::env::temp_dir().join(format!("tl-critical-journal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(crate::safety::Store::open(&dir.join("config.toml")).unwrap());
+        let board: BoardConfig =
+            toml::from_str("id='a'\nname='A'\nserial='fixture'\nclient_port=18110").unwrap();
+        let mut config = Config::default();
+        config.hardware.boards.push(board.clone());
+        let progress = Arc::new(timelord_supervisor::progress::Progress::default());
+        let shared = Shared {
+            assignments: config.assignments().unwrap(),
+            config,
+            clients: Default::default(),
+            runtime: Arc::new(std::sync::Mutex::new(crate::runtime::RuntimeState {
+                safety: Some(store.clone()),
+                progress: Some(progress.clone()),
+                ..Default::default()
+            })),
+            started_unix: crate::unix_now(),
+            service_started_unix: crate::unix_now(),
+        };
+        let mut child = tokio::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (ready, _rx) = oneshot::channel();
+        let mut log = ClientLog::new(child.stderr.take().unwrap(), ready);
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let saved = store.clone();
+        let holder = std::thread::spawn(move || saved.held_fixture(entered, held));
+        waiting.recv().unwrap();
+        let point = Point {
+            frequency_mhz: 1460.,
+            voltage_v: 1.,
+        };
+        let pending = journal_point(&shared, &board, point, &mut log);
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(2100), &mut pending)
+                .await
+                .is_err(),
+            "caller treated an unfinished critical journal as a completed failure"
+        );
+        assert!(progress.arithmetic(9).try_acquire_owned().is_err());
+        release.send(()).unwrap();
+        assert!(pending.await.unwrap().is_none());
+        holder.join().unwrap();
+        assert_eq!(store.board("fixture").unwrap().last_point, Some(point));
+        assert!(progress.arithmetic(9).try_acquire_owned().is_ok());
+        let newer = Point {
+            frequency_mhz: 1470.,
+            voltage_v: 1.,
+        };
+        store.before_open("fixture", newer).unwrap();
+        assert_eq!(store.board("fixture").unwrap().last_point, Some(newer));
+        child.kill().await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
