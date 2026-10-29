@@ -138,3 +138,9 @@ registration using the same state/config/account; restore config only as an expl
 administrator action. Installer rollback restores registration on an install failure,
 not an entire app/config/credential deployment. Qualify this procedure on a canary
 before automating fleet updates.
+
+A rollback target must support the durable intent and safety-state schema. The
+board-recovery version retains owner epochs so rollback from operational hardening
+can read the same journal. Pre-supervisor GUI-only builds are not unattended
+rollback targets. Never delete the safety journal to make an incompatible reader
+start; validate the target bundle/state pair on the canary first.
