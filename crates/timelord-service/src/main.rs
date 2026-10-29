@@ -316,7 +316,7 @@ async fn main() -> Result<()> {
         Command::Serve { config, supervised } => {
             // Install the async termination handler before the lifetime thread
             // can signal us, including while configuration/USB startup awaits.
-            let _termination =
+            let termination =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
             if supervised {
                 timelord_supervisor::watch_parent()?;
@@ -331,7 +331,13 @@ async fn main() -> Result<()> {
                     .unwrap_or(Path::new("."))
                     .join("automatic-profiles.json"),
             );
-            serve(value, config.with_extension("history.json"), config).await?;
+            serve(
+                value,
+                config.with_extension("history.json"),
+                config,
+                shutdown_signal_from(termination),
+            )
+            .await?;
         }
         Command::Tuning { config, paused } => {
             let value = load(&config)?;
@@ -761,41 +767,56 @@ fn retain_board_on_reconfiguration(board: &runtime::HardwareState) -> bool {
     board.latched_fault || board.unavailable_since_unix.is_some() || board.state == "admitted"
 }
 
-async fn serve(config: Config, history_path: PathBuf, config_path: PathBuf) -> Result<()> {
+async fn serve(
+    config: Config,
+    history_path: PathBuf,
+    config_path: PathBuf,
+    signal: impl std::future::Future<Output = ()>,
+) -> Result<()> {
+    tokio::pin!(signal);
     let service_started_unix = unix_now();
     // The status listener outlives each topology. No UI or external supervisor
     // is required to restart the service after a USB change.
-    let http = TcpListener::bind(config.service.status_listen)
-        .await
-        .context("Binding status endpoint")?;
-    let observer = if let Some(address) = config.service.observability_listen {
-        Some(
-            TcpListener::bind(address)
-                .await
-                .with_context(|| format!("Binding observability endpoint {address}"))?,
-        )
-    } else {
-        None
-    };
-    let metrics = observability::Metrics::new(config.node.network)?;
-    let safety = if config.hardware.client_binary.is_some() {
-        Some(Arc::new(
-            safety::Store::open(&config_path)?.monitored(metrics.progress.clone()),
-        ))
-    } else {
-        None
-    };
-    let config = inventory::connected_configuration(config).await?;
     let mut faults = std::collections::HashMap::new();
-    let mut run = start_run(
-        config,
-        history_path.clone(),
-        &faults,
-        service_started_unix,
-        metrics.clone(),
-        safety.clone(),
-    )
-    .await?;
+    let startup = async {
+        let http = TcpListener::bind(config.service.status_listen)
+            .await
+            .context("Binding status endpoint")?;
+        let observer = if let Some(address) = config.service.observability_listen {
+            Some(
+                TcpListener::bind(address)
+                    .await
+                    .with_context(|| format!("Binding observability endpoint {address}"))?,
+            )
+        } else {
+            None
+        };
+        let metrics = observability::Metrics::new(config.node.network)?;
+        let safety = if config.hardware.client_binary.is_some() {
+            Some(Arc::new(
+                safety::Store::open(&config_path)?.monitored(metrics.progress.clone()),
+            ))
+        } else {
+            None
+        };
+        let config = inventory::connected_configuration(config).await?;
+        let run = start_run(
+            config,
+            history_path.clone(),
+            &faults,
+            service_started_unix,
+            metrics.clone(),
+            safety.clone(),
+        )
+        .await?;
+        Ok::<_, anyhow::Error>((http, observer, metrics, safety, run))
+    };
+    let (http, observer, metrics, safety, mut run) = tokio::select! {
+        biased;
+        _ = &mut signal => return Ok(()),
+        result = startup => result?,
+    };
+
     let (current, state) = watch::channel(run.shared.clone());
     let report_state = state.clone();
     let report_metrics = metrics.clone();
@@ -835,8 +856,6 @@ async fn serve(config: Config, history_path: PathBuf, config_path: PathBuf) -> R
                 .await
         })
     });
-    let signal = shutdown_signal();
-    tokio::pin!(signal);
     let mut poll = tokio::time::interval(Duration::from_secs(5));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut topology = inventory::TopologyChange::default();
@@ -1011,16 +1030,13 @@ async fn idle_client(mut socket: TcpStream) -> Result<()> {
 }
 
 async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler");
-        tokio::select! {_=tokio::signal::ctrl_c()=>{},_=term.recv()=>{}}
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
+    let term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("SIGTERM handler");
+    shutdown_signal_from(term).await;
+}
+
+async fn shutdown_signal_from(mut term: tokio::signal::unix::Signal) {
+    tokio::select! {_=tokio::signal::ctrl_c()=>{},_=term.recv()=>{}}
 }
 
 #[cfg(test)]
@@ -1043,6 +1059,29 @@ mod tests {
         hardware.usb_present = Some(true);
         boards.insert("a".into(), hardware);
         assert!(!hardware::unavailable_for(&config, &boards, None).contains("a"));
+    }
+
+    #[tokio::test]
+    async fn requested_shutdown_prevents_startup_from_binding_or_opening_hardware() {
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::default();
+        config.service.status_listen = occupied.local_addr().unwrap();
+        serve(config, PathBuf::new(), PathBuf::new(), async {})
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn startup_sigterm_is_retained_until_shutdown_is_polled() {
+        let term =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+        assert_eq!(
+            unsafe { libc::kill(std::process::id() as i32, libc::SIGTERM) },
+            0
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::timeout(Duration::from_secs(1), shutdown_signal_from(term))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

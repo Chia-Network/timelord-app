@@ -605,3 +605,28 @@ async fn deployment_monitor_survives_pause_and_never_confuses_worker_presence_wi
     );
     fixture.terminate(supervisor).await;
 }
+
+#[test]
+fn check_owner_rejects_supervisor_or_worker_ownership() {
+    let fixture = Fixture::new();
+    let paths = Paths::for_config(&fixture.config()).unwrap();
+    for path in [&paths.lock, &paths.worker_lock] {
+        let held = timelord_supervisor::InstanceLock::acquire(path).unwrap();
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_timelord-supervisor"))
+            .args(["check-owner", "--config"])
+            .arg(fixture.config())
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        drop(held);
+    }
+    assert!(
+        std::process::Command::new(env!("CARGO_BIN_EXE_timelord-supervisor"))
+            .args(["check-owner", "--config"])
+            .arg(fixture.config())
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+}
