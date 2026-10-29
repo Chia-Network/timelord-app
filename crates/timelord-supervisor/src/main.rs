@@ -424,6 +424,7 @@ impl SupervisorState {
                 } else {
                     Mode::Running
                 };
+                let resuming = mode == Mode::Running && self.intent.mode == Mode::Paused;
                 if mode != self.intent.mode || matches!(self.lifecycle, Lifecycle::StateError(_)) {
                     let updated = Intent {
                         mode,
@@ -440,7 +441,9 @@ impl SupervisorState {
                 if mode == Mode::Paused {
                     self.retire(snapshots).await?;
                     self.lifecycle = Lifecycle::Paused;
-                } else if matches!(self.lifecycle, Lifecycle::Paused | Lifecycle::StateError(_)) {
+                } else if resuming
+                    || matches!(self.lifecycle, Lifecycle::Paused | Lifecycle::StateError(_))
+                {
                     self.lifecycle = Lifecycle::Starting;
                 }
             }
@@ -551,6 +554,37 @@ async fn run(paths: Paths, helper: PathBuf) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn explicit_resume_clears_failed_pause_backoff_but_repeated_resume_does_not() {
+        let dir = std::env::temp_dir().join(format!("tl-resume-cleanup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = Paths::for_config(&dir.join("config.toml")).unwrap();
+        let mut state = SupervisorState::new(Ok(Intent {
+            mode: Mode::Paused,
+            ..Default::default()
+        }));
+        state.lifecycle = Lifecycle::Backoff {
+            next: Instant::now() + Duration::from_secs(120),
+            error: "Worker cleanup failed".into(),
+        };
+        let (snapshots, _) = watch::channel(state.snapshot());
+        let resume = || Request {
+            command: Control::Resume,
+            expected_revision: None,
+        };
+        state.control(&paths, resume(), &snapshots).await.unwrap();
+        assert_eq!(state.intent.mode, Mode::Running);
+        assert!(matches!(state.lifecycle, Lifecycle::Starting));
+        let revision = state.intent.revision;
+        state.lifecycle = Lifecycle::Backoff {
+            next: Instant::now() + Duration::from_secs(120),
+            error: "Worker crashed".into(),
+        };
+        state.control(&paths, resume(), &snapshots).await.unwrap();
+        assert!(matches!(state.lifecycle, Lifecycle::Backoff { .. }));
+        assert_eq!(state.intent.revision, revision);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn initial_status_projects_durable_pause_and_invalid_state() {
         let paused = SupervisorState::new(Ok(Intent {
