@@ -797,6 +797,7 @@ async fn serve(
             None
         };
         let metrics = observability::Metrics::new(config.node.network)?;
+        metrics.progress.configuration(fallback);
         let safety = if config.hardware.client_binary.is_some() {
             Some(Arc::new(
                 safety::Store::open(&config_path)?.monitored(metrics.progress.clone()),

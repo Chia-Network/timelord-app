@@ -339,6 +339,7 @@ async fn validate_before_reload(helper: &Path, config: &Path) -> Result<()> {
         child,
         group,
         log_tasks: Vec::new(),
+        started: Instant::now(),
         watchdog: timelord_supervisor::progress::Watchdog::new(std::time::Instant::now()),
     };
     let completed = tokio::time::timeout(Duration::from_secs(5), async {
