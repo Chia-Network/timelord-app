@@ -90,6 +90,8 @@ pub struct BoardLifecycle {
     phase: Phase,
     native: Native,
     generation: u64,
+    verified_generation: Option<u64>,
+    verified_slots: std::collections::BTreeSet<u8>,
     started_unix: u64,
     restriction: Option<Fault>,
     fault_reason: Option<String>,
@@ -183,8 +185,32 @@ impl BoardLifecycle {
     }
     pub fn begin_attempt(&mut self, now: u64) {
         self.generation = self.generation.saturating_add(1);
+        self.verified_generation = None;
+        self.verified_slots.clear();
         self.started_unix = now;
         self.start_native();
+    }
+    /// Proof evidence belongs to the native session that produced it. A late
+    /// verification cannot certify a replacement session or another physical slot.
+    pub fn verified(&mut self, generation: u64, slot: u8) -> bool {
+        if generation != self.generation || slot >= 3 {
+            return false;
+        }
+        self.verified_generation = Some(generation);
+        self.verified_slots.insert(slot);
+        true
+    }
+    pub fn forget_slot(&mut self, slot: u8) {
+        self.verified_slots.remove(&slot);
+        if self.verified_slots.is_empty() {
+            self.verified_generation = None;
+        }
+    }
+    pub fn verified_generation(&self) -> Option<u64> {
+        self.verified_generation
+    }
+    pub fn slot_verified(&self, slot: u8) -> bool {
+        self.verified_generation == Some(self.generation) && self.verified_slots.contains(&slot)
     }
     pub fn start_native(&mut self) {
         self.phase = Phase::Starting;
@@ -313,5 +339,43 @@ mod tests {
         replacement.bind(Some("B"));
         assert!(!replacement.status().latched_fault);
         assert!(!replacement.status().quiesced);
+    }
+    #[test]
+    fn proof_evidence_is_fenced_to_the_current_native_generation() {
+        let mut owner = BoardLifecycle::default();
+        owner.bind(Some("A"));
+        owner.begin_attempt(1);
+        let first = owner.status().generation;
+        assert!(owner.verified(first, 1));
+        assert_eq!(owner.verified_generation(), Some(first));
+        assert!(owner.slot_verified(1));
+        assert!(!owner.verified(first, 3));
+        owner.begin_attempt(2);
+        assert_eq!(owner.verified_generation(), None);
+        assert!(!owner.slot_verified(1));
+        assert!(!owner.verified(first, 1));
+        assert_eq!(owner.verified_generation(), None);
+        let next = owner.status().generation;
+        assert!(owner.verified(next, 2));
+        owner.forget_slot(1);
+        assert!(owner.slot_verified(2));
+        owner.forget_slot(2);
+        assert_eq!(owner.verified_generation(), None);
+    }
+    #[test]
+    fn physical_identity_rebinding_cannot_inherit_verified_slots() {
+        let mut owner = BoardLifecycle::default();
+        owner.bind(Some("A"));
+        owner.begin_attempt(1);
+        assert!(owner.verified(owner.status().generation, 0));
+        owner.bind(Some("A"));
+        assert!(owner.slot_verified(0));
+        owner.bind(Some("B"));
+        assert_eq!(owner.verified_generation(), None);
+        assert!(!owner.slot_verified(0));
+        assert_eq!(
+            serde_json::to_value(&owner).unwrap(),
+            serde_json::json!({"state":"not_inspected"})
+        );
     }
 }

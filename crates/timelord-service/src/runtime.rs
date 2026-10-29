@@ -2,6 +2,7 @@
 use crate::{
     Shared,
     asic::{AsicBackend, AsicFailure, ProofTiming},
+    observability::{PeakResult, ProofStage, SubmissionKind},
     unix_now,
 };
 use anyhow::{Context, Result, bail};
@@ -15,7 +16,6 @@ use dg_xch_servers::transport::{
 };
 use dg_xch_timelord::scheduler::{Output, Scheduler, WorkPlan, WorkResult};
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -29,192 +29,9 @@ use tokio_tungstenite::{
 };
 
 pub type Socket = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Observation {
-    pub id: u64,
-    pub chain: Chain,
-    pub timestamp_unix: u64,
-    pub work_started_unix: u64,
-    pub ips: f64,
-}
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Event {
-    pub id: u64,
-    pub timestamp_unix: u64,
-    pub board_id: Option<String>,
-    pub kind: String,
-    pub end_unix: Option<u64>,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RawState {
-    Running,
-    Sampling,
-    Idle,
-}
-#[derive(Clone, Serialize)]
-pub struct RawSpeed {
-    pub state: RawState,
-    pub engine: usize,
-    pub ips: f64,
-    pub timestamp_unix: u64,
-}
-#[derive(Clone, Default, Serialize)]
-pub struct HardwareState {
-    #[serde(flatten)]
-    pub lifecycle: crate::board_lifecycle::BoardLifecycle,
-    #[serde(skip)]
-    pub verified_generation: Option<u64>,
-    #[serde(skip)]
-    pub verified_slots: std::collections::BTreeSet<u8>,
-    pub device_location: Option<u32>,
-    pub raw_speeds: Vec<RawSpeed>,
-    pub temperature_c: Option<f64>,
-    pub frequency_mhz: Option<f64>,
-    pub voltage_v: Option<f64>,
-    pub recoveries: u64,
-    pub temperature_unix: u64,
-    #[serde(skip)]
-    pub temperature_samples: u64,
-    pub automatic: Option<crate::automatic::Status>,
-}
-impl HardwareState {
-    pub fn raw_sample(&mut self, engine: usize, ips: f64, state: RawState, now: u64) {
-        if let Some(sample) = self.raw_speeds.iter_mut().find(|s| s.engine == engine) {
-            sample.state = state;
-            if state == RawState::Running {
-                sample.ips = ips;
-                sample.timestamp_unix = now;
-            }
-        } else {
-            self.raw_speeds.push(RawSpeed {
-                engine,
-                ips,
-                state,
-                timestamp_unix: now,
-            });
-        }
-    }
-}
-pub struct RuntimeState {
-    pub experiments: Arc<crate::experiments::Gate>,
-    pub safety: Option<Arc<crate::safety::Store>>,
-    pub progress: Option<Arc<timelord_supervisor::progress::Progress>>,
-    pub metrics: Option<Arc<crate::observability::Metrics>>,
-    pub metric_epoch: u64,
-    pub pending: [u32; 3],
-    pub scheduler_initialized: bool,
-    pub scheduler_height: Option<u32>,
-    pub scheduler_deficit: Option<u8>,
-    pub phase: String,
-    pub node: String,
-    pub message: String,
-    pub observations: Vec<Observation>,
-    pub estimated_observations: Vec<Observation>,
-    pub events: Vec<Event>,
-    pub proofs_delivered: u64,
-    pub failed_proofs: u64,
-    pub tuning_paused: bool,
-    pub(crate) events_created: u64,
-    pub(crate) observations_created: u64,
-    pub(crate) archive: Option<crate::history_store::Snapshot>,
-    pub boards: std::collections::HashMap<String, HardwareState>,
-}
-impl Default for RuntimeState {
-    fn default() -> Self {
-        Self {
-            experiments: Default::default(),
-            safety: None,
-            progress: None,
-            metrics: None,
-            metric_epoch: 0,
-            pending: [0; 3],
-            scheduler_initialized: false,
-            scheduler_height: None,
-            scheduler_deficit: None,
-            phase: "setup_required".into(),
-            node: "not_configured".into(),
-            message: "Connect a full node to get started.".into(),
-            observations: vec![],
-            estimated_observations: vec![],
-            events: vec![],
-            proofs_delivered: 0,
-            failed_proofs: 0,
-            tuning_paused: false,
-            events_created: 0,
-            observations_created: 0,
-            archive: None,
-            boards: Default::default(),
-        }
-    }
-}
-impl RuntimeState {
-    pub fn with_tuning_paused(tuning_paused: bool) -> Self {
-        Self {
-            tuning_paused,
-            ..Default::default()
-        }
-    }
-    pub fn transition(&mut self, phase: &str, node: &str, message: &str) {
-        self.phase = phase.into();
-        self.node = node.into();
-        self.message = message.into();
-    }
-    pub fn event(&mut self, board_id: Option<String>, kind: &str) {
-        self.events_created += 1;
-        self.events.push(Event {
-            id: self.events_created,
-            timestamp_unix: unix_now(),
-            board_id,
-            kind: kind.into(),
-            end_unix: None,
-        });
-        self.events
-            .retain(|e| e.timestamp_unix >= unix_now().saturating_sub(86400));
-    }
-    fn connected(&mut self) {
-        for event in &mut self.events {
-            if event.kind == "node_unavailable" && event.end_unix.is_none() {
-                event.end_unix = Some(unix_now());
-            }
-        }
-    }
-    pub fn estimated(&mut self, chain: Chain, ips: f64, work_started_unix: u64) {
-        self.observations_created += 1;
-        self.estimated_observations.push(Observation {
-            id: self.observations_created,
-            chain,
-            ips,
-            timestamp_unix: unix_now(),
-            work_started_unix,
-        });
-        self.estimated_observations
-            .retain(|o| o.timestamp_unix >= unix_now().saturating_sub(86400));
-        let excess = self.estimated_observations.len().saturating_sub(86400);
-        self.estimated_observations.drain(..excess);
-    }
-    fn delivered(&mut self, speeds: Vec<(Chain, ProofTiming)>) {
-        for (chain, timing) in speeds {
-            let ips = timing.delivered_ips();
-            self.observations_created += 1;
-            self.observations.push(Observation {
-                id: self.observations_created,
-                chain,
-                ips,
-                timestamp_unix: unix_now(),
-                work_started_unix: timing.started_unix(),
-            });
-            self.proofs_delivered += 1;
-        }
-        if self.observations.len() > 86400 {
-            self.observations.drain(..self.observations.len() - 86400);
-        }
-        self.observations
-            .retain(|e| e.timestamp_unix >= unix_now().saturating_sub(86400));
-        self.phase = "running".into();
-        self.message = "Producing verified proofs for your full node.".into();
-    }
-}
+mod state;
+pub use state::{Event, HardwareState, Observation, RawSpeed, RawState, RuntimeState};
+
 pub fn chain(config: &Config) -> Result<ChainSelection> {
     let name = match config.node.network {
         timelord_core::Network::Mainnet => "mainnet",
@@ -336,19 +153,13 @@ async fn send(socket: &mut Socket, message: Message) -> Result<()> {
 }
 async fn submit(
     shared: &Shared,
-    kind: &str,
+    kind: SubmissionKind,
+    stage: Option<&timelord_supervisor::progress::Guard>,
     sending: impl std::future::Future<Output = Result<()>>,
 ) -> Result<()> {
-    let progress = shared
-        .runtime
-        .lock()
-        .expect("runtime")
-        .metrics
-        .as_ref()
-        .map(|m| m.progress.clone());
-    let _stage = progress
-        .as_ref()
-        .map(|p| p.begin(3, 0, 0, timelord_supervisor::progress::Stage::Submitting));
+    if let Some(stage) = stage {
+        stage.stage(timelord_supervisor::progress::Stage::Submitting);
+    }
     let started = Instant::now();
     sending.await?;
     if let Some(metrics) = &shared.runtime.lock().expect("runtime").metrics {
@@ -450,7 +261,7 @@ async fn execute(backend: Arc<AsicBackend>, plan: WorkPlan) -> Result<Completed>
     for (chain, timing) in &speeds {
         backend.observe_duration(
             *chain,
-            "bundle_wait",
+            ProofStage::BundleWait,
             bundle_ready.saturating_duration_since(timing.ready_at),
         );
         tracing::info!(
@@ -600,9 +411,9 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
             && let Some(completed) = ready.take()
         {
             eligibility.take();
-            let _stage = progress.as_ref().map(|p| {
+            let stage = progress.as_ref().map(|p| {
                 p.begin(
-                    3,
+                    timelord_supervisor::progress::Resource::Scheduler,
                     completed.plan.generation,
                     completed.plan.challenge.iterations,
                     timelord_supervisor::progress::Stage::Scheduler,
@@ -623,9 +434,9 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                     _ => None,
                 };
                 let kind = match &output {
-                    Output::SignagePoint(_) => "signage",
-                    Output::InfusionPoint(_) => "infusion",
-                    Output::EndOfSubSlot(_) => "end_of_sub_slot",
+                    Output::SignagePoint(_) => SubmissionKind::Signage,
+                    Output::InfusionPoint(_) => SubmissionKind::Infusion,
+                    Output::EndOfSubSlot(_) => SubmissionKind::EndOfSubSlot,
                 };
                 let infusion = matches!(&output, Output::InfusionPoint(_));
                 let message = match output {
@@ -641,7 +452,7 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                         encode(ProtocolMessageTypes::NewEndOfSubSlotVdf, &value, None)?
                     }
                 };
-                submit(&shared, kind, send(&mut socket, message)).await?;
+                submit(&shared, kind, stage.as_ref(), send(&mut socket, message)).await?;
                 if infusion {
                     infusion_submitted_at = Some(Instant::now());
                 }
@@ -671,13 +482,13 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
             Some(completed) = workers.join_next(), if !workers.is_empty() => {
                 match completed { Ok(Ok(result)) if result.plan.generation == scheduler.generation() => {
                     let wait_seconds = result.plan.not_before.saturating_duration_since(Instant::now()).as_secs().saturating_add(1);
-                    eligibility=progress.as_ref().map(|p|p.begin(7,result.plan.generation,result.plan.challenge.iterations,timelord_supervisor::progress::Stage::Eligibility{wait_seconds}));
+                    eligibility=progress.as_ref().map(|p|p.begin(timelord_supervisor::progress::Resource::Eligibility,result.plan.generation,result.plan.challenge.iterations,timelord_supervisor::progress::Stage::Eligibility{wait_seconds}));
                     ready = Some(result);
                 }, Ok(Ok(_)) => {}, Ok(Err(error)) => return Err(error), Err(error) if error.is_cancelled() => {}, Err(error) => return Err(error.into()) }
             }
             incoming = socket.next() => {
                 last_message = Instant::now();
-                if incoming.as_ref().is_some_and(|r|r.is_ok()) && let Some(metrics)=&shared.runtime.lock().expect("runtime").metrics {metrics.stamp("last_node_message_timestamp_seconds",&[]);}
+                if incoming.as_ref().is_some_and(|r|r.is_ok()) && let Some(metrics)=&shared.runtime.lock().expect("runtime").metrics {metrics.node_message_received();}
                 match incoming.context("Node disconnected")?? {
                     Message::Binary(bytes) => {
                         let message: ChiaMessage = decode_exact(&bytes)?;
@@ -685,12 +496,12 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                             ProtocolMessageTypes::NewPeakTimelord => {
                                 let peak: dg_xch_core::protocols::timelord::NewPeakTimelord=decode_exact(message.data.as_slice())?;
                                 let metrics=shared.runtime.lock().expect("runtime").metrics.clone();
-                                if let Some(metrics)=&metrics {metrics.stamp("last_peak_received_timestamp_seconds",&[]);}
+                                if let Some(metrics)=&metrics {metrics.peak_received();}
                                 let accepted=match scheduler.set_peak(peak.clone()) {
                                     Ok(accepted)=>accepted,
-                                    Err(error)=>{if let Some(metrics)=&metrics {metrics.inc("peak_updates_total",&["rejected"]);}return Err(error.into());}
+                                    Err(error)=>{if let Some(metrics)=&metrics {metrics.peak_updated(PeakResult::Rejected);}return Err(error.into());}
                                 };
-                                if let Some(metrics)=&metrics {metrics.inc("peak_updates_total",&[if accepted {"accepted"} else {"ignored"}]);}
+                                if let Some(metrics)=&metrics {metrics.peak_updated(if accepted {PeakResult::Accepted} else {PeakResult::Ignored});}
                                 if accepted {
                                     {
                                         let mut state=shared.runtime.lock().expect("runtime");
@@ -1028,14 +839,51 @@ mod tests {
             service_started_unix: unix_now(),
         };
         assert!(
-            submit(&shared, "signage", async { bail!("fixture send failed") })
-                .await
-                .is_err()
+            submit(&shared, SubmissionKind::Signage, None, async {
+                bail!("fixture send failed")
+            })
+            .await
+            .is_err()
         );
         assert_eq!(metrics.counter("submissions_total", &["signage"]), 0);
-        submit(&shared, "signage", async { Ok(()) }).await.unwrap();
+        submit(&shared, SubmissionKind::Signage, None, async { Ok(()) })
+            .await
+            .unwrap();
         assert_eq!(metrics.counter("submissions_total", &["signage"]), 1);
     }
+    #[tokio::test]
+    async fn submission_transitions_the_scheduler_owner_instead_of_replacing_it() {
+        use timelord_supervisor::progress::{Resource, Stage};
+        let metrics = crate::observability::Metrics::new(timelord_core::Network::Mainnet).unwrap();
+        let shared = Shared {
+            config: Config::default(),
+            assignments: vec![],
+            clients: Default::default(),
+            runtime: Arc::new(std::sync::Mutex::new(RuntimeState {
+                metrics: Some(metrics.clone()),
+                ..Default::default()
+            })),
+            started_unix: unix_now(),
+            service_started_unix: unix_now(),
+        };
+        let guard = metrics
+            .progress
+            .begin(Resource::Scheduler, 12, 42, Stage::Scheduler);
+        let previous = metrics.progress.snapshot(1, 1).unwrap().work[3].unwrap();
+        submit(&shared, SubmissionKind::Signage, Some(&guard), async {
+            let work = metrics.progress.snapshot(1, 2).unwrap().work[3].unwrap();
+            assert_eq!(work.id, previous.id);
+            assert_eq!(work.generation, previous.generation);
+            assert_eq!(work.stage, Stage::Submitting);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(metrics.progress.snapshot(1, 3).unwrap().work[3].is_some());
+        drop(guard);
+        assert!(metrics.progress.snapshot(1, 4).unwrap().work[3].is_none());
+    }
+
     #[tokio::test]
     async fn authenticates_a_mutual_tls_chia_websocket_with_a_fixture_only_identity() {
         fixture("chia.net", false).await.unwrap();

@@ -271,18 +271,15 @@ impl Tuning {
                     .map_err(|error| anyhow::anyhow!("{}: {error}", board.name))?;
                 if let Some(metrics) = &shared.runtime.lock().expect("runtime").metrics {
                     let kind = if !persist {
-                        "trial"
+                        crate::observability::OperatingPointReason::Trial
                     } else if reason.to_ascii_lowercase().contains("restor") {
-                        "restore"
+                        crate::observability::OperatingPointReason::Restore
                     } else {
-                        "backoff"
+                        crate::observability::OperatingPointReason::Backoff
                     };
-                    metrics.inc(
-                        "operating_point_changes_total",
-                        &[
-                            &crate::observability::board(&shared.config, &board.id),
-                            kind,
-                        ],
+                    metrics.operating_point_changed(
+                        &crate::observability::board(&shared.config, &board.id),
+                        kind,
                     );
                 }
                 self.policy.applied(actual, crate::unix_now(), reason);

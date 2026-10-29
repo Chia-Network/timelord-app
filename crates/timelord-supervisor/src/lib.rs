@@ -1,4 +1,5 @@
 //! Small control plane: no USB driver, node protocol, or proof arithmetic.
+pub mod power;
 pub mod progress;
 
 use anyhow::{Context, Result, bail, ensure};
