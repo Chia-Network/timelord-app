@@ -415,18 +415,23 @@ pub async fn live_configuration(shared: &crate::Shared) -> Result<Config> {
     let _discovery = progress
         .as_ref()
         .map(|p| p.begin(8, 0, 0, timelord_supervisor::progress::Stage::Discovery));
+    // Only confirm admissions that were already pending when this probe began.
+    let pending: std::collections::HashMap<_, _> = shared
+        .runtime
+        .lock()
+        .expect("runtime")
+        .boards
+        .iter()
+        .filter_map(|(id, h)| h.admission_inventory_epoch.map(|epoch| (id.clone(), epoch)))
+        .collect();
     let mut devices = discover(&shared.config).await?;
     {
         let mut state = shared.runtime.lock().expect("runtime");
         for board in &shared.config.hardware.boards {
             if let Some(hardware) = state.boards.get_mut(&board.id)
-                && hardware.state == "admitted"
+                && let Some(epoch) = pending.get(&board.id)
             {
-                hardware.usb_present = Some(
-                    devices
-                        .iter()
-                        .any(|d| d.serial.is_some() && d.serial == board.serial),
-                );
+                confirm_admitted_presence(hardware, board, &devices, *epoch);
             }
         }
     }
@@ -437,6 +442,36 @@ pub async fn live_configuration(shared: &crate::Shared) -> Result<Config> {
         crate::unix_now(),
     );
     connected_plan(shared.config.clone(), devices)
+}
+
+pub(crate) fn confirm_board_presence(
+    hardware: &mut crate::runtime::HardwareState,
+    board: &timelord_core::BoardConfig,
+    devices: &[Device],
+) {
+    let matches = devices
+        .iter()
+        .filter(|d| d.serial.is_some() && d.serial == board.serial)
+        .count();
+    hardware.usb_present = match matches {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    };
+    if matches == 1 {
+        hardware.admission_inventory_epoch = None;
+    }
+}
+
+fn confirm_admitted_presence(
+    hardware: &mut crate::runtime::HardwareState,
+    board: &timelord_core::BoardConfig,
+    devices: &[Device],
+    epoch: u64,
+) {
+    if hardware.admission_inventory_epoch == Some(epoch) {
+        confirm_board_presence(hardware, board, devices);
+    }
 }
 
 fn preserve_managed_boards(
@@ -507,6 +542,39 @@ mod tests {
         drop(initialization);
         assert!(pending.await.is_err());
         assert!(metrics.progress.snapshot(0, 2).unwrap().work[8].is_none());
+    }
+
+    #[test]
+    fn admitted_capacity_requires_matching_fresh_inventory_despite_display_changes() {
+        let config = configured();
+        let board = &config.hardware.boards[0];
+        for display in ["admitted", "starting", "connected", "reconnecting"] {
+            let mut h = crate::runtime::HardwareState {
+                state: display.into(),
+                admission_inventory_epoch: Some(7),
+                ..Default::default()
+            };
+            let blocked = |h: &crate::runtime::HardwareState| {
+                crate::hardware::unavailable_for(
+                    &config,
+                    &std::collections::HashMap::from([(board.id.clone(), h.clone())]),
+                    None,
+                )
+                .contains(&board.id)
+            };
+            assert!(blocked(&h));
+            confirm_admitted_presence(&mut h, board, &devices(&[0]), 6);
+            assert!(blocked(&h), "old inventory released a newer admission");
+            confirm_admitted_presence(&mut h, board, &[], 7);
+            assert!(blocked(&h));
+            let mut duplicate = devices(&[0]);
+            duplicate.extend(devices(&[0]));
+            confirm_admitted_presence(&mut h, board, &duplicate, 7);
+            assert!(blocked(&h), "ambiguous inventory released capacity");
+            confirm_admitted_presence(&mut h, board, &devices(&[0]), 7);
+            assert!(!blocked(&h));
+            assert_eq!(h.usb_present, Some(true));
+        }
     }
 
     fn configured() -> Config {

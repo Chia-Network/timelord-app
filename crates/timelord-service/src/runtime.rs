@@ -81,6 +81,9 @@ pub struct HardwareState {
     // Set only by discovery while this board's native owner is closed.
     #[serde(skip)]
     pub usb_present: Option<bool>,
+    // Admission owner epoch awaiting a newer closed-owner inventory observation.
+    #[serde(skip)]
+    pub admission_inventory_epoch: Option<u64>,
     #[serde(skip)]
     pub fault_reason: Option<String>,
     pub raw_speeds: Vec<RawSpeed>,

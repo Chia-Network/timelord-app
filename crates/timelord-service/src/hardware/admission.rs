@@ -344,6 +344,9 @@ mod tests {
                 let mut request = vec![0; size];
                 socket.read_exact(&mut request).unwrap();
                 assert_eq!(std::str::from_utf8(&request).unwrap(), "360");
+                if let Ok(path) = std::env::var("TL_ADMISSION_READY_FILE") {
+                    std::fs::write(path, b"proof requested").unwrap();
+                }
                 let blob = include_bytes!("../../tests/fixtures/checkpointed-proof.bin");
                 let mut raw = 360_u64.to_be_bytes().to_vec();
                 raw.extend(100_u64.to_be_bytes());
@@ -381,13 +384,12 @@ mod tests {
             let cancelling = variant.starts_with("cancelled");
             let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
             std::fs::write(&script,format!(r#"#!/bin/sh
-export TL_ADMISSION_FIXTURE_PORT="$7" TL_ADMISSION_FIXTURE_ENGINES="$8" TL_ADMISSION_FIXTURE_INVALID={invalid}
+export TL_ADMISSION_FIXTURE_PORT="$7" TL_ADMISSION_FIXTURE_ENGINES="$8" TL_ADMISSION_FIXTURE_INVALID={invalid} TL_ADMISSION_READY_FILE={started}
 {exe} --exact hardware::admission::tests::native_peer_fixture --nocapture >/dev/null 2>/dev/null &
 pid=$!
 trap 'kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null' EXIT
 trap 'exit 143' TERM
 printf '%s\n' 'Connected to timelord, waiting for challenge' 'ASIC Temp = 40 C; Frequency = 1450 MHz' >&2
-touch {started}
 while read command version id frequency voltage; do
  printf 'TLACK 1 %s %s %s\n' "$id" "$frequency" "$voltage"
 done
