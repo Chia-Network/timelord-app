@@ -273,28 +273,25 @@ async fn journal_point(
         .as_ref()
         .map(|p| p.arithmetic(9))
         .unwrap_or_else(|| JOURNALS.clone());
-    let permit = match gate.try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            return Ok(Some(anyhow::anyhow!(
-                "An operating-point journal is still pending; current point held"
-            )));
-        }
-    };
-    let stage = progress
-        .as_ref()
-        .map(|p| p.begin(9, 0, 0, timelord_supervisor::progress::Stage::Persistence));
-    let job = tokio::task::spawn_blocking(move || {
-        // Keep the real job and its watchdog stage/permit alive even if a log
-        // fault cancels its caller. Never queue a replacement behind it.
-        let (_permit, _stage) = (permit, stage);
-        store.before_open(&serial, point)
-    });
-    // This is write-ahead safety state, not an optional learned profile. Await
-    // the actual result while draining thermal/USB logs; a caller timeout must
-    // not report "held" and then let a detached write change the journal.
+    // Serialize real writes, not admission to the caller: another board's
+    // pending write must not make a restrictive setting skip its own journal.
     while_logging(
-        async move { job.await.context("Operating-point journal task failed")? },
+        async move {
+            let permit = gate
+                .acquire_owned()
+                .await
+                .context("Operating-point journal gate closed")?;
+            let stage = progress
+                .as_ref()
+                .map(|p| p.begin(9, 0, 0, timelord_supervisor::progress::Stage::Persistence));
+            let job = tokio::task::spawn_blocking(move || {
+                // Actual jobs retain their slot and watchdog if a log fault
+                // cancels the caller. Waiting callers have not spawned jobs.
+                let (_permit, _stage) = (permit, stage);
+                store.before_open(&serial, point)
+            });
+            job.await.context("Operating-point journal task failed")?
+        },
         shared,
         board,
         log,
@@ -725,8 +722,8 @@ impl NativeOwner {
                         self.experiment.take();
                         return Ok(());
                     }
-                    // Restrictive backoff remains allowed. The persisted older,
-                    // faster point makes a crash conservative, not falsely safe.
+                    // before_open retains restrictive safety state in memory
+                    // even if the disk write fails; contention is awaited above.
                 }
                 tracing::info!(board=%board.name, frequency_mhz=point.frequency_mhz, voltage_v=point.voltage_v, %reason, "Applying automatic setting");
                 let actual = self
@@ -2020,6 +2017,27 @@ printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
             .unwrap();
         let (ready, _rx) = oneshot::channel();
         let mut log = ClientLog::new(child.stderr.take().unwrap(), ready);
+        let mut second_board = board.clone();
+        second_board.id = "b".into();
+        second_board.serial = Some("second".into());
+        store
+            .before_open(
+                "second",
+                Point {
+                    frequency_mhz: 1960.,
+                    voltage_v: 1.,
+                },
+            )
+            .unwrap();
+        let mut second_child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (second_ready, _second_ready) = oneshot::channel();
+        let mut second_log = ClientLog::new(second_child.stderr.take().unwrap(), second_ready);
         let (entered, waiting) = std::sync::mpsc::channel();
         let (release, held) = std::sync::mpsc::channel();
         let saved = store.clone();
@@ -2038,8 +2056,31 @@ printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
             "caller treated an unfinished critical journal as a completed failure"
         );
         assert!(progress.arithmetic(9).try_acquire_owned().is_err());
+        let lower = Point {
+            frequency_mhz: 1440.,
+            voltage_v: 1.,
+        };
+        let second_pending = journal_point(&shared, &second_board, lower, &mut second_log);
+        tokio::pin!(second_pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut second_pending)
+                .await
+                .is_err(),
+            "another board skipped its journal instead of waiting for the writer"
+        );
         release.send(()).unwrap();
-        assert!(pending.await.unwrap().is_none());
+        let (first_result, second_result) = tokio::join!(pending, second_pending);
+        assert!(first_result.unwrap().is_none());
+        assert!(second_result.unwrap().is_none());
+        assert_eq!(store.board("second").unwrap().last_point, Some(lower));
+        store
+            .quarantine("second", crate::safety::Reason::Thermal)
+            .unwrap();
+        assert_eq!(
+            store.board("second").unwrap().admission_frequency_mhz,
+            Some(1390.)
+        );
+        second_child.kill().await.unwrap();
         holder.join().unwrap();
         assert_eq!(store.board("fixture").unwrap().last_point, Some(point));
         assert!(progress.arithmetic(9).try_acquire_owned().is_ok());
