@@ -830,7 +830,6 @@ async fn serve(
             _ = observation_exit(&mut observation_server, &metrics), if observation_server.is_some() => continue,
             result = &mut server => break result.context("Status task failed")?.context("Status server failed"),
             _ = poll.tick() => {
-                let _discovery = metrics.progress.begin(8,0,0,timelord_supervisor::progress::Stage::Discovery);
                 tokio::select! {
                     _ = &mut signal => break Ok(()),
                     result = inventory::live_configuration(&run.shared) => result,
