@@ -366,6 +366,7 @@ struct SupervisorState {
     failures: usize,
     power: timelord_supervisor::power::Assertion,
     recoveries: Vec<timelord_supervisor::Recovery>,
+    monitor_error: Option<String>,
 }
 impl SupervisorState {
     fn new(loaded: Result<Intent>) -> Self {
@@ -394,6 +395,7 @@ impl SupervisorState {
             failures: 0,
             power: Default::default(),
             recoveries: Vec::new(),
+            monitor_error: None,
         }
     }
     fn snapshot(&self) -> Status {
@@ -418,7 +420,7 @@ impl SupervisorState {
             worker_generation: self.generation,
             restarts: self.restarts,
             phase: phase.into(),
-            error,
+            error: error.or_else(|| self.monitor_error.clone()),
             progress: progress.map(|(snapshot, _)| snapshot.clone()),
             progress_age_seconds: progress.map(|(_, received)| received.elapsed().as_secs()),
             recoveries: self.recoveries.clone(),
@@ -616,6 +618,23 @@ impl SupervisorState {
         Ok(())
     }
 }
+async fn monitoring_exit(
+    monitor: &mut Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+    state: &mut SupervisorState,
+    snapshots: &watch::Sender<Published>,
+) {
+    let result = monitor.as_mut().expect("monitor").await;
+    monitor.take();
+    state.monitor_error = Some(
+        format!("Supervisor monitoring exited unexpectedly: {result:?}")
+            .chars()
+            .take(512)
+            .collect(),
+    );
+    eprintln!("{}", state.monitor_error.as_deref().expect("monitor error"));
+    state.publish(snapshots);
+}
+
 async fn run(
     paths: Paths,
     helper: PathBuf,
@@ -676,10 +695,7 @@ async fn run(
         loop {
             tokio::select! {
                 _ = &mut stop => break,
-                result = async { monitor.as_mut().expect("monitor").await }, if monitor.is_some() => {
-                    result.context("Supervisor monitoring task failed")??;
-                    anyhow::bail!("Supervisor monitoring exited unexpectedly");
-                },
+                _ = monitoring_exit(&mut monitor, &mut state, &snapshots), if monitor.is_some() => {},
                 received = progress.recv(&mut buffer) => {
                     let size = received.context("Reading worker progress")?;
                     if size < buffer.len()
@@ -731,7 +747,7 @@ mod tests {
             next: Instant::now() + Duration::from_secs(120),
             error: "Worker cleanup failed".into(),
         };
-        let (snapshots, _) = watch::channel(state.snapshot());
+        let (snapshots, _) = watch::channel(state.published());
         let resume = || Request {
             command: Control::Resume,
             expected_revision: None,
