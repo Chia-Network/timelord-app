@@ -73,8 +73,9 @@ Physical installation, boot/logout and hardware qualification remain separate ga
   never silently replace operator intent or credentials with defaults.
 - Keep configuration and peer identities accessible without an unlocked GUI;
   authenticate local mutation separately from public read-only observability.
-- Retain the sleep assertion in the persistent service, including recoverable
-  dependency outages, and release it when explicitly paused.
+- Retain the supervisor-owned sleep assertion, including recoverable dependency
+  outages, and release it after explicit Pause cleanup. This ownership is part of
+  the initial independent-lifetime implementation.
 - Tolerate delayed network, volumes and certificates; retain control and monitoring
   while unavailable and retry without crashing the supervisor.
 - Provide remote CLI status, pause/resume, reload and bounded diagnostic export.

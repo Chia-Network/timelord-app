@@ -1,4 +1,5 @@
 //! Small control plane: no USB driver, node protocol, or proof arithmetic.
+pub mod power;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{

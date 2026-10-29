@@ -4,6 +4,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 bash scripts/bundle-inputs-test.sh
 bash scripts/release-inputs-test.sh
+bash scripts/installer-remove-test.sh
 mkdir -p build
 c++ -std=c++17 -Wall -Wextra -Werror integrations/chiavdf/tests/live_control_test.cpp -o build/native-control-test
 build/native-control-test

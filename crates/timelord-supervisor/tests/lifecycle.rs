@@ -125,7 +125,10 @@ async fn explicit_pause_survives_supervisor_restart_and_resume_uses_one_owner() 
     assert_eq!(unsafe { libc::kill(old as i32, 0) }, -1);
     fixture.terminate(first).await;
     let second = fixture.supervisor(&helper);
-    fixture.status(|s| s.mode == Mode::Paused).await;
+    let restored = fixture.status(|s| s.mode == Mode::Paused).await;
+    assert_eq!(restored.phase, "paused");
+    assert!(restored.error.is_none());
+    assert_eq!(restored.revision, paused.revision);
     sleep(Duration::from_millis(300)).await;
     assert_eq!(
         fs::read_to_string(fixture.0.join("pids"))
@@ -510,4 +513,66 @@ async fn installer_pid_extraction_matches_live_status_cli() {
     );
     assert_eq!(Some(running.supervisor_pid), owner.id());
     fixture.terminate(owner).await;
+}
+
+#[tokio::test]
+async fn fresh_status_readers_observe_durable_pause_before_cleanup_acknowledges() {
+    let fixture = Fixture::new();
+    let ready = fixture.0.join("ready");
+    let helper = fixture.helper(&format!(
+        "trap 'sleep 2; exit 0' TERM\ntouch '{}'\nwhile :; do sleep 1; done",
+        ready.display()
+    ));
+    let supervisor = fixture.supervisor(&helper);
+    let running = fixture.status(|s| s.worker_pid.is_some()).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !ready.exists() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let config = fixture.config();
+    let pause = tokio::spawn(async move { request(&config, Control::Pause, None).await });
+    let stopping = tokio::time::timeout(
+        Duration::from_secs(1),
+        fixture.status(|s| s.phase == "stopping"),
+    )
+    .await
+    .expect("fresh status reader blocked behind worker cleanup");
+    assert_eq!(stopping.mode, Mode::Paused);
+    assert_eq!(stopping.revision, running.revision + 1);
+    assert_eq!(stopping.worker_pid, running.worker_pid);
+    assert_eq!(
+        Paths::for_config(&fixture.config())
+            .unwrap()
+            .load_intent()
+            .unwrap()
+            .mode,
+        Mode::Paused
+    );
+    assert!(
+        !pause.is_finished(),
+        "Pause acknowledged before graceful cleanup"
+    );
+    let paused = pause.await.unwrap().unwrap();
+    assert_eq!(paused.phase, "paused");
+    assert!(paused.worker_pid.is_none());
+    fixture.terminate(supervisor).await;
+}
+
+#[tokio::test]
+async fn idempotent_resume_during_backoff_does_not_rewrite_intent() {
+    let fixture = Fixture::new();
+    let helper = fixture.helper("exit 17");
+    let supervisor = fixture.supervisor(&helper);
+    let failed = fixture.status(|s| s.phase == "recovering").await;
+    let resumed = request(&fixture.config(), Control::Resume, Some(failed.revision))
+        .await
+        .unwrap();
+    assert_eq!(resumed.revision, failed.revision);
+    request(&fixture.config(), Control::Pause, None)
+        .await
+        .unwrap();
+    fixture.terminate(supervisor).await;
 }

@@ -13,6 +13,23 @@ while (($#)); do
   esac
 done
 [[ "$(uname -s)" == Darwin && "$MODE" =~ ^(plan|install|remove)$ ]] || { echo 'Expected macOS and plan, install or remove.' >&2; exit 2; }
+LABEL=net.chia.timelord.supervisor
+PLIST="/Library/LaunchDaemons/$LABEL.plist"
+if [[ "$MODE" != plan ]]; then
+  [[ "$EUID" == 0 ]] || { echo 'Registration changes require administrator approval.' >&2; exit 1; }
+  if [[ -e "$PLIST" || -L "$PLIST" ]]; then
+    [[ -f "$PLIST" && ! -L "$PLIST" && "$(stat -f %u "$PLIST")" == 0 && "$(stat -f %l "$PLIST")" == 1 ]] || { echo 'Unsafe registration path.' >&2; exit 1; }
+  fi
+fi
+if [[ "$MODE" == remove ]]; then
+  # Removal depends only on the registration, even if app/config are damaged.
+  # A failed bootout must not be reported as successful removal of a live job.
+  if launchctl print "system/$LABEL" >/dev/null 2>&1; then
+    launchctl bootout "system/$LABEL" || exit 1
+  fi
+  rm -f "$PLIST"
+  exit 0
+fi
 [[ -n "$APP" && -n "$CONFIG" && "$SERVICE_USER" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || { echo 'Invalid installation arguments.' >&2; exit 2; }
 SERVICE_UID="$(id -u "$SERVICE_USER")"
 [[ "$SERVICE_UID" != 0 ]] || { echo 'Select a non-root deployment account.' >&2; exit 1; }
@@ -31,17 +48,6 @@ if [[ "$MODE" == plan ]]; then
 fi
 [[ "$EUID" == 0 && "$APP" == /Applications/Timelord.app ]] || { echo 'Installation requires administrator approval and /Applications/Timelord.app.' >&2; exit 1; }
 codesign --verify --deep --strict "$APP" || exit 1
-LABEL=net.chia.timelord.supervisor
-PLIST="/Library/LaunchDaemons/$LABEL.plist"
-if [[ -e "$PLIST" || -L "$PLIST" ]]; then
-  [[ -f "$PLIST" && ! -L "$PLIST" && "$(stat -f %u "$PLIST")" == 0 && "$(stat -f %l "$PLIST")" == 1 ]] || { echo 'Unsafe registration path.' >&2; exit 1; }
-fi
-if [[ "$MODE" == remove ]]; then
-  # Removal is an explicit administrative action, not a rewrite of Run/Pause.
-  launchctl bootout "system/$LABEL" 2>/dev/null || true
-  rm -f "$PLIST"
-  exit 0
-fi
 # Validate everything possible before interrupting an existing registered job.
 STAGE="$(mktemp -d /private/tmp/timelord-registration.XXXXXX)" || exit 1
 WAS_LOADED=false; STOPPED=false; SUCCEEDED=false; HAD_PLIST=false

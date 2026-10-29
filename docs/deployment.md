@@ -27,7 +27,9 @@ sudo /bin/bash /Applications/Timelord.app/Contents/Resources/install-service.sh 
 ```
 
 The same command with `plan` prints and validates inputs without registering a
-job. `remove` unregisters the job but preserves durable Run/Pause state. Updates
+job. `sudo /bin/bash scripts/install-service.sh remove` unregisters the fixed job
+without requiring an intact app or configuration, and preserves durable Run/Pause
+state. Keep a copy of the removal script for recovery. Updates
 must retain the same config path/account so explicit Pause is preserved.
 Configuration, node credentials and parent directories must be accessible to that
 account without a logged-in GUI or unlocked keychain. Avoid removable or network
@@ -52,8 +54,9 @@ Status reports supervisor/worker process identity and recovery state. It is **no
 a claim that ASICs are connected or verified proofs are being submitted. Worker
 status/history and the upcoming work watchdog distinguish those stages. A CLI
 request timing out has an unknown outcome: reread status before retrying mutation.
-Logs currently go to `supervisor.log` beside config; bounded log rotation and
-persistent sleep protection belong to the operational-hardening PR.
+Logs currently go to `supervisor.log` beside config; bounded log rotation belongs
+to the operational-hardening PR. The supervisor retains idle-sleep protection
+through worker recovery and releases it after Pause cleanup or shutdown.
 
 ## Qualification before unattended operation
 
