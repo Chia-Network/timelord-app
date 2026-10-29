@@ -213,18 +213,10 @@ impl AsicBackend {
                     .get(&lane.board)
                     .map(|b| {
                         (
-                            b.generation,
-                            b.latched_fault
-                                || (state.safety.is_some() && !b.native_initialized)
-                                || [
-                                    "fault",
-                                    "thermal_stop",
-                                    "reconnecting",
-                                    "quarantined",
-                                    "checking",
-                                    "admitted",
-                                ]
-                                .contains(&b.state.as_str()),
+                            b.lifecycle.status().generation,
+                            !b.lifecycle
+                                .capacity(crate::unix_now(), state.safety.is_some())
+                                .accepts_work,
                         )
                     })
                     .unwrap_or((0, state.safety.is_some()))
@@ -239,8 +231,8 @@ impl AsicBackend {
                     loop {
                         tokio::time::sleep(Duration::from_millis(250)).await;
                         let state = self.runtime.lock().expect("runtime");
-                        if state.boards.get(&lane.board).is_some_and(|b| b.generation != generation
-                            || b.latched_fault || ["fault", "thermal_stop", "reconnecting"].contains(&b.state.as_str())) { break; }
+                        if state.boards.get(&lane.board).is_some_and(|b| b.lifecycle.status().generation != generation
+                            || !b.lifecycle.capacity(crate::unix_now(), state.safety.is_some()).accepts_work) { break; }
                     }
                 } => continue,
             };
@@ -265,19 +257,23 @@ impl AsicBackend {
                     let mut state = self.runtime.lock().expect("runtime");
                     let hardware = state.boards.entry(lane.board.clone()).or_default();
                     // A delayed EOF from the previous process must not kill its replacement.
-                    if hardware.generation != generation {
+                    if hardware.lifecycle.status().generation != generation {
                         continue;
                     }
                     let verification = error
                         .downcast_ref::<AsicFailure>()
                         .is_some_and(|e| e.verification);
-                    hardware.latched_fault |= verification;
-                    if hardware.state != "thermal_stop" {
-                        hardware.state = "fault".into();
-                    }
-                    hardware.fault_reason = Some(error.to_string());
+                    hardware.lifecycle.fault(
+                        if verification {
+                            crate::board_lifecycle::Fault::InvalidProof
+                        } else {
+                            crate::board_lifecycle::Fault::Transport
+                        },
+                        error.to_string(),
+                        crate::unix_now(),
+                    );
                     hardware.raw_speeds.clear();
-                    let needs_attention = hardware.latched_fault;
+                    let needs_attention = hardware.lifecycle.status().latched_fault;
                     if verification {
                         state.failed_proofs += 1;
                     }
@@ -359,7 +355,7 @@ impl AsicBackend {
             .expect("runtime")
             .boards
             .get(&lane.board)
-            .map(|b| b.generation)
+            .map(|b| b.lifecycle.status().generation)
             .unwrap_or(0);
         let mut active = owner.take().filter(|a| a.lease.generation == generation);
         // A new discriminant does not depend on the old socket. Start it before
@@ -430,7 +426,7 @@ impl AsicBackend {
                             .expect("runtime")
                             .boards
                             .get(&lane.board)
-                            .map(|b| b.generation)
+                            .map(|b| b.lifecycle.status().generation)
                             .unwrap_or(0);
                         if lease.generation == current {
                             return Ok::<_, anyhow::Error>(lease);
@@ -876,7 +872,9 @@ mod tests {
                     .unwrap()
                     .boards
                     .get("failed")
-                    .is_some_and(|b| b.state == "fault")
+                    .is_some_and(|b| {
+                        b.lifecycle.status().phase == crate::board_lifecycle::Phase::Fault
+                    })
                 {
                     break;
                 }
@@ -905,14 +903,16 @@ mod tests {
             .boards
             .get_mut("failed")
             .unwrap()
-            .generation = 1;
+            .lifecycle
+            .begin_attempt(crate::unix_now());
         runtime
             .lock()
             .unwrap()
             .boards
             .get_mut("failed")
             .unwrap()
-            .state = "starting".into();
+            .lifecycle
+            .start_native();
         // A queued socket from the dead process is discarded, never assigned to the replacement.
         let stale = TcpStream::connect(listener.local_addr().unwrap())
             .await
@@ -997,7 +997,7 @@ mod tests {
                     .unwrap()
                     .boards
                     .get("a")
-                    .is_some_and(|b| b.latched_fault)
+                    .is_some_and(|b| b.lifecycle.status().latched_fault)
                 {
                     break;
                 }
@@ -1010,7 +1010,7 @@ mod tests {
             let state = backend.runtime.lock().unwrap();
             assert_eq!(state.failed_proofs, 1);
             assert!(state.estimated_observations.is_empty());
-            assert_eq!(state.boards["a"].state, "fault");
+            assert_eq!(state.boards["a"].lifecycle.status().phase.as_str(), "fault");
         }
         assert!(!pending.is_finished());
         pending.abort();

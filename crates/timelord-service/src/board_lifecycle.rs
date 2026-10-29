@@ -1,0 +1,317 @@
+//! Serial-scoped board state. Runtime, inventory and proof lanes report events;
+//! only this model decides legal status and usable capacity. Telemetry is separate.
+use serde::{Serialize, Serializer, ser::SerializeStruct};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Phase {
+    #[default]
+    Idle,
+    Starting,
+    Checking,
+    Admitted,
+    Connected,
+    Stopped,
+    Fault,
+    ThermalStop,
+    Quarantined,
+    Reconnecting,
+}
+impl Phase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "not_inspected",
+            Self::Starting => "starting",
+            Self::Checking => "checking",
+            Self::Admitted => "admitted",
+            Self::Connected => "connected",
+            Self::Stopped => "stopped",
+            Self::Fault => "fault",
+            Self::ThermalStop => "thermal_stop",
+            Self::Quarantined => "quarantined",
+            Self::Reconnecting => "reconnecting",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fault {
+    Transport,
+    Thermal,
+    InvalidProof,
+    UncleanOwner,
+}
+impl From<crate::safety::Reason> for Fault {
+    fn from(reason: crate::safety::Reason) -> Self {
+        match reason {
+            crate::safety::Reason::Thermal => Self::Thermal,
+            crate::safety::Reason::InvalidProof => Self::InvalidProof,
+            crate::safety::Reason::UncleanOwner => Self::UncleanOwner,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Native {
+    #[default]
+    Absent,
+    Initializing,
+    Ready,
+    Retired {
+        confirmed: bool,
+    },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Inventory {
+    Missing,
+    Present,
+    Ambiguous,
+}
+/// Immutable view. Consumers cannot mutate lifecycle by changing display state.
+#[derive(Clone, Copy, Debug)]
+pub struct Status<'a> {
+    pub phase: Phase,
+    pub generation: u64,
+    pub started_unix: u64,
+    pub native_initialized: bool,
+    pub quiesced: bool,
+    pub latched_fault: bool,
+    pub fault: Option<Fault>,
+    pub fault_reason: Option<&'a str>,
+    pub usb_present: Option<bool>,
+    pub admission_inventory_epoch: Option<u64>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Capacity {
+    pub usable: bool,
+    pub accepts_work: bool,
+    pub exploration_ready: bool,
+}
+#[derive(Clone, Debug, Default)]
+pub struct BoardLifecycle {
+    serial: Option<String>,
+    phase: Phase,
+    native: Native,
+    generation: u64,
+    started_unix: u64,
+    restriction: Option<Fault>,
+    fault_reason: Option<String>,
+    unavailable_since: Option<u64>,
+    inventory: Option<Inventory>,
+    awaiting_inventory: Option<u64>,
+}
+impl Serialize for BoardLifecycle {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("BoardLifecycle", 1)?;
+        state.serialize_field("state", self.phase.as_str())?;
+        state.end()
+    }
+}
+impl BoardLifecycle {
+    #[cfg(test)]
+    pub fn fixture(
+        phase: Phase,
+        ready: bool,
+        fault: Option<Fault>,
+        inventory: Option<bool>,
+        generation: u64,
+    ) -> Self {
+        Self {
+            phase,
+            generation,
+            restriction: fault,
+            native: if ready { Native::Ready } else { Native::Absent },
+            inventory: inventory.map(|p| {
+                if p {
+                    Inventory::Present
+                } else {
+                    Inventory::Missing
+                }
+            }),
+            ..Self::default()
+        }
+    }
+    /// Call before transferring a drained run's board into a new configuration.
+    /// A different physical serial cannot inherit the old board's admission.
+    pub fn bind(&mut self, serial: Option<&str>) {
+        if self.serial.as_deref() != serial {
+            *self = Self {
+                serial: serial.map(str::to_owned),
+                ..Self::default()
+            };
+        }
+    }
+    pub fn status(&self) -> Status<'_> {
+        Status {
+            phase: self.phase,
+            generation: self.generation,
+            started_unix: self.started_unix,
+            native_initialized: self.native == Native::Ready,
+            quiesced: self.native == Native::Retired { confirmed: true },
+            latched_fault: self.restriction.is_some(),
+            fault: self.restriction,
+            fault_reason: self.fault_reason.as_deref(),
+            usb_present: match self.inventory {
+                Some(Inventory::Present) => Some(true),
+                Some(Inventory::Missing) => Some(false),
+                _ => None,
+            },
+            admission_inventory_epoch: self.awaiting_inventory,
+        }
+    }
+    pub fn capacity(&self, now: u64, managed: bool) -> Capacity {
+        let usable = self.restriction.is_none()
+            && self.awaiting_inventory.is_none()
+            && self
+                .unavailable_since
+                .is_none_or(|since| now.saturating_sub(since) < 60);
+        let accepts_work = self.restriction.is_none()
+            && (!managed || self.native == Native::Ready)
+            && !matches!(
+                self.phase,
+                Phase::Fault
+                    | Phase::ThermalStop
+                    | Phase::Reconnecting
+                    | Phase::Quarantined
+                    | Phase::Checking
+                    | Phase::Admitted
+            );
+        Capacity {
+            usable,
+            accepts_work,
+            exploration_ready: self.native == Native::Ready
+                && self.phase == Phase::Connected
+                && self.restriction.is_none(),
+        }
+    }
+    pub fn begin_attempt(&mut self, now: u64) {
+        self.generation = self.generation.saturating_add(1);
+        self.started_unix = now;
+        self.start_native();
+    }
+    pub fn start_native(&mut self) {
+        self.phase = Phase::Starting;
+        self.native = Native::Initializing;
+        self.fault_reason = None;
+    }
+    pub fn checking(&mut self) {
+        self.phase = Phase::Checking;
+    }
+    pub fn initialized(&mut self) {
+        self.native = Native::Ready;
+    }
+    pub fn cool_telemetry(&mut self) {
+        if matches!(self.phase, Phase::Starting | Phase::Connected) {
+            self.phase = Phase::Connected;
+        }
+        if self.native == Native::Ready {
+            self.unavailable_since = None;
+        }
+    }
+    pub fn fault(&mut self, fault: Fault, reason: String, now: u64) {
+        if fault != Fault::Transport {
+            self.restriction = match (self.restriction, fault) {
+                (Some(Fault::InvalidProof), _) | (_, Fault::InvalidProof) => {
+                    Some(Fault::InvalidProof)
+                }
+                (Some(Fault::Thermal), _) | (_, Fault::Thermal) => Some(Fault::Thermal),
+                _ => Some(fault),
+            };
+        }
+        self.unavailable_since.get_or_insert(now);
+        self.phase = if self.restriction == Some(Fault::Thermal) {
+            Phase::ThermalStop
+        } else {
+            Phase::Fault
+        };
+        self.fault_reason = Some(reason);
+    }
+    pub fn retry(&mut self) {
+        self.phase = match self.restriction {
+            Some(Fault::Thermal) => Phase::ThermalStop,
+            Some(_) => Phase::Fault,
+            None => Phase::Reconnecting,
+        };
+    }
+    pub fn quarantined(&mut self, fault: Fault, reason: String, now: u64) {
+        self.fault(fault, reason, now);
+        self.phase = Phase::Quarantined;
+    }
+    pub fn admitted(&mut self, epoch: u64) {
+        self.phase = Phase::Admitted;
+        self.native = Native::Retired { confirmed: true };
+        self.restriction = None;
+        self.fault_reason = None;
+        self.unavailable_since = None;
+        self.awaiting_inventory = Some(epoch);
+        self.inventory = None;
+    }
+    /// epoch=None is a closed-owner discovery made by the current supervisor.
+    /// A periodic probe must carry the admission epoch it observed before I/O.
+    pub fn inventory(&mut self, epoch: Option<u64>, observed: Inventory) {
+        if epoch.is_some() && epoch != self.awaiting_inventory {
+            return;
+        }
+        self.inventory = Some(observed);
+        if observed == Inventory::Present {
+            self.awaiting_inventory = None;
+        }
+    }
+    pub fn retired(&mut self, confirmed: bool, error: Option<String>, now: u64) {
+        self.native = Native::Retired { confirmed };
+        if let Some(error) = error {
+            self.fault(Fault::Transport, error, now);
+        } else if self.phase != Phase::ThermalStop {
+            self.phase = Phase::Stopped;
+        }
+    }
+    pub fn preserve_in_inventory(&self, telemetry_fresh: bool) -> bool {
+        let status = self.status();
+        (!status.latched_fault || status.phase == Phase::Checking)
+            && (status.usb_present == Some(true)
+                || (status.usb_present.is_none()
+                    && status.phase == Phase::Connected
+                    && telemetry_fresh))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn admission_and_inventory_are_one_transition_contract() {
+        let mut owner = BoardLifecycle::default();
+        owner.bind(Some("A"));
+        owner.begin_attempt(10);
+        owner.fault(Fault::InvalidProof, "bad proof".into(), 12);
+        owner.admitted(7);
+        assert!(!owner.capacity(100, true).usable);
+        owner.inventory(Some(6), Inventory::Present);
+        assert!(!owner.capacity(100, true).usable);
+        owner.inventory(Some(7), Inventory::Ambiguous);
+        assert!(!owner.capacity(100, true).usable);
+        owner.inventory(Some(7), Inventory::Present);
+        assert!(owner.capacity(100, true).usable);
+        assert!(!owner.capacity(100, true).accepts_work);
+        owner.start_native();
+        owner.initialized();
+        owner.cool_telemetry();
+        assert!(owner.capacity(100, true).exploration_ready);
+        assert_eq!(
+            serde_json::to_value(&owner).unwrap(),
+            serde_json::json!({"state":"connected"})
+        );
+    }
+    #[test]
+    fn replacement_preserves_fault_but_new_serial_does_not_inherit_it() {
+        let mut owner = BoardLifecycle::default();
+        owner.bind(Some("A"));
+        owner.begin_attempt(1);
+        owner.fault(Fault::Thermal, "hot".into(), 2);
+        owner.retired(true, Some("hot".into()), 3);
+        let mut replacement = owner.clone();
+        replacement.bind(Some("A"));
+        assert!(replacement.status().latched_fault);
+        assert!(replacement.status().quiesced);
+        replacement.bind(Some("B"));
+        assert!(!replacement.status().latched_fault);
+        assert!(!replacement.status().quiesced);
+    }
+}

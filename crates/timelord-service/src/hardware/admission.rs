@@ -122,8 +122,13 @@ pub(super) async fn check(
     state.boards.insert(
         probe.id.clone(),
         HardwareState {
-            generation: 1,
-            state: "starting".into(),
+            lifecycle: {
+                let mut owner = crate::board_lifecycle::BoardLifecycle::default();
+                owner.bind(probe.serial.as_deref());
+                owner.begin_attempt(crate::unix_now());
+                owner
+            },
+
             ..Default::default()
         },
     );
@@ -194,8 +199,8 @@ pub(super) async fn check(
         };
         let cool = |state: &RuntimeState| {
             state.boards.get(&probe.id).is_some_and(|h| {
-                h.native_initialized
-                    && !h.latched_fault
+                h.lifecycle.status().native_initialized
+                    && !h.lifecycle.status().latched_fault
                     && h.temperature_c.is_some_and(|t| t > 0. && t <= cool_limit)
                     && h.temperature_unix <= crate::unix_now()
                     && crate::unix_now() - h.temperature_unix <= 10
@@ -206,10 +211,13 @@ pub(super) async fn check(
                 let state = private.runtime.lock().expect("runtime");
                 let board_state = &state.boards[&probe.id];
                 ensure!(
-                    !board_state.latched_fault,
+                    !board_state.lifecycle.status().latched_fault,
                     "ASIC admission rejected: temperature_limit"
                 );
-                ensure!(board_state.state != "fault", "ASIC admission owner failed");
+                ensure!(
+                    board_state.lifecycle.status().phase != crate::board_lifecycle::Phase::Fault,
+                    "ASIC admission owner failed"
+                );
                 if cool(&state) {
                     break;
                 }
@@ -246,11 +254,12 @@ pub(super) async fn check(
             {
                 let state = private.runtime.lock().expect("runtime");
                 ensure!(
-                    !state.boards[&probe.id].latched_fault,
+                    !state.boards[&probe.id].lifecycle.status().latched_fault,
                     "ASIC admission rejected: temperature_limit"
                 );
                 ensure!(
-                    state.boards[&probe.id].state != "fault",
+                    state.boards[&probe.id].lifecycle.status().phase
+                        != crate::board_lifecycle::Phase::Fault,
                     "ASIC admission owner failed"
                 );
                 if cool(&state)
@@ -290,7 +299,7 @@ pub(super) async fn check(
             .expect("runtime")
             .boards
             .get(&probe.id)
-            .is_some_and(|h| h.quiesced),
+            .is_some_and(|h| h.lifecycle.status().quiesced),
         "Admission native owner did not confirm hardware quiescence"
     );
     if private.runtime.lock().expect("runtime").failed_proofs != 0 {

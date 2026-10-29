@@ -1,6 +1,7 @@
 mod asic;
 mod assignment;
 mod automatic;
+mod board_lifecycle;
 mod connection;
 mod diagnostics;
 mod experiments;
@@ -491,7 +492,7 @@ async fn status(State(http): State<observability::HttpState>) -> Json<Status> {
                 hardware_state: runtime
                     .boards
                     .get(&b.id)
-                    .map(|b| b.state.clone())
+                    .map(|b| b.lifecycle.status().phase.as_str().to_owned())
                     .unwrap_or_else(|| "not_inspected".into()),
                 raw_speeds: runtime
                     .boards
@@ -520,7 +521,7 @@ async fn status(State(http): State<observability::HttpState>) -> Json<Status> {
                             >= runtime
                                 .boards
                                 .get(&b.id)
-                                .map(|h| h.started_unix)
+                                .map(|h| h.lifecycle.status().started_unix)
                                 .unwrap_or(0)
                             && shared
                                 .assignments
@@ -597,12 +598,12 @@ impl Run {
 async fn start_run(
     config: Config,
     history_path: PathBuf,
-    faults: &std::collections::HashMap<String, runtime::HardwareState>,
+    board_states: &std::collections::HashMap<String, runtime::HardwareState>,
     service_started_unix: u64,
     metrics: Arc<observability::Metrics>,
     safety: Option<Arc<safety::Store>>,
 ) -> Result<Run> {
-    let unavailable = hardware::unavailable_for(&config, faults, safety.as_deref());
+    let unavailable = hardware::unavailable_for(&config, board_states, safety.as_deref());
     let assignments = assignment::resolve_usable(&config, &unavailable)?;
     hardware::validate_automatic(&config, &assignments).await?;
     tracing::info!(plan=?assignments, "Resolved chain assignments for this run");
@@ -641,7 +642,15 @@ async fn start_run(
             false
         }
     };
-    runtime.boards = faults.clone();
+    runtime.boards = board_states.clone();
+    for board in &config.hardware.boards {
+        runtime
+            .boards
+            .entry(board.id.clone())
+            .or_default()
+            .lifecycle
+            .bind(board.serial.as_deref());
+    }
     if let Some(store) = &safety {
         for board in &config.hardware.boards {
             if let Some(saved) = board
@@ -651,9 +660,11 @@ async fn start_run(
                 && let Some(reason) = saved.quarantine
             {
                 let hardware = runtime.boards.entry(board.id.clone()).or_default();
-                hardware.latched_fault = true;
-                hardware.state = "quarantined".into();
-                hardware.fault_reason = Some(format!("Board admission required after {reason:?}"));
+                hardware.lifecycle.quarantined(
+                    reason.into(),
+                    format!("Board admission required after {reason:?}"),
+                    unix_now(),
+                );
             }
         }
     }
@@ -763,12 +774,6 @@ async fn observation_exit(
     tracing::error!(?result, "Observability server exited unexpectedly");
 }
 
-fn retain_board_on_reconfiguration(board: &runtime::HardwareState) -> bool {
-    board.latched_fault
-        || board.unavailable_since_unix.is_some()
-        || board.admission_inventory_epoch.is_some()
-}
-
 async fn serve(
     config: Config,
     history_path: PathBuf,
@@ -779,7 +784,7 @@ async fn serve(
     let service_started_unix = unix_now();
     // The status listener outlives each topology. No UI or external supervisor
     // is required to restart the service after a USB change.
-    let mut faults = std::collections::HashMap::new();
+    let mut board_states = std::collections::HashMap::new();
     let startup = async {
         let http = TcpListener::bind(config.service.status_listen)
             .await
@@ -805,7 +810,7 @@ async fn serve(
         let run = start_run(
             config,
             history_path.clone(),
-            &faults,
+            &board_states,
             service_started_unix,
             metrics.clone(),
             safety.clone(),
@@ -923,25 +928,11 @@ async fn serve(
         let previous = run.shared.clone();
         run.stop().await?;
         // Collect after shutdown too: verification can finish while tasks drain.
-        faults = previous
-            .runtime
-            .lock()
-            .expect("runtime")
-            .boards
-            .iter()
-            .filter(|(_, b)| retain_board_on_reconfiguration(b))
-            .map(|(id, b)| {
-                let mut fault = b.clone();
-                fault.raw_speeds.clear();
-                fault.temperature_c = None;
-                fault.temperature_unix = 0;
-                (id.clone(), fault)
-            })
-            .collect();
+        board_states = previous.runtime.lock().expect("runtime").boards.clone();
         run = start_run(
             config,
             history_path.clone(),
-            &faults,
+            &board_states,
             service_started_unix,
             metrics.clone(),
             safety.clone(),
@@ -997,7 +988,7 @@ async fn client_listener(
                             let hardware = runtime.boards.entry(id.clone()).or_default();
                             // Reusing a slot must never reuse its predecessor's verified readiness.
                             hardware.verified_slots.remove(&slot);
-                            hardware.generation
+                            hardware.lifecycle.status().generation
                         };
                         let lease = asic::Lease { socket, board: id.clone(), slot, generation, clients: shared.clients.clone() };
                         if offers.try_send(lease).is_err() { tracing::warn!(board=%id, "ASIC socket queue full"); }
@@ -1051,17 +1042,21 @@ mod tests {
             toml::from_str("id='a'\nname='A'\nserial='A'\nclient_port=18110").unwrap();
         let mut config = Config::default();
         config.hardware.boards.push(board);
-        let mut hardware = runtime::HardwareState {
-            state: "admitted".into(),
-            admission_inventory_epoch: Some(1),
-            usb_present: None,
+        let hardware = runtime::HardwareState {
+            lifecycle: {
+                let mut owner = crate::board_lifecycle::BoardLifecycle::default();
+                owner.admitted(1);
+                owner
+            },
+
             ..Default::default()
         };
-        assert!(retain_board_on_reconfiguration(&hardware));
+        let mut hardware = hardware.clone(); // The entire drained state transfers to a replacement run.
         let mut boards = std::collections::HashMap::from([("a".into(), hardware.clone())]);
         assert!(hardware::unavailable_for(&config, &boards, None).contains("a"));
-        hardware.usb_present = Some(true);
-        hardware.admission_inventory_epoch = None;
+        hardware
+            .lifecycle
+            .inventory(Some(1), crate::board_lifecycle::Inventory::Present);
         boards.insert("a".into(), hardware);
         assert!(!hardware::unavailable_for(&config, &boards, None).contains("a"));
     }
@@ -1111,20 +1106,35 @@ mod tests {
             config.hardware.boards.push(toml::from_str(&format!("id='b{i}'\nname='B{i}'\nserial='s{i}'\nprofile='manual'\ndevice_location={}\nclient_port={}", i+1, port.local_addr().unwrap().port())).unwrap());
             reserved.push(port);
         }
-        let mut faults = std::collections::HashMap::new();
-        faults.insert(
+        let mut board_states = std::collections::HashMap::new();
+        board_states.insert(
             "b2".into(),
             runtime::HardwareState {
-                latched_fault: true,
-                state: "thermal_stop".into(),
+                lifecycle: crate::board_lifecycle::BoardLifecycle::fixture(
+                    crate::board_lifecycle::Phase::ThermalStop,
+                    false,
+                    Some(crate::board_lifecycle::Fault::Thermal),
+                    None,
+                    0,
+                ),
+
                 ..Default::default()
             },
         );
+        // Fixture restrictions are attached to the same physical serial as production snapshots.
+        let mut preserved = board_states.remove("b2").unwrap();
+        preserved.lifecycle.bind(Some("s2"));
+        preserved.lifecycle.fault(
+            crate::board_lifecycle::Fault::Thermal,
+            "fixture".into(),
+            unix_now(),
+        );
+        board_states.insert("b2".into(), preserved);
         drop(reserved);
         let mut run = start_run(
             config,
             dir.join("history.json"),
-            &faults,
+            &board_states,
             unix_now() - 3600,
             metrics.clone(),
             None,
@@ -1189,7 +1199,7 @@ mod tests {
             run = start_run(
                 next,
                 dir.join("history.json"),
-                &faults,
+                &board_states,
                 service_started_unix,
                 metrics.clone(),
                 None,
@@ -1198,7 +1208,12 @@ mod tests {
             .unwrap();
             current.send_replace(run.shared.clone());
             assert_eq!(metrics.counter("topology_changes_total", &[]), 1);
-            assert!(run.shared.runtime.lock().unwrap().boards["b2"].latched_fault);
+            assert!(
+                run.shared.runtime.lock().unwrap().boards["b2"]
+                    .lifecycle
+                    .status()
+                    .latched_fault
+            );
             assert_eq!(
                 run.shared.assignments.len(),
                 if indices.is_empty() { 0 } else { 3 }

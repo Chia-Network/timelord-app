@@ -61,36 +61,17 @@ pub struct RawSpeed {
 }
 #[derive(Clone, Default, Serialize)]
 pub struct HardwareState {
-    #[serde(skip)]
-    pub native_initialized: bool,
-    #[serde(skip)]
-    pub quiesced: bool,
-    #[serde(skip)]
-    pub unavailable_since_unix: Option<u64>,
+    #[serde(flatten)]
+    pub lifecycle: crate::board_lifecycle::BoardLifecycle,
     #[serde(skip)]
     pub verified_generation: Option<u64>,
     #[serde(skip)]
     pub verified_slots: std::collections::BTreeSet<u8>,
-    #[serde(skip)]
-    pub generation: u64,
     pub device_location: Option<u32>,
-    #[serde(skip)]
-    pub started_unix: u64,
-    #[serde(skip)]
-    pub latched_fault: bool,
-    // Set only by discovery while this board's native owner is closed.
-    #[serde(skip)]
-    pub usb_present: Option<bool>,
-    // Admission owner epoch awaiting a newer closed-owner inventory observation.
-    #[serde(skip)]
-    pub admission_inventory_epoch: Option<u64>,
-    #[serde(skip)]
-    pub fault_reason: Option<String>,
     pub raw_speeds: Vec<RawSpeed>,
     pub temperature_c: Option<f64>,
     pub frequency_mhz: Option<f64>,
     pub voltage_v: Option<f64>,
-    pub state: String,
     pub recoveries: u64,
     pub temperature_unix: u64,
     #[serde(skip)]
@@ -750,7 +731,16 @@ pub async fn run(
                     .boards
                     .entry(failure.board_id.clone())
                     .or_default()
-                    .state = "fault".into();
+                    .lifecycle
+                    .fault(
+                        if failure.verification {
+                            crate::board_lifecycle::Fault::InvalidProof
+                        } else {
+                            crate::board_lifecycle::Fault::Transport
+                        },
+                        error.to_string(),
+                        unix_now(),
+                    );
                 if failure.verification {
                     state.failed_proofs += 1;
                 }
@@ -979,8 +969,13 @@ mod tests {
             runtime.lock().unwrap().boards.insert(
                 "failed".into(),
                 HardwareState {
-                    state: "fault".into(),
-                    latched_fault: true,
+                    lifecycle: crate::board_lifecycle::BoardLifecycle::fixture(
+                        crate::board_lifecycle::Phase::Fault,
+                        false,
+                        Some(crate::board_lifecycle::Fault::InvalidProof),
+                        None,
+                        0,
+                    ),
                     ..Default::default()
                 },
             );

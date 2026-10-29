@@ -422,7 +422,12 @@ pub async fn live_configuration(shared: &crate::Shared) -> Result<Config> {
         .expect("runtime")
         .boards
         .iter()
-        .filter_map(|(id, h)| h.admission_inventory_epoch.map(|epoch| (id.clone(), epoch)))
+        .filter_map(|(id, h)| {
+            h.lifecycle
+                .status()
+                .admission_inventory_epoch
+                .map(|epoch| (id.clone(), epoch))
+        })
         .collect();
     let mut devices = discover(&shared.config).await?;
     {
@@ -453,14 +458,9 @@ pub(crate) fn confirm_board_presence(
         .iter()
         .filter(|d| d.serial.is_some() && d.serial == board.serial)
         .count();
-    hardware.usb_present = match matches {
-        0 => Some(false),
-        1 => Some(true),
-        _ => None,
-    };
-    if matches == 1 {
-        hardware.admission_inventory_epoch = None;
-    }
+    hardware
+        .lifecycle
+        .inventory(None, inventory_observation(matches));
 }
 
 fn confirm_admitted_presence(
@@ -469,8 +469,20 @@ fn confirm_admitted_presence(
     devices: &[Device],
     epoch: u64,
 ) {
-    if hardware.admission_inventory_epoch == Some(epoch) {
-        confirm_board_presence(hardware, board, devices);
+    let matches = devices
+        .iter()
+        .filter(|d| d.serial.is_some() && d.serial == board.serial)
+        .count();
+    hardware
+        .lifecycle
+        .inventory(Some(epoch), inventory_observation(matches));
+}
+
+fn inventory_observation(matches: usize) -> crate::board_lifecycle::Inventory {
+    match matches {
+        0 => crate::board_lifecycle::Inventory::Missing,
+        1 => crate::board_lifecycle::Inventory::Present,
+        _ => crate::board_lifecycle::Inventory::Ambiguous,
     }
 }
 
@@ -486,15 +498,13 @@ fn preserve_managed_boards(
     // and obtained a successful inventory that actually omits that serial.
     for board in &config.hardware.boards {
         if let Some(state) = runtime.boards.get(&board.id)
-            && (!state.latched_fault || state.state == "checking")
-            && (state.usb_present == Some(true)
-                || (state.usb_present.is_none()
-                    && state.state == "connected"
-                    && state.temperature_unix > 0
+            && state.lifecycle.preserve_in_inventory(
+                state.temperature_unix > 0
                     && now.saturating_sub(state.temperature_unix)
-                        <= crate::hardware::TEMPERATURE_TIMEOUT_SECONDS))
+                        <= crate::hardware::TEMPERATURE_TIMEOUT_SECONDS,
+            )
             && !devices.iter().any(|d| {
-                d.serial == board.serial && d.serial.is_some()
+                (d.serial.is_some() && d.serial == board.serial)
                     || Some(d.location) == state.device_location.or(board.device_location)
             })
             && let Some(location) = state.device_location.or(board.device_location)
@@ -548,10 +558,13 @@ mod tests {
     fn admitted_capacity_requires_matching_fresh_inventory_despite_display_changes() {
         let config = configured();
         let board = &config.hardware.boards[0];
-        for display in ["admitted", "starting", "connected", "reconnecting"] {
+        {
             let mut h = crate::runtime::HardwareState {
-                state: display.into(),
-                admission_inventory_epoch: Some(7),
+                lifecycle: {
+                    let mut owner = crate::board_lifecycle::BoardLifecycle::default();
+                    owner.admitted(7);
+                    owner
+                },
                 ..Default::default()
             };
             let blocked = |h: &crate::runtime::HardwareState| {
@@ -573,7 +586,7 @@ mod tests {
             assert!(blocked(&h), "ambiguous inventory released capacity");
             confirm_admitted_presence(&mut h, board, &devices(&[0]), 7);
             assert!(!blocked(&h));
-            assert_eq!(h.usb_present, Some(true));
+            assert_eq!(h.lifecycle.status().usb_present, Some(true));
         }
     }
 
@@ -718,14 +731,41 @@ mod tests {
         assert!(connected_plan(configured(), devices(&[0, 0])).is_err());
     }
     #[test]
+    fn visible_managed_board_is_not_synthesized_twice() {
+        let config = configured();
+        let mut runtime = crate::runtime::RuntimeState::default();
+        let mut board = crate::runtime::HardwareState::default();
+        board
+            .lifecycle
+            .inventory(None, crate::board_lifecycle::Inventory::Present);
+        runtime.boards.insert("b0".into(), board);
+        let mut detected = devices(&[0, 1, 2]);
+        preserve_managed_boards(&config, &mut detected, &runtime, 1000);
+        assert_eq!(detected.len(), 3);
+        assert_eq!(
+            connected_plan(config, detected)
+                .unwrap()
+                .hardware
+                .boards
+                .len(),
+            3
+        );
+    }
+
+    #[test]
     fn idle_owner_without_socket_keeps_three_board_layout_through_metadata_gaps() {
         let config = configured();
         let mut runtime = crate::runtime::RuntimeState::default();
         runtime.boards.insert(
             "b2".into(),
             crate::runtime::HardwareState {
-                state: "connected".into(),
-                usb_present: Some(true),
+                lifecycle: crate::board_lifecycle::BoardLifecycle::fixture(
+                    crate::board_lifecycle::Phase::Connected,
+                    false,
+                    None,
+                    Some(true),
+                    0,
+                ),
                 temperature_unix: 1000,
                 device_location: Some(3),
                 ..Default::default()
@@ -750,13 +790,23 @@ mod tests {
     #[test]
     fn transport_and_sensor_recovery_do_not_become_false_usb_removals() {
         let config = configured();
-        for state in ["connected", "fault", "reconnecting", "starting"] {
+        for phase in [
+            crate::board_lifecycle::Phase::Connected,
+            crate::board_lifecycle::Phase::Fault,
+            crate::board_lifecycle::Phase::Reconnecting,
+            crate::board_lifecycle::Phase::Starting,
+        ] {
             let mut runtime = crate::runtime::RuntimeState::default();
             runtime.boards.insert(
                 "b2".into(),
                 crate::runtime::HardwareState {
-                    state: state.into(),
-                    usb_present: Some(true),
+                    lifecycle: crate::board_lifecycle::BoardLifecycle::fixture(
+                        phase,
+                        false,
+                        None,
+                        Some(true),
+                        0,
+                    ),
                     temperature_unix: 1000,
                     ..Default::default()
                 },
@@ -781,8 +831,13 @@ mod tests {
         runtime.boards.insert(
             "b2".into(),
             crate::runtime::HardwareState {
-                state: "connected".into(),
-                usb_present: Some(false),
+                lifecycle: crate::board_lifecycle::BoardLifecycle::fixture(
+                    crate::board_lifecycle::Phase::Connected,
+                    false,
+                    None,
+                    Some(false),
+                    0,
+                ),
                 temperature_unix: 1000,
                 ..Default::default()
             },
@@ -801,19 +856,24 @@ mod tests {
     #[test]
     fn absent_faulted_or_stale_owner_does_not_hide_an_unplugged_board() {
         let config = configured();
-        for (state, latched, age) in [
-            ("reconnecting", false, 1),
-            ("fault", false, 1),
-            ("starting", false, 1),
-            ("connected", true, 1),
-            ("connected", false, 61),
+        for (phase, latched, age) in [
+            (crate::board_lifecycle::Phase::Reconnecting, false, 1),
+            (crate::board_lifecycle::Phase::Fault, false, 1),
+            (crate::board_lifecycle::Phase::Starting, false, 1),
+            (crate::board_lifecycle::Phase::Connected, true, 1),
+            (crate::board_lifecycle::Phase::Connected, false, 61),
         ] {
             let mut runtime = crate::runtime::RuntimeState::default();
             runtime.boards.insert(
                 "b2".into(),
                 crate::runtime::HardwareState {
-                    state: state.into(),
-                    latched_fault: latched,
+                    lifecycle: crate::board_lifecycle::BoardLifecycle::fixture(
+                        phase,
+                        false,
+                        latched.then_some(crate::board_lifecycle::Fault::InvalidProof),
+                        None,
+                        0,
+                    ),
                     temperature_unix: 1000,
                     ..Default::default()
                 },
