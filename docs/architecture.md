@@ -168,4 +168,7 @@ its own. Critical owner/safety writes retain their independent deadline. Delayed
 saves from an older owner cannot relax a newer owner's safety state.
 
 The previously persisted active-owner marker covers a crash or failed fault write;
-unknown/unclean quarantine also requires extra cooling on admission.
+unknown/unclean quarantine also requires the extra cooling margin on admission.
+
+USB serial leases use the service account's private persistent `~/.timelord-usb-locks` directory, resolved through the account database. Deployment accounts need an owned writable home; `HOME` and temporary-directory cleanup do not select or rotate the namespace.
+

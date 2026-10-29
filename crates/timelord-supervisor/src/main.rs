@@ -112,7 +112,8 @@ async fn main() -> Result<()> {
         }
         Action::CheckOwner { config } => {
             let paths = Paths::for_config(&config)?;
-            let _owner = InstanceLock::acquire(&paths.worker_lock)?;
+            let _supervisor = InstanceLock::acquire(&paths.lock)?;
+            let _worker = InstanceLock::acquire(&paths.worker_lock)?;
             println!("{}", serde_json::json!({"available":true}));
             Ok(())
         }
@@ -185,11 +186,21 @@ impl Drop for SocketGuard {
         }
     }
 }
+fn retry_delay(failures: &mut usize, elapsed: Option<Duration>) -> u64 {
+    if elapsed.is_some_and(|elapsed| elapsed >= Duration::from_secs(60)) {
+        *failures = 0;
+    }
+    let delay = [1, 5, 30, 60, 120][(*failures).min(4)];
+    *failures = failures.saturating_add(1);
+    delay
+}
+
 struct Worker {
     log_tasks: Vec<tokio::task::JoinHandle<()>>,
     child: Child,
     group: i32,
     watchdog: timelord_supervisor::progress::Watchdog,
+    started: Instant,
 }
 impl Worker {
     fn spawn(
@@ -236,6 +247,7 @@ impl Worker {
             child,
             group,
             watchdog: timelord_supervisor::progress::Watchdog::new(std::time::Instant::now()),
+            started: Instant::now(),
         })
     }
     fn signal(&self, signal: i32) {
@@ -550,8 +562,10 @@ async fn run(
                 state.lock().expect("status").progress_age_seconds=worker.as_ref().and_then(|w|w.watchdog.age(std::time::Instant::now()));
                 if watchdog_failure.is_some() || worker.as_ref().map(Worker::exited).transpose()?.unwrap_or(false) {
                     let previous_pid=worker.as_ref().and_then(|w|w.child.id());
-                    let exit=worker.take().expect("worker").stop().await?;
-                    let delay=[1,5,30,60,120][failures.min(4)]; failures=failures.saturating_add(1);
+                    let child=worker.take().expect("worker");
+                    let elapsed=child.started.elapsed();
+                    let exit=child.stop().await?;
+                    let delay=retry_delay(&mut failures,Some(elapsed));
                     next=Instant::now()+Duration::from_secs(delay);
                     let mut status=state.lock().expect("status");status.worker_pid=None;status.progress=None;status.progress_age_seconds=None;status.restarts+=1;
                     let reason=watchdog_failure.unwrap_or_else(||format!("Worker exited: {exit}"));
@@ -568,7 +582,7 @@ async fn run(
                             status.phase="worker_started".into();status.error=None;worker=Some(child);
                         },
                         Err(error)=>{
-                            let delay=[1,5,30,60,120][failures.min(4)];failures=failures.saturating_add(1);
+                            let delay=retry_delay(&mut failures, None);
                             next=Instant::now()+Duration::from_secs(delay);
                             let mut status=state.lock().expect("status");status.phase="recovering".into();status.error=Some(format!("{error:#}"));
                         },
@@ -588,4 +602,21 @@ async fn run(
     handlers.abort_all();
     while handlers.join_next().await.is_some() {}
     result
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    #[test]
+    fn stable_worker_resets_crash_streak_but_short_crashes_keep_backoff() {
+        let mut failures = 0;
+        for expected in [1, 5, 30, 60, 120, 120] {
+            assert_eq!(
+                retry_delay(&mut failures, Some(Duration::from_secs(1))),
+                expected
+            );
+        }
+        assert_eq!(retry_delay(&mut failures, Some(Duration::from_secs(60))), 1);
+        assert_eq!(retry_delay(&mut failures, None), 5);
+    }
 }
