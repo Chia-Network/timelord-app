@@ -70,7 +70,8 @@ impl HardwareState {
 pub struct RuntimeState {
     pub experiments: Arc<crate::experiments::Gate>,
     pub safety: Option<Arc<crate::safety::Store>>,
-    pub progress: Option<Arc<timelord_supervisor::progress::Progress>>,
+    // The same owner is carried through every topology and isolated admission run.
+    pub process: Arc<crate::operational::State>,
     pub metrics: Option<Arc<crate::observability::Metrics>>,
     pub metric_epoch: u64,
     pub pending: [u32; 3],
@@ -96,7 +97,7 @@ impl Default for RuntimeState {
         Self {
             experiments: Default::default(),
             safety: None,
-            progress: None,
+            process: Arc::default(),
             metrics: None,
             metric_epoch: 0,
             pending: [0; 3],

@@ -88,15 +88,14 @@ pub(super) async fn check(
         guard=INITIALIZATION.lock()=>guard,
         _=outer_shutdown.changed()=>return Ok(Outcome::Cancelled),
     };
-    let progress = shared.runtime.lock().expect("runtime").progress.clone();
-    let _stage = progress.as_ref().map(|p| {
-        p.begin(
-            timelord_supervisor::progress::Resource::Admission,
-            0,
-            360,
-            timelord_supervisor::progress::Stage::Admission,
-        )
-    });
+    let process = shared.runtime.lock().expect("runtime").process.clone();
+    let progress = process.progress.clone();
+    let _stage = progress.begin(
+        timelord_supervisor::progress::Resource::Admission,
+        0,
+        360,
+        timelord_supervisor::progress::Stage::Admission,
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let mut probe = board.clone();
     probe.client_port = listener.local_addr()?.port();
@@ -121,7 +120,7 @@ pub(super) async fn check(
         })
         .collect();
     let mut state = RuntimeState {
-        progress,
+        process,
         ..Default::default()
     };
     state.boards.insert(

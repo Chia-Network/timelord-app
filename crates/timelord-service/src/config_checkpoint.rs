@@ -68,7 +68,6 @@ pub async fn record(
     candidate: Config,
     path: PathBuf,
     current: watch::Receiver<Arc<Shared>>,
-    metrics: Arc<observability::Metrics>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut timer = tokio::time::interval(Duration::from_secs(1));
@@ -76,12 +75,13 @@ pub async fn record(
         tokio::select! {_=shutdown.changed()=>return Ok(()),_=timer.tick()=>{}}
         let shared = current.borrow().clone();
         let sent = shared.runtime.lock().expect("runtime").proofs_delivered > 0;
-        if !sent || !observability::ready(&shared, &metrics) {
+        if !sent || !observability::ready(&shared) {
             continue;
         }
-        let permit = tokio::select! {p=metrics.progress.arithmetic(timelord_supervisor::progress::Resource::OptionalCheckpoint).acquire_owned()=>p?,_=shutdown.changed()=>return Ok(())};
-        let stage = metrics.progress.begin(
-            20,
+        let process = shared.runtime.lock().expect("runtime").process.clone();
+        let permit = tokio::select! {p=process.progress.arithmetic(timelord_supervisor::progress::Resource::OptionalCheckpoint).acquire_owned()=>p?,_=shutdown.changed()=>return Ok(())};
+        let stage = process.progress.begin(
+            timelord_supervisor::progress::Resource::OptionalCheckpoint,
             0,
             0,
             timelord_supervisor::progress::Stage::OptionalPersistence,
@@ -95,7 +95,7 @@ pub async fn record(
         .await?
         {
             Ok(()) => {
-                metrics.progress.checkpointed();
+                process.progress.checkpointed();
                 return Ok(());
             }
             Err(error) => {
@@ -153,16 +153,10 @@ mod tests {
             started_unix: crate::unix_now(),
             service_started_unix: crate::unix_now(),
         });
-        let metrics = observability::Metrics::new(config.node.network).unwrap();
+        let process = shared.runtime.lock().unwrap().process.clone();
         let (_current, current) = watch::channel(shared.clone());
         let (stop, rx) = watch::channel(false);
-        let task = tokio::spawn(record(
-            config.clone(),
-            path.clone(),
-            current,
-            metrics.clone(),
-            rx,
-        ));
+        let task = tokio::spawn(record(config.clone(), path.clone(), current, rx));
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(!saved_path(&path).unwrap().exists());
         {
@@ -173,9 +167,18 @@ mod tests {
             state.boards.insert(
                 "a".into(),
                 crate::runtime::HardwareState {
-                    generation: 1,
-                    verified_generation: Some(1),
-                    verified_slots: [0, 1].into(),
+                    lifecycle: {
+                        let mut owner = crate::board_lifecycle::BoardLifecycle::fixture(
+                            crate::board_lifecycle::Phase::Connected,
+                            true,
+                            None,
+                            None,
+                            1,
+                        );
+                        owner.verified(1, 0);
+                        owner.verified(1, 1);
+                        owner
+                    },
                     ..Default::default()
                 },
             );
@@ -191,7 +194,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            metrics
+            process
                 .progress
                 .snapshot(1, 1)
                 .unwrap()

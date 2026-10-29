@@ -7,7 +7,7 @@ use axum::{
     http::Request,
 };
 use std::{
-    sync::{Arc, Mutex, atomic::Ordering},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use timelord_core::{Chain, Config, Network};
@@ -59,8 +59,10 @@ fn fixture() -> (Arc<Shared>, Arc<Metrics>, HttpState) {
         service_started_unix: now,
     });
     let (_, current) = watch::channel(shared.clone());
+    let process = shared.runtime.lock().unwrap().process.clone();
     let http = HttpState {
         current,
+        process,
         metrics: metrics.clone(),
     };
     (shared, metrics, http)
@@ -100,7 +102,7 @@ async fn response(http: HttpState, path: &str) -> (StatusCode, String, String) {
 }
 #[tokio::test]
 async fn probes_distinguish_internal_failure_dependencies_and_normal_idle() {
-    let (shared, metrics, http) = fixture();
+    let (shared, _metrics, http) = fixture();
     assert_eq!(response(http.clone(), "/healthz").await.0, StatusCode::OK);
     // Two clients can cover CC/RC while ICC has no work. Tuning pause is independent.
     shared.runtime.lock().unwrap().tuning_paused = true;
@@ -119,7 +121,10 @@ async fn probes_distinguish_internal_failure_dependencies_and_normal_idle() {
             .2
             .contains("waiting_for_node")
     );
-    metrics.failed.store(true, Ordering::Relaxed);
+    http.process.fail();
+    let body = response(http.clone(), "/metrics").await.2;
+    assert_eq!(value(&body, "chia_timelord_healthy", &[]), Some(0.));
+    assert_eq!(value(&body, "chia_timelord_ready", &[]), Some(0.));
     assert_eq!(
         response(http.clone(), "/healthz").await.0,
         StatusCode::SERVICE_UNAVAILABLE
@@ -130,8 +135,8 @@ async fn probes_distinguish_internal_failure_dependencies_and_normal_idle() {
             .2
             .contains("service_unavailable")
     );
-    metrics.failed.store(false, Ordering::Relaxed);
-    metrics.stopping.store(true, Ordering::Relaxed);
+    let (_, _, http) = fixture();
+    http.process.stop();
     assert_eq!(
         response(http, "/healthz").await.0,
         StatusCode::SERVICE_UNAVAILABLE
@@ -139,7 +144,7 @@ async fn probes_distinguish_internal_failure_dependencies_and_normal_idle() {
 }
 #[tokio::test]
 async fn readiness_requires_initialization_fresh_managed_telemetry_or_verified_generation() {
-    let (mut shared, metrics, mut http) = fixture();
+    let (mut shared, _metrics, mut http) = fixture();
     shared.runtime.lock().unwrap().scheduler_initialized = false;
     assert!(
         response(http.clone(), "/readyz")
@@ -232,7 +237,7 @@ async fn readiness_requires_initialization_fresh_managed_telemetry_or_verified_g
         response(http.clone(), "/readyz").await.0,
         StatusCode::SERVICE_UNAVAILABLE
     );
-    metrics.reconfiguring.store(true, Ordering::Relaxed);
+    http.process.reconfigure();
     assert!(
         response(http.clone(), "/readyz")
             .await
@@ -481,6 +486,7 @@ fn process_totals_survive_history_pruning_and_runtime_replacement() {
     let before = metrics.render(&shared, crate::unix_now()).unwrap();
     let mut state = shared.runtime.lock().unwrap();
     *state = RuntimeState {
+        process: state.process.clone(),
         metrics: Some(metrics.clone()),
         metric_epoch: metrics.begin_session(),
         ..Default::default()

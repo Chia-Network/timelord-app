@@ -1,11 +1,8 @@
 //! Optional Automatic policy. Manual sessions have no policy or learned state.
 use super::*;
 
-// The permit lives in the actual blocking closure, across owner generations.
-// A stalled optional file cannot accumulate more blocking jobs or own the
-// critical safety writer. A later healthy observation retries a skipped save.
-static OPTIONAL_CHECKPOINT: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
-    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+// The actual job retains the process-lifetime optional checkpoint permit after
+// a caller timeout; safety-journal work uses its independent critical writer.
 
 enum JournalDecision {
     Durable,
@@ -42,12 +39,15 @@ impl Tuning {
             .automatic_state
             .as_ref()
             .context("Automatic state path missing")?;
-        let progress = shared.runtime.lock().expect("runtime").progress.clone();
-        let gate = progress
-            .as_ref()
-            .map(|p| p.arithmetic(timelord_supervisor::progress::Resource::OptionalCheckpoint))
-            .unwrap_or_else(|| OPTIONAL_CHECKPOINT.clone());
-        let permit = gate
+        let progress = shared
+            .runtime
+            .lock()
+            .expect("runtime")
+            .process
+            .progress
+            .clone();
+        let permit = progress
+            .arithmetic(timelord_supervisor::progress::Resource::OptionalCheckpoint)
             .try_acquire_owned()
             .context("Optional checkpoint writer is busy")?;
         self.last_record_unix = crate::unix_now();
@@ -77,20 +77,12 @@ impl Tuning {
         } else {
             None
         };
-        let stage = shared
-            .runtime
-            .lock()
-            .expect("runtime")
-            .progress
-            .as_ref()
-            .map(|p| {
-                p.begin(
-                    timelord_supervisor::progress::Resource::OptionalCheckpoint,
-                    0,
-                    0,
-                    timelord_supervisor::progress::Stage::OptionalPersistence,
-                )
-            });
+        let stage = progress.begin(
+            timelord_supervisor::progress::Resource::OptionalCheckpoint,
+            0,
+            0,
+            timelord_supervisor::progress::Stage::OptionalPersistence,
+        );
         Ok(tokio::task::spawn_blocking(move || {
             let (_permit, _stage) = (permit, stage);
             automatic::save(&path, entry)?;

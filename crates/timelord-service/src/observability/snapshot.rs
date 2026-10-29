@@ -1,8 +1,8 @@
 //! Current availability policy and bounded gauge projection; never reads chart history.
-use super::{Metrics, chain, index};
+use super::{chain, index};
 use crate::{Shared, runtime::RawState};
 use serde::Serialize;
-use std::{collections::BTreeMap, sync::atomic::Ordering};
+use std::collections::BTreeMap;
 use timelord_core::Chain;
 
 #[derive(Default)]
@@ -45,27 +45,28 @@ fn board_usable(h: &crate::runtime::HardwareState, managed: bool, now: u64) -> b
             h.lifecycle.verified_generation() == Some(h.lifecycle.status().generation)
         }
 }
-pub fn ready(shared: &Shared, metrics: &Metrics) -> bool {
-    metrics.healthy()
-        && !metrics.reconfiguring.load(Ordering::Relaxed)
-        && snapshot(shared, crate::unix_now()).1.ready
+pub fn ready(shared: &Shared) -> bool {
+    snapshot(shared, crate::unix_now()).1.ready
 }
 pub(super) fn snapshot(shared: &Shared, now: u64) -> (Samples, Readiness, u64) {
     // Same lock order as /v1/status; no chart history is traversed or copied.
     let clients = shared.clients.lock().expect("clients");
     let state = shared.runtime.lock().expect("runtime");
     let mut samples = Samples::default();
-    if state.metrics.as_ref().is_some_and(|m| {
-        m.reconfiguring.load(Ordering::Relaxed) || m.stopping.load(Ordering::Relaxed)
-    }) {
+    let process = state.process.snapshot();
+    if process.phase != crate::operational::Phase::Running {
         samples.add("node_connected", &[], &[], 0.);
         return (
             samples,
             Readiness {
                 ready: false,
-                reason: "reconfiguring",
+                reason: if process.healthy() {
+                    "reconfiguring"
+                } else {
+                    "service_unavailable"
+                },
             },
-            0,
+            state.metric_epoch,
         );
     }
     samples.add(
@@ -226,7 +227,9 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> (Samples, Readiness, u64) {
             }
         }
     }
-    let reason = if shared.config.node.certificate.is_none() {
+    let reason = if !process.healthy() {
+        "service_unavailable"
+    } else if shared.config.node.certificate.is_none() {
         "setup_required"
     } else if shared.assignments.is_empty() {
         "waiting_for_clients"

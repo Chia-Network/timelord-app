@@ -154,12 +154,10 @@ async fn send(socket: &mut Socket, message: Message) -> Result<()> {
 async fn submit(
     shared: &Shared,
     kind: SubmissionKind,
-    stage: Option<&timelord_supervisor::progress::Guard>,
+    stage: &timelord_supervisor::progress::Guard,
     sending: impl std::future::Future<Output = Result<()>>,
 ) -> Result<()> {
-    if let Some(stage) = stage {
-        stage.stage(timelord_supervisor::progress::Stage::Submitting);
-    }
+    stage.stage(timelord_supervisor::progress::Stage::Submitting);
     let started = Instant::now();
     sending.await?;
     if let Some(metrics) = &shared.runtime.lock().expect("runtime").metrics {
@@ -351,9 +349,9 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
         .runtime
         .lock()
         .expect("runtime")
-        .metrics
-        .as_ref()
-        .map(|m| m.progress.clone());
+        .process
+        .progress
+        .clone();
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
@@ -411,14 +409,12 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
             && let Some(completed) = ready.take()
         {
             eligibility.take();
-            let stage = progress.as_ref().map(|p| {
-                p.begin(
-                    timelord_supervisor::progress::Resource::Scheduler,
-                    completed.plan.generation,
-                    completed.plan.challenge.iterations,
-                    timelord_supervisor::progress::Stage::Scheduler,
-                )
-            });
+            let stage = progress.begin(
+                timelord_supervisor::progress::Resource::Scheduler,
+                completed.plan.generation,
+                completed.plan.challenge.iterations,
+                timelord_supervisor::progress::Stage::Scheduler,
+            );
             // finish independently verifies full checkpointed proofs and request identity.
             if let Some(output) = scheduler.finish(completed.plan, completed.result)? {
                 let next_infused = match &output {
@@ -452,7 +448,7 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                         encode(ProtocolMessageTypes::NewEndOfSubSlotVdf, &value, None)?
                     }
                 };
-                submit(&shared, kind, stage.as_ref(), send(&mut socket, message)).await?;
+                submit(&shared, kind, &stage, send(&mut socket, message)).await?;
                 if infusion {
                     infusion_submitted_at = Some(Instant::now());
                 }
@@ -482,7 +478,7 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
             Some(completed) = workers.join_next(), if !workers.is_empty() => {
                 match completed { Ok(Ok(result)) if result.plan.generation == scheduler.generation() => {
                     let wait_seconds = result.plan.not_before.saturating_duration_since(Instant::now()).as_secs().saturating_add(1);
-                    eligibility=progress.as_ref().map(|p|p.begin(timelord_supervisor::progress::Resource::Eligibility,result.plan.generation,result.plan.challenge.iterations,timelord_supervisor::progress::Stage::Eligibility{wait_seconds}));
+                    eligibility=Some(progress.begin(timelord_supervisor::progress::Resource::Eligibility,result.plan.generation,result.plan.challenge.iterations,timelord_supervisor::progress::Stage::Eligibility{wait_seconds}));
                     ready = Some(result);
                 }, Ok(Ok(_)) => {}, Ok(Err(error)) => return Err(error), Err(error) if error.is_cancelled() => {}, Err(error) => return Err(error.into()) }
             }
@@ -838,15 +834,21 @@ mod tests {
             started_unix: unix_now(),
             service_started_unix: unix_now(),
         };
+        let stage = shared.runtime.lock().unwrap().process.progress.begin(
+            timelord_supervisor::progress::Resource::Scheduler,
+            0,
+            0,
+            timelord_supervisor::progress::Stage::Scheduler,
+        );
         assert!(
-            submit(&shared, SubmissionKind::Signage, None, async {
+            submit(&shared, SubmissionKind::Signage, &stage, async {
                 bail!("fixture send failed")
             })
             .await
             .is_err()
         );
         assert_eq!(metrics.counter("submissions_total", &["signage"]), 0);
-        submit(&shared, SubmissionKind::Signage, None, async { Ok(()) })
+        submit(&shared, SubmissionKind::Signage, &stage, async { Ok(()) })
             .await
             .unwrap();
         assert_eq!(metrics.counter("submissions_total", &["signage"]), 1);
@@ -866,12 +868,33 @@ mod tests {
             started_unix: unix_now(),
             service_started_unix: unix_now(),
         };
-        let guard = metrics
+        let guard = shared.runtime.lock().unwrap().process.progress.begin(
+            Resource::Scheduler,
+            12,
+            42,
+            Stage::Scheduler,
+        );
+        let previous = shared
+            .runtime
+            .lock()
+            .unwrap()
+            .process
             .progress
-            .begin(Resource::Scheduler, 12, 42, Stage::Scheduler);
-        let previous = metrics.progress.snapshot(1, 1).unwrap().work[3].unwrap();
-        submit(&shared, SubmissionKind::Signage, Some(&guard), async {
-            let work = metrics.progress.snapshot(1, 2).unwrap().work[3].unwrap();
+            .snapshot(1, 1)
+            .unwrap()
+            .work[3]
+            .unwrap();
+        submit(&shared, SubmissionKind::Signage, &guard, async {
+            let work = shared
+                .runtime
+                .lock()
+                .unwrap()
+                .process
+                .progress
+                .snapshot(1, 2)
+                .unwrap()
+                .work[3]
+                .unwrap();
             assert_eq!(work.id, previous.id);
             assert_eq!(work.generation, previous.generation);
             assert_eq!(work.stage, Stage::Submitting);
@@ -879,9 +902,31 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(metrics.progress.snapshot(1, 3).unwrap().work[3].is_some());
+        assert!(
+            shared
+                .runtime
+                .lock()
+                .unwrap()
+                .process
+                .progress
+                .snapshot(1, 3)
+                .unwrap()
+                .work[3]
+                .is_some()
+        );
         drop(guard);
-        assert!(metrics.progress.snapshot(1, 4).unwrap().work[3].is_none());
+        assert!(
+            shared
+                .runtime
+                .lock()
+                .unwrap()
+                .process
+                .progress
+                .snapshot(1, 4)
+                .unwrap()
+                .work[3]
+                .is_none()
+        );
     }
 
     #[tokio::test]

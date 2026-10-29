@@ -266,7 +266,7 @@ pub async fn run(
             _ = shutdown.changed() => break,
             Some(result) = children.join_next(), if !children.is_empty() => {
                 if let Err(error) = result {
-                    if let Some(metrics)=&shared.runtime.lock().expect("runtime").metrics {metrics.failed.store(true,std::sync::atomic::Ordering::Relaxed);}
+                    shared.runtime.lock().expect("runtime").process.essential_failure();
                     tracing::error!(%error, "ASIC supervisor task failed");
                     return Err(error.into());
                 }

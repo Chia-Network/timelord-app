@@ -410,30 +410,19 @@ pub async fn live_configuration(shared: &crate::Shared) -> Result<Config> {
         return Ok(shared.config.clone());
     }
     let _initialization = crate::hardware::INITIALIZATION.lock().await;
-    let progress = shared.runtime.lock().expect("runtime").progress.clone();
-
-    let _discovery = progress.as_ref().map(|p| {
-        p.begin(
-            timelord_supervisor::progress::Resource::Topology,
-            0,
-            0,
-            timelord_supervisor::progress::Stage::Discovery,
-        )
-    });
-    // Only confirm admissions that were already pending when this probe began.
-    let pending: std::collections::HashMap<_, _> = shared
+    let progress = shared
         .runtime
         .lock()
         .expect("runtime")
-        .boards
-        .iter()
-        .filter_map(|(id, h)| {
-            h.lifecycle
-                .status()
-                .admission_inventory_epoch
-                .map(|epoch| (id.clone(), epoch))
-        })
-        .collect();
+        .process
+        .progress
+        .clone();
+    let _discovery = progress.begin(
+        timelord_supervisor::progress::Resource::Topology,
+        0,
+        0,
+        timelord_supervisor::progress::Stage::Discovery,
+    );
     let mut devices = discover(&shared.config).await?;
     {
         let mut state = shared.runtime.lock().expect("runtime");
@@ -528,13 +517,12 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn initialization_wait_does_not_arm_discovery_watchdog() {
-        let metrics = crate::observability::Metrics::new(timelord_core::Network::Mainnet).unwrap();
+        let process = std::sync::Arc::new(crate::operational::State::default());
         let mut config = Config::default();
         config.hardware.client_binary = Some("/not-present/client".into());
         config.hardware.driver_library = Some("/not-present/driver".into());
         let state = crate::runtime::RuntimeState {
-            progress: Some(metrics.progress.clone()),
-            metrics: Some(metrics.clone()),
+            process: process.clone(),
             ..Default::default()
         };
         let shared = crate::Shared {
@@ -553,10 +541,10 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(metrics.progress.snapshot(0, 1).unwrap().work[8].is_none());
+        assert!(process.progress.snapshot(0, 1).unwrap().work[8].is_none());
         drop(initialization);
         assert!(pending.await.is_err());
-        assert!(metrics.progress.snapshot(0, 2).unwrap().work[8].is_none());
+        assert!(process.progress.snapshot(0, 2).unwrap().work[8].is_none());
     }
 
     #[test]

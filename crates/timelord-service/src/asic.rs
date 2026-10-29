@@ -90,7 +90,6 @@ struct Active {
 struct Lane {
     board: String,
     active: Mutex<Option<Active>>,
-    arithmetic: Arc<tokio::sync::Semaphore>,
     started_once: std::sync::atomic::AtomicBool,
 }
 #[derive(Debug)]
@@ -152,7 +151,6 @@ impl AsicBackend {
                     Lane {
                         board: a.board_id,
                         active: Mutex::new(None),
-                        arithmetic: Arc::new(tokio::sync::Semaphore::new(1)),
                         started_once: std::sync::atomic::AtomicBool::new(false),
                     },
                 )
@@ -346,21 +344,16 @@ impl AsicBackend {
             (
                 state.metrics.clone(),
                 state.metric_epoch,
-                state
-                    .progress
-                    .clone()
-                    .or_else(|| state.metrics.as_ref().map(|m| m.progress.clone())),
+                state.process.progress.clone(),
             )
         };
         let mut owner = lane.active.lock().await;
-        let progress = process_progress.as_ref().map(|p| {
-            p.begin(
-                self.purpose.io(chain),
-                work.generation,
-                work.iterations,
-                Stage::Preparing,
-            )
-        });
+        let progress = process_progress.begin(
+            self.purpose.io(chain),
+            work.generation,
+            work.iterations,
+            Stage::Preparing,
+        );
         // Take ownership during I/O. Cancellation retires the socket instead of
         // leaving a partially consumed frame in a reusable session.
         let generation = self
@@ -383,19 +376,14 @@ impl AsicBackend {
         {
             // The permit and stage live in the actual blocking closure. Cancelling
             // an async request cannot hide stuck GMP work or queue more of it.
-            let semaphore = process_progress
-                .as_ref()
-                .map(|p| p.arithmetic(self.purpose.arithmetic(chain)))
-                .unwrap_or_else(|| lane.arithmetic.clone());
+            let semaphore = process_progress.arithmetic(self.purpose.arithmetic(chain));
             let permit = semaphore.acquire_owned().await?;
-            let arithmetic = process_progress.as_ref().map(|p| {
-                p.begin(
-                    self.purpose.arithmetic(chain),
-                    work.generation,
-                    work.iterations,
-                    Stage::Preparing,
-                )
-            });
+            let arithmetic = process_progress.begin(
+                self.purpose.arithmetic(chain),
+                work.generation,
+                work.iterations,
+                Stage::Preparing,
+            );
             let seed = work.challenge.const_bytes().to_vec();
             let bits = work.discriminant_bits;
             let metrics = metrics.clone();
@@ -421,9 +409,7 @@ impl AsicBackend {
         let mut active = match active {
             Some(session) => session,
             None => {
-                if let Some(p) = &progress {
-                    p.stage(Stage::WaitingForClient);
-                }
+                progress.stage(Stage::WaitingForClient);
                 let waiting = Instant::now();
                 let mut pool = self
                     .pools
@@ -455,17 +441,13 @@ impl AsicBackend {
                 // Match Python timelord: start the IPS clock when assigning the
                 // client, even if discriminant preparation is already running.
                 let estimated_started = Instant::now();
-                if let Some(p) = &progress {
-                    p.stage(Stage::Preparing);
-                }
+                progress.stage(Stage::Preparing);
                 let magnitude = discriminant
                     .expect("A new session needs a discriminant")
                     .await??;
                 let decimal = format!("-{}", num_bigint::BigUint::from_bytes_be(&magnitude));
                 let started = Instant::now();
-                if let Some(p) = &progress {
-                    p.stage(Stage::Handshake);
-                }
+                progress.stage(Stage::Handshake);
                 lease
                     .socket
                     .write_all(&encode_initial(&decimal, &work.input.data.const_bytes())?)
@@ -500,9 +482,7 @@ impl AsicBackend {
                 }
             }
         };
-        if let Some(p) = &progress {
-            p.stage(Stage::NativeWork);
-        }
+        progress.stage(Stage::NativeWork);
         request(&mut active.lease.socket, work.iterations).await?;
         let proof = tokio::time::timeout(
             Duration::from_secs(3600),
@@ -517,23 +497,16 @@ impl AsicBackend {
         // Publish only after the proof has passed verification.
         let ips = estimated_ips(work.iterations, active.estimated_started.elapsed());
         let checked = work.clone();
-        if let Some(p) = &progress {
-            p.stage(Stage::Verifying);
-        }
+        progress.stage(Stage::Verifying);
         let verification_started = Instant::now();
-        let semaphore = process_progress
-            .as_ref()
-            .map(|p| p.arithmetic(self.purpose.arithmetic(chain)))
-            .unwrap_or_else(|| lane.arithmetic.clone());
+        let semaphore = process_progress.arithmetic(self.purpose.arithmetic(chain));
         let permit = semaphore.acquire_owned().await?;
-        let arithmetic = process_progress.as_ref().map(|p| {
-            p.begin(
-                self.purpose.arithmetic(chain),
-                work.generation,
-                work.iterations,
-                Stage::Verifying,
-            )
-        });
+        let arithmetic = process_progress.begin(
+            self.purpose.arithmetic(chain),
+            work.generation,
+            work.iterations,
+            Stage::Verifying,
+        );
         let verification = tokio::task::spawn_blocking(move || {
             let (_permit, _arithmetic) = (permit, arithmetic);
             verify(&checked, *proof)

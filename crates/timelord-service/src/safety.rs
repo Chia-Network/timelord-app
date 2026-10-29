@@ -684,6 +684,30 @@ mod tests {
         assert!(!store.set_point("A", current, point).unwrap());
     }
     #[test]
+    fn stale_healthy_evidence_cannot_relax_a_successor() {
+        let f = Fixture::new();
+        let store = Store::open(&f.config()).unwrap();
+        let point = qualification().point;
+        let old = store.begin_owner("A", point).unwrap();
+        store.quarantine("A", Reason::InvalidProof).unwrap();
+        store.qualify("A", qualification()).unwrap();
+        let successor = store.begin_owner("A", point).unwrap();
+        store.healthy_profile_saved("A", old).unwrap();
+        assert!(store.set_point("A", successor, point).unwrap());
+        assert!(store.board("A").unwrap().force_safe);
+        store.healthy_profile_saved("A", successor).unwrap();
+        assert!(store.set_point("A", successor, point).unwrap());
+        assert!(!store.board("A").unwrap().force_safe);
+        store.closed("A").unwrap();
+        assert!(
+            !Store::open(&f.config())
+                .unwrap()
+                .board("A")
+                .unwrap()
+                .force_safe
+        );
+    }
+    #[test]
     fn queued_old_point_cannot_modify_a_successor() {
         let f = Fixture::new();
         let store = std::sync::Arc::new(Store::open(&f.config()).unwrap());
@@ -724,7 +748,10 @@ mod tests {
         let first = std::thread::spawn(move || first.set_point("A", token, qualification().point));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let id = loop {
-            if let Some(work) = progress.snapshot(0, 1).unwrap().work[9] {
+            if let Some(work) = progress
+                .snapshot(0, 1)
+                .and_then(|snapshot| snapshot.work[9])
+            {
                 break work.id;
             }
             assert!(std::time::Instant::now() < deadline);

@@ -1,5 +1,5 @@
 //! Read-only HTTP projection of cached operational state.
-use super::{Metrics, Readiness, snapshot};
+use super::{Metrics, snapshot};
 use crate::Shared;
 use axum::{
     Json, Router,
@@ -8,13 +8,14 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::Arc;
 use tokio::sync::watch;
 
 #[derive(Clone)]
 pub struct HttpState {
     pub current: watch::Receiver<Arc<Shared>>,
     pub metrics: Arc<Metrics>,
+    pub process: Arc<crate::operational::State>,
 }
 pub fn routes() -> Router<HttpState> {
     Router::new()
@@ -44,7 +45,7 @@ async fn metrics(State(state): State<HttpState>) -> impl IntoResponse {
     }
 }
 async fn healthz(State(state): State<HttpState>) -> impl IntoResponse {
-    if state.metrics.healthy() {
+    if state.process.snapshot().healthy() {
         (StatusCode::OK, "Ok\n")
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "Unavailable\n")
@@ -52,18 +53,7 @@ async fn healthz(State(state): State<HttpState>) -> impl IntoResponse {
 }
 async fn readyz(State(state): State<HttpState>) -> impl IntoResponse {
     let shared = state.current.borrow().clone();
-    let (_, mut ready, _) = snapshot(&shared, crate::unix_now());
-    if !state.metrics.healthy() {
-        ready = Readiness {
-            ready: false,
-            reason: "service_unavailable",
-        };
-    } else if state.metrics.reconfiguring.load(Ordering::Relaxed) {
-        ready = Readiness {
-            ready: false,
-            reason: "reconfiguring",
-        };
-    }
+    let (_, ready, _) = snapshot(&shared, crate::unix_now());
     (
         if ready.ready {
             StatusCode::OK

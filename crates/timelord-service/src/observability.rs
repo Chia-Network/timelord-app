@@ -13,8 +13,8 @@ pub use domain::{
 };
 pub use http::{HttpState, routes};
 pub use metrics::Metrics;
+pub use snapshot::ready;
 use snapshot::snapshot;
-pub use snapshot::{Readiness, ready};
 
 #[cfg(test)]
 mod tests;

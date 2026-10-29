@@ -26,7 +26,6 @@ struct Last {
     chains: [Option<f64>; 3],
 }
 pub struct Metrics {
-    pub progress: Arc<timelord_supervisor::progress::Progress>,
     registry: Registry,
     proofs_verified_total: IntCounterVec,
     proof_verification_failures_total: IntCounterVec,
@@ -49,9 +48,6 @@ pub struct Metrics {
     last: Mutex<Last>,
     ever_connected: AtomicBool,
     clients_started: Mutex<BTreeSet<String>>,
-    pub failed: AtomicBool,
-    pub stopping: AtomicBool,
-    pub reconfiguring: AtomicBool,
 }
 impl Metrics {
     pub fn new(network: Network) -> Result<Arc<Self>> {
@@ -204,7 +200,6 @@ impl Metrics {
         registry.register(Box::new(proof_duration.clone()))?;
         registry.register(Box::new(submission_duration.clone()))?;
         let metrics = Arc::new(Self {
-            progress: Arc::default(),
             registry,
             proofs_verified_total,
             proof_verification_failures_total,
@@ -227,9 +222,6 @@ impl Metrics {
             last: Mutex::new(Last::default()),
             ever_connected: AtomicBool::new(false),
             clients_started: Mutex::new(BTreeSet::new()),
-            failed: AtomicBool::new(false),
-            stopping: AtomicBool::new(false),
-            reconfiguring: AtomicBool::new(false),
         });
         for c in Chain::ALL {
             metrics.proofs_verified_total.with_label_values(&[chain(c)]);
@@ -408,17 +400,15 @@ impl Metrics {
             }
         }
     }
-    pub fn healthy(&self) -> bool {
-        !self.failed.load(Ordering::Relaxed) && !self.stopping.load(Ordering::Relaxed)
-    }
     pub fn render(&self, shared: &Shared, now: u64) -> Result<String> {
         let (mut samples, readiness, epoch) = snapshot(shared, now);
+        let process = shared.runtime.lock().expect("runtime").process.snapshot();
         let network = match shared.config.node.network {
             Network::Mainnet => "mainnet",
             Network::Testnet11 => "testnet11",
         };
         let last = self.last.lock().expect("metrics");
-        if last.epoch == epoch && !self.reconfiguring.load(Ordering::Relaxed) {
+        if last.epoch == epoch && process.phase == crate::operational::Phase::Running {
             if let Some(ips) = last.ips {
                 samples.add("estimated_ips", &[], &[], ips);
             }
@@ -429,10 +419,9 @@ impl Metrics {
             }
         }
         drop(last);
-        let ready =
-            readiness.ready && self.healthy() && !self.reconfiguring.load(Ordering::Relaxed);
+        let ready = readiness.ready && process.ready();
         samples.add("ready", &[], &[], f64::from(ready));
-        samples.add("healthy", &[], &[], f64::from(self.healthy()));
+        samples.add("healthy", &[], &[], f64::from(process.healthy()));
         let mut families = self.registry.gather();
         for (name, group) in samples.0 {
             let mut keys = vec!["network"];

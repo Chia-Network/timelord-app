@@ -7,7 +7,7 @@ pub(super) struct RestartBackoff {
     pub(super) delays: [Duration; 3],
 }
 impl Default for RestartBackoff {
-    pub(super) fn default() -> Self {
+    fn default() -> Self {
         Self {
             used: 0,
             delays: RESTART_DELAYS.map(Duration::from_secs),
@@ -187,7 +187,13 @@ pub(super) async fn supervise_board(
             guard = INITIALIZATION.lock() => guard,
             _ = shutdown.changed() => return,
         };
-        let progress = shared.runtime.lock().expect("runtime").progress.clone();
+        let progress = shared
+            .runtime
+            .lock()
+            .expect("runtime")
+            .process
+            .progress
+            .clone();
         let board_index = shared
             .config
             .hardware
@@ -195,8 +201,8 @@ pub(super) async fn supervise_board(
             .iter()
             .position(|b| b.id == board.id)
             .unwrap_or(0);
-        let mut preparing = progress.as_ref().map(|p| {
-            p.begin(
+        let mut preparing = Some(
+            progress.begin(
                 timelord_supervisor::progress::Resource::BoardPreparation(
                     timelord_supervisor::progress::BoardSlot::from_index(board_index)
                         .expect("at most three configured boards"),
@@ -204,8 +210,8 @@ pub(super) async fn supervise_board(
                 0,
                 0,
                 timelord_supervisor::progress::Stage::BoardPreparation,
-            )
-        });
+            ),
+        );
         let preparation = tokio::select! {
             result = locate(&shared, &mut board) => result,
             _ = shutdown.changed() => return,
@@ -223,7 +229,10 @@ pub(super) async fn supervise_board(
                 (Some(_), None) => bail!("Managed ASIC needs a persistent serial identity"),
                 _ => None,
             };
-            if let (Some(store), Some(serial)) = (&safety, &board.serial) {
+            // The serial lease pins identity; rediscovery only updates location.
+            // Own that identity independently of the mutable discovery config.
+            let serial = board.serial.clone();
+            if let (Some(store), Some(serial)) = (&safety, serial.as_deref()) {
                 let prospective = if engines > 0 {
                     engines
                 } else {
@@ -301,8 +310,8 @@ pub(super) async fn supervise_board(
                         return Ok(());
                     }
                     initialization = INITIALIZATION.lock().await;
-                    preparing = progress.as_ref().map(|p| {
-                        p.begin(
+                    preparing = Some(
+                        progress.begin(
                             timelord_supervisor::progress::Resource::BoardPreparation(
                                 timelord_supervisor::progress::BoardSlot::from_index(board_index)
                                     .expect("at most three configured boards"),
@@ -310,8 +319,8 @@ pub(super) async fn supervise_board(
                             0,
                             0,
                             timelord_supervisor::progress::Stage::BoardPreparation,
-                        )
-                    });
+                        ),
+                    );
                     locate(&shared, &mut board).await?;
                 }
                 if *shutdown.borrow() {

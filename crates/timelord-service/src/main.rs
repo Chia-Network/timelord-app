@@ -12,6 +12,7 @@ mod history_store;
 mod inventory;
 mod node_status;
 mod observability;
+mod operational;
 #[cfg(test)]
 mod operations_tests;
 mod private_control;
@@ -456,7 +457,7 @@ async fn status(State(http): State<observability::HttpState>) -> Json<Status> {
     let runtime = shared.runtime.lock().expect("runtime");
     Json(Status {
         diagnostic_logging: timelord_supervisor::logging::Writer::stderr_stats(),
-        configuration_fallback: http.metrics.progress.using_last_good(),
+        configuration_fallback: http.process.progress.using_last_good(),
         api_version: 1,
         service_pid: std::process::id(),
         service_state: "ready",
@@ -604,6 +605,7 @@ async fn start_run(
     board_states: &std::collections::HashMap<String, runtime::HardwareState>,
     service_started_unix: u64,
     metrics: Arc<observability::Metrics>,
+    process: Arc<operational::State>,
     safety: Option<Arc<safety::Store>>,
 ) -> Result<Run> {
     let unavailable = hardware::unavailable_for(&config, board_states, safety.as_deref());
@@ -672,7 +674,7 @@ async fn start_run(
         }
     }
     runtime.safety = safety;
-    runtime.progress = Some(metrics.progress.clone());
+    runtime.process = process;
     runtime.metric_epoch = metrics.begin_session();
     metrics.register_boards(&config);
     runtime.metrics = Some(metrics);
@@ -752,28 +754,23 @@ async fn start_run(
 
 async fn essential_exit(
     tasks: &mut JoinSet<Result<()>>,
-    metrics: &observability::Metrics,
+    process: &operational::State,
 ) -> anyhow::Error {
     let task = tasks.join_next().await;
-    metrics
-        .failed
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    metrics.progress.fail();
+    process.essential_failure();
     tracing::error!(?task, "Essential service task exited unexpectedly");
     anyhow::anyhow!("Essential service task exited unexpectedly: {task:?}")
 }
 
 async fn observation_exit(
     server: &mut Option<tokio::task::JoinHandle<std::io::Result<()>>>,
-    metrics: &observability::Metrics,
+    process: &operational::State,
 ) {
     let result = server.as_mut().expect("observer").await;
     // Remove the completed handle so it cannot be polled again. A scrape
     // listener failure must not interrupt proof work or topology supervision.
     server.take();
-    metrics
-        .failed
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    process.fail();
     tracing::error!(?result, "Observability server exited unexpectedly");
 }
 
@@ -790,6 +787,7 @@ async fn serve(
     // The status listener outlives each topology. No UI or external supervisor
     // is required to restart the service after a USB change.
     let mut board_states = std::collections::HashMap::new();
+    let process = Arc::new(operational::State::default());
     let startup = async {
         let http = TcpListener::bind(config.service.status_listen)
             .await
@@ -804,10 +802,10 @@ async fn serve(
             None
         };
         let metrics = observability::Metrics::new(config.node.network)?;
-        metrics.progress.configuration(fallback);
+        process.progress.configuration(fallback);
         let safety = if config.hardware.client_binary.is_some() {
             Some(Arc::new(
-                safety::Store::open(&config_path)?.monitored(metrics.progress.clone()),
+                safety::Store::open(&config_path)?.monitored(process.progress.clone()),
             ))
         } else {
             None
@@ -819,6 +817,7 @@ async fn serve(
             &board_states,
             service_started_unix,
             metrics.clone(),
+            process.clone(),
             safety.clone(),
         )
         .await?;
@@ -832,10 +831,9 @@ async fn serve(
 
     let (current, state) = watch::channel(run.shared.clone());
     let report_state = state.clone();
-    let report_metrics = metrics.clone();
     let _reporter = timelord_supervisor::progress::Reporter::with_readiness(
-        metrics.progress.clone(),
-        move || observability::ready(&report_state.borrow(), &report_metrics),
+        process.progress.clone(),
+        move || observability::ready(&report_state.borrow()),
     )?;
     let app = Router::new()
         .route("/health", get(health))
@@ -845,13 +843,13 @@ async fn serve(
         .with_state(observability::HttpState {
             current: state.clone(),
             metrics: metrics.clone(),
+            process: process.clone(),
         });
     let (http_stop, mut stopped) = watch::channel(false);
     let mut checkpoint = Some(tokio::spawn(config_checkpoint::record(
         requested_config,
         config_path,
         state.clone(),
-        metrics.clone(),
         stopped.clone(),
     )));
     let observation_stopped = stopped.clone();
@@ -870,6 +868,7 @@ async fn serve(
         let app = observability::routes().with_state(observability::HttpState {
             current: state,
             metrics: metrics.clone(),
+            process: process.clone(),
         });
         tokio::spawn(async move {
             axum::serve(
@@ -894,8 +893,8 @@ async fn serve(
                 match result {Ok(Ok(()))=>{},Ok(Err(error))=>tracing::warn!(%error,"Configuration checkpoint stopped"),Err(error)=>tracing::warn!(%error,"Configuration checkpoint task failed")}
                 checkpoint=None;continue;
             },
-            error = essential_exit(&mut run.tasks, &metrics), if !run.tasks.is_empty() => break Err(error),
-            _ = observation_exit(&mut observation_server, &metrics), if observation_server.is_some() => continue,
+            error = essential_exit(&mut run.tasks, &process), if !run.tasks.is_empty() => break Err(error),
+            _ = observation_exit(&mut observation_server, &process), if observation_server.is_some() => continue,
             result = &mut server => break result.context("Status task failed")?.context("Status server failed"),
             result=async{inventory_task.as_mut().expect("inventory").await}, if inventory_task.is_some()=>{
                 inventory_task.take();
@@ -918,7 +917,7 @@ async fn serve(
             continue;
         }
         let mut config = next.unwrap_or_else(|| run.shared.config.clone());
-        let _topology = metrics.progress.begin(
+        let _topology = process.progress.begin(
             timelord_supervisor::progress::Resource::Topology,
             0,
             0,
@@ -943,9 +942,7 @@ async fn serve(
                 board.raw_speeds.clear();
             }
         }
-        metrics
-            .reconfiguring
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        process.reconfigure();
         metrics.topology_changed();
         tracing::info!(plan=?plan, "USB topology changed; replacing chain owners");
         let previous = run.shared.clone();
@@ -958,19 +955,16 @@ async fn serve(
             &board_states,
             service_started_unix,
             metrics.clone(),
+            process.clone(),
             safety.clone(),
         )
         .await?;
         current.send_replace(run.shared.clone());
-        metrics
-            .reconfiguring
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        process.resume();
     };
-    metrics
-        .stopping
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    process.stop();
     if result.is_err() {
-        metrics.progress.fail();
+        process.essential_failure();
     }
     run.stop().await?;
     if let Some(inventory) = inventory_task {
@@ -1113,6 +1107,7 @@ mod tests {
     #[tokio::test]
     async fn topology_generations_release_owners_keep_status_and_preserve_faults() {
         let metrics = observability::Metrics::new(Network::Mainnet).unwrap();
+        let process = Arc::new(operational::State::default());
         metrics.topology_changed();
         // All ports and files belong to this fixture; no node, native binary or USB.
         let dir = std::env::temp_dir().join(format!(
@@ -1163,6 +1158,7 @@ mod tests {
             &board_states,
             unix_now() - 3600,
             metrics.clone(),
+            process.clone(),
             None,
         )
         .await
@@ -1172,6 +1168,7 @@ mod tests {
         let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = http.local_addr().unwrap();
         let http_metrics = metrics.clone();
+        let http_process = process.clone();
         let server = tokio::spawn(async move {
             axum::serve(
                 http,
@@ -1179,6 +1176,7 @@ mod tests {
                     observability::HttpState {
                         current: state,
                         metrics: http_metrics,
+                        process: http_process,
                     },
                 ),
             )
@@ -1228,6 +1226,7 @@ mod tests {
                 &board_states,
                 service_started_unix,
                 metrics.clone(),
+                process.clone(),
                 None,
             )
             .await
@@ -1269,25 +1268,30 @@ mod tests {
     #[tokio::test]
     async fn unexpected_supervisor_exit_is_latched_as_unhealthy() {
         let metrics = observability::Metrics::new(Network::Mainnet).unwrap();
+        let process = Arc::new(operational::State::default());
         let mut tasks = JoinSet::new();
         tasks.spawn(async { Ok(()) });
-        essential_exit(&mut tasks, &metrics).await;
-        assert!(!metrics.healthy());
+        essential_exit(&mut tasks, &process).await;
+        assert!(!process.snapshot().healthy());
         // Creating a replacement runtime cannot clear the process health latch.
         metrics.begin_session();
-        assert!(!metrics.healthy());
+        assert!(!process.snapshot().healthy());
     }
     #[tokio::test]
     async fn observability_failures_leave_client_service_running() {
         for failure in ["io", "panic", "early_success"] {
             let metrics = observability::Metrics::new(Network::Mainnet).unwrap();
+            let process = Arc::new(operational::State::default());
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let shared = Arc::new(Shared {
                 config: Config::default(),
                 assignments: vec![],
                 clients: Arc::new(Mutex::new(BTreeSet::new())),
-                runtime: Default::default(),
+                runtime: Arc::new(Mutex::new(runtime::RuntimeState {
+                    process: process.clone(),
+                    ..Default::default()
+                })),
                 started_unix: unix_now(),
                 service_started_unix: unix_now(),
             });
@@ -1302,13 +1306,13 @@ mod tests {
                 }
             }));
             tokio::select! {
-                _ = observation_exit(&mut observer, &metrics) => {},
+                _ = observation_exit(&mut observer, &process) => {},
                 result = &mut client => panic!("Client service stopped: {result:?}"),
             }
             assert!(observer.is_none());
-            assert!(!metrics.healthy());
+            assert!(!process.snapshot().healthy());
             metrics.begin_session();
-            assert!(!metrics.healthy());
+            assert!(!process.snapshot().healthy());
             // The independent client listener still handles protocol traffic.
             let mut socket = TcpStream::connect(address).await.unwrap();
             socket.write_all(b"STOP").await.unwrap();
