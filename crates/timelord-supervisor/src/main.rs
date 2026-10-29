@@ -354,7 +354,7 @@ enum Lifecycle {
     Paused,
     StateError(String),
     Starting,
-    Running(Worker),
+    Running(Box<Worker>),
     Stopping { pid: u32 },
     Backoff { next: Instant, error: String },
 }
@@ -483,7 +483,7 @@ impl SupervisorState {
             pid: worker.group as u32,
         };
         self.publish(snapshots);
-        let exit = match worker.stop().await {
+        let exit = match (*worker).stop().await {
             Ok(exit) => exit,
             Err(error) => {
                 self.lifecycle = Lifecycle::Backoff {
@@ -598,7 +598,7 @@ impl SupervisorState {
             {
                 Ok(worker) => {
                     self.generation += 1;
-                    Lifecycle::Running(worker)
+                    Lifecycle::Running(Box::new(worker))
                 }
                 Err(error) => {
                     let delay = retry_delay(&mut self.failures, None);
