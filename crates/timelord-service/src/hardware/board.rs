@@ -7,7 +7,7 @@ pub(super) struct RestartBackoff {
     pub(super) delays: [Duration; 3],
 }
 impl Default for RestartBackoff {
-    pub(super) fn default() -> Self {
+    fn default() -> Self {
         Self {
             used: 0,
             delays: RESTART_DELAYS.map(Duration::from_secs),
@@ -223,7 +223,10 @@ pub(super) async fn supervise_board(
                 (Some(_), None) => bail!("Managed ASIC needs a persistent serial identity"),
                 _ => None,
             };
-            if let (Some(store), Some(serial)) = (&safety, &board.serial) {
+            // The serial lease pins identity; rediscovery only updates location.
+            // Own that identity independently of the mutable discovery config.
+            let serial = board.serial.clone();
+            if let (Some(store), Some(serial)) = (&safety, serial.as_deref()) {
                 let prospective = if engines > 0 {
                     engines
                 } else {
