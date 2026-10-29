@@ -782,6 +782,26 @@ async fn serve(
 ) -> Result<()> {
     tokio::pin!(signal);
     let service_started_unix = unix_now();
+    // Start reporting before discovery or native initialization can wait.
+    let metrics = observability::Metrics::new(config.node.network)?;
+    let initial = Arc::new(Shared {
+        config: config.clone(),
+        assignments: vec![],
+        clients: Default::default(),
+        runtime: Arc::new(Mutex::new(runtime::RuntimeState {
+            metrics: Some(metrics.clone()),
+            ..Default::default()
+        })),
+        started_unix: service_started_unix,
+        service_started_unix,
+    });
+    let (current, state) = watch::channel(initial);
+    let report_state = state.clone();
+    let report_metrics = metrics.clone();
+    let _reporter = timelord_supervisor::progress::Reporter::with_readiness(
+        metrics.progress.clone(),
+        move || observability::ready(&report_state.borrow(), &report_metrics),
+    )?;
     // The status listener outlives each topology. No UI or external supervisor
     // is required to restart the service after a USB change.
     let mut board_states = std::collections::HashMap::new();
@@ -798,7 +818,6 @@ async fn serve(
         } else {
             None
         };
-        let metrics = observability::Metrics::new(config.node.network)?;
         let safety = if config.hardware.client_binary.is_some() {
             Some(Arc::new(
                 safety::Store::open(&config_path)?.monitored(metrics.progress.clone()),
@@ -806,7 +825,15 @@ async fn serve(
         } else {
             None
         };
-        let config = inventory::connected_configuration(config).await?;
+        let config = {
+            let _discovery = metrics.progress.begin(
+                timelord_supervisor::progress::Resource::Topology,
+                0,
+                0,
+                timelord_supervisor::progress::Stage::Discovery,
+            );
+            inventory::connected_configuration(config).await?
+        };
         let run = start_run(
             config,
             history_path.clone(),
@@ -816,21 +843,14 @@ async fn serve(
             safety.clone(),
         )
         .await?;
-        Ok::<_, anyhow::Error>((http, observer, metrics, safety, run))
+        Ok::<_, anyhow::Error>((http, observer, safety, run))
     };
-    let (http, observer, metrics, safety, mut run) = tokio::select! {
+    let (http, observer, safety, mut run) = tokio::select! {
         biased;
         _ = &mut signal => return Ok(()),
         result = startup => result?,
     };
-
-    let (current, state) = watch::channel(run.shared.clone());
-    let report_state = state.clone();
-    let report_metrics = metrics.clone();
-    let _reporter = timelord_supervisor::progress::Reporter::with_readiness(
-        metrics.progress.clone(),
-        move || observability::ready(&report_state.borrow(), &report_metrics),
-    )?;
+    current.send_replace(run.shared.clone());
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/status", get(status))
