@@ -467,3 +467,47 @@ fn check_owner_rejects_supervisor_or_worker_ownership() {
             .success()
     );
 }
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn installer_pid_extraction_matches_live_status_cli() {
+    let fixture = Fixture::new();
+    let helper = fixture.helper("exec /bin/sleep 60");
+    let owner = fixture.supervisor(&helper);
+    let running = fixture.status(|s| s.worker_pid.is_some()).await;
+    let output = Command::new(env!("CARGO_BIN_EXE_timelord-supervisor"))
+        .arg("status")
+        .arg("--config")
+        .arg(fixture.config())
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    let script = include_str!("../../../scripts/install-service.sh");
+    let reported = script
+        .lines()
+        .find(|line| line.trim_start().starts_with("REPORTED="))
+        .unwrap();
+    let key = reported
+        .split("plutil -extract ")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    let mut parser = std::process::Command::new("/usr/bin/plutil")
+        .args(["-extract", key, "raw", "-o", "-", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(&mut parser.stdin.take().unwrap(), &output.stdout).unwrap();
+    let parsed = parser.wait_with_output().unwrap();
+    assert!(parsed.status.success());
+    assert_eq!(
+        String::from_utf8(parsed.stdout).unwrap().trim(),
+        running.supervisor_pid.to_string()
+    );
+    assert_eq!(Some(running.supervisor_pid), owner.id());
+    fixture.terminate(owner).await;
+}

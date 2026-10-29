@@ -91,7 +91,7 @@ launchctl bootstrap system "$PLIST" || exit 1
 CONFIRMED=false
 for attempt in 1 2 3 4 5; do
   PID="$(launchctl print "system/$LABEL" 2>/dev/null | awk '/^[[:space:]]*pid = / { print $3; exit }')"
-  REPORTED="$(run_as_owner "$HELPER" status --config "$CONFIG" 2>/dev/null | plutil -extract status.supervisor_pid raw -o - - 2>/dev/null || true)"
+  REPORTED="$(run_as_owner "$HELPER" status --config "$CONFIG" 2>/dev/null | plutil -extract supervisor_pid raw -o - - 2>/dev/null || true)"
   if [[ "$PID" =~ ^[0-9]+$ && "$REPORTED" == "$PID" ]]; then CONFIRMED=true; break; fi
   sleep 1
 done
