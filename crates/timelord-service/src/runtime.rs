@@ -3,7 +3,6 @@ use crate::{
     Shared,
     asic::{AsicBackend, AsicFailure, ProofTiming},
     observability::{PeakResult, ProofStage, SubmissionKind},
-    unix_now,
 };
 use anyhow::{Context, Result, bail};
 use dg_xch_core::{
@@ -564,6 +563,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::unix_now;
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
     use std::{fs, path::PathBuf};
     use tokio::net::TcpListener;

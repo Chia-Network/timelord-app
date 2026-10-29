@@ -1,7 +1,7 @@
 use super::*;
 use crate::runtime::{HardwareState, RuntimeState};
 use crate::{Shared, runtime::RawState};
-use axum::http::header;
+use axum::http::{StatusCode, header};
 use axum::{
     body::{Body, to_bytes},
     http::Request,

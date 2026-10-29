@@ -172,7 +172,7 @@ impl RuntimeState {
         let excess = self.estimated_observations.len().saturating_sub(86400);
         self.estimated_observations.drain(..excess);
     }
-    fn delivered(&mut self, speeds: Vec<(Chain, ProofTiming)>) {
+    pub(super) fn delivered(&mut self, speeds: Vec<(Chain, ProofTiming)>) {
         for (chain, timing) in speeds {
             let ips = timing.delivered_ips();
             self.observations_created += 1;
