@@ -171,4 +171,3 @@ The previously persisted active-owner marker covers a crash or failed fault writ
 unknown/unclean quarantine also requires the extra cooling margin on admission.
 
 USB serial leases use the service account's private persistent `~/.timelord-usb-locks` directory, resolved through the account database. Deployment accounts need an owned writable home; `HOME` and temporary-directory cleanup do not select or rotate the namespace.
-
