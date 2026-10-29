@@ -51,9 +51,10 @@ This briefly restarts the proof session and native clients, while the status API
 stays available. Each layout uses its own learned tuning profile. Explicit
 serial-pinned chain assignments retain their mapping instead.
 
-Sleep protection is being moved from the interface to the persistent service as
-part of operational hardening. Until that is qualified, configure deployment Macs
-to stay awake; display sleep and screen locking are separate from system sleep.
+The persistent supervisor prevents idle system sleep while Run is requested,
+including worker recovery, and releases the assertion after Pause cleanup or
+supervisor shutdown. Display sleep and screen locking remain permitted. Explicit
+system sleep is not prevented.
 
 The dashboard shows node sync/height, per-chain proof history, temperature and
 Automatic tuning status. The headline IPS is the last-hour arithmetic mean of
