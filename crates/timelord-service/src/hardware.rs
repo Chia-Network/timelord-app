@@ -1204,10 +1204,8 @@ async fn supervise_board(
                     // This owner's old process has exited, so its own open FTDI
                     // handle cannot be hiding metadata. Only this observation
                     // may declare an already-managed board absent.
-                    let matches = devices.iter().filter(|d| d.serial == board.serial).count();
-                    shared.runtime.lock().expect("runtime").boards.get_mut(&board.id).expect("board").usb_present = match matches {
-                        0 => Some(false), 1 => Some(true), _ => None,
-                    };
+                    crate::inventory::confirm_board_presence(
+                        shared.runtime.lock().expect("runtime").boards.get_mut(&board.id).expect("board"), &board, &devices);
                     board.device_location = Some(crate::inventory::board_location(&board, &devices)?);
                 }
                 shared.runtime.lock().expect("runtime").boards.get_mut(&board.id).expect("board").device_location = board.device_location;
@@ -1285,12 +1283,17 @@ async fn supervise_board(
                         return Err(error);
                     }
                     store.qualify(serial, q.clone())?;
+                    let admission_epoch = store
+                        .board(serial)
+                        .context("Admitted board missing")?
+                        .owner_epoch;
                     {
                         let mut state = shared.runtime.lock().expect("runtime");
                         let hardware = state.boards.entry(board.id.clone()).or_default();
                         hardware.latched_fault = false;
                         hardware.unavailable_since_unix = None;
                         hardware.state = "admitted".into();
+                        hardware.admission_inventory_epoch = Some(admission_epoch);
                         hardware.usb_present = None;
                         hardware.fault_reason = None;
                     }
@@ -1310,6 +1313,17 @@ async fn supervise_board(
                         )
                     });
                     let devices = crate::inventory::discover(&shared.config).await?;
+                    crate::inventory::confirm_board_presence(
+                        shared
+                            .runtime
+                            .lock()
+                            .expect("runtime")
+                            .boards
+                            .get_mut(&board.id)
+                            .expect("board"),
+                        &board,
+                        &devices,
+                    );
                     board.device_location =
                         Some(crate::inventory::board_location(&board, &devices)?);
                 }
@@ -1457,7 +1471,7 @@ pub(crate) fn unavailable_for(
         .filter(|board| {
             boards.get(&board.id).is_some_and(|h| {
                 h.latched_fault
-                    || (h.state == "admitted" && h.usb_present != Some(true))
+                    || h.admission_inventory_epoch.is_some()
                     || h.unavailable_since_unix
                         .is_some_and(|since| crate::unix_now().saturating_sub(since) >= 60)
             }) || safety

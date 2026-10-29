@@ -767,7 +767,9 @@ async fn observation_exit(
 }
 
 fn retain_board_on_reconfiguration(board: &runtime::HardwareState) -> bool {
-    board.latched_fault || board.unavailable_since_unix.is_some() || board.state == "admitted"
+    board.latched_fault
+        || board.unavailable_since_unix.is_some()
+        || board.admission_inventory_epoch.is_some()
 }
 
 async fn serve(
@@ -1077,6 +1079,7 @@ mod tests {
         config.hardware.boards.push(board);
         let mut hardware = runtime::HardwareState {
             state: "admitted".into(),
+            admission_inventory_epoch: Some(1),
             usb_present: None,
             ..Default::default()
         };
@@ -1084,6 +1087,7 @@ mod tests {
         let mut boards = std::collections::HashMap::from([("a".into(), hardware.clone())]);
         assert!(hardware::unavailable_for(&config, &boards, None).contains("a"));
         hardware.usb_present = Some(true);
+        hardware.admission_inventory_epoch = None;
         boards.insert("a".into(), hardware);
         assert!(!hardware::unavailable_for(&config, &boards, None).contains("a"));
     }
