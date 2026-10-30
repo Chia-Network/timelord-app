@@ -33,6 +33,7 @@ final class TimelordModel: ObservableObject {
     private var pausedByUser = false
     private var automaticStartPending = true
     private var quitting = false
+    private var startup: Task<Void, Never>?
     private var monitoring: Task<Void, Never>?
     private let monitoringEnabled: Bool
 
@@ -185,18 +186,18 @@ final class TimelordModel: ObservableObject {
     }
     func startService() {
         guard canStartService else { return }; automaticStartPending = false; starting = true; pausedByUser = false; errorMessage = nil
-        Task {
+        startup = Task {
+            defer { starting = false; startup = nil; updateSnapshot() }
             await refreshDevices()
-            defer { starting = false }
-            guard !quitting else { return }
+            guard !quitting, !Task.isCancelled else { return }
             do {
                 guard !discoveredDevices.isEmpty else { throw ConfigurationError.message("Connect an ASIC board to start.") }
                 try await configurationClient.save(savedConfiguration)
-                guard !quitting else { return }
+                guard !quitting, !Task.isCancelled else { return }
                 useSavedStatusEndpoint()
                 try controller.start(); configurationNeedsRestart = false
-            } catch {errorMessage=error.localizedDescription}
-            starting = false; if monitoringEnabled { await refresh() }
+            } catch { if !Task.isCancelled { errorMessage = error.localizedDescription } }
+            if monitoringEnabled && !Task.isCancelled { await refresh() }
         }
     }
     func stopService() {
@@ -290,7 +291,11 @@ final class TimelordModel: ObservableObject {
             // The service owns debounced topology changes, including headless
             // deployments. Discovery must not ask users to restart it manually.
             updateSnapshot()
-        } catch { if liveStatus == nil {discoveredDevices=[];updateSnapshot()}; discoveryError=error.localizedDescription;errorMessage=error.localizedDescription }
+        } catch {
+            guard !Task.isCancelled else { return }
+            if liveStatus == nil {discoveredDevices=[];updateSnapshot()}
+            discoveryError=error.localizedDescription;errorMessage=error.localizedDescription
+        }
     }
     func importNode(local: Bool) async {
         guard !operationInProgress else { return }
@@ -331,6 +336,7 @@ final class TimelordModel: ObservableObject {
     func prepareForTermination(timeout: TimeInterval = 30) async -> Bool {
         quitting = true
         automaticStartPending = false
+        startup?.cancel()
         monitoring?.cancel(); monitoring = nil
         let deadline = ProcessInfo.processInfo.systemUptime + timeout
         guard await controller.stopAndWait(timeout: timeout) else {

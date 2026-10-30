@@ -103,6 +103,42 @@ final class TerminationTests: XCTestCase {
         XCTAssertFalse(controller.preventsIdleSleep)
     }
 
+    func testTimedOutQuitNeverRevivesTheCancelledStartup() async throws {
+        let (directory, controller) = try fixture()
+        let helper = directory.appendingPathComponent("fixture-helper")
+        let release = directory.appendingPathComponent("fixture-helper.release")
+        let script = """
+        #!/bin/sh
+        case "$1" in
+          devices) printf '%s' '[{"name":"Fixture","location":1,"serial":"fixture-only"}]' ;;
+          configure)
+            trap '' TERM
+            printf saving > "$0.saving"
+            while [ ! -f "$0.release" ]; do /bin/sleep 0.02; done ;;
+          serve) printf ready > "$0.ready"; exit 0 ;;
+        esac
+        """
+        try Data(script.utf8).write(to: helper)
+        defer {
+            try? Data().write(to: release)
+            controller.stop()
+        }
+        var configuration = AppConfiguration()
+        configuration.hardware.clientBinary = "/fixture/not-executed"
+        let model = TimelordModel(controller: controller, initialConfiguration: configuration, monitoringEnabled: false)
+        model.startService()
+        try await waitUntil { FileManager.default.fileExists(atPath: helper.path + ".saving") }
+        let stopped = await model.prepareForTermination(timeout: 0.05)
+        XCTAssertFalse(stopped)
+        XCTAssertTrue(model.starting)
+        try Data().write(to: release)
+        try await waitUntil { !model.starting }
+        XCTAssertFalse(controller.ownsService)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: helper.path + ".ready"))
+        XCTAssertTrue(model.canStartService, "A new explicit Run remains available after cancelled setup drains")
+        try FileManager.default.removeItem(at: directory)
+    }
+
     func testQuitDuringDiscoveryDoesNotLaunchHelperAfterCleanup() async throws {
         let (directory, controller) = try fixture()
         defer { controller.stop(); try? FileManager.default.removeItem(at: directory) }
