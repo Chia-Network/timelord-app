@@ -114,6 +114,32 @@ pub(super) fn checkpoint_retired(
     Ok(())
 }
 
+// The journal must be armed before spawning an owner. Only a failed spawn can
+// roll that intent back without a native shutdown confirmation: no child exists.
+pub(super) async fn launch_prepared(shared: &Shared, board: &BoardConfig) -> Result<Child> {
+    match launch(shared, board).await {
+        Ok(child) => Ok(child),
+        Err(error) => {
+            let safety = shared.runtime.lock().expect("runtime").safety.clone();
+            if let (Some(store), Some(serial)) = (safety, &board.serial) {
+                store
+                    .closed(serial)
+                    .context("Closing journal after native spawn failed")?;
+            }
+            shared
+                .runtime
+                .lock()
+                .expect("runtime")
+                .boards
+                .entry(board.id.clone())
+                .or_default()
+                .lifecycle
+                .retired(true, None, crate::unix_now());
+            Err(error)
+        }
+    }
+}
+
 /// Closed-owner discovery is the only observation allowed to declare this
 /// serial absent. Both initial preparation and post-admission use this path.
 async fn locate(shared: &Shared, board: &mut BoardConfig) -> Result<()> {
@@ -364,7 +390,7 @@ pub(super) async fn supervise_board(
                 let hardware = state.boards.entry(board.id.clone()).or_default();
                 hardware.lifecycle.start_native();
             }
-            let child = launch(&shared, &board).await?;
+            let child = launch_prepared(&shared, &board).await?;
             if let Some(metrics) = &shared.runtime.lock().expect("runtime").metrics {
                 metrics.client_started(
                     &crate::observability::board(&shared.config, &board.id),

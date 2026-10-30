@@ -815,6 +815,67 @@ async fn oversized_native_diagnostic_does_not_retire_the_owner_or_hide_following
 }
 
 #[tokio::test]
+async fn failed_spawn_closes_only_the_unopened_journal_owner() {
+    let dir = std::env::temp_dir().join(format!("tl-failed-spawn-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let binary = dir.join("removed-client");
+    std::fs::write(&binary, "fixture identity").unwrap();
+    let board: BoardConfig = toml::from_str("id='spawn'\nname='Spawn'\nserial='fixture'\nclient_port=18110\ndevice_location=1\nprofile='manual'").unwrap();
+    let mut config = Config::default();
+    config.hardware.client_binary = Some(binary.clone());
+    config.hardware.boards = vec![board.clone()];
+    let path = dir.join("config.toml");
+    let store = Arc::new(crate::safety::Store::open(&path).unwrap());
+    let shared = Shared {
+        assignments: config.assignments().unwrap(),
+        config,
+        clients: Default::default(),
+        runtime: Arc::new(std::sync::Mutex::new(crate::runtime::RuntimeState {
+            safety: Some(store.clone()),
+            ..Default::default()
+        })),
+        started_unix: crate::unix_now(),
+        service_started_unix: crate::unix_now(),
+    };
+    let q = admission::qualification(&shared, &board, 3).unwrap();
+    store.qualify("fixture", q.clone()).unwrap();
+    std::fs::remove_file(binary).unwrap();
+    for _ in 0..2 {
+        store.begin_owner("fixture", q.point).unwrap();
+        shared
+            .runtime
+            .lock()
+            .unwrap()
+            .boards
+            .entry(board.id.clone())
+            .or_default()
+            .lifecycle
+            .start_native();
+        assert!(launch_prepared(&shared, &board).await.is_err());
+        let record = store.board("fixture").unwrap();
+        assert!(!record.owner_active);
+        assert_eq!(record.qualification, Some(q.clone()));
+        assert!(record.quarantine.is_none());
+        assert!(!store.needs_self_test("fixture", &q));
+        assert!(
+            shared.runtime.lock().unwrap().boards[&board.id]
+                .lifecycle
+                .status()
+                .quiesced
+        );
+    }
+    // The rollback is persisted, so restarting the service cannot mistake the
+    // unsuccessful spawn for an owner that opened USB and failed to retire.
+    drop(shared);
+    drop(store);
+    let reopened = crate::safety::Store::open(&path).unwrap();
+    assert!(!reopened.needs_self_test("fixture", &q));
+    assert!(reopened.board("fixture").unwrap().quarantine.is_none());
+    drop(reopened);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn first_handshake_retirement_distinguishes_cancellation_failure_and_confirmation() {
     use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("tl-handshake-stop-{}", std::process::id()));
