@@ -72,8 +72,17 @@ final class TimelordModel: ObservableObject {
             ?? URL(string: "http://\(savedConfiguration.service.statusListen)/v1/status")!
         liveClient = LiveStatusClient(endpoint: endpoint)
     }
+    private var presentationOperation: ServiceControlOperation? {
+        if let controlOperation { return controlOperation }
+        if controller.desiredRunning, let phase = controller.supervisor?.phase,
+           ["starting", "recovering"].contains(phase) { return .start }
+        return nil
+    }
+    private var presentationError: String? {
+        presentationOperation == .start ? nil : controller.presentationError
+    }
     private func updateSnapshot() {
-        snapshot = LivePresentation.snapshot(status: liveStatus, history: history, configuration: configurationLoaded ? savedConfiguration : nil, detectedDevices: discoveredDevices, nodeSync: nodeSync, paused: pausedByUser, controlOperation: controlOperation, error: controller.errorMessage)
+        snapshot = LivePresentation.snapshot(status: liveStatus, history: history, configuration: configurationLoaded ? savedConfiguration : nil, detectedDevices: discoveredDevices, nodeSync: nodeSync, paused: pausedByUser, controlOperation: presentationOperation, error: presentationError)
     }
     func refresh() async {
         guard !quitting else { return }
@@ -88,18 +97,23 @@ final class TimelordModel: ObservableObject {
         await controller.refresh()
         await refreshNodeSync()
         do {
-            if canControlService && controller.processID == nil { throw ConfigurationError.message(controller.errorMessage ?? (pausedByUser ? "Timelord is paused." : "Background service is recovering.")) }
-            let result = try await liveClient.fetch(expectedPID: controller.processID)
-            if liveStatus?.servicePid != result.servicePid || liveStatus?.startedUnix != result.startedUnix { history = nil; lastHistoryFetch = .distantPast }
-            liveStatus = result
-            if Date().timeIntervalSince(lastHistoryFetch) >= 15 {
-                do { history = try await liveClient.history(expectedPID: result.servicePid); lastHistoryFetch = Date() }
-                catch { /* Keep the previous history with its original coverage end. */ }
+            // No worker is normal during Pause, initial startup, and replacement.
+            // Do not query an unrelated or stale HTTP listener without an owned PID.
+            if let workerPID = controller.processID {
+                let result = try await liveClient.fetch(expectedPID: workerPID)
+                if liveStatus?.servicePid != result.servicePid || liveStatus?.startedUnix != result.startedUnix { history = nil; lastHistoryFetch = .distantPast }
+                liveStatus = result
+                if Date().timeIntervalSince(lastHistoryFetch) >= 15 {
+                    do { history = try await liveClient.history(expectedPID: result.servicePid); lastHistoryFetch = Date() }
+                    catch { /* Keep the previous history with its original coverage end. */ }
+                }
+            } else {
+                liveStatus = nil; history = nil
             }
             updateSnapshot()
         } catch {
             let hadService = liveStatus != nil || canControlService; liveStatus = nil; history = nil
-            snapshot = LivePresentation.snapshot(status: nil, configuration: configurationLoaded ? savedConfiguration : nil, detectedDevices: discoveredDevices, nodeSync: nodeSync, paused: pausedByUser, controlOperation: controlOperation, error: hadService && !pausedByUser ? error.localizedDescription : controller.errorMessage)
+            snapshot = LivePresentation.snapshot(status: nil, configuration: configurationLoaded ? savedConfiguration : nil, detectedDevices: discoveredDevices, nodeSync: nodeSync, paused: pausedByUser, controlOperation: presentationOperation, error: hadService && !pausedByUser ? error.localizedDescription : presentationError)
         }
         if !operationInProgress && !isBusy && Date().timeIntervalSince(lastDiscovery)>15 { await refreshDevices() }
     }
