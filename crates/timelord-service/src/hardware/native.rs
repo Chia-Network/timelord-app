@@ -487,7 +487,11 @@ pub(super) async fn supervise(
             .or_default()
             .lifecycle
             .fault(
-                crate::board_lifecycle::Fault::Transport,
+                if thermal_rejection(error) {
+                    crate::board_lifecycle::Fault::Thermal
+                } else {
+                    crate::board_lifecycle::Fault::Transport
+                },
                 error.to_string(),
                 crate::unix_now(),
             );

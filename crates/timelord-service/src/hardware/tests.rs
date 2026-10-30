@@ -848,13 +848,18 @@ async fn first_handshake_retirement_distinguishes_cancellation_failure_and_confi
     use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("tl-handshake-stop-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    for (confirmed, rejected, prior_fault) in [
-        (true, false, false),
-        (false, false, false),
-        (true, true, false),
-        (true, false, true),
+    for (confirmed, rejection, prior_fault) in [
+        (true, None, false),
+        (false, None, false),
+        (true, Some("rejected"), false),
+        (true, None, true),
+        (true, Some("temperature_guard"), false),
+        (true, Some("temperature_limit"), false),
     ] {
-        let binary = dir.join(format!("client-{confirmed}-{rejected}-{prior_fault}"));
+        let rejected = rejection.is_some();
+        let thermal = matches!(rejection, Some("temperature_guard" | "temperature_limit"));
+        let variant = rejection.unwrap_or("none");
+        let binary = dir.join(format!("client-{confirmed}-{variant}-{prior_fault}"));
         let started = binary.with_extension("started");
         std::fs::write(
             &binary,
@@ -868,11 +873,9 @@ cat >/dev/null
 {}
 "#,
                 started.display(),
-                if rejected {
-                    r#"printf 'TLERR 1 %s rejected\n' "$id""#
-                } else {
-                    ""
-                },
+                rejection
+                    .map(|reason| format!(r#"printf 'TLERR 1 %s {reason}\n' "$id""#))
+                    .unwrap_or_default(),
                 if confirmed {
                     "printf '%s\\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2"
                 } else {
@@ -888,7 +891,7 @@ cat >/dev/null
         config.hardware.boards = vec![board.clone()];
         let store = Arc::new(
             crate::safety::Store::open(
-                &dir.join(format!("{confirmed}-{rejected}-{prior_fault}.toml")),
+                &dir.join(format!("{confirmed}-{variant}-{prior_fault}.toml")),
             )
             .unwrap(),
         );
@@ -955,18 +958,39 @@ cat >/dev/null
         let status = state.boards[&board.id].lifecycle.status();
         assert_eq!(status.quiesced, confirmed);
         assert_eq!(status.fault_reason.is_some(), rejected || prior_fault);
+        assert_eq!(
+            status.fault,
+            thermal.then_some(crate::board_lifecycle::Fault::Thermal)
+        );
+        if thermal {
+            assert_eq!(status.phase, crate::board_lifecycle::Phase::ThermalStop);
+        }
         drop(state);
+        let checkpoint_started = crate::unix_now();
         checkpoint_retired(&shared, &board, &store, "fixture").unwrap();
         let record = store.board("fixture").unwrap();
         assert_eq!(
             record.qualification,
-            (confirmed && !rejected && !prior_fault).then_some(q)
+            (confirmed && !rejected && !prior_fault).then_some(q.clone())
         );
         assert_eq!(
             record.quarantine,
-            (!confirmed || rejected || prior_fault).then_some(crate::safety::Reason::UncleanOwner)
+            if thermal {
+                Some(crate::safety::Reason::Thermal)
+            } else {
+                (!confirmed || rejected || prior_fault)
+                    .then_some(crate::safety::Reason::UncleanOwner)
+            }
         );
         assert_eq!(record.owner_active, !confirmed);
+        if thermal {
+            assert_eq!(
+                record.admission_frequency_mhz,
+                Some((q.point.frequency_mhz - 50.).max(200.))
+            );
+            assert!(record.retry_after_unix >= checkpoint_started + 300);
+            assert!(store.needs_self_test("fixture", &q));
+        }
     }
     std::fs::remove_dir_all(dir).unwrap();
 }

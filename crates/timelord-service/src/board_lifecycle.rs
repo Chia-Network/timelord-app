@@ -211,9 +211,15 @@ impl BoardLifecycle {
         self.verified_generation == Some(self.generation) && self.verified_slots.contains(&slot)
     }
     pub fn start_native(&mut self) {
-        self.phase = Phase::Starting;
         self.native = Native::Initializing;
-        self.fault_reason = None;
+        self.phase = match self.restriction {
+            Some(Fault::Thermal) => Phase::ThermalStop,
+            Some(_) => Phase::Fault,
+            None => {
+                self.fault_reason = None;
+                Phase::Starting
+            }
+        };
     }
     pub fn checking(&mut self) {
         self.phase = Phase::Checking;
@@ -222,10 +228,10 @@ impl BoardLifecycle {
         self.native = Native::Ready;
     }
     pub fn cool_telemetry(&mut self) {
-        if matches!(self.phase, Phase::Starting | Phase::Connected) {
+        if self.restriction.is_none() && matches!(self.phase, Phase::Starting | Phase::Connected) {
             self.phase = Phase::Connected;
         }
-        if self.native == Native::Ready {
+        if self.restriction.is_none() && self.native == Native::Ready {
             self.unavailable_since = None;
         }
     }
@@ -306,6 +312,39 @@ impl BoardLifecycle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_start_and_cool_telemetry_cannot_clear_latched_restrictions() {
+        for (fault, phase) in [
+            (Fault::Thermal, Phase::ThermalStop),
+            (Fault::InvalidProof, Phase::Fault),
+        ] {
+            let mut owner = BoardLifecycle::default();
+            owner.fault(fault, "Original safety restriction".into(), 1);
+            owner.retired(true, None, 2);
+            owner.begin_attempt(3);
+            owner.initialized();
+            owner.cool_telemetry();
+            assert_eq!(owner.status().phase, phase);
+            assert_eq!(owner.status().fault, Some(fault));
+            assert_eq!(
+                owner.status().fault_reason,
+                Some("Original safety restriction")
+            );
+            assert!(!owner.capacity(100, true).usable);
+            assert!(!owner.capacity(100, true).accepts_work);
+            assert!(!owner.capacity(100, true).exploration_ready);
+            // Only a successful admission can release the persisted restriction.
+            owner.admitted(4);
+            owner.inventory(Some(4), Inventory::Present);
+            owner.begin_attempt(5);
+            owner.initialized();
+            owner.cool_telemetry();
+            assert_eq!(owner.status().phase, Phase::Connected);
+            assert_eq!(owner.status().fault, None);
+            assert_eq!(owner.status().fault_reason, None);
+            assert!(owner.capacity(100, true).exploration_ready);
+        }
+    }
     #[test]
     fn production_retirement_cannot_revive_an_old_admission_inventory_ticket() {
         for error in [None, Some("transport failed".to_owned())] {
