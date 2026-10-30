@@ -12,14 +12,22 @@ pub enum Phase {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Snapshot {
     pub phase: Phase,
-    pub failed: bool,
+    pub failure: Option<Failure>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Failure {
+    Observation,
+    Essential,
 }
 impl Snapshot {
     pub fn healthy(self) -> bool {
-        !self.failed && self.phase != Phase::Stopping
+        self.failure.is_none() && self.phase != Phase::Stopping
     }
     pub fn ready(self) -> bool {
         self.healthy() && self.phase == Phase::Running
+    }
+    pub fn producing(self) -> bool {
+        self.phase == Phase::Running && self.failure != Some(Failure::Essential)
     }
 }
 #[derive(Default)]
@@ -33,10 +41,14 @@ impl State {
     }
     /// A projection failure affects health while productive work may continue.
     pub fn fail(&self) {
-        self.lifecycle.lock().expect("process lifecycle").failed = true;
+        self.lifecycle
+            .lock()
+            .expect("process lifecycle")
+            .failure
+            .get_or_insert(Failure::Observation);
     }
     pub fn essential_failure(&self) {
-        self.fail();
+        self.lifecycle.lock().expect("process lifecycle").failure = Some(Failure::Essential);
         self.progress.fail();
     }
     pub fn reconfigure(&self) {

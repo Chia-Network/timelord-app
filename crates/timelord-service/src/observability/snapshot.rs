@@ -49,12 +49,30 @@ pub fn ready(shared: &Shared) -> bool {
     snapshot(shared, crate::unix_now()).1.ready
 }
 pub(super) fn snapshot(shared: &Shared, now: u64) -> (Samples, Readiness, u64) {
+    let mut snapshot = work_snapshot(shared, now);
+    let process = shared.runtime.lock().expect("runtime").process.snapshot();
+    if !process.ready() {
+        snapshot.1.ready = false;
+        snapshot.1.reason = if process.healthy() {
+            "reconfiguring"
+        } else {
+            "service_unavailable"
+        };
+    }
+    snapshot
+}
+// Productive capacity is independent of a failed observer. Reporting readiness
+// additionally requires the process health latch above.
+pub(crate) fn work_ready(shared: &Shared) -> bool {
+    work_snapshot(shared, crate::unix_now()).1.ready
+}
+fn work_snapshot(shared: &Shared, now: u64) -> (Samples, Readiness, u64) {
     // Same lock order as /v1/status; no chart history is traversed or copied.
     let clients = shared.clients.lock().expect("clients");
     let state = shared.runtime.lock().expect("runtime");
     let mut samples = Samples::default();
     let process = state.process.snapshot();
-    if process.phase != crate::operational::Phase::Running {
+    if !process.producing() {
         samples.add("node_connected", &[], &[], 0.);
         return (
             samples,
@@ -227,9 +245,7 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> (Samples, Readiness, u64) {
             }
         }
     }
-    let reason = if !process.healthy() {
-        "service_unavailable"
-    } else if shared.config.node.certificate.is_none() {
+    let reason = if shared.config.node.certificate.is_none() {
         "setup_required"
     } else if shared.assignments.is_empty() {
         "waiting_for_clients"

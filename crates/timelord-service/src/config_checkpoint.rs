@@ -67,6 +67,13 @@ pub fn load_running(path: &Path) -> Result<(Config, bool)> {
         }
     }
 }
+fn eligible(shared: &Shared) -> bool {
+    let sent = {
+        let state = shared.runtime.lock().expect("runtime");
+        state.proofs_delivered > 0 && state.failed_proofs == 0
+    };
+    sent && observability::work_ready(shared)
+}
 pub async fn record(
     candidate: Config,
     path: PathBuf,
@@ -77,8 +84,7 @@ pub async fn record(
     loop {
         tokio::select! {_=shutdown.changed()=>return Ok(()),_=timer.tick()=>{}}
         let shared = current.borrow().clone();
-        let sent = shared.runtime.lock().expect("runtime").proofs_delivered > 0;
-        if !sent || !observability::ready(&shared) {
+        if !eligible(&shared) {
             continue;
         }
         let process = shared.runtime.lock().expect("runtime").process.clone();
@@ -178,7 +184,8 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[tokio::test]
-    async fn checkpoint_requires_actual_live_sent_work_and_recovers_an_invalid_edit() {
+    async fn checkpoint_preserves_proven_work_despite_observer_failure_but_rejects_production_failure()
+     {
         let dir = std::env::temp_dir().join(format!("tl-lkg-work-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
@@ -197,7 +204,8 @@ mod tests {
             service_started_unix: crate::unix_now(),
         });
         let process = shared.runtime.lock().unwrap().process.clone();
-        let (_current, current) = watch::channel(shared.clone());
+        process.fail(); // A failed scrape listener leaves proof production running.
+        let (current_tx, current) = watch::channel(shared.clone());
         let (stop, rx) = watch::channel(false);
         let task = tokio::spawn(record(config.clone(), path.clone(), current, rx));
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -231,6 +239,8 @@ mod tests {
             .lock()
             .unwrap()
             .extend([("a".into(), 0), ("a".into(), 1)]);
+        assert!(!observability::ready(&shared));
+        assert!(eligible(&shared));
         tokio::time::timeout(Duration::from_secs(4), task)
             .await
             .unwrap()
@@ -245,6 +255,42 @@ mod tests {
         );
         std::fs::write(&path, "broken edited config").unwrap();
         assert!(load_running(&path).unwrap().1);
+        assert!(
+            !observability::ready(&shared),
+            "promotion cannot clear observer failure"
+        );
+        shared.runtime.lock().unwrap().failed_proofs = 1;
+        assert!(!eligible(&shared), "sent work cannot hide a failed proof");
+        let rejected = dir.join("proof-failed.toml");
+        let (reject_stop, rx) = watch::channel(false);
+        let rejecting = tokio::spawn(record(
+            config.clone(),
+            rejected.clone(),
+            current_tx.subscribe(),
+            rx,
+        ));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        reject_stop.send(true).unwrap();
+        rejecting.await.unwrap().unwrap();
+        assert!(!saved_path(&rejected).unwrap().exists());
+        // Even with a clean proof counter, an essential task exit must reject
+        // promotion before the serve loop changes the process to Stopping.
+        shared.runtime.lock().unwrap().failed_proofs = 0;
+        process.essential_failure();
+        assert_eq!(process.snapshot().phase, crate::operational::Phase::Running);
+        assert!(!eligible(&shared));
+        process.fail();
+        assert!(
+            !eligible(&shared),
+            "observer failure cannot downgrade essential failure"
+        );
+        let rejected = dir.join("essential-failed.toml");
+        let (reject_stop, rx) = watch::channel(false);
+        let rejecting = tokio::spawn(record(config, rejected.clone(), current_tx.subscribe(), rx));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        reject_stop.send(true).unwrap();
+        rejecting.await.unwrap().unwrap();
+        assert!(!saved_path(&rejected).unwrap().exists());
         let _ = stop.send(true);
         std::fs::remove_dir_all(dir).unwrap();
     }
