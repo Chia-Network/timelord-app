@@ -74,6 +74,15 @@ fn eligible(shared: &Shared) -> bool {
     };
     sent && observability::work_ready(shared)
 }
+fn eligible_for_write(
+    shared: &Arc<Shared>,
+    current: &watch::Receiver<Arc<Shared>>,
+    shutdown: &watch::Receiver<bool>,
+) -> bool {
+    let stopped = *shutdown.borrow();
+    let latest = current.borrow().clone();
+    !stopped && Arc::ptr_eq(shared, &latest) && eligible(shared)
+}
 pub async fn record(
     candidate: Config,
     path: PathBuf,
@@ -89,24 +98,37 @@ pub async fn record(
         }
         let process = shared.runtime.lock().expect("runtime").process.clone();
         let permit = tokio::select! {p=process.progress.arithmetic(timelord_supervisor::progress::Resource::OptionalCheckpoint).acquire_owned()=>p?,_=shutdown.changed()=>return Ok(())};
-        let stage = process.progress.begin(
-            timelord_supervisor::progress::Resource::OptionalCheckpoint,
-            0,
-            0,
-            timelord_supervisor::progress::Stage::OptionalPersistence,
-        );
+        if !eligible_for_write(&shared, &current, &shutdown) {
+            continue;
+        }
         let candidate = candidate.clone();
         let path = path.clone();
+        let writer_current = current.clone();
+        let writer_shutdown = shutdown.clone();
+        let writer_process = process.clone();
         match tokio::task::spawn_blocking(move || {
-            let (_permit, _stage) = (permit, stage);
-            crate::save(&saved_path(&path)?, &candidate)
+            let _permit = permit;
+            // Both the capacity wait and the blocking pool may queue this job.
+            // Inspect current evidence at the actual I/O boundary, then release
+            // all runtime/watch locks before touching the filesystem.
+            if !eligible_for_write(&shared, &writer_current, &writer_shutdown) {
+                return Ok(false);
+            }
+            let _stage = writer_process.progress.begin(
+                timelord_supervisor::progress::Resource::OptionalCheckpoint,
+                0,
+                0,
+                timelord_supervisor::progress::Stage::OptionalPersistence,
+            );
+            crate::save(&saved_path(&path)?, &candidate).map(|()| true)
         })
         .await?
         {
-            Ok(()) => {
+            Ok(true) => {
                 process.progress.checkpointed();
                 return Ok(());
             }
+            Ok(false) => continue,
             Err(error) => {
                 tracing::warn!(%error,"Last-good configuration checkpoint unavailable; proof work continues")
             }
@@ -259,6 +281,52 @@ mod tests {
             !observability::ready(&shared),
             "promotion cannot clear observer failure"
         );
+        for essential in [false, true] {
+            let waiting_process = Arc::new(crate::operational::State::default());
+            waiting_process.fail(); // Observer failure alone must remain acceptable.
+            shared.runtime.lock().unwrap().process = waiting_process.clone();
+            assert!(eligible(&shared));
+            let capacity = waiting_process
+                .progress
+                .arithmetic(timelord_supervisor::progress::Resource::OptionalCheckpoint);
+            let held = capacity.acquire_owned().await.unwrap();
+            let rejected = dir.join(format!("failed-during-permit-wait-{essential}.toml"));
+            let (reject_stop, rx) = watch::channel(false);
+            let recording = record(config.clone(), rejected.clone(), current_tx.subscribe(), rx);
+            tokio::pin!(recording);
+            // First tick passes eligibility and blocks on the held capacity.
+            tokio::select! {
+                biased;
+                result = &mut recording => panic!("record exited before capacity became available: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+            }
+            if essential {
+                waiting_process.essential_failure();
+            } else {
+                shared.runtime.lock().unwrap().failed_proofs = 1;
+            }
+            drop(held);
+            tokio::select! {
+                result = &mut recording => panic!("ineligible checkpoint was promoted: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+            }
+            reject_stop.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(3), &mut recording)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!saved_path(&rejected).unwrap().exists());
+            assert!(
+                !waiting_process
+                    .progress
+                    .snapshot(1, 1)
+                    .unwrap()
+                    .configuration_checkpointed
+            );
+            let mut state = shared.runtime.lock().unwrap();
+            state.failed_proofs = 0;
+            state.process = process.clone();
+        }
         shared.runtime.lock().unwrap().failed_proofs = 1;
         assert!(!eligible(&shared), "sent work cannot hide a failed proof");
         let rejected = dir.join("proof-failed.toml");
