@@ -159,6 +159,8 @@ async fn icc_primer_does_not_supply_unmanaged_readiness_evidence() {
     let mut config: Config =
         toml::from_str("[[hardware.boards]]\nid='a'\nname='A'\nclient_port=18110\n").unwrap();
     config.node.certificate = Some("/fixture/no-io.crt".into());
+    config.node.private_key = Some("/fixture/no-io.key".into());
+    config.node.ca_certificate = Some("/fixture/no-io-ca.crt".into());
     let metrics = crate::observability::Metrics::new(config.node.network).unwrap();
     let runtime = Arc::new(SyncMutex::new(crate::runtime::RuntimeState {
         metrics: Some(metrics.clone()),
