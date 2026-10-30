@@ -528,13 +528,6 @@ impl AsicBackend {
                 message: error.to_string(),
             }
         })?;
-        {
-            let mut state = self.runtime.lock().expect("runtime");
-            let hardware = state.boards.entry(lane.board.clone()).or_default();
-            hardware
-                .lifecycle
-                .verified(active.lease.generation, active.lease.slot);
-        }
         let timing = ProofTiming {
             iterations: work.iterations,
             started: active.started,
@@ -545,6 +538,15 @@ impl AsicBackend {
                 .as_millis(),
         };
         if record_metric {
+            // Primers establish the ICC session but do not prove that a required
+            // chain can serve real work. Keep them out of readiness evidence.
+            {
+                let mut state = self.runtime.lock().expect("runtime");
+                let hardware = state.boards.entry(lane.board.clone()).or_default();
+                hardware
+                    .lifecycle
+                    .verified(active.lease.generation, active.lease.slot);
+            }
             if let Some(metrics) = &metrics {
                 metrics.verified(epoch, chain, ips);
             }
