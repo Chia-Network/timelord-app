@@ -13,8 +13,12 @@ final class ServiceController {
     var onChange: (() -> Void)?
     private(set) var errorMessage: String?
     private(set) var supervisor: SupervisorStatus?
+    private var hasObservedSupervisor = false
     private var changingIntent = false
     private var controlEpoch: UInt64 = 0
+    // Before the first successful contact, an absent background service is setup.
+    // Once observed, losing contact must remain visible as a runtime failure.
+    var presentationError: String? { hasObservedSupervisor ? errorMessage : nil }
     var canControlService: Bool { supervisor != nil }
     var desiredRunning: Bool { supervisor?.mode == .running }
     var processID: Int32? { supervisor?.workerPid }
@@ -38,7 +42,7 @@ final class ServiceController {
         do {
             let current = try await client.send(.status)
             guard epoch == controlEpoch, !changingIntent else { return }
-            supervisor = current; errorMessage = current.error
+            supervisor = current; hasObservedSupervisor = true; errorMessage = current.error
         } catch {
             guard epoch == controlEpoch, !changingIntent else { return }
             supervisor = nil; errorMessage = "Background supervision unavailable: \(error.localizedDescription)"
@@ -52,7 +56,7 @@ final class ServiceController {
         changingIntent = true; defer { changingIntent = false; onChange?() }
         do {
             let current = try await client.send(.status)
-            supervisor = current
+            supervisor = current; hasObservedSupervisor = true
             supervisor = try await client.send(command, expectedRevision: current.revision)
             errorMessage = supervisor?.error
         } catch { errorMessage = error.localizedDescription; throw error }
