@@ -182,6 +182,18 @@ fn parse_config(path: &Path, text: &str) -> Result<Config> {
     Ok(config)
 }
 
+fn set_default_automatic_state(config: &mut Config, path: &Path) -> Result<()> {
+    if config.hardware.automatic_state.is_none() {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .canonicalize()?;
+        config.hardware.automatic_state = Some(parent.join("automatic-profiles.json"));
+    }
+    Ok(())
+}
+
 fn save(path: &Path, config: &Config) -> Result<()> {
     config.validate().map_err(anyhow::Error::msg)?;
     let parent = path
@@ -298,12 +310,7 @@ async fn main() -> Result<()> {
         }
         Command::Plan { config } => {
             let mut value = load(&config)?;
-            value.hardware.automatic_state.get_or_insert(
-                config
-                    .parent()
-                    .unwrap_or(Path::new("."))
-                    .join("automatic-profiles.json"),
-            );
+            set_default_automatic_state(&mut value, &config)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&assignment::resolve(&value)?)?
@@ -321,12 +328,7 @@ async fn main() -> Result<()> {
             let _owner = timelord_supervisor::InstanceLock::acquire(&paths.worker_lock)?;
             let (mut value, fallback) = config_checkpoint::load_running(&config)?;
             value.service.control_socket = Some(automatic::socket_path(&config, &value));
-            value.hardware.automatic_state.get_or_insert(
-                config
-                    .parent()
-                    .unwrap_or(Path::new("."))
-                    .join("automatic-profiles.json"),
-            );
+            set_default_automatic_state(&mut value, &config)?;
             serve(
                 value,
                 config.with_extension("history.json"),

@@ -54,7 +54,10 @@ pub fn load_running(path: &Path) -> Result<(Config, bool)> {
             let text = bounded_text(&saved, true).context(
                 "Requested configuration invalid and no readable last-good checkpoint is available",
             )?;
-            let config = crate::parse_config(&saved, &text).with_context(|| {
+            // The checkpoint retains the original configuration's path context.
+            // Moving its bytes into the private state directory must not relocate
+            // relative credentials, native libraries or learned profiles.
+            let config = crate::parse_config(path, &text).with_context(|| {
                 format!("Requested configuration and last-good checkpoint are invalid: {requested}")
             })?;
             tracing::warn!(
@@ -133,6 +136,46 @@ mod tests {
         std::fs::write(&saved, "also broken").unwrap();
         assert!(load_running(&path).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn relative_config_checkpoint_keeps_original_profile_and_credential_paths() {
+        let root = PathBuf::from(format!(".tl-lkg-paths-{}", std::process::id()));
+        for directory in [root.clone(), root.join("nested")] {
+            std::fs::create_dir_all(&directory).unwrap();
+            let path = directory.join("config.toml");
+            crate::save(&path, &Config::default()).unwrap();
+            let mut candidate = crate::load(&path).unwrap();
+            crate::set_default_automatic_state(&mut candidate, &path).unwrap();
+            let parent = directory.canonicalize().unwrap();
+            let expected = parent.join("automatic-profiles.json");
+            assert_eq!(candidate.hardware.automatic_state.as_ref(), Some(&expected));
+            let saved = saved_path(&path).unwrap();
+            crate::save(&saved, &candidate).unwrap();
+            std::fs::write(&path, "invalid requested edit").unwrap();
+            let (fallback, used_saved) = load_running(&path).unwrap();
+            assert!(used_saved);
+            assert_eq!(fallback.hardware.automatic_state, Some(expected));
+
+            // Relative checkpoint fields also belong to the original config,
+            // including when the operator has removed that file altogether.
+            candidate.hardware.automatic_state = Some("learned/profiles.json".into());
+            candidate.node.certificate = Some("credentials/node.crt".into());
+            candidate.node.private_key = Some("credentials/node.key".into());
+            candidate.node.ca_certificate = Some("credentials/ca.crt".into());
+            crate::save(&saved, &candidate).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            let (fallback, used_saved) = load_running(&path).unwrap();
+            assert!(used_saved);
+            assert_eq!(
+                fallback.hardware.automatic_state,
+                Some(parent.join("learned/profiles.json"))
+            );
+            assert_eq!(
+                fallback.node.certificate,
+                Some(parent.join("credentials/node.crt"))
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[tokio::test]
     async fn checkpoint_requires_actual_live_sent_work_and_recovers_an_invalid_edit() {
