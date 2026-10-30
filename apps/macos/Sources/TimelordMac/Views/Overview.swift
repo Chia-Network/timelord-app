@@ -13,7 +13,7 @@ struct Overview: View {
                     Label(model.runControlTitle, systemImage: model.canPause ? "pause.fill" : "play.fill")
                 }
                 .labelStyle(.titleAndIcon)
-                .disabled(model.starting || (model.snapshot.serviceAvailable && !model.canControlService))
+                .disabled(model.isBusy || (model.snapshot.serviceAvailable && !model.canControlService))
                 .help(model.canPause ? "Pause Timelord" : "Run Timelord")
             }
             ToolbarItem(placement: .automatic) { Button { model.sheet = .settings } label: { Label("Settings", systemImage: "gearshape") } }

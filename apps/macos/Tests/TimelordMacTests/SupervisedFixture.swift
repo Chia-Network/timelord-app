@@ -15,7 +15,7 @@ final class SupervisedFixture {
     let controller: ServiceController
     let client: ConfigurationClient
 
-    init() throws {
+    init(workerBody: String = "exec /bin/sleep 60") throws {
         var root = URL(fileURLWithPath: #filePath)
         for _ in 0..<5 { root.deleteLastPathComponent() }
         nativeHelper = root.appendingPathComponent("build/rust/debug/timelord-service")
@@ -34,7 +34,7 @@ final class SupervisedFixture {
               if [ "$1" = --config ]; then cp "$2" "$0.started.$$"; break; fi
               shift
             done
-            exec /bin/sleep 60 ;;
+            \(workerBody) ;;
           devices) printf '%s' '[{"name":"Fixture","location":1,"serial":"fixture-only"}]' ;;
           *) exec '\(nativeHelper.path)' "$@" ;;
         esac
