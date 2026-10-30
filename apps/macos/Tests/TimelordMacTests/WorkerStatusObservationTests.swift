@@ -1,6 +1,7 @@
 import Foundation
 import XCTest
 @testable import TimelordMac
+import TimelordPresentation
 
 final class WorkerStatusObservationTests: XCTestCase {
     func testConnectionGraceIsBoundedAndDoesNotRestartForTheSameWorker() {
@@ -24,6 +25,24 @@ final class WorkerStatusObservationTests: XCTestCase {
         observation.failed(pid: 11, error: URLError(.timedOut), now: later)
         XCTAssertFalse(observation.isStarting(at: later), "An established endpoint outage is immediate")
     }
+    func testGraceExpiryRemainsAFailureWithoutAnotherHTTPPoll() {
+        let now = ContinuousClock.now
+        var observation = WorkerStatusObservation.absent
+        observation.observe(pid: 10, now: now)
+        let deadline = now.advanced(by: .seconds(60))
+        XCTAssertNil(observation.failure(at: deadline.advanced(by: .nanoseconds(-1))))
+        for instant in [deadline, deadline.advanced(by: .seconds(30))] {
+            // Discovery/settings may rebuild presentation before another fetch finishes.
+            let snapshot = LivePresentation.snapshot(status: nil,
+                controlOperation: observation.isStarting(at: instant) ? .start : nil, error: observation.failure(at: instant))
+            XCTAssertEqual(snapshot.phase, .serviceUnavailable)
+            XCTAssertFalse(snapshot.readyToRun)
+            XCTAssertEqual(snapshot.explanation, "The local service did not respond within 60 seconds. Check its log.")
+        }
+        observation.received(pid: 10)
+        XCTAssertNil(observation.failure(at: deadline))
+    }
+
     func testInvalidStatusBypassesStartupGraceAndNoProcessClearsIt() {
         var observation = WorkerStatusObservation.absent
         observation.observe(pid: 10)
