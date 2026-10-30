@@ -26,6 +26,7 @@ final class TimelordModel: ObservableObject {
     private let configurationClient: ConfigurationClient
     private var savedConfiguration = AppConfiguration()
     private var liveStatus: ServiceStatus?
+    private var workerStatus = WorkerStatusObservation.absent
     private var history: HistoryPayload?
     private var nodeSync: NodeSyncStatus?
     private var lastNodeSyncFetch = Date.distantPast
@@ -76,7 +77,7 @@ final class TimelordModel: ObservableObject {
         liveClient = LiveStatusClient(endpoint: endpoint)
     }
     private func updateSnapshot() {
-        snapshot = LivePresentation.snapshot(status: liveStatus, history: history, configuration: configurationLoaded ? savedConfiguration : nil, detectedDevices: discoveredDevices, nodeSync: nodeSync, paused: pausedByUser, starting: starting, error: controller.errorMessage)
+        snapshot = LivePresentation.snapshot(status: liveStatus, history: history, configuration: configurationLoaded ? savedConfiguration : nil, detectedDevices: discoveredDevices, nodeSync: nodeSync, paused: pausedByUser, starting: starting || (!pausedByUser && workerStatus.isStarting()), error: controller.errorMessage)
     }
     func refresh() async {
         guard !quitting else { return }
@@ -90,8 +91,11 @@ final class TimelordModel: ObservableObject {
         }
         await refreshNodeSync()
         var serviceAbsent = false
+        let expectedPID = ownsService ? controller.processID : nil
+        workerStatus.observe(pid: expectedPID)
         do {
-            let result = try await liveClient.fetch(expectedPID: controller.processID)
+            let result = try await liveClient.fetch(expectedPID: expectedPID)
+            if let expectedPID { workerStatus.received(pid: expectedPID) }
             if liveStatus?.servicePid != result.servicePid || liveStatus?.startedUnix != result.startedUnix { history = nil; lastHistoryFetch = .distantPast }
             liveStatus = result
             automaticStartPending = false // Observe an existing service without taking ownership.
@@ -104,8 +108,9 @@ final class TimelordModel: ObservableObject {
             // A refused connection proves the status listener is absent. An invalid,
             // stale or timed-out response may belong to another running service.
             serviceAbsent = (error as? URLError)?.code == .cannotConnectToHost
+            if let expectedPID { workerStatus.failed(pid: expectedPID, error: error) }
             let hadService = liveStatus != nil || ownsService; liveStatus = nil; history = nil
-            snapshot = LivePresentation.snapshot(status: nil, configuration: configurationLoaded ? savedConfiguration : nil, detectedDevices: discoveredDevices, nodeSync: nodeSync, paused: pausedByUser, starting: starting, error: hadService && !pausedByUser ? error.localizedDescription : controller.errorMessage)
+            snapshot = LivePresentation.snapshot(status: nil, configuration: configurationLoaded ? savedConfiguration : nil, detectedDevices: discoveredDevices, nodeSync: nodeSync, paused: pausedByUser, starting: starting || (!pausedByUser && workerStatus.isStarting()), error: hadService && !pausedByUser && !workerStatus.isStarting() ? error.localizedDescription : controller.errorMessage)
         }
         if !operationInProgress && !starting && Date().timeIntervalSince(lastDiscovery)>15 { await refreshDevices() }
         considerAutomaticStart(serviceAbsent: serviceAbsent)
@@ -195,7 +200,7 @@ final class TimelordModel: ObservableObject {
                 try await configurationClient.save(savedConfiguration)
                 guard !quitting, !Task.isCancelled else { return }
                 useSavedStatusEndpoint()
-                try controller.start(); configurationNeedsRestart = false
+                try controller.start(); workerStatus.observe(pid: controller.processID); configurationNeedsRestart = false
             } catch { if !Task.isCancelled { errorMessage = error.localizedDescription } }
             // controller.onChange schedules status polling separately from startup.
         }

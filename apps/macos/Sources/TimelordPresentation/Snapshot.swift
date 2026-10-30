@@ -283,7 +283,7 @@ public enum LivePresentation {
             return status.message
         }
         return AppSnapshot(phase: phase,
-            explanation: error ?? faultReason ?? (paused ? "Timelord is paused. Resume when you’re ready." : live?.message ?? (configuration?.node.hasIdentity == true && configuration?.hardware.clientBinary != nil && !boards.isEmpty
+            explanation: error ?? faultReason ?? (phase == .starting ? "Starting Timelord; waiting for the service to respond." : paused ? "Timelord is paused. Resume when you’re ready." : live?.message ?? (configuration?.node.hasIdentity == true && configuration?.hardware.clientBinary != nil && !boards.isEmpty
                 ? (configuration?.service.startAutomatically == true
                     ? "Timelord starts automatically when the app opens, once setup and connected boards are ready."
                     : (boards.contains(where: { $0.isAutomatic }) ? "Press Run to start producing proofs. Automatic tuning learns while Timelord runs." : "Press Run to start producing proofs."))

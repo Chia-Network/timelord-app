@@ -167,6 +167,7 @@ final class TerminationTests: XCTestCase {
         try await waitUntil { FileManager.default.fileExists(atPath: helper.path + ".polling") }
         model.startService()
         try await waitUntil { controller.ownsService && !model.starting }
+        XCTAssertEqual(model.snapshot.phase, .starting, "The owned worker has not served status yet")
         XCTAssertTrue(model.canPause)
         XCTAssertTrue(model.canFinishSettings)
         XCTAssertEqual(model.runControlTitle, "Pause")
