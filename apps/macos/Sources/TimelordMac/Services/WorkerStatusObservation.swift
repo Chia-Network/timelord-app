@@ -6,13 +6,17 @@ enum WorkerStatusObservation {
     case absent
     case awaiting(pid: Int32, until: ContinuousClock.Instant)
     case responsive(pid: Int32)
-    case unavailable(pid: Int32)
+    case unavailable(pid: Int32, error: String)
 
     private var pid: Int32? {
         switch self {
         case .absent: return nil
-        case .awaiting(let pid, _), .responsive(let pid), .unavailable(let pid): return pid
+        case .awaiting(let pid, _), .responsive(let pid), .unavailable(let pid, _): return pid
         }
+    }
+    var error: String? {
+        if case .unavailable(_, let error) = self { return error }
+        return nil
     }
     mutating func observe(pid: Int32?, now: ContinuousClock.Instant = .now) {
         guard pid != self.pid else { return }
@@ -30,6 +34,6 @@ enum WorkerStatusObservation {
         guard self.pid == pid else { return }
         if isStarting(at: now), let code = (error as? URLError)?.code,
            [.cannotConnectToHost, .timedOut, .networkConnectionLost].contains(code) { return }
-        self = .unavailable(pid: pid)
+        self = .unavailable(pid: pid, error: error.localizedDescription)
     }
 }

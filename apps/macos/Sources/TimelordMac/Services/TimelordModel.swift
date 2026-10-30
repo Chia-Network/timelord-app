@@ -77,7 +77,7 @@ final class TimelordModel: ObservableObject {
         liveClient = LiveStatusClient(endpoint: endpoint)
     }
     private func updateSnapshot() {
-        snapshot = LivePresentation.snapshot(status: liveStatus, history: history, configuration: configurationLoaded ? savedConfiguration : nil, detectedDevices: discoveredDevices, nodeSync: nodeSync, paused: pausedByUser, starting: starting || (!pausedByUser && workerStatus.isStarting()), error: controller.errorMessage)
+        snapshot = LivePresentation.snapshot(status: liveStatus, history: history, configuration: configurationLoaded ? savedConfiguration : nil, detectedDevices: discoveredDevices, nodeSync: nodeSync, paused: pausedByUser, starting: starting || (!pausedByUser && workerStatus.isStarting()), error: workerStatus.error ?? controller.errorMessage)
     }
     func refresh() async {
         guard !quitting else { return }
@@ -95,6 +95,7 @@ final class TimelordModel: ObservableObject {
         workerStatus.observe(pid: expectedPID)
         do {
             let result = try await liveClient.fetch(expectedPID: expectedPID)
+            guard (ownsService ? controller.processID : nil) == expectedPID else { return }
             if let expectedPID { workerStatus.received(pid: expectedPID) }
             if liveStatus?.servicePid != result.servicePid || liveStatus?.startedUnix != result.startedUnix { history = nil; lastHistoryFetch = .distantPast }
             liveStatus = result
@@ -105,6 +106,7 @@ final class TimelordModel: ObservableObject {
             }
             updateSnapshot()
         } catch {
+            guard (ownsService ? controller.processID : nil) == expectedPID else { return }
             // A refused connection proves the status listener is absent. An invalid,
             // stale or timed-out response may belong to another running service.
             serviceAbsent = (error as? URLError)?.code == .cannotConnectToHost
