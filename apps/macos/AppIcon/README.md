@@ -6,7 +6,9 @@
   `AppIcon.icns`, and `Info.plist` names it with `CFBundleIconName`.
 - `AppIcon.icns` is the flat icon, rebuilt by `scripts/build-icon.sh` from `AppIcon.svg` (and
   `AppIcon-small.svg` for 16 and 32 px). The bundle uses it only when `actool` is unavailable,
-  because the command line tools alone do not include it. Keep the two designs in step.
+  or when the selected compiler predates Xcode 26. A failed compiler probe or a real
+  compilation error on supported tools fails the bundle; it is not hidden by fallback.
+  Keep the two designs in step.
 
 The layers in `AppIcon.icon/Assets` are 1024 × 1024 and full bleed, with no mask, rim, shadow or
 glow, because the system adds those. Layers with two files switch by appearance through
