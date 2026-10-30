@@ -211,7 +211,6 @@ impl BoardLifecycle {
         self.verified_generation == Some(self.generation) && self.verified_slots.contains(&slot)
     }
     pub fn start_native(&mut self) {
-        self.admission_inventory = None;
         self.phase = Phase::Starting;
         self.native = Native::Initializing;
         self.fault_reason = None;
@@ -280,7 +279,7 @@ impl BoardLifecycle {
     /// epoch=None is a closed-owner discovery made by the current supervisor.
     /// A periodic probe must carry the admission epoch it observed before I/O.
     pub fn inventory(&mut self, epoch: Option<u64>, observed: Inventory) {
-        if epoch.is_some() && epoch != self.admission_inventory {
+        if epoch.is_some() && epoch != self.admitted_inventory_epoch() {
             return;
         }
         self.inventory = Some(observed);
@@ -306,6 +305,32 @@ impl BoardLifecycle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_attempt_does_not_release_unconfirmed_admitted_capacity() {
+        for observation in [None, Some(Inventory::Missing), Some(Inventory::Ambiguous)] {
+            let mut owner = BoardLifecycle::default();
+            owner.admitted(7);
+            if let Some(observation) = observation {
+                owner.inventory(Some(7), observation);
+            }
+            assert!(!owner.capacity(1, true).usable);
+            owner.start_native();
+            assert!(!owner.capacity(2, true).usable);
+            assert_eq!(owner.admitted_inventory_epoch(), None);
+            owner.inventory(Some(7), Inventory::Present);
+            assert!(
+                !owner.capacity(3, true).usable,
+                "an old background probe released startup capacity"
+            );
+            owner.begin_attempt(4);
+            assert!(!owner.capacity(4, true).usable);
+            // The native owner has not opened yet; its fresh, explicit locate
+            // probe can confirm presence without reviving an old background ticket.
+            owner.inventory(None, Inventory::Present);
+            assert!(owner.capacity(5, true).usable);
+            assert!(!owner.capacity(5, true).accepts_work);
+        }
+    }
     #[test]
     fn admission_and_inventory_are_one_transition_contract() {
         let mut owner = BoardLifecycle::default();
