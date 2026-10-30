@@ -848,8 +848,13 @@ async fn first_handshake_retirement_distinguishes_cancellation_failure_and_confi
     use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("tl-handshake-stop-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    for (confirmed, rejected) in [(true, false), (false, false), (true, true)] {
-        let binary = dir.join(format!("client-{confirmed}-{rejected}"));
+    for (confirmed, rejected, prior_fault) in [
+        (true, false, false),
+        (false, false, false),
+        (true, true, false),
+        (true, false, true),
+    ] {
+        let binary = dir.join(format!("client-{confirmed}-{rejected}-{prior_fault}"));
         let started = binary.with_extension("started");
         std::fs::write(
             &binary,
@@ -882,7 +887,10 @@ cat >/dev/null
         config.hardware.client_binary = Some(binary);
         config.hardware.boards = vec![board.clone()];
         let store = Arc::new(
-            crate::safety::Store::open(&dir.join(format!("{confirmed}-{rejected}.toml"))).unwrap(),
+            crate::safety::Store::open(
+                &dir.join(format!("{confirmed}-{rejected}-{prior_fault}.toml")),
+            )
+            .unwrap(),
         );
         let shared = Arc::new(Shared {
             assignments: config.assignments().unwrap(),
@@ -933,20 +941,30 @@ cat >/dev/null
                     }
                 } => {}
             }
+            if prior_fault {
+                shared.runtime.lock().unwrap().boards.get_mut(&board.id).unwrap().lifecycle.fault(
+                    crate::board_lifecycle::Fault::Transport,
+                    "Transport failed before topology cancellation".into(),
+                    crate::unix_now(),
+                );
+            }
             stop.send(true).unwrap();
             supervising.await.unwrap();
         }).await.unwrap();
         let state = shared.runtime.lock().unwrap();
         let status = state.boards[&board.id].lifecycle.status();
         assert_eq!(status.quiesced, confirmed);
-        assert_eq!(status.fault_reason.is_some(), rejected);
+        assert_eq!(status.fault_reason.is_some(), rejected || prior_fault);
         drop(state);
         checkpoint_retired(&shared, &board, &store, "fixture").unwrap();
         let record = store.board("fixture").unwrap();
-        assert_eq!(record.qualification, (confirmed && !rejected).then_some(q));
+        assert_eq!(
+            record.qualification,
+            (confirmed && !rejected && !prior_fault).then_some(q)
+        );
         assert_eq!(
             record.quarantine,
-            (!confirmed || rejected).then_some(crate::safety::Reason::UncleanOwner)
+            (!confirmed || rejected || prior_fault).then_some(crate::safety::Reason::UncleanOwner)
         );
         assert_eq!(record.owner_active, !confirmed);
     }

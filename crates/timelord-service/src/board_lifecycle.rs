@@ -289,7 +289,7 @@ impl BoardLifecycle {
         self.native = Native::Retired { confirmed };
         if let Some(error) = error {
             self.fault(Fault::Transport, error, now);
-        } else if self.phase != Phase::ThermalStop {
+        } else if !matches!(self.phase, Phase::Fault | Phase::ThermalStop) {
             self.phase = Phase::Stopped;
         }
     }

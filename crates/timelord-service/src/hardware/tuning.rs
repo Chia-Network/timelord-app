@@ -28,6 +28,19 @@ pub(super) struct Tuning {
     pub(super) last_record_unix: u64,
     pub(super) journal: Option<Journal>,
 }
+fn exploration_allowed(
+    state: &crate::runtime::RuntimeState,
+    board_id: &str,
+    now: u64,
+    owns_trial: bool,
+) -> bool {
+    owns_trial
+        && !state.experiments.admission_pending()
+        && state.boards.get(board_id).is_some_and(|hardware| {
+            hardware.lifecycle.capacity(now, true).exploration_ready
+                && now.saturating_sub(hardware.temperature_unix) <= 30
+        })
+}
 impl Tuning {
     pub(super) fn checkpoint(
         &mut self,
@@ -195,14 +208,12 @@ impl Tuning {
                 self.policy.settings.minimum_proofs_per_chain,
             );
             automatic::Input {
-                exploration_allowed: self.experiment.is_some()
-                    && !gate.admission_pending()
-                    && shared.config.hardware.boards.iter().all(|b| {
-                        state.boards.get(&b.id).is_some_and(|h| {
-                            h.lifecycle.capacity(now, true).exploration_ready
-                                && now.saturating_sub(h.temperature_unix) <= 30
-                        })
-                    }),
+                exploration_allowed: exploration_allowed(
+                    &state,
+                    &board.id,
+                    now,
+                    self.experiment.is_some(),
+                ),
                 healthy: state.phase == "running"
                     && ["ready", "authenticated"].contains(&state.node.as_str())
                     && latest.is_some_and(|t| now.saturating_sub(t) <= 30)
@@ -340,6 +351,79 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    #[tokio::test]
+    async fn exploration_is_local_to_the_candidate_but_exclusive_with_trials_and_admission() {
+        use crate::board_lifecycle::{BoardLifecycle, Fault, Phase};
+        let mut state = crate::runtime::RuntimeState::default();
+        state.boards.insert(
+            "healthy".into(),
+            crate::runtime::HardwareState {
+                lifecycle: BoardLifecycle::fixture(Phase::Connected, true, None, Some(true), 1),
+                temperature_unix: 100,
+                ..Default::default()
+            },
+        );
+        state.boards.insert(
+            "quarantined-manual".into(),
+            crate::runtime::HardwareState {
+                lifecycle: BoardLifecycle::fixture(
+                    Phase::Quarantined,
+                    false,
+                    Some(Fault::InvalidProof),
+                    Some(true),
+                    1,
+                ),
+                ..Default::default()
+            },
+        );
+        // An absent pinned board has no runtime entry at all.
+        let gate = state.experiments.clone();
+        let trial = gate.trial().unwrap();
+        assert!(exploration_allowed(&state, "healthy", 100, true));
+        assert!(!exploration_allowed(
+            &state,
+            "quarantined-manual",
+            100,
+            true
+        ));
+        assert!(!exploration_allowed(&state, "missing-pinned", 100, true));
+        assert!(!exploration_allowed(&state, "healthy", 131, true));
+        assert!(!exploration_allowed(
+            &state,
+            "healthy",
+            100,
+            gate.trial().is_some()
+        ));
+        state.boards.get_mut("healthy").unwrap().lifecycle.fault(
+            Fault::Transport,
+            "own failure".into(),
+            100,
+        );
+        assert!(!exploration_allowed(&state, "healthy", 100, true));
+        state.boards.get_mut("healthy").unwrap().lifecycle =
+            BoardLifecycle::fixture(Phase::Connected, true, None, Some(true), 1);
+        let admission = gate.admission();
+        tokio::pin!(admission);
+        tokio::select! {
+            biased;
+            _ = &mut admission => panic!("admission bypassed the active trial"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert!(gate.admission_pending());
+        assert!(!exploration_allowed(&state, "healthy", 100, true));
+        drop(trial);
+        let admission = admission.await;
+        assert!(!exploration_allowed(
+            &state,
+            "healthy",
+            100,
+            gate.trial().is_some()
+        ));
+        drop(admission);
+        let trial = gate.trial().unwrap();
+        assert!(exploration_allowed(&state, "healthy", 100, true));
+        drop(trial);
+    }
     #[tokio::test]
     async fn critical_journal_wait_still_drains_thermal_logs_and_retires_native_owner() {
         let dir = std::env::temp_dir().join(format!("tl-journal-thermal-{}", std::process::id()));
