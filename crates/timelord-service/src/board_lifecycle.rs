@@ -270,7 +270,8 @@ impl BoardLifecycle {
     /// Keep refreshing an admitted, closed board throughout layout debounce.
     /// Native startup invalidates the ticket so open-handle omissions are ignored.
     pub fn admitted_inventory_epoch(&self) -> Option<u64> {
-        if self.native == (Native::Retired { confirmed: true }) {
+        // Confirmed production retirement cannot renew an admission ticket.
+        if self.phase == Phase::Admitted && self.native == (Native::Retired { confirmed: true }) {
             self.admission_inventory
         } else {
             None
@@ -305,6 +306,33 @@ impl BoardLifecycle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn production_retirement_cannot_revive_an_old_admission_inventory_ticket() {
+        for error in [None, Some("transport failed".to_owned())] {
+            let mut owner = BoardLifecycle::default();
+            owner.admitted(7);
+            owner.inventory(Some(7), Inventory::Present);
+            owner.begin_attempt(1);
+            owner.initialized();
+            owner.cool_telemetry();
+            owner.retired(true, error.clone(), 10);
+            assert!(owner.status().quiesced);
+            assert_eq!(owner.admitted_inventory_epoch(), None);
+            // A delayed admission probe, or a newly scheduled periodic probe,
+            // cannot reinterpret a production retirement as admission waiting.
+            owner.inventory(Some(7), Inventory::Missing);
+            assert_eq!(owner.status().usb_present, Some(true));
+            assert!(owner.capacity(69, true).usable);
+            assert_eq!(owner.capacity(70, true).usable, error.is_none());
+
+            owner.admitted(8);
+            assert_eq!(owner.admitted_inventory_epoch(), Some(8));
+            owner.inventory(Some(7), Inventory::Present);
+            assert!(!owner.capacity(71, true).usable);
+            owner.inventory(Some(8), Inventory::Present);
+            assert!(owner.capacity(71, true).usable);
+        }
+    }
     #[test]
     fn native_attempt_does_not_release_unconfirmed_admitted_capacity() {
         for observation in [None, Some(Inventory::Missing), Some(Inventory::Ambiguous)] {
