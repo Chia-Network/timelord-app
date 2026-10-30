@@ -6,7 +6,7 @@ public enum MenuBarGlyph: Sendable, Equatable {
         switch phase {
         case .running: self = .running
         case .paused: self = .paused
-        case .setupRequired, .starting, .waitingForNode, .waitingForProofs: self = .waiting
+        case .setupRequired, .starting, .pausing, .waitingForNode, .waitingForProofs: self = .waiting
         case .nodeUnreachable, .boardMissing, .temperatureLimit, .serviceUnavailable: self = .attention
         }
     }

@@ -162,7 +162,7 @@ struct SettingsSheet: View {
                 Section("Startup and background") {
                     Text("Timelord starts at boot and keeps running when this interface is closed. Pause persists until you press Run.").font(.caption).foregroundStyle(.secondary)
                     Button("Enable background service…") { Task { await model.installBackgroundService() } }
-                        .disabled(model.starting || model.operationInProgress)
+                        .disabled(model.isBusy || model.operationInProgress)
                     Text("Requires administrator approval. Install the app in /Applications first.").font(.caption).foregroundStyle(.secondary)
                 }
                 Section {

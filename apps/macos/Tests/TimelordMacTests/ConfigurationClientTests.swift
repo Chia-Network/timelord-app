@@ -155,7 +155,7 @@ final class ConfigurationClientTests: XCTestCase {
         XCTAssertNil(controller.processID)
         relaunched.startService()
         let deadline = Date().addingTimeInterval(5)
-        while relaunched.starting && Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
+        while relaunched.isBusy && Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
         try await fixture.waitForWorker()
         XCTAssertTrue(relaunched.canPause)
     }

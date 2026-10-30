@@ -5,6 +5,23 @@ import XCTest
 final class PresentationTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_000_000)
 
+    func testPauseCleanupIsDistinctFromStartingAndCompletedPause() throws {
+        let status = try operationalStatus()
+        let pausing = LivePresentation.snapshot(status: status, controlOperation: .pause, now: now)
+        XCTAssertEqual(pausing.phase, .pausing)
+        XCTAssertEqual(pausing.phase.title, "Pausing")
+        XCTAssertEqual(pausing.timelord.title, "Stopping")
+        XCTAssertEqual(pausing.explanation, "Pausing Timelord; waiting for the worker to stop.")
+        let paused = LivePresentation.snapshot(status: nil, paused: true, now: now)
+        XCTAssertEqual(paused.phase, .paused)
+        let starting = LivePresentation.snapshot(status: nil, controlOperation: .start, now: now)
+        XCTAssertEqual(starting.phase, .starting)
+        let runningReload = LivePresentation.snapshot(status: status, controlOperation: .reload, now: now)
+        XCTAssertEqual(runningReload.phase, .starting)
+        let pausedReload = LivePresentation.snapshot(status: nil, paused: true, controlOperation: .reload, now: now)
+        XCTAssertEqual(pausedReload.phase, .paused)
+    }
+
     func testServiceUptimeSurvivesAnEngineSessionRestart() throws {
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
         func status(sessionStart: Double) throws -> ServiceStatus {
