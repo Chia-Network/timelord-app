@@ -95,14 +95,27 @@ final class ServiceController {
     func stop() { if let process, process.isRunning { process.terminate() } }
 
     /// The helper exits only after its native clients and final history flush finish.
-    func stopAndWait() async {
-        guard let child = process else { return }
+    func stopAndWait(timeout: TimeInterval = 30) async -> Bool {
+        guard let child = process else { return true }
         if child.isRunning { child.terminate() }
-        while child.isRunning { try? await Task.sleep(nanoseconds: 100_000_000) }
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        while child.isRunning && ProcessInfo.processInfo.systemUptime < deadline {
+            do { try await Task.sleep(nanoseconds: 20_000_000) }
+            catch { break }
+        }
+        guard !child.isRunning else {
+            // Keep ownership, the log and the sleep assertion until the actual
+            // child exits. Refusing Quit is safer than abandoning native clients.
+            errorMessage = "The local service has not stopped. Quit was cancelled; the app still owns the service. Check its log and try again."
+            onChange?()
+            return false
+        }
         // The termination callback may still be queued on the main actor.
-        guard process === child else { return }
-        releaseActivity()
-        process = nil
-        try? logHandle?.close(); logHandle = nil
+        if process === child {
+            releaseActivity()
+            process = nil
+            try? logHandle?.close(); logHandle = nil
+        }
+        return true
     }
 }

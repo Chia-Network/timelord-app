@@ -30,7 +30,9 @@ Done saves settings. Changes to a running service use **Save & Restart**. Settin
 includes **Run Timelord when the app opens**, enabled by default. Pause holds until
 Run is selected or the app is reopened. Closing the window keeps the menu bar and
 service running. Quit from the app, menu bar, Dock, or system logout waits for the
-app’s owned service to stop its ASIC clients and save chart history. An externally
+app’s owned service to stop its ASIC clients and save chart history. If it does
+not exit within thirty seconds, Quit is cancelled with an error and the app keeps
+ownership; inspect the log and retry. An externally
 started service is observed without taking ownership.
 
 USB disconnects and unreadable sensor data stop only the affected client. The
@@ -71,6 +73,8 @@ The native clients retain recent ASIC values for off-grid proof endpoints
 
 Developer prerequisites: macOS 14 or later, Xcode command-line tools, Swift 5.10 or
 later, Rust/Cargo (minimum version in Cargo.toml), CMake, GMP and Boost headers.
+Xcode 26 or newer compiles the layered icon; older selected tools use the committed
+flat icon. Errors from a supported icon compiler still fail the bundle.
 For Homebrew dependencies:
 
 ```sh

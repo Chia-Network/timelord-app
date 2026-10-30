@@ -365,6 +365,30 @@ extension PresentationTests {
         let incomplete = LivePresentation.snapshot(status: nil, configuration: config, detectedDevices: [device], now: now)
         XCTAssertFalse(incomplete.readyToRun)
     }
+    func testManagedOwnerEnrichesUSBLocationWithoutDuplicateIdentity() {
+        let owner = DiscoveredDevice(name: "Managed", location: 7, serial: "A")
+        let hiddenSerial = DiscoveredDevice(name: "USB", location: 7)
+        let merged = BoardDiscovery.includingManagedOwner(owner, in: [hiddenSerial])
+        XCTAssertEqual(merged.map(\.id), [7])
+        XCTAssertEqual(merged.first?.serial, "A")
+        let repeated = BoardDiscovery.includingManagedOwner(owner, in: merged)
+        XCTAssertEqual(repeated.map(\.id), [7])
+        let replacement = DiscoveredDevice(name: "Fresh", location: 7, serial: "B")
+        XCTAssertEqual(BoardDiscovery.includingManagedOwner(owner, in: [replacement]).first?.serial, "B")
+        let moved = DiscoveredDevice(name: "Fresh", location: 8, serial: "A")
+        XCTAssertEqual(BoardDiscovery.includingManagedOwner(owner, in: [moved]).map(\.id), [8])
+        for inventory in [[hiddenSerial, moved], [moved, hiddenSerial]] {
+            let result = BoardDiscovery.includingManagedOwner(owner, in: inventory)
+            XCTAssertEqual(result.count, 2)
+            XCTAssertEqual(result.filter { $0.serial == "A" }.count, 1)
+            XCTAssertEqual(result.first { $0.serial == "A" }?.location, 8)
+            XCTAssertEqual(result.first { $0.location == 7 }?.serial, nil)
+        }
+        let reconciled = BoardDiscovery.reconcile(merged, hardware: HardwareConfiguration())
+        XCTAssertEqual(reconciled.boards.count, 1)
+        XCTAssertEqual(reconciled.boards.first?.serial, "A")
+    }
+
     func testDetectedBoardsUseAutomaticSeedAndRememberProfilesAcrossUsbPorts() {
         var hardware=HardwareConfiguration()
         hardware=BoardDiscovery.reconcile([DiscoveredDevice(name:"Chia VDF A",location:4113,serial:"one")],hardware:hardware)

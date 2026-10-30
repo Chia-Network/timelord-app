@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import XCTest
 @testable import TimelordMac
 import TimelordPresentation
@@ -59,6 +60,47 @@ final class TerminationTests: XCTestCase {
         model.startService()
         XCTAssertFalse(model.starting)
         XCTAssertEqual(delegate.applicationShouldTerminate(NSApplication.shared), .terminateNow)
+    }
+
+    func testUnresponsiveOwnedHelperCancelsQuitAndCanBeRetried() async throws {
+        let (directory, controller) = try fixture()
+        let helper = directory.appendingPathComponent("fixture-helper")
+        let script = """
+        #!/bin/sh
+        trap '' TERM
+        trap 'exit 0' USR1
+        printf ready > "$0.ready"
+        while :; do /bin/sleep 0.05; done
+        """
+        try Data(script.utf8).write(to: helper)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try controller.start()
+        try await waitUntil { FileManager.default.fileExists(atPath: helper.path + ".ready") }
+        let pid = try XCTUnwrap(controller.processID)
+        defer { if controller.processID == pid && controller.ownsService { _ = kill(pid, SIGUSR1) } }
+        // Pause may request termination, but retains ownership until actual exit.
+        controller.stop()
+        XCTAssertTrue(controller.ownsService)
+        let model = TimelordModel(controller: controller, initialConfiguration: AppConfiguration(), monitoringEnabled: false)
+        var replies = [Bool]()
+        let delegate = ApplicationDelegate(model: model, shutdownTimeout: 0.1, reply: { replies.append($0) })
+        XCTAssertEqual(delegate.applicationShouldTerminate(NSApplication.shared), .terminateLater)
+        try await waitUntil { !replies.isEmpty }
+        XCTAssertEqual(replies, [false])
+        XCTAssertEqual(controller.processID, pid)
+        XCTAssertTrue(controller.ownsService)
+        XCTAssertTrue(controller.preventsIdleSleep)
+        XCTAssertNotNil(model.errorMessage)
+        XCTAssertFalse(model.canStartService)
+        // The fixture has an explicit exit signal; no force-kill or unrelated process.
+        XCTAssertEqual(kill(pid, SIGUSR1), 0)
+        try await waitUntil { !controller.ownsService }
+        XCTAssertEqual(delegate.applicationShouldTerminate(NSApplication.shared), .terminateLater)
+        try await waitUntil { replies.count == 2 }
+        XCTAssertEqual(replies, [false, true])
+        XCTAssertEqual(delegate.applicationShouldTerminate(NSApplication.shared), .terminateNow)
+        XCTAssertNil(controller.processID)
+        XCTAssertFalse(controller.preventsIdleSleep)
     }
 
     func testQuitDuringDiscoveryDoesNotLaunchHelperAfterCleanup() async throws {

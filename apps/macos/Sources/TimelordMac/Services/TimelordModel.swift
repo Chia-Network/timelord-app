@@ -53,10 +53,14 @@ final class TimelordModel: ObservableObject {
             configuration = initialConfiguration; savedConfiguration = initialConfiguration; configurationLoaded = true
         }
         controller.onChange = { [weak self] in
-            guard let self else { return }; self.objectWillChange.send()
+            guard let self, !self.quitting else { return }; self.objectWillChange.send()
             if monitoringEnabled { Task { await self.refresh() } }
         }
-        guard monitoringEnabled else { return }
+        startMonitoring()
+    }
+
+    private func startMonitoring() {
+        guard monitoringEnabled, monitoring == nil else { return }
         monitoring = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.refresh()
@@ -275,9 +279,8 @@ final class TimelordModel: ObservableObject {
             for status in liveStatus?.boards ?? [] where status.hardwareState == "connected" || (status.connectedClients>0 && status.hardwareState == "starting") {
                 let configured=(savedConfiguration.hardware.boards + savedConfiguration.hardware.rememberedBoards).first(where:{$0.id==status.id})
                 let serial=status.serial ?? configured?.serial
-                if let location=status.deviceLocation ?? configured?.deviceLocation,
-                   !devices.contains(where:{ device in if let serial { return device.serial == serial }; return device.location == location }) {
-                    devices.append(DiscoveredDevice(name:status.name,location:location,serial:serial))
+                if let location = status.deviceLocation ?? configured?.deviceLocation {
+                    devices = BoardDiscovery.includingManagedOwner(DiscoveredDevice(name: status.name, location: location, serial: serial), in: devices)
                 }
             }
             discoveredDevices=devices
@@ -324,14 +327,30 @@ final class TimelordModel: ObservableObject {
     }
     func stopAndQuit() { NSApplication.shared.terminate(nil) }
 
-    func prepareForTermination() async {
+    @discardableResult
+    func prepareForTermination(timeout: TimeInterval = 30) async -> Bool {
         quitting = true
         automaticStartPending = false
         monitoring?.cancel(); monitoring = nil
-        controller.onChange = nil
-        await controller.stopAndWait()
-        // A startup awaiting USB discovery or a config write must observe quitting
-        // before it can launch a helper, even if termination arrived mid-start.
-        while starting { try? await Task.sleep(nanoseconds: 100_000_000) }
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        guard await controller.stopAndWait(timeout: timeout) else {
+            quitting = false
+            errorMessage = controller.errorMessage
+            startMonitoring()
+            updateSnapshot()
+            return false
+        }
+        // Startup must observe quitting before it can launch another helper.
+        while starting && ProcessInfo.processInfo.systemUptime < deadline {
+            do { try await Task.sleep(nanoseconds: 20_000_000) }
+            catch { break }
+        }
+        guard !starting else {
+            errorMessage = "Setup has not stopped. Quit was cancelled; wait for the current operation and try again."
+            quitting = false
+            startMonitoring()
+            return false
+        }
+        return true
     }
 }
