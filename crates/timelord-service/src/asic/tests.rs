@@ -241,7 +241,7 @@ async fn icc_primer_does_not_supply_unmanaged_readiness_evidence() {
             );
         }
         assert_eq!(
-            crate::observability::ready(&shared, &metrics),
+            crate::observability::ready(&shared),
             slot == 2,
             "readiness requires real proofs from both required chains"
         );
