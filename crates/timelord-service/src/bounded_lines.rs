@@ -1,4 +1,4 @@
-//! Cancellation-safe native log framing with a fixed maximum retained line.
+//! Cancellation-safe native logs: at most 4096 content bytes plus one provisional CR framing byte.
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 const MAX_LINE: usize = 4096;
 #[derive(Debug, PartialEq, Eq)]
@@ -15,7 +15,7 @@ impl<R: AsyncBufRead + Unpin> Lines<R> {
     pub fn new(reader: R) -> Self {
         Self {
             reader,
-            pending: Vec::with_capacity(MAX_LINE),
+            pending: Vec::with_capacity(MAX_LINE + 1),
             discarding: false,
         }
     }
@@ -26,7 +26,8 @@ impl<R: AsyncBufRead + Unpin> Lines<R> {
         loop {
             let available = self.reader.fill_buf().await?;
             if available.is_empty() {
-                if std::mem::take(&mut self.discarding) {
+                if std::mem::take(&mut self.discarding) || self.pending.len() > MAX_LINE {
+                    self.pending.clear();
                     return Ok(Some(Line::Oversized));
                 }
                 if self.pending.is_empty() {
@@ -34,22 +35,25 @@ impl<R: AsyncBufRead + Unpin> Lines<R> {
                 }
                 return Self::text(std::mem::take(&mut self.pending));
             }
-            let end = available.iter().position(|b| *b == b'\n').map(|i| i + 1);
+            let end = available.iter().position(|b| *b == b'\n');
             let count = end.unwrap_or(available.len());
-            if self.pending.len() + count > MAX_LINE {
+            // LF is framing, and a trailing CR may become CRLF even when the
+            // next read contains its LF. Retain at most that one extra byte.
+            let last = available[..count].last().or_else(|| self.pending.last());
+            let limit = MAX_LINE + usize::from(last == Some(&b'\r'));
+            if self.pending.len() + count > limit {
                 self.pending.clear();
                 self.discarding = true;
             }
             if !self.discarding {
                 self.pending.extend_from_slice(&available[..count]);
             }
-            self.reader.consume(count);
+            self.reader.consume(count + usize::from(end.is_some()));
             if end.is_some() {
                 if std::mem::take(&mut self.discarding) {
                     return Ok(Some(Line::Oversized));
                 }
                 let mut bytes = std::mem::take(&mut self.pending);
-                bytes.pop();
                 if bytes.last() == Some(&b'\r') {
                     bytes.pop();
                 }
@@ -72,6 +76,38 @@ impl<R: AsyncBufRead + Unpin> Lines<R> {
 mod tests {
     use super::*;
     use tokio::io::{AsyncWriteExt, BufReader};
+    #[tokio::test]
+    async fn line_limit_counts_content_not_lf_or_crlf_framing() {
+        for content in [MAX_LINE, MAX_LINE + 1] {
+            for ending in [b"".as_slice(), b"\n".as_slice(), b"\r\n".as_slice()] {
+                for capacity in [1, 511, MAX_LINE + 2] {
+                    let mut bytes = vec![b'x'; content];
+                    bytes.extend_from_slice(ending);
+                    let mut lines =
+                        Lines::new(BufReader::with_capacity(capacity, bytes.as_slice()));
+                    let expected = if content == MAX_LINE {
+                        Line::Text("x".repeat(content))
+                    } else {
+                        Line::Oversized
+                    };
+                    assert_eq!(
+                        lines.next_line().await.unwrap(),
+                        Some(expected),
+                        "content={content}, ending={ending:?}, buffer={capacity}"
+                    );
+                    assert!(lines.pending.len() <= MAX_LINE + 1);
+                    assert_eq!(lines.next_line().await.unwrap(), None);
+                }
+            }
+        }
+        // CR only becomes framing when followed by LF; at EOF it is content.
+        let mut bytes = vec![b'x'; MAX_LINE];
+        bytes.push(b'\r');
+        let mut lines = Lines::new(BufReader::with_capacity(MAX_LINE + 1, bytes.as_slice()));
+        assert_eq!(lines.next_line().await.unwrap(), Some(Line::Oversized));
+        assert_eq!(lines.next_line().await.unwrap(), None);
+    }
+
     #[tokio::test]
     async fn cancellation_preserves_partial_lines() {
         let (mut sender, receiver) = tokio::io::duplex(8192);

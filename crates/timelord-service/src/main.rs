@@ -18,11 +18,10 @@ mod operations_tests;
 mod private_control;
 mod runtime;
 mod safety;
+mod status_api;
 
 use anyhow::{Context, Result, bail};
-use axum::{Json, Router, extract::State, routing::get};
 use clap::{Parser, Subcommand};
-use serde::Serialize;
 use std::{
     collections::BTreeSet,
     net::SocketAddr,
@@ -30,7 +29,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use timelord_core::{Assignment, Chain, Config, Network};
+use timelord_core::{Assignment, Config};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -387,177 +386,11 @@ struct Shared {
     service_started_unix: u64,
 }
 
-#[derive(Serialize)]
-struct Status {
-    diagnostic_logging: timelord_supervisor::logging::Stats,
-    configuration_fallback: bool,
-    api_version: u32,
-    service_pid: u32,
-    service_state: &'static str,
-    timelord_state: String,
-    message: String,
-    production_enabled: bool,
-    started_unix: u64,
-    service_started_unix: u64,
-    timestamp_unix: u64,
-    full_node: NodeStatus,
-    boards: Vec<BoardStatus>,
-    connected_client_count: usize,
-    latest_proof_unix: Option<u64>,
-    delivered_ips: Option<f64>,
-    proofs_delivered: u64,
-    failed_proofs: u64,
-    tuning_paused: bool,
-}
-#[derive(Serialize)]
-struct NodeStatus {
-    host: String,
-    port: u16,
-    network: Network,
-    state: String,
-}
-#[derive(Serialize)]
-struct BoardStatus {
-    raw_speeds: Vec<runtime::RawSpeed>,
-    id: String,
-    name: String,
-    client_port: u16,
-    assigned_chains: Vec<Chain>,
-    connected_clients: usize,
-    hardware_state: String,
-    temperature_c: Option<f64>,
-    temperature_limit_c: f64,
-    frequency_mhz: Option<f64>,
-    voltage_v: Option<f64>,
-    profile: &'static str,
-    device_location: Option<u32>,
-    serial: Option<String>,
-    recoveries: u64,
-    automatic: Option<automatic::Status>,
-    latest_proof_unix: Option<u64>,
-}
-
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-async fn health(State(http): State<observability::HttpState>) -> Json<serde_json::Value> {
-    let shared = http.current.borrow().clone();
-    Json(
-        serde_json::json!({"service":"timelord-service","api_version":1,"production_enabled":shared.config.node.certificate.is_some()}),
-    )
-}
-
-async fn status(State(http): State<observability::HttpState>) -> Json<Status> {
-    let shared = http.current.borrow().clone();
-    let clients = shared.clients.lock().expect("client state lock");
-    let runtime = shared.runtime.lock().expect("runtime");
-    Json(Status {
-        diagnostic_logging: timelord_supervisor::logging::Writer::stderr_stats(),
-        configuration_fallback: http.process.progress.using_last_good(),
-        api_version: 1,
-        service_pid: std::process::id(),
-        service_state: "ready",
-        timelord_state: runtime.phase.clone(),
-        message: runtime.message.clone(),
-        production_enabled: shared.config.node.certificate.is_some(),
-        started_unix: shared.started_unix,
-        service_started_unix: shared.service_started_unix,
-        timestamp_unix: unix_now(),
-        full_node: NodeStatus {
-            host: shared.config.node.host.clone(),
-            port: shared.config.node.port,
-            network: shared.config.node.network,
-            state: if shared.config.node.certificate.is_none() {
-                "not_connected".into()
-            } else {
-                runtime.node.clone()
-            },
-        },
-        boards: shared
-            .config
-            .hardware
-            .boards
-            .iter()
-            .map(|b| BoardStatus {
-                id: b.id.clone(),
-                name: b.name.clone(),
-                client_port: b.client_port,
-                assigned_chains: shared
-                    .assignments
-                    .iter()
-                    .filter(|a| a.board_id == b.id)
-                    .map(|a| a.chain)
-                    .collect(),
-                connected_clients: clients.iter().filter(|(id, _)| id == &b.id).count(),
-                hardware_state: runtime
-                    .boards
-                    .get(&b.id)
-                    .map(|b| b.lifecycle.status().phase.as_str().to_owned())
-                    .unwrap_or_else(|| "not_inspected".into()),
-                raw_speeds: runtime
-                    .boards
-                    .get(&b.id)
-                    .map(|b| b.raw_speeds.clone())
-                    .unwrap_or_default(),
-                temperature_c: runtime.boards.get(&b.id).and_then(|b| b.temperature_c),
-                temperature_limit_c: b.temperature_limit_c,
-                frequency_mhz: runtime.boards.get(&b.id).and_then(|b| b.frequency_mhz),
-                voltage_v: runtime.boards.get(&b.id).and_then(|b| b.voltage_v),
-                profile: b.profile_name(),
-                device_location: runtime
-                    .boards
-                    .get(&b.id)
-                    .and_then(|h| h.device_location)
-                    .or(b.device_location),
-                serial: b.serial.clone(),
-                recoveries: runtime.boards.get(&b.id).map(|b| b.recoveries).unwrap_or(0),
-                automatic: runtime.boards.get(&b.id).and_then(|b| b.automatic.clone()),
-                latest_proof_unix: runtime
-                    .observations
-                    .iter()
-                    .rev()
-                    .find(|o| {
-                        o.work_started_unix
-                            >= runtime
-                                .boards
-                                .get(&b.id)
-                                .map(|h| h.lifecycle.status().started_unix)
-                                .unwrap_or(0)
-                            && shared
-                                .assignments
-                                .iter()
-                                .any(|a| a.board_id == b.id && a.chain == o.chain)
-                    })
-                    .map(|o| o.timestamp_unix),
-            })
-            .collect(),
-        connected_client_count: clients.len(),
-        latest_proof_unix: runtime.observations.last().map(|o| o.timestamp_unix),
-        delivered_ips: runtime
-            .observations
-            .iter()
-            .rev()
-            .find(|o| o.chain == Chain::Challenge && o.timestamp_unix + 90 >= unix_now())
-            .map(|o| o.ips),
-        proofs_delivered: runtime.proofs_delivered,
-        failed_proofs: runtime.failed_proofs,
-        tuning_paused: runtime.tuning_paused,
-    })
-}
-
-async fn history(State(http): State<observability::HttpState>) -> Json<serde_json::Value> {
-    let shared = http.current.borrow().clone();
-    let runtime = shared.runtime.lock().expect("runtime");
-    let store = history_store::Store::new(PathBuf::new(), &shared.config, &shared.assignments)
-        .expect("validated history scope");
-    let saved = store.snapshot(&runtime, shared.started_unix, unix_now());
-    Json(
-        serde_json::json!({"api_version":3,"service_pid":std::process::id(),"timestamp_unix":unix_now(),"capture_intervals":saved.capture_intervals,"estimated_observations":saved.estimated_observations,"events":saved.events}),
-    )
 }
 
 struct Run {
@@ -856,16 +689,11 @@ async fn serve(
         result = startup => result?,
     };
     current.send_replace(run.shared.clone());
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/v1/status", get(status))
-        .route("/v3/history", get(history))
-        .merge(observability::routes())
-        .with_state(observability::HttpState {
-            current: state.clone(),
-            metrics: metrics.clone(),
-            process: process.clone(),
-        });
+    let app = status_api::router(observability::HttpState {
+        current: state.clone(),
+        metrics: metrics.clone(),
+        process: process.clone(),
+    });
     let (http_stop, mut stopped) = watch::channel(false);
     let mut checkpoint = Some(tokio::spawn(config_checkpoint::record(
         requested_config,
@@ -1077,6 +905,7 @@ async fn shutdown_signal_from(mut term: tokio::signal::unix::Signal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use timelord_core::Network;
     #[test]
     fn admitted_board_remains_unavailable_across_reconfiguration_until_fresh_inventory() {
         let board: timelord_core::BoardConfig =
@@ -1193,13 +1022,11 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(
                 http,
-                Router::new().route("/v1/status", get(status)).with_state(
-                    observability::HttpState {
-                        current: state,
-                        metrics: http_metrics,
-                        process: http_process,
-                    },
-                ),
+                status_api::router(observability::HttpState {
+                    current: state,
+                    metrics: http_metrics,
+                    process: http_process,
+                }),
             )
             .await
             .unwrap();

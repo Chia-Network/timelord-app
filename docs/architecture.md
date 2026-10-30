@@ -16,6 +16,15 @@ supervision, telemetry and Automatic tuning. The optimized prover and USB driver
 remain in the pinned public chiavdf dependency, including its live-control channel;
 no native source overlays are maintained here. The app has no Python, wallet, full node or software-VDF mode.
 
+Within the service, `main.rs` owns topology and task lifetimes; `status_api.rs`
+projects that state into HTTP responses. `hardware/board.rs` owns each board's
+retry loop, `hardware/native.rs` its subprocess and telemetry, and
+`hardware/tuning.rs` its optional Automatic policy. Native control belongs to the
+session in `hardware/native.rs`. `automatic.rs` is
+pure tuning policy; `automatic/profiles.rs` owns saved evidence and machine identity.
+A frequency trial owns its rollback point and kind, so a retest cannot exist
+without an active trial.
+
 ## Process ownership
 
 The non-root boot supervisor owns durable Run/Pause intent, exclusive coordinator
@@ -68,7 +77,11 @@ board settings by serial. Configuration edits still require a manual restart.
 `runtime.rs` uses the pinned dg_xch regular scheduler over an authenticated Chia
 WebSocket session. `asic.rs` maps scheduler work to persistent native chain sessions,
 derives discriminants, and verifies complete checkpointed proofs before handing
-them to the scheduler. The scheduler independently validates request identity,
+them to the scheduler. The process owner's typed arithmetic resources bound real
+blocking work to one job per resource, including a job whose async caller has been
+cancelled. Production and isolated-admission resources remain independent. The
+actual job retains its permit and progress guard until it finishes; replacing a
+backend or USB topology does not reset that process capacity. The scheduler independently validates request identity,
 generation and consensus validity before encoding a node message. Primer ICC work
 keeps that chain running; primer proofs are never counted or submitted.
 
