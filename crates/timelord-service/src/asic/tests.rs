@@ -155,6 +155,89 @@ async fn send_fixture_proof(socket: &mut TcpStream, request: &ProofRequest) {
     socket.write_all(&hex).await.unwrap();
 }
 #[tokio::test]
+async fn icc_primer_does_not_supply_unmanaged_readiness_evidence() {
+    let mut config: Config =
+        toml::from_str("[[hardware.boards]]\nid='a'\nname='A'\nclient_port=18110\n").unwrap();
+    config.node.certificate = Some("/fixture/no-io.crt".into());
+    let metrics = crate::observability::Metrics::new(config.node.network).unwrap();
+    let runtime = Arc::new(SyncMutex::new(crate::runtime::RuntimeState {
+        metrics: Some(metrics.clone()),
+        metric_epoch: metrics.begin_session(),
+        scheduler_initialized: true,
+        node: "authenticated".into(),
+        ..Default::default()
+    }));
+    let assignments = config.assignments().unwrap();
+    let (backend, offers) = AsicBackend::new(&config, &assignments, runtime.clone()).unwrap();
+    let backend = Arc::new(backend);
+    let shared = crate::Shared {
+        config,
+        assignments,
+        clients: Default::default(),
+        runtime: runtime.clone(),
+        started_unix: crate::unix_now(),
+        service_started_unix: crate::unix_now(),
+    };
+    runtime
+        .lock()
+        .unwrap()
+        .boards
+        .entry("a".into())
+        .or_default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    for (slot, chain, record_metric) in [
+        (0, Chain::InfusedChallenge, false),
+        (1, Chain::Challenge, true),
+        (2, Chain::Reward, true),
+    ] {
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        shared.clients.lock().unwrap().insert(("a".into(), slot));
+        offers["a"]
+            .send(Lease {
+                socket,
+                board: "a".into(),
+                slot,
+                generation: 0,
+                clients: shared.clients.clone(),
+            })
+            .await
+            .ok()
+            .unwrap();
+        let request = work(if record_metric { 20 } else { 1 }, 64);
+        let proving = tokio::spawn({
+            let backend = backend.clone();
+            let request = request.clone();
+            async move {
+                backend
+                    .prove_when_available(chain, request, record_metric)
+                    .await
+            }
+        });
+        handshake(&mut client).await;
+        assert_eq!(requested(&mut client).await, request.iterations);
+        send_fixture_proof(&mut client, &request).await;
+        proving.await.unwrap().unwrap();
+        {
+            let state = runtime.lock().unwrap();
+            let board = &state.boards["a"];
+            assert!(
+                !board.verified_slots.contains(&0),
+                "primer became capacity evidence"
+            );
+            assert_eq!(board.verified_slots.len(), usize::from(slot));
+            assert_eq!(board.verified_generation, record_metric.then_some(0));
+        }
+        assert_eq!(
+            crate::observability::ready(&shared, &metrics),
+            slot == 2,
+            "readiness requires real proofs from both required chains"
+        );
+    }
+}
+#[tokio::test]
 async fn failed_board_reconnects_without_retiring_a_healthy_chain_session() {
     let config:Config=toml::from_str("[[hardware.boards]]\nid='healthy'\nname='Healthy'\nclient_port=18110\n[[hardware.boards]]\nid='failed'\nname='Failed'\nclient_port=18111").unwrap();
     let runtime = Arc::new(SyncMutex::new(crate::runtime::RuntimeState::default()));
