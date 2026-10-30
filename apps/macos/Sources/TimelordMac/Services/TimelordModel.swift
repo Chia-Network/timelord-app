@@ -197,7 +197,7 @@ final class TimelordModel: ObservableObject {
                 useSavedStatusEndpoint()
                 try controller.start(); configurationNeedsRestart = false
             } catch { if !Task.isCancelled { errorMessage = error.localizedDescription } }
-            if monitoringEnabled && !Task.isCancelled { await refresh() }
+            // controller.onChange schedules status polling separately from startup.
         }
     }
     func stopService() {

@@ -26,7 +26,7 @@ final class TerminationTests: XCTestCase {
         """
         try Data(script.utf8).write(to: helper)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
-        let controller = ServiceController(configURL: directory.appendingPathComponent("config.toml"), logsURL: directory.appendingPathComponent("fixture.log"), helperURL: helper)
+        let controller = ServiceController(configURL: directory.appendingPathComponent("config.toml"), logsURL: directory.appendingPathComponent("fixture.log"), helperURL: helper, endpoint: URL(string: "http://127.0.0.1:0/v1/status")!)
         return (directory, controller)
     }
 
@@ -136,6 +136,44 @@ final class TerminationTests: XCTestCase {
         XCTAssertFalse(controller.ownsService)
         XCTAssertFalse(FileManager.default.fileExists(atPath: helper.path + ".ready"))
         XCTAssertTrue(model.canStartService, "A new explicit Run remains available after cancelled setup drains")
+        try FileManager.default.removeItem(at: directory)
+    }
+
+    func testLaunchedServiceCanBePausedWhileNodePollingIsBlocked() async throws {
+        let (directory, controller) = try fixture()
+        let helper = directory.appendingPathComponent("fixture-helper")
+        let release = directory.appendingPathComponent("fixture-helper.release")
+        let script = """
+        #!/bin/sh
+        case "$1" in
+          devices) printf '%s' '[{"name":"Fixture","location":1,"serial":"fixture-only"}]' ;;
+          configure) exit 0 ;;
+          node-state)
+            printf polling > "$0.polling"
+            while [ ! -f "$0.release" ]; do /bin/sleep 0.02; done
+            exit 1 ;;
+          serve) exec /bin/sleep 30 ;;
+        esac
+        """
+        try Data(script.utf8).write(to: helper)
+        defer { try? Data().write(to: release); controller.stop() }
+        var configuration = AppConfiguration()
+        configuration.service.startAutomatically = false
+        configuration.service.statusListen = "127.0.0.1:0"
+        configuration.hardware.clientBinary = "/fixture/not-executed"
+        configuration.node.rpc = try JSONDecoder().decode(NodeRPCConfiguration.self, from: Data(
+            #"{"host":"fixture","port":1,"serverName":"chia.net","certificate":"unused","privateKey":"unused","caCertificate":"unused"}"#.utf8))
+        let model = TimelordModel(controller: controller, initialConfiguration: configuration)
+        try await waitUntil { FileManager.default.fileExists(atPath: helper.path + ".polling") }
+        model.startService()
+        try await waitUntil { controller.ownsService && !model.starting }
+        XCTAssertTrue(model.canPause)
+        XCTAssertTrue(model.canFinishSettings)
+        XCTAssertEqual(model.runControlTitle, "Pause")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: release.path))
+        try Data().write(to: release)
+        let stopped = await model.prepareForTermination()
+        XCTAssertTrue(stopped)
         try FileManager.default.removeItem(at: directory)
     }
 
