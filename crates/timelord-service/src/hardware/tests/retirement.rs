@@ -114,12 +114,14 @@ cat >/dev/null
             )
             .unwrap(),
         );
+        let metrics = crate::observability::Metrics::new(config.node.network).unwrap();
         let shared = Arc::new(Shared {
             assignments: config.assignments().unwrap(),
             config,
             clients: Default::default(),
             runtime: Arc::new(std::sync::Mutex::new(crate::runtime::RuntimeState {
                 safety: Some(store.clone()),
+                metrics: Some(metrics.clone()),
                 ..Default::default()
             })),
             started_unix: crate::unix_now(),
@@ -177,6 +179,22 @@ cat >/dev/null
         let status = state.boards[&board.id].lifecycle.status();
         assert_eq!(status.quiesced, confirmed);
         assert_eq!(status.fault_reason.is_some(), rejected || prior_fault);
+        assert_eq!(
+            metrics.counter(
+                "thermal_stops_total",
+                &[&crate::observability::board(&shared.config, &board.id)]
+            ),
+            u64::from(thermal),
+            "initial thermal rejections must emit one stop; other handshakes emit none"
+        );
+        assert_eq!(
+            state
+                .events
+                .iter()
+                .filter(|event| event.kind == "thermal_stop")
+                .count(),
+            usize::from(thermal)
+        );
         assert_eq!(
             status.fault,
             thermal.then_some(crate::board_lifecycle::Fault::Thermal)

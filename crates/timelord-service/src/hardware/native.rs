@@ -482,23 +482,25 @@ pub(super) async fn supervise(
         }
     };
     if let Err(error) = &initialized {
-        shared
-            .runtime
-            .lock()
-            .expect("runtime")
-            .boards
-            .entry(board.id.clone())
-            .or_default()
-            .lifecycle
-            .fault(
-                if thermal_rejection(error) {
-                    crate::board_lifecycle::Fault::Thermal
-                } else {
-                    crate::board_lifecycle::Fault::Transport
-                },
-                error.to_string(),
-                crate::unix_now(),
-            );
+        let thermal = thermal_rejection(error);
+        let mut state = shared.runtime.lock().expect("runtime");
+        let hardware = state.boards.entry(board.id.clone()).or_default();
+        let first = !hardware.lifecycle.status().latched_fault;
+        hardware.lifecycle.fault(
+            if thermal {
+                crate::board_lifecycle::Fault::Thermal
+            } else {
+                crate::board_lifecycle::Fault::Transport
+            },
+            error.to_string(),
+            crate::unix_now(),
+        );
+        if thermal {
+            state.event(Some(board.id.clone()), "thermal_stop");
+            if first && let Some(metrics) = &state.metrics {
+                metrics.thermal_stopped(&crate::observability::board(&shared.config, &board.id));
+            }
+        }
     }
     let mut watchdog = tokio::time::interval(Duration::from_secs(5));
     let result: Result<()> = match initialized {
