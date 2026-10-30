@@ -228,11 +228,39 @@ pub(super) fn startup_point(
     automatic::initial(&shared.config, board, engines, hash, host)
 }
 impl NativeOwner {
-    pub(super) async fn new(
-        shared: &Shared,
-        board: &BoardConfig,
-        child: &mut Child,
-    ) -> Result<Self> {
+    pub(super) fn attach(board: &BoardConfig, child: &mut Child) -> Result<Self> {
+        let automatic = board.profile == ProfileMode::Automatic;
+        let owner = Self {
+            control: NativeControl {
+                input: child.stdin.take().context("Native control input missing")?,
+                output: BufReader::new(
+                    child
+                        .stdout
+                        .take()
+                        .context("Native control output missing")?,
+                ),
+                sequence: 0,
+                minimum_frequency: if automatic {
+                    board.automatic.min_frequency_mhz
+                } else {
+                    200.
+                },
+                maximum_frequency: if automatic {
+                    board.automatic.max_frequency_mhz
+                } else {
+                    2200.
+                },
+                minimum_voltage: if automatic {
+                    board.automatic.min_voltage_v
+                } else {
+                    0.7
+                },
+            },
+            tuning: None,
+        };
+        Ok(owner)
+    }
+    pub(super) async fn initialize(&mut self, shared: &Shared, board: &BoardConfig) -> Result<()> {
         let engines = shared
             .assignments
             .iter()
@@ -293,43 +321,16 @@ impl NativeOwner {
                 None,
             )
         };
-        let mut owner = Self {
-            control: NativeControl {
-                input: child.stdin.take().context("Native control input missing")?,
-                output: BufReader::new(
-                    child
-                        .stdout
-                        .take()
-                        .context("Native control output missing")?,
-                ),
-                sequence: 0,
-                minimum_frequency: if automatic {
-                    board.automatic.min_frequency_mhz
-                } else {
-                    200.
-                },
-                maximum_frequency: if automatic {
-                    board.automatic.max_frequency_mhz
-                } else {
-                    2200.
-                },
-                minimum_voltage: if automatic {
-                    board.automatic.min_voltage_v
-                } else {
-                    0.7
-                },
-            },
-            tuning,
-        };
-        let actual = owner.control.change(point, 30).await?;
-        if let Some(tuning) = &mut owner.tuning {
+        self.tuning = tuning;
+        let actual = self.control.change(point, 30).await?;
+        if let Some(tuning) = &mut self.tuning {
             tuning.policy.applied(
                 actual,
                 crate::unix_now(),
                 "Observing live proofs at the initial setting".into(),
             );
         }
-        Ok(owner)
+        Ok(())
     }
     pub(super) async fn stop(self, child: &mut Child, log: ClientLog) -> bool {
         self.control.stop(child, log).await
@@ -465,53 +466,65 @@ pub(super) async fn supervise(
     initialization: tokio::sync::MutexGuard<'static, ()>,
     preparing: Option<timelord_supervisor::progress::Guard>,
 ) -> Result<()> {
-    let owner = tokio::select! {
-        result=NativeOwner::new(&shared,&board,&mut child)=>result,
-        _=shutdown.changed()=>{terminate(&mut child).await;return Ok(());}
-    };
-    let mut owner = match owner {
-        Ok(owner) => owner,
-        Err(error) => {
-            terminate(&mut child).await;
-            let mut state = shared.runtime.lock().expect("runtime");
-            let hardware = state.boards.entry(board.id.clone()).or_default();
-            hardware.lifecycle.fault(
-                crate::board_lifecycle::Fault::Transport,
-                error.to_string(),
-                crate::unix_now(),
-            );
-            return Err(error);
-        }
-    };
+    // Attach the pipes before polling initialization: cancellation must leave EOF
+    // shutdown and its confirmation available to the same owner as normal exit.
+    let mut owner = NativeOwner::attach(&board, &mut child)?;
     let output = child.stderr.take().context("ASIC client log unavailable")?;
     let mut log = ClientLog::new(output, ready);
     log.initialization = Some(initialization);
     log.preparing = preparing;
-    let mut watchdog = tokio::time::interval(Duration::from_secs(5));
-    let result: Result<()> = loop {
-        if *shutdown.borrow() {
-            break Ok(());
-        }
+    let initialized = if *shutdown.borrow() {
+        Ok(false)
+    } else {
         tokio::select! {
-            _ = shutdown.changed() => break Ok(()),
-            _ = watchdog.tick() => {
-                if let Some(hardware) = shared.runtime.lock().expect("runtime").boards.get(&board.id)
-                    && (hardware.lifecycle.status().latched_fault || hardware.lifecycle.status().phase == crate::board_lifecycle::Phase::Fault) {
-                    break Err(anyhow::anyhow!(hardware.lifecycle.status().fault_reason.unwrap_or("ASIC needs attention").to_owned()));
-                }
-                if log.last_temperature.elapsed() > Duration::from_secs(TEMPERATURE_TIMEOUT_SECONDS) { break Err(anyhow::anyhow!("ASIC temperature telemetry stopped")); }
-                match child.try_wait() {
-                    Ok(Some(exit)) => break Err(anyhow::anyhow!("ASIC client exited: {exit}")),
-                    Err(error) => break Err(error.into()),
-                    Ok(None) => {}
-                }
-                if let Err(error)=owner.tick(&shared,&board,&mut log,&mut shutdown).await {break Err(error);}
-            }
-            result = log.read(&shared, &board) => {
-                let recovery = match result { Ok(recovery) => recovery, Err(error) => break Err(error) };
-                if recovery && let Err(error)=owner.tick(&shared,&board,&mut log,&mut shutdown).await {break Err(error);}
-            }
+            result = owner.initialize(&shared, &board) => result.map(|()| true),
+            _ = shutdown.changed() => Ok(false),
         }
+    };
+    if let Err(error) = &initialized {
+        shared
+            .runtime
+            .lock()
+            .expect("runtime")
+            .boards
+            .entry(board.id.clone())
+            .or_default()
+            .lifecycle
+            .fault(
+                crate::board_lifecycle::Fault::Transport,
+                error.to_string(),
+                crate::unix_now(),
+            );
+    }
+    let mut watchdog = tokio::time::interval(Duration::from_secs(5));
+    let result: Result<()> = match initialized {
+        Err(error) => Err(error),
+        Ok(false) => Ok(()),
+        Ok(true) => loop {
+            if *shutdown.borrow() {
+                break Ok(());
+            }
+            tokio::select! {
+                _ = shutdown.changed() => break Ok(()),
+                _ = watchdog.tick() => {
+                    if let Some(hardware) = shared.runtime.lock().expect("runtime").boards.get(&board.id)
+                        && (hardware.lifecycle.status().latched_fault || hardware.lifecycle.status().phase == crate::board_lifecycle::Phase::Fault) {
+                        break Err(anyhow::anyhow!(hardware.lifecycle.status().fault_reason.unwrap_or("ASIC needs attention").to_owned()));
+                    }
+                    if log.last_temperature.elapsed() > Duration::from_secs(TEMPERATURE_TIMEOUT_SECONDS) { break Err(anyhow::anyhow!("ASIC temperature telemetry stopped")); }
+                    match child.try_wait() {
+                        Ok(Some(exit)) => break Err(anyhow::anyhow!("ASIC client exited: {exit}")),
+                        Err(error) => break Err(error.into()),
+                        Ok(None) => {}
+                    }
+                    if let Err(error)=owner.tick(&shared,&board,&mut log,&mut shutdown).await {break Err(error);}
+                }
+                result = log.read(&shared, &board) => {
+                    let recovery = match result { Ok(recovery) => recovery, Err(error) => break Err(error) };
+                    if recovery && let Err(error)=owner.tick(&shared,&board,&mut log,&mut shutdown).await {break Err(error);}
+                }
+            }
+        },
     };
     let quiesced = owner.stop(&mut child, log).await;
     if !quiesced {
