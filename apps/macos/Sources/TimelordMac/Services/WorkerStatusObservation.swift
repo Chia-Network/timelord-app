@@ -14,9 +14,14 @@ enum WorkerStatusObservation {
         case .awaiting(let pid, _), .responsive(let pid), .unavailable(let pid, _): return pid
         }
     }
-    var error: String? {
-        if case .unavailable(_, let error) = self { return error }
-        return nil
+    var error: String? { failure(at: .now) }
+    func failure(at now: ContinuousClock.Instant) -> String? {
+        switch self {
+        case .unavailable(_, let error): return error
+        case .awaiting(_, let until) where now >= until:
+            return "The local service did not respond within 60 seconds. Check its log."
+        default: return nil
+        }
     }
     mutating func observe(pid: Int32?, now: ContinuousClock.Instant = .now) {
         guard pid != self.pid else { return }
