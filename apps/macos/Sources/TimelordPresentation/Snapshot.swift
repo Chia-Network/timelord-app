@@ -2,12 +2,24 @@ import Foundation
 
 public enum StatusTone: Sendable { case neutral, positive, attention, critical }
 
+public enum ServiceControlOperation: Equatable, Sendable {
+    case start, pause, reload
+    public var title: String {
+        switch self {
+        case .start: return "Starting…"
+        case .pause: return "Pausing…"
+        case .reload: return "Applying settings…"
+        }
+    }
+}
+
 public enum AppPhase: String, Sendable {
-    case setupRequired, starting, waitingForNode, waitingForProofs, running, paused, nodeUnreachable, boardMissing, temperatureLimit, serviceUnavailable
+    case setupRequired, starting, pausing, waitingForNode, waitingForProofs, running, paused, nodeUnreachable, boardMissing, temperatureLimit, serviceUnavailable
     public var title: String {
         switch self {
         case .setupRequired: return "Ready to set up"
         case .starting: return "Starting"
+        case .pausing: return "Pausing"
         case .waitingForNode: return "Waiting for the node"
         case .waitingForProofs: return "Waiting for proofs"
         case .running: return "Running"
@@ -198,7 +210,7 @@ public struct AutomaticStatus: Decodable, Sendable {
 }
 
 public enum LivePresentation {
-    public static func snapshot(status: ServiceStatus?, history: HistoryPayload? = nil, configuration: AppConfiguration? = nil, detectedDevices: [DiscoveredDevice]? = nil, nodeSync: NodeSyncStatus? = nil, paused: Bool = false, starting: Bool = false, error: String? = nil, now: Date = Date()) -> AppSnapshot {
+    public static func snapshot(status: ServiceStatus?, history: HistoryPayload? = nil, configuration: AppConfiguration? = nil, detectedDevices: [DiscoveredDevice]? = nil, nodeSync: NodeSyncStatus? = nil, paused: Bool = false, controlOperation: ServiceControlOperation? = nil, error: String? = nil, now: Date = Date()) -> AppSnapshot {
         let recent = status.map { now.timeIntervalSince1970 - $0.timestampUnix <= 10 && $0.timestampUnix <= now.timeIntervalSince1970 + 5 } ?? false
         let live = recent ? status : nil
         let hostname = live?.fullNode.host ?? configuration?.node.host
@@ -211,7 +223,8 @@ public enum LivePresentation {
         let thermal = live?.boards.contains { $0.hardwareState == "thermal_stop" } == true
         let allBoardsFailed = live.map { !$0.boards.isEmpty && $0.boards.allSatisfy { ["fault", "thermal_stop"].contains($0.hardwareState) } } ?? false
         let phase: AppPhase
-        if starting { phase = .starting }
+        if controlOperation == .pause { phase = .pausing }
+        else if controlOperation == .start || (controlOperation == .reload && !paused) { phase = .starting }
         else if thermal && !productive { phase = .temperatureLimit }
         else if error != nil || live?.timelordState == "fault" || allBoardsFailed { phase = .serviceUnavailable }
         else if paused { phase = .paused }
@@ -283,11 +296,11 @@ public enum LivePresentation {
             return status.message
         }
         return AppSnapshot(phase: phase,
-            explanation: error ?? faultReason ?? (paused ? "Timelord is paused. Resume when you’re ready." : live?.message ?? (configuration?.node.hasIdentity == true && configuration?.hardware.clientBinary != nil && !boards.isEmpty
+            explanation: phase == .pausing ? "Pausing Timelord; waiting for the worker to stop." : error ?? faultReason ?? (paused ? "Timelord is paused. Resume when you’re ready." : live?.message ?? (configuration?.node.hasIdentity == true && configuration?.hardware.clientBinary != nil && !boards.isEmpty
                 ? "Enable the background service in Settings to run Timelord independently of this interface."
                 : "Connect a full node and plug in your ASIC boards to get started.")),
             node: ConnectionSnapshot(title: nodeTitle, detail: nodeDetail, tone: nodeTone, height: freshSync?.height),
-            timelord: ConnectionSnapshot(title: phase == .serviceUnavailable ? "Stopped" : productive ? "Running" : live != nil ? "Ready" : "Stopped", detail: "On this Mac", tone: phase == .serviceUnavailable ? .critical : productive ? .positive : .neutral),
+            timelord: ConnectionSnapshot(title: phase == .pausing ? "Stopping" : phase == .serviceUnavailable ? "Stopped" : productive ? "Running" : live != nil ? "Ready" : "Stopped", detail: "On this Mac", tone: phase == .serviceUnavailable ? .critical : productive ? .positive : .neutral),
             boards: boards, proofsToday: proofCapable ? live?.proofsDelivered : nil, uptimeSeconds: proofCapable ? live.map { max(0, now.timeIntervalSince1970 - ($0.serviceStartedUnix ?? $0.startedUnix)) } : nil, now: now, serviceAvailable: live != nil, tuningPaused: live?.tuningPaused ?? false, readyToRun: phase == .setupRequired && configuration?.node.hasIdentity == true && configuration?.hardware.clientBinary != nil && !boards.isEmpty, sessionUptimeSeconds: proofCapable ? live.map { max(0, now.timeIntervalSince1970 - $0.startedUnix) } : nil)
     }
 }
