@@ -32,6 +32,32 @@ final class SupervisorPresentationTests: XCTestCase {
         XCTAssertFalse(model.canControlService)
     }
 
+    func testDiscoveryCannotEraseANonTransientWorkerStatusFailure() async throws {
+        let fixture = try StatusFixture(endpoint: URL(string: "timelord-fixture://status")!)
+        defer { fixture.close() }
+        var configuration = AppConfiguration()
+        configuration.hardware.clientBinary = "/fixture/client"
+        configuration.hardware.boards = [ConfiguredBoard(id: "fixture", name: "Fixture", port: 18110, location: 1)]
+        let model = fixture.model(configuration)
+        try fixture.publish(mode: "running", phase: "worker_started", workerPID: 456)
+        await model.refresh()
+        XCTAssertFalse(model.discoveredDevices.isEmpty, "Exercise discovery's snapshot update after the failed HTTP poll")
+        XCTAssertEqual(model.snapshot.phase, .serviceUnavailable)
+        XCTAssertNotEqual(model.snapshot.explanation, "Starting Timelord; waiting for the service to respond.")
+    }
+
+    func testWorkerPIDBeforeFirstHTTPResponseStillShowsStartup() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        let model = fixture.model(AppConfiguration())
+        try fixture.publish(mode: "running", phase: "worker_started", workerPID: 456)
+        await model.refresh() // Port zero cannot be a live service fixture.
+        XCTAssertEqual(model.snapshot.phase, .starting)
+        XCTAssertEqual(model.snapshot.explanation, "Starting Timelord; waiting for the service to respond.")
+        XCTAssertTrue(model.canPause)
+        XCTAssertEqual(model.runControlTitle, "Pause")
+    }
+
     func testWorkerAbsenceUsesSupervisorLifecycleWithoutBecomingAHardFailure() async throws {
         let fixture = try StatusFixture()
         defer { fixture.close() }
@@ -64,7 +90,7 @@ private final class StatusFixture {
     let directory: URL
     let response: URL
     let controller: ServiceController
-    init() throws {
+    init(endpoint: URL = URL(string: "http://127.0.0.1:0/v1/status")!) throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent("supervisor-presentation-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         response = directory.appendingPathComponent("status.json")
@@ -79,14 +105,15 @@ private final class StatusFixture {
         """
         try Data(script.utf8).write(to: helper)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
-        controller = ServiceController(configURL: directory.appendingPathComponent("config.toml"), logsURL: directory.appendingPathComponent("log"), helperURL: helper, endpoint: URL(string: "http://127.0.0.1:0/v1/status")!, supervisorURL: helper)
+        controller = ServiceController(configURL: directory.appendingPathComponent("config.toml"), logsURL: directory.appendingPathComponent("log"), helperURL: helper, endpoint: endpoint, supervisorURL: helper)
     }
     func model(_ configuration: AppConfiguration) -> TimelordModel {
         TimelordModel(controller: controller, initialConfiguration: configuration, monitoringEnabled: false)
     }
-    func publish(mode: String, phase: String, error: String? = nil) throws {
+    func publish(mode: String, phase: String, error: String? = nil, workerPID: Int? = nil) throws {
         var status: [String: Any] = ["api_version": 1, "supervisor_pid": 123, "mode": mode, "revision": 1, "worker_generation": 1, "restarts": 0, "phase": phase]
         if let error { status["error"] = error }
+        if let workerPID { status["worker_pid"] = workerPID }
         try JSONSerialization.data(withJSONObject: status).write(to: response)
     }
     func close() { try? FileManager.default.removeItem(at: directory) }
