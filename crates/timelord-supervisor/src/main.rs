@@ -3,6 +3,7 @@ use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use std::{
     fs,
+    io::Write,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
@@ -203,6 +204,8 @@ struct Worker {
     progress: Option<(timelord_supervisor::progress::Snapshot, std::time::Instant)>,
     #[cfg(test)]
     stop_failures: usize,
+    #[cfg(test)]
+    wait_errors: std::cell::RefCell<std::collections::VecDeque<i32>>,
 }
 impl Worker {
     fn spawn(
@@ -253,6 +256,8 @@ impl Worker {
             progress: None,
             #[cfg(test)]
             stop_failures: 0,
+            #[cfg(test)]
+            wait_errors: Default::default(),
         })
     }
     fn signal(&self, signal: i32) {
@@ -261,22 +266,16 @@ impl Worker {
         };
     }
     fn exited(&self) -> Result<bool> {
-        Self::group_exited(self.group)
-    }
-    fn group_exited(group: i32) -> Result<bool> {
         // Observe exit without reaping. Keeping the leader's PID reserved until
         // descendants are terminated prevents signaling a reused process group.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                group as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error().into());
+        if let Err(error) = self.waitid(&mut info) {
+            // EINTR is not evidence of exit. The existing tick/stop polling
+            // intervals retry without spinning or relinquishing child identity.
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(error).context("Observing timelord worker exit without reaping");
         }
         #[cfg(target_os = "macos")]
         let pid = info.si_pid;
@@ -289,6 +288,25 @@ impl Worker {
                 info.si_code,
                 libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
             ))
+    }
+    fn waitid(&self, info: &mut libc::siginfo_t) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(error) = self.wait_errors.borrow_mut().pop_front() {
+            return Err(std::io::Error::from_raw_os_error(error));
+        }
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.group as libc::id_t,
+                info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
     }
     async fn stop(&mut self) -> Result<std::process::ExitStatus> {
         #[cfg(test)]
@@ -354,6 +372,8 @@ async fn validate_before_reload(helper: &Path, config: &Path) -> Result<()> {
         watchdog: timelord_supervisor::progress::Watchdog::new(std::time::Instant::now()),
         #[cfg(test)]
         stop_failures: 0,
+        #[cfg(test)]
+        wait_errors: Default::default(),
     };
     let completed = tokio::time::timeout(Duration::from_secs(5), async {
         while !owner.exited()? {
@@ -444,13 +464,33 @@ async fn accept_controls(
     listener: UnixListener,
     current: Snapshot,
     tx: mpsc::Sender<Envelope>,
+    mut log: timelord_supervisor::logging::Writer,
+    #[cfg(test)] mut accept_errors: std::collections::VecDeque<std::io::Error>,
 ) -> Result<()> {
     let mut handlers = JoinSet::new();
+    let mut failures: u32 = 0;
+    let mut retry_at = Instant::now();
     loop {
         tokio::select! {
             Some(_) = handlers.join_next(), if !handlers.is_empty() => {},
-            accepted = listener.accept() => {
-                let (socket, _) = accepted?;
+            accepted = async {
+                tokio::time::sleep_until(retry_at).await;
+                #[cfg(test)]
+                if let Some(error) = accept_errors.pop_front() { return Err(error); }
+                listener.accept().await
+            } => {
+                let (socket, _) = match accepted {
+                    Ok(accepted) => { failures = 0; accepted }
+                    Err(error) => {
+                        // An aborted peer or descriptor pressure does not revoke
+                        // this listener or the healthy worker it controls.
+                        failures = failures.saturating_add(1);
+                        let delay = Duration::from_millis(50 * (1u64 << failures.saturating_sub(1).min(5))).min(Duration::from_secs(1));
+                        let _ = writeln!(&mut log, "Supervisor control accept failed ({failures} consecutive): {error}; retry in {delay:?}");
+                        retry_at = Instant::now() + delay;
+                        continue;
+                    }
+                };
                 if handlers.len() < 16 {
                     let (current, tx) = (current.clone(), tx.clone());
                     handlers.spawn(async move { let _ = handle(socket, current, tx).await; });
@@ -866,7 +906,14 @@ async fn run(
     };
     let (tx, mut rx) = mpsc::channel::<Envelope>(16);
     // Accept status readers independently of graceful worker cleanup.
-    let mut controls = tokio::spawn(accept_controls(listener, current, tx));
+    let mut controls = tokio::spawn(accept_controls(
+        listener,
+        current,
+        tx,
+        state.log.clone(),
+        #[cfg(test)]
+        Default::default(),
+    ));
     let mut timer = tokio::time::interval(Duration::from_millis(100));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let stop = signal();

@@ -1,5 +1,125 @@
 use super::*;
 #[tokio::test]
+async fn control_accept_errors_back_off_and_keep_listener_and_worker() {
+    let dir = std::env::temp_dir().join(format!("tl-accept-retry-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let helper = dir.join("worker");
+    fs::write(&helper, "#!/bin/sh\ncat >/dev/null\n").unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    let log = timelord_supervisor::logging::Writer::stderr();
+    let worker = Worker::spawn(
+        &helper,
+        &dir.join("config.toml"),
+        &dir.join("progress.sock"),
+        1,
+        &log,
+    )
+    .unwrap();
+    let pid = worker.group;
+    let socket = dir.join("control.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let inode = fs::symlink_metadata(&socket).unwrap().ino();
+    let mut state = SupervisorState::new(Ok(Intent::default()), log.clone());
+    state.lifecycle = Lifecycle::Running(Box::new(worker));
+    let (snapshots, current) = watch::channel(state.published());
+    let (tx, _rx) = mpsc::channel(16);
+    let started = Instant::now();
+    let acceptor = tokio::spawn(accept_controls(
+        listener,
+        current,
+        tx,
+        log,
+        [
+            std::io::Error::from_raw_os_error(libc::ECONNABORTED),
+            std::io::Error::from_raw_os_error(libc::EMFILE),
+        ]
+        .into(),
+    ));
+    let mut stream = UnixStream::connect(&socket).await.unwrap();
+    stream
+        .write_all(b"{\"command\":\"status\"}\n")
+        .await
+        .unwrap();
+    let mut line = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        BufReader::new(stream).read_line(&mut line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let response: Response = serde_json::from_str(&line).unwrap();
+    assert_eq!(response.status.worker_pid, Some(pid as u32));
+    assert!(
+        started.elapsed() >= Duration::from_millis(150),
+        "Errors must not busy-loop"
+    );
+    assert_eq!(fs::symlink_metadata(&socket).unwrap().ino(), inode);
+    assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+    assert!(!acceptor.is_finished());
+    acceptor.abort();
+    let _ = acceptor.await;
+    state.retire(&snapshots).await.unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn interrupted_wait_retains_worker_identity_and_graceful_cleanup() {
+    let dir = std::env::temp_dir().join(format!("tl-wait-interrupted-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let helper = dir.join("worker");
+    fs::write(&helper, "#!/bin/sh\ncat >/dev/null\n").unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    let log = timelord_supervisor::logging::Writer::stderr();
+    let worker = Worker::spawn(
+        &helper,
+        &dir.join("config.toml"),
+        &dir.join("progress.sock"),
+        1,
+        &log,
+    )
+    .unwrap();
+    let pid = worker.group;
+    worker
+        .wait_errors
+        .borrow_mut()
+        .extend([libc::EINTR, libc::EINTR]);
+    let mut state = SupervisorState::new(Ok(Intent::default()), log.clone());
+    state.lifecycle = Lifecycle::Running(Box::new(worker));
+    let (snapshots, _) = watch::channel(state.published());
+    for _ in 0..2 {
+        state
+            .tick(
+                &helper,
+                &dir.join("config.toml"),
+                &dir.join("progress.sock"),
+                &snapshots,
+            )
+            .await
+            .unwrap();
+        assert_eq!(state.snapshot().worker_pid, Some(pid as u32));
+        assert_eq!(state.restarts, 0);
+        assert!(state.needs_power());
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+    }
+    let Lifecycle::Running(worker) = &state.lifecycle else {
+        panic!("worker ownership lost")
+    };
+    worker.wait_errors.borrow_mut().push_back(libc::EINVAL);
+    assert!(
+        worker
+            .exited()
+            .unwrap_err()
+            .to_string()
+            .contains("Observing timelord worker exit")
+    );
+    worker.wait_errors.borrow_mut().push_back(libc::EINTR);
+    state.retire(&snapshots).await.unwrap();
+    assert_eq!(state.snapshot().worker_pid, None);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn failed_pause_retains_owner_and_power_until_confirmed_cleanup() {
     let dir = std::env::temp_dir().join(format!("tl-pause-owner-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
