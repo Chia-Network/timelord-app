@@ -151,6 +151,8 @@ struct Worker {
     child: Child,
     group: i32,
     started: Instant,
+    #[cfg(test)]
+    stop_failures: usize,
 }
 impl Worker {
     fn spawn(helper: &Path, config: &Path) -> Result<Self> {
@@ -171,6 +173,8 @@ impl Worker {
             child,
             group,
             started: Instant::now(),
+            #[cfg(test)]
+            stop_failures: 0,
         })
     }
     fn signal(&self, signal: i32) {
@@ -205,7 +209,12 @@ impl Worker {
                 libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
             ))
     }
-    async fn stop(mut self) -> Result<std::process::ExitStatus> {
+    async fn stop(&mut self) -> Result<std::process::ExitStatus> {
+        #[cfg(test)]
+        if self.stop_failures > 0 {
+            self.stop_failures -= 1;
+            anyhow::bail!("Injected worker cleanup failure");
+        }
         self.signal(libc::SIGTERM);
         let deadline = Instant::now() + Duration::from_secs(10);
         while !self.exited()? && Instant::now() < deadline {
@@ -290,8 +299,18 @@ enum Lifecycle {
     StateError(String),
     Starting,
     Running(Worker),
-    Stopping { pid: u32 },
-    Backoff { next: Instant, error: String },
+    Stopping {
+        pid: u32,
+    },
+    CleanupFailed {
+        worker: Worker,
+        next: Instant,
+        error: String,
+    },
+    Backoff {
+        next: Instant,
+        error: String,
+    },
 }
 struct SupervisorState {
     intent: Intent,
@@ -336,6 +355,9 @@ impl SupervisorState {
             Lifecycle::Starting => ("starting", None, None),
             Lifecycle::Running(worker) => ("worker_started", Some(worker.group as u32), None),
             Lifecycle::Stopping { pid } => ("stopping", Some(*pid), None),
+            Lifecycle::CleanupFailed { worker, error, .. } => {
+                ("stopping", Some(worker.group as u32), Some(error.clone()))
+            }
             Lifecycle::Backoff { error, .. } => ("recovering", None, Some(error.clone())),
         };
         Status {
@@ -354,7 +376,9 @@ impl SupervisorState {
         self.intent.mode == Mode::Running
             || matches!(
                 self.lifecycle,
-                Lifecycle::Running(_) | Lifecycle::Stopping { .. }
+                Lifecycle::Running(_)
+                    | Lifecycle::Stopping { .. }
+                    | Lifecycle::CleanupFailed { .. }
             )
     }
     fn publish(&mut self, snapshots: &watch::Sender<Status>) {
@@ -373,13 +397,15 @@ impl SupervisorState {
         &mut self,
         snapshots: &watch::Sender<Status>,
     ) -> Result<Option<(Duration, std::process::ExitStatus)>> {
-        if !matches!(self.lifecycle, Lifecycle::Running(_)) {
+        if !matches!(
+            self.lifecycle,
+            Lifecycle::Running(_) | Lifecycle::CleanupFailed { .. }
+        ) {
             return Ok(None);
         }
-        let Lifecycle::Running(worker) =
-            std::mem::replace(&mut self.lifecycle, Lifecycle::Starting)
-        else {
-            unreachable!()
+        let mut worker = match std::mem::replace(&mut self.lifecycle, Lifecycle::Starting) {
+            Lifecycle::Running(worker) | Lifecycle::CleanupFailed { worker, .. } => worker,
+            _ => unreachable!(),
         };
         let elapsed = worker.started.elapsed();
         self.lifecycle = Lifecycle::Stopping {
@@ -389,7 +415,10 @@ impl SupervisorState {
         let exit = match worker.stop().await {
             Ok(exit) => exit,
             Err(error) => {
-                self.lifecycle = Lifecycle::Backoff {
+                // Keep the child handle and reserved process-group identity:
+                // neither durable Pause nor a retry grants retirement evidence.
+                self.lifecycle = Lifecycle::CleanupFailed {
+                    worker,
                     next: Instant::now() + Duration::from_secs(120),
                     error: format!("Worker cleanup failed: {error:#}"),
                 };
@@ -441,10 +470,15 @@ impl SupervisorState {
                 if mode == Mode::Paused {
                     self.retire(snapshots).await?;
                     self.lifecycle = Lifecycle::Paused;
-                } else if resuming
-                    || matches!(self.lifecycle, Lifecycle::Paused | Lifecycle::StateError(_))
-                {
-                    self.lifecycle = Lifecycle::Starting;
+                } else {
+                    if matches!(self.lifecycle, Lifecycle::CleanupFailed { .. }) {
+                        self.retire(snapshots).await?;
+                    }
+                    if resuming
+                        || matches!(self.lifecycle, Lifecycle::Paused | Lifecycle::StateError(_))
+                    {
+                        self.lifecycle = Lifecycle::Starting;
+                    }
                 }
             }
             Control::Reload => {
@@ -468,8 +502,18 @@ impl SupervisorState {
         config: &Path,
         snapshots: &watch::Sender<Status>,
     ) -> Result<()> {
+        if matches!(self.lifecycle, Lifecycle::CleanupFailed { next, .. } if Instant::now() >= next)
+        {
+            // Cleanup failure is recoverable without relinquishing ownership or
+            // exiting the supervisor (which would release its sleep assertion).
+            let _ = self.retire(snapshots).await;
+            return Ok(());
+        }
         if matches!(&self.lifecycle, Lifecycle::Running(worker) if worker.exited()?) {
-            let (elapsed, exit) = self.retire(snapshots).await?.expect("exited worker");
+            let (elapsed, exit) = match self.retire(snapshots).await {
+                Ok(retired) => retired.expect("exited worker"),
+                Err(_) => return Ok(()), // CleanupFailed retains ownership and retries.
+            };
             let delay = retry_delay(&mut self.failures, Some(elapsed));
             self.restarts += 1;
             self.lifecycle = Lifecycle::Backoff {
@@ -555,7 +599,85 @@ async fn run(paths: Paths, helper: PathBuf) -> Result<()> {
 mod tests {
     use super::*;
     #[tokio::test]
-    async fn explicit_resume_clears_failed_pause_backoff_but_repeated_resume_does_not() {
+    async fn failed_pause_retains_owner_and_power_until_confirmed_cleanup() {
+        let dir = std::env::temp_dir().join(format!("tl-pause-owner-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let helper = dir.join("worker");
+        fs::write(&helper, "#!/bin/sh\ncat >/dev/null\n").unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = Paths::for_config(&dir.join("config.toml")).unwrap();
+        for resume in [false, true] {
+            let mut worker = Worker::spawn(&helper, &paths.config).unwrap();
+            let pid = worker.group;
+            worker.stop_failures = if resume { 2 } else { 1 };
+            let mut state = SupervisorState::new(Ok(Intent::default()));
+            state.lifecycle = Lifecycle::Running(worker);
+            let (snapshots, _) = watch::channel(state.snapshot());
+            let request = |command| Request {
+                command,
+                expected_revision: None,
+            };
+            assert!(
+                state
+                    .control(&paths, request(Control::Pause), &snapshots)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(paths.load_intent().unwrap().mode, Mode::Paused);
+            assert!(state.needs_power());
+            assert_eq!(state.snapshot().phase, "stopping");
+            assert_eq!(state.snapshot().worker_pid, Some(pid as u32));
+            assert!(state.snapshot().error.unwrap().contains("cleanup failed"));
+            assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+            // No replacement is admitted while the cleanup retry is pending.
+            state
+                .tick(&helper, &paths.config, &snapshots)
+                .await
+                .unwrap();
+            assert_eq!(state.snapshot().worker_pid, Some(pid as u32));
+            assert_eq!(state.generation, 0);
+            if resume {
+                assert!(
+                    state
+                        .control(&paths, request(Control::Resume), &snapshots)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(state.intent.mode, Mode::Running);
+                assert_eq!(state.snapshot().worker_pid, Some(pid as u32));
+                assert!(matches!(state.lifecycle, Lifecycle::CleanupFailed { .. }));
+                state
+                    .control(&paths, request(Control::Pause), &snapshots)
+                    .await
+                    .unwrap();
+            } else {
+                let Lifecycle::CleanupFailed { next, .. } = &mut state.lifecycle else {
+                    panic!("cleanup ownership lost")
+                };
+                *next = Instant::now();
+                state
+                    .tick(&helper, &paths.config, &snapshots)
+                    .await
+                    .unwrap();
+            }
+            assert!(matches!(state.lifecycle, Lifecycle::Paused));
+            assert!(!state.needs_power());
+            assert_eq!(state.snapshot().worker_pid, None);
+            assert_eq!(state.generation, 0);
+            let mut status = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn explicit_resume_retries_paused_start_backoff_but_repeated_resume_does_not() {
         let dir = std::env::temp_dir().join(format!("tl-resume-cleanup-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let paths = Paths::for_config(&dir.join("config.toml")).unwrap();
@@ -565,7 +687,7 @@ mod tests {
         }));
         state.lifecycle = Lifecycle::Backoff {
             next: Instant::now() + Duration::from_secs(120),
-            error: "Worker cleanup failed".into(),
+            error: "Worker start failed".into(),
         };
         let (snapshots, _) = watch::channel(state.snapshot());
         let resume = || Request {

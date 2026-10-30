@@ -296,7 +296,7 @@ public enum LivePresentation {
             return status.message
         }
         return AppSnapshot(phase: phase,
-            explanation: phase == .pausing ? "Pausing Timelord; waiting for the worker to stop." : error ?? faultReason ?? (paused ? "Timelord is paused. Resume when you’re ready." : live?.message ?? (configuration?.node.hasIdentity == true && configuration?.hardware.clientBinary != nil && !boards.isEmpty
+            explanation: phase == .pausing ? "Pausing Timelord; waiting for the worker to stop." : error ?? faultReason ?? (phase == .starting ? "Starting Timelord; waiting for the service to respond." : paused ? "Timelord is paused. Resume when you’re ready." : live?.message ?? (configuration?.node.hasIdentity == true && configuration?.hardware.clientBinary != nil && !boards.isEmpty
                 ? "Enable the background service in Settings to run Timelord independently of this interface."
                 : "Connect a full node and plug in your ASIC boards to get started.")),
             node: ConnectionSnapshot(title: nodeTitle, detail: nodeDetail, tone: nodeTone, height: freshSync?.height),

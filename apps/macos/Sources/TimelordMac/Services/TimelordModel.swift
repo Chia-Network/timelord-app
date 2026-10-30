@@ -26,6 +26,7 @@ final class TimelordModel: ObservableObject {
     private let configurationClient: ConfigurationClient
     private var savedConfiguration = AppConfiguration()
     private var liveStatus: ServiceStatus?
+    private var workerStatus = WorkerStatusObservation.absent
     private var history: HistoryPayload?
     private var nodeSync: NodeSyncStatus?
     private var lastNodeSyncFetch = Date.distantPast
@@ -75,11 +76,11 @@ final class TimelordModel: ObservableObject {
     private var presentationOperation: ServiceControlOperation? {
         if let controlOperation { return controlOperation }
         if controller.desiredRunning, let phase = controller.supervisor?.phase,
-           ["starting", "recovering"].contains(phase) { return .start }
+           (["starting", "recovering"].contains(phase) || workerStatus.isStarting()) { return .start }
         return nil
     }
     private func updateSnapshot() {
-        snapshot = LivePresentation.snapshot(status: liveStatus, history: history, configuration: configurationLoaded ? savedConfiguration : nil, detectedDevices: discoveredDevices, nodeSync: nodeSync, paused: pausedByUser, controlOperation: presentationOperation, error: controller.presentationError)
+        snapshot = LivePresentation.snapshot(status: liveStatus, history: history, configuration: configurationLoaded ? savedConfiguration : nil, detectedDevices: discoveredDevices, nodeSync: nodeSync, paused: pausedByUser, controlOperation: presentationOperation, error: workerStatus.error ?? controller.presentationError)
     }
     func refresh() async {
         guard !quitting else { return }
@@ -93,11 +94,15 @@ final class TimelordModel: ObservableObject {
         }
         await controller.refresh()
         await refreshNodeSync()
+        let expectedPID = controller.processID
+        workerStatus.observe(pid: controller.desiredRunning ? expectedPID : nil)
         do {
             // No worker is normal during Pause, initial startup, and replacement.
             // Do not query an unrelated or stale HTTP listener without an owned PID.
-            if let workerPID = controller.processID {
+            if let workerPID = expectedPID {
                 let result = try await liveClient.fetch(expectedPID: workerPID)
+                guard controller.processID == expectedPID else { return }
+                workerStatus.received(pid: workerPID)
                 if liveStatus?.servicePid != result.servicePid || liveStatus?.startedUnix != result.startedUnix { history = nil; lastHistoryFetch = .distantPast }
                 liveStatus = result
                 if Date().timeIntervalSince(lastHistoryFetch) >= 15 {
@@ -109,8 +114,10 @@ final class TimelordModel: ObservableObject {
             }
             updateSnapshot()
         } catch {
+            guard controller.processID == expectedPID else { return }
+            if let workerPID = expectedPID { workerStatus.failed(pid: workerPID, error: error) }
             let hadService = liveStatus != nil || canControlService; liveStatus = nil; history = nil
-            snapshot = LivePresentation.snapshot(status: nil, configuration: configurationLoaded ? savedConfiguration : nil, detectedDevices: discoveredDevices, nodeSync: nodeSync, paused: pausedByUser, controlOperation: presentationOperation, error: hadService && !pausedByUser ? error.localizedDescription : controller.presentationError)
+            snapshot = LivePresentation.snapshot(status: nil, configuration: configurationLoaded ? savedConfiguration : nil, detectedDevices: discoveredDevices, nodeSync: nodeSync, paused: pausedByUser, controlOperation: presentationOperation, error: hadService && !pausedByUser && !workerStatus.isStarting() ? error.localizedDescription : controller.presentationError)
         }
         if !operationInProgress && !isBusy && Date().timeIntervalSince(lastDiscovery)>15 { await refreshDevices() }
     }
