@@ -82,7 +82,7 @@ pub(super) fn checkpoint_retired(
     store: &crate::safety::Store,
     serial: &str,
 ) -> Result<()> {
-    let (quiesced, fault) = {
+    let (quiesced, fault, failed) = {
         let state = shared.runtime.lock().expect("runtime");
         let status = state
             .boards
@@ -90,7 +90,11 @@ pub(super) fn checkpoint_retired(
             .context("Retired board missing")?
             .lifecycle
             .status();
-        (status.quiesced, status.fault)
+        (
+            status.quiesced,
+            status.fault,
+            status.phase == crate::board_lifecycle::Phase::Fault,
+        )
     };
     if let Some(fault) = fault {
         let reason = match fault {
@@ -99,7 +103,9 @@ pub(super) fn checkpoint_retired(
             _ => crate::safety::Reason::UncleanOwner,
         };
         store.quarantine(serial, reason)?;
-    } else if !quiesced {
+    } else if failed || !quiesced {
+        // Confirmed retirement proves the hardware stopped; it cannot validate a
+        // failed control exchange. Transport failures require fresh admission.
         store.quarantine(serial, crate::safety::Reason::UncleanOwner)?;
     }
     if quiesced {

@@ -1027,7 +1027,7 @@ printf '%s' '[{"name":"Chia VDF A","location":4113,"serial":"test"}]'"#,
         assert_eq!(found[0].location, 4113);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn repeated_timeouts_kill_and_reap_the_driver_process() {
         let fixture = Fixture::new();
         for i in 0..3 {
@@ -1036,15 +1036,33 @@ printf '%s' '[{"name":"Chia VDF A","location":4113,"serial":"test"}]'"#,
                 &format!("hang-{i}"),
                 &format!("echo $$ > '{}'; exec /bin/sleep 30", pidfile.display()),
             );
-            let error = probe(&helper, Path::new("unused"), Duration::from_secs(1))
-                .await
-                .unwrap_err();
+            let probing = tokio::spawn(async move {
+                probe(&helper, Path::new("unused"), Duration::from_secs(1)).await
+            });
+            // Establish a real running process before advancing the deadline.
+            // CPU pressure in parallel tests must not turn this into a test of
+            // killing a helper that has not executed its first instruction yet.
+            let startup = std::time::Instant::now();
+            let pid: i32 = loop {
+                if let Ok(contents) = std::fs::read_to_string(&pidfile)
+                    && contents.ends_with('\n')
+                    && let Ok(pid) = contents.trim().parse()
+                {
+                    break pid;
+                }
+                assert!(
+                    !probing.is_finished(),
+                    "Probe exited before its fixture started"
+                );
+                assert!(
+                    startup.elapsed() < Duration::from_secs(5),
+                    "Probe fixture did not start"
+                );
+                tokio::task::yield_now().await;
+            };
+            tokio::time::advance(Duration::from_secs(1)).await;
+            let error = probing.await.unwrap().unwrap_err();
             assert!(error.to_string().contains("timed out"), "{error:#}");
-            let pid: i32 = std::fs::read_to_string(pidfile)
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
             assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
             assert_eq!(
                 std::io::Error::last_os_error().raw_os_error(),

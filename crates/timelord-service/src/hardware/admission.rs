@@ -393,6 +393,8 @@ mod tests {
             ("stale-temperature", false, false),
             ("cancelled", false, false),
             ("cancelled-unclean", false, true),
+            ("cancelled-handshake", false, false),
+            ("cancelled-handshake-unclean", false, true),
         ] {
             let script = dir.join(variant);
             let cancelling = variant.starts_with("cancelled");
@@ -405,13 +407,17 @@ trap 'kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null' EXIT
 trap 'exit 143' TERM
 printf '%s\n' 'Connected to timelord, waiting for challenge' 'ASIC Temp = 40 C; Frequency = 1450 MHz' >&2
 while read command version id frequency voltage; do
+ if [ {handshake} = 1 ]; then
+  printf '%s\n' 'handshake requested' > {started}
+  continue
+ fi
  printf 'TLACK 1 %s %s %s\n' "$id" "$frequency" "$voltage"
 done
 kill "$pid" 2>/dev/null
 wait "$pid" 2>/dev/null
 {marker}
 exit 0
-"#,invalid=if invalid{1}else{0},exe=quote(exe.to_str().unwrap()),started=quote(script.with_extension("started").to_str().unwrap()),marker=if unconfirmed{""}else{"printf '%s\\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2"})).unwrap();
+"#,handshake=if variant.contains("handshake"){1}else{0},invalid=if invalid{1}else{0},exe=quote(exe.to_str().unwrap()),started=quote(script.with_extension("started").to_str().unwrap()),marker=if unconfirmed{""}else{"printf '%s\\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2"})).unwrap();
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
             let mut config = Config::default();
             let board:BoardConfig=toml::from_str("id='probe'\nname='Probe'\nserial='fixture'\nclient_port=18110\ndevice_location=1\nprofile='manual'\nfrequency_mhz=1450.0\nvoltage_v=1.0").unwrap();
@@ -465,7 +471,7 @@ exit 0
             } else {
                 checking.await
             };
-            if variant == "cancelled" {
+            if cancelling && !unconfirmed {
                 assert_eq!(result.unwrap(), Outcome::Cancelled);
                 continue;
             }

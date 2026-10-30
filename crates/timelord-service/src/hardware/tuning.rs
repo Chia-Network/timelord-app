@@ -379,7 +379,8 @@ printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
             service_started_unix: 0,
         };
         let mut child = launch(&shared, &board).await.unwrap();
-        let owner = NativeOwner::new(&shared, &board, &mut child).await.unwrap();
+        let mut owner = NativeOwner::attach(&board, &mut child).unwrap();
+        owner.initialize(&shared, &board).await.unwrap();
         let tuning = Tuning {
             experiment: None,
             policy: Policy::new(board.automatic.clone(), point, 0, vec![1450., 1460.]),
