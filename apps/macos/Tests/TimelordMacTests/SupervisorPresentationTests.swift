@@ -37,14 +37,17 @@ final class SupervisorPresentationTests: XCTestCase {
         defer { fixture.close() }
         let model = fixture.model(AppConfiguration())
         for phase in ["starting", "recovering"] {
-            try fixture.publish(mode: "running", phase: phase, error: phase == "recovering" ? "Previous worker exited" : nil)
+            try fixture.publish(mode: "running", phase: phase, error: phase == "recovering" ? "Worker spawn failed: executable is not accessible" : nil)
             await model.refresh()
             XCTAssertEqual(model.snapshot.phase, .starting, phase)
             XCTAssertTrue(model.canPause)
             XCTAssertNil(model.controlOperation, "Observed startup does not fabricate a pending UI command")
             XCTAssertNil(fixture.controller.processID)
         }
-        XCTAssertEqual(fixture.controller.errorMessage, "Previous worker exited", "Preserve recovery diagnostics")
+        XCTAssertEqual(fixture.controller.errorMessage, "Worker spawn failed: executable is not accessible", "Preserve recovery diagnostics")
+        XCTAssertEqual(model.snapshot.explanation, "Worker spawn failed: executable is not accessible", "Recovery failures must be visible while the supervisor retries")
+        XCTAssertEqual(model.snapshot.phase, .starting)
+        XCTAssertEqual(model.runControlTitle, "Pause")
         try fixture.publish(mode: "paused", phase: "paused")
         await model.refresh()
         XCTAssertEqual(model.snapshot.phase, .paused)

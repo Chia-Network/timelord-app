@@ -78,11 +78,8 @@ final class TimelordModel: ObservableObject {
            ["starting", "recovering"].contains(phase) { return .start }
         return nil
     }
-    private var presentationError: String? {
-        presentationOperation == .start ? nil : controller.presentationError
-    }
     private func updateSnapshot() {
-        snapshot = LivePresentation.snapshot(status: liveStatus, history: history, configuration: configurationLoaded ? savedConfiguration : nil, detectedDevices: discoveredDevices, nodeSync: nodeSync, paused: pausedByUser, controlOperation: presentationOperation, error: presentationError)
+        snapshot = LivePresentation.snapshot(status: liveStatus, history: history, configuration: configurationLoaded ? savedConfiguration : nil, detectedDevices: discoveredDevices, nodeSync: nodeSync, paused: pausedByUser, controlOperation: presentationOperation, error: controller.presentationError)
     }
     func refresh() async {
         guard !quitting else { return }
@@ -113,7 +110,7 @@ final class TimelordModel: ObservableObject {
             updateSnapshot()
         } catch {
             let hadService = liveStatus != nil || canControlService; liveStatus = nil; history = nil
-            snapshot = LivePresentation.snapshot(status: nil, configuration: configurationLoaded ? savedConfiguration : nil, detectedDevices: discoveredDevices, nodeSync: nodeSync, paused: pausedByUser, controlOperation: presentationOperation, error: hadService && !pausedByUser ? error.localizedDescription : presentationError)
+            snapshot = LivePresentation.snapshot(status: nil, configuration: configurationLoaded ? savedConfiguration : nil, detectedDevices: discoveredDevices, nodeSync: nodeSync, paused: pausedByUser, controlOperation: presentationOperation, error: hadService && !pausedByUser ? error.localizedDescription : controller.presentationError)
         }
         if !operationInProgress && !isBusy && Date().timeIntervalSince(lastDiscovery)>15 { await refreshDevices() }
     }
