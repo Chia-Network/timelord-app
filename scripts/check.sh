@@ -3,6 +3,7 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 bash scripts/bundle-inputs-test.sh
+bash scripts/bundle-icon-test.sh
 bash scripts/release-inputs-test.sh
 bash scripts/installer-remove-test.sh
 mkdir -p build
