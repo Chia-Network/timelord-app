@@ -79,6 +79,8 @@ The native clients retain recent ASIC values for off-grid proof endpoints
 
 Developer prerequisites: macOS 14 or later, Xcode command-line tools, Swift 5.10 or
 later, Rust/Cargo (minimum version in Cargo.toml), CMake, GMP and Boost headers.
+Xcode 26 or newer compiles the layered icon; older selected tools use the committed
+flat icon. Errors from a supported icon compiler still fail the bundle.
 For Homebrew dependencies:
 
 ```sh

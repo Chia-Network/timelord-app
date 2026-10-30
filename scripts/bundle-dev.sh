@@ -5,6 +5,7 @@ export MACOSX_DEPLOYMENT_TARGET=14.0
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 source "$PROJECT_ROOT/scripts/macho-load-commands.sh"
+source "$PROJECT_ROOT/scripts/bundle-icon.sh"
 [[ "$(uname -s)" == Darwin ]] || { echo 'The Mac app bundle must be built on macOS.' >&2; exit 1; }
 CLIENT="${TIMELORD_ASIC_CLIENT:-$PROJECT_ROOT/build/controlled-native/hw_vdf_client}"
 [[ -x "$CLIENT" ]] || { echo 'Build the native client first: bash scripts/build-native-control.sh' >&2; exit 1; }
@@ -58,24 +59,7 @@ for binary in "$APP/Contents/Frameworks/"*.dylib "$APP/Contents/Helpers/hw_vdf_c
   if [[ "$binary" == "$APP/Contents/Frameworks/"* ]]; then install_name_tool -id "@rpath/$(basename "$binary")" "$binary"; fi
   codesign --force --sign - "$binary"
 done
-# The layered icon needs Xcode 26's actool: Assets.car carries the macOS 26 appearances and
-# actool also writes a fallback AppIcon.icns. With only the command line tools, ship the flat icon.
-if xcrun --find actool >/dev/null 2>&1; then
-  ICON_LOG="$(mktemp)"
-  # actool resolves relative input paths against the output folder, so pass absolute paths.
-  if ! xcrun actool "$PROJECT_ROOT/apps/macos/AppIcon/AppIcon.icon" --compile "$APP/Contents/Resources" \
-      --platform macosx --minimum-deployment-target "$MACOSX_DEPLOYMENT_TARGET" --app-icon AppIcon \
-      --output-partial-info-plist "$ICON_LOG.plist" --output-format human-readable-text --errors --warnings >"$ICON_LOG" 2>&1 \
-    || [[ ! -f "$APP/Contents/Resources/Assets.car" || ! -f "$APP/Contents/Resources/AppIcon.icns" ]]; then
-    cat "$ICON_LOG" >&2
-    echo 'Could not compile apps/macos/AppIcon/AppIcon.icon (requires Xcode 26 or newer).' >&2
-    exit 1
-  fi
-  rm -f "$ICON_LOG" "$ICON_LOG.plist"
-else
-  echo 'actool not found (it ships with Xcode, not the command line tools); bundling the flat AppIcon.icns.' >&2
-  cp apps/macos/AppIcon/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
-fi
+bundle_app_icon "$PROJECT_ROOT/apps/macos/AppIcon" "$APP/Contents/Resources" "$MACOSX_DEPLOYMENT_TARGET"
 cp LICENSE "$APP/Contents/Resources/LICENSE"
 cp integrations/dg-xch/LICENSE "$APP/Contents/Resources/ThirdParty/dg-xch-LICENSE"
 cp integrations/chiavdf/LICENSE "$APP/Contents/Resources/ThirdParty/chiavdf-LICENSE"

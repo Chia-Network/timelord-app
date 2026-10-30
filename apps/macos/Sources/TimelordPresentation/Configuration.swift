@@ -108,6 +108,23 @@ public enum BoardTopology {
 }
 
 public enum BoardDiscovery {
+    /// Enrich a metadata-hidden USB row rather than creating another device
+    /// with the same location ID. Fresh conflicting inventory wins over status.
+    public static func includingManagedOwner(_ owner: DiscoveredDevice, in devices: [DiscoveredDevice]) -> [DiscoveredDevice] {
+        // A serial observed at a new port outranks the owner's old location,
+        // regardless of the order in which inventory rows arrived.
+        if let serial = owner.serial, devices.contains(where: { $0.serial == serial }) { return devices }
+        var result = devices
+        if let index = result.firstIndex(where: { $0.location == owner.location }) {
+            let observed = result[index]
+            if observed.serial == nil && observed.location == owner.location {
+                result[index] = DiscoveredDevice(name: observed.name, location: observed.location, serial: owner.serial)
+            }
+        } else {
+            result.append(owner)
+        }
+        return result
+    }
     public static func reconcile(_ devices:[DiscoveredDevice], hardware:HardwareConfiguration) -> HardwareConfiguration {
         var result=hardware
         if hardware.chainAssignments != nil {

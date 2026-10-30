@@ -277,9 +277,8 @@ final class TimelordModel: ObservableObject {
             for status in liveStatus?.boards ?? [] where status.hardwareState == "connected" || (status.connectedClients>0 && status.hardwareState == "starting") {
                 let configured=(savedConfiguration.hardware.boards + savedConfiguration.hardware.rememberedBoards).first(where:{$0.id==status.id})
                 let serial=status.serial ?? configured?.serial
-                if let location=status.deviceLocation ?? configured?.deviceLocation,
-                   !devices.contains(where:{ device in if let serial { return device.serial == serial }; return device.location == location }) {
-                    devices.append(DiscoveredDevice(name:status.name,location:location,serial:serial))
+                if let location = status.deviceLocation ?? configured?.deviceLocation {
+                    devices = BoardDiscovery.includingManagedOwner(DiscoveredDevice(name: status.name, location: location, serial: serial), in: devices)
                 }
             }
             discoveredDevices=devices
