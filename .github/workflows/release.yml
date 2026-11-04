@@ -80,7 +80,7 @@ jobs:
           ditto -x -k Timelord-macos-arm64.zip ..
       - name: Import Developer ID Application certificate
         id: certificate
-        uses: Apple-Actions/import-codesign-certs@ecbd19dea13f98382982b6b0267f77080d1cfea3 # v7
+        uses: Apple-Actions/import-codesign-certs@4cfe2fe1e08914305eba4f8bd021d9544e2e8040 # v7
         with:
           p12-file-base64: ${{ secrets.APPLE_DEV_ID_APP }}
           p12-password: ${{ secrets.APPLE_DEV_ID_APP_PASS }}
