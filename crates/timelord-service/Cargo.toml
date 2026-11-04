@@ -11,7 +11,7 @@ timelord-core = { path = "../timelord-core" }
 vdf-client-protocol = { path = "../vdf-client-protocol" }
 anyhow.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-yaml-rust2 = "0.11"
+yaml-rust2 = "0.13"
 libc.workspace = true
 axum.workspace = true
 clap.workspace = true
@@ -34,4 +34,4 @@ num-bigint.workspace = true
 x509-cert.workspace = true
 
 [dev-dependencies]
-rcgen = "0.13"
+rcgen = "0.14"
