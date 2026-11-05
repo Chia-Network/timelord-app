@@ -230,12 +230,6 @@ async fn replace(
     process: &Arc<operational::State>,
     current: &watch::Sender<Arc<Shared>>,
 ) -> Result<Run> {
-    let _topology = process.progress.begin(
-        timelord_supervisor::progress::Resource::Topology,
-        0,
-        0,
-        timelord_supervisor::progress::Stage::TopologyChange,
-    );
     // Validate the replacement before interrupting healthy work.
     let prepared = match hardware::prepare(&config).await {
         Ok(prepared) => prepared,
@@ -244,6 +238,12 @@ async fn replace(
             return Ok(run);
         }
     };
+    let _topology = process.progress.begin(
+        timelord_supervisor::progress::Resource::Topology,
+        0,
+        0,
+        timelord_supervisor::progress::Stage::TopologyChange,
+    );
     {
         let mut runtime = run.shared.runtime.lock().expect("runtime");
         config.service.tuning_paused = runtime.tuning_paused;
