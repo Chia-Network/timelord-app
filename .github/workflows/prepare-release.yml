@@ -17,16 +17,16 @@ concurrency:
 
 jobs:
   prepare:
-    name: Open version bump PR
+    name: Commit version and start release
     if: github.repository == 'Chia-Network/timelord-app'
     runs-on: macos-15
     timeout-minutes: 45
     permissions:
       contents: write
-      pull-requests: write
       actions: write
     env:
-      GH_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ secrets.RELEASE_PREPARE_TOKEN || github.token }}
+      USE_AUTOMATION_TOKEN: ${{ secrets.RELEASE_PREPARE_TOKEN != '' }}
       GH_REPO: ${{ github.repository }}
       VERSION: ${{ inputs.version }}
     steps:
@@ -40,17 +40,16 @@ jobs:
           persist-credentials: false
       - name: Configure authenticated Git access
         run: gh auth setup-git
-      - name: Validate version and reserve a fresh branch
+      - name: Validate version and require a fresh tag
         run: |
           number='(0|[1-9][0-9]*)'
           [[ "$VERSION" =~ ^${number}\.${number}\.${number}(-(beta|rc)\.${number})?$ ]]
           test "$VERSION" != "$(bash scripts/release-version.sh)"
-          existing_refs="$(git ls-remote origin "refs/tags/v$VERSION" "refs/heads/release/v$VERSION")"
+          existing_refs="$(git ls-remote origin "refs/tags/v$VERSION")"
           if [[ -n "$existing_refs" ]]; then
-            echo "Tag v$VERSION or preparation branch release/v$VERSION already exists." >&2
+            echo "Tag v$VERSION already exists. Retry Release against that tag, or choose a new version." >&2
             exit 1
           fi
-          git switch -c "release/v$VERSION"
       - name: Install build dependencies
         run: brew install cmake gmp boost prometheus
       - name: Set up Rust
@@ -59,24 +58,21 @@ jobs:
           rustup default stable
       - name: Update workspace and lockfile versions
         run: bash scripts/prepare-release.sh "$VERSION"
-      - name: Commit and push version bump
+      - name: Commit version and atomically push main and tag
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add Cargo.toml Cargo.lock
-          git commit -m "Prepare release v$VERSION"
-          git push origin "HEAD:refs/heads/release/v$VERSION"
-      - name: Open pull request and start CI
+          bash scripts/push-release.sh "$VERSION"
+          echo "Created v$VERSION at $(git rev-parse HEAD)." >> "$GITHUB_STEP_SUMMARY"
+          echo "To retry Release: gh workflow run release.yml --ref v$VERSION" >> "$GITHUB_STEP_SUMMARY"
+      - name: Start Release against the version tag
+        if: env.USE_AUTOMATION_TOKEN != 'true'
         run: |
-          cat > "$RUNNER_TEMP/release-body.md" <<EOF
-          Prepare Timelord v$VERSION by updating the workspace version and Cargo lockfile.
-
-          After this PR merges and checks pass, tag the merged version commit with
-          \`v$VERSION\` and push the tag to start Release. Review and publish its draft
-          after signing and notarization succeed. See docs/releases.md.
-          EOF
-          url="$(gh pr create --base main --head "release/v$VERSION" \
-            --title "Prepare release v$VERSION" --body-file "$RUNNER_TEMP/release-body.md")"
-          echo "Version bump PR: $url" >> "$GITHUB_STEP_SUMMARY"
-          # Explicit dispatch works with GITHUB_TOKEN without relying on bot PR events.
-          gh workflow run ci.yml --ref "release/v$VERSION"
+          # Tags pushed with GITHUB_TOKEN do not trigger push workflows.
+          # Release runs CI itself before signing and creating the draft.
+          gh workflow run release.yml --ref "v$VERSION"
+      - name: Report release handoff
+        run: |
+          # An automation token's tag push triggers Release directly; dispatching
+          # as well would start a second signed build for the same tag.
+          echo "Release started for v$VERSION. Follow Actions → Release, then review and publish its draft." >> "$GITHUB_STEP_SUMMARY"
