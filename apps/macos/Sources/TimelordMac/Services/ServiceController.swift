@@ -50,7 +50,8 @@ final class ServiceController {
     }
 
     /// Fresh revision protects a remote administrator's concurrent Pause/Run.
-    private func control(_ command: SupervisorClient.Command) async throws {
+    @discardableResult
+    private func control(_ command: SupervisorClient.Command) async throws -> SupervisorStatus {
         guard !changingIntent else { throw ConfigurationError.message("A background service change is already in progress.") }
         controlEpoch &+= 1
         changingIntent = true; defer { changingIntent = false; onChange?() }
@@ -64,6 +65,7 @@ final class ServiceController {
         do {
             supervisor = try await client.send(command, expectedRevision: current.revision)
             errorMessage = supervisor?.error
+            return current
         } catch {
             if let refreshed = try? await client.send(.status) { observe(refreshed) }
             errorMessage = error.localizedDescription; throw error
@@ -73,7 +75,7 @@ final class ServiceController {
         supervisor = status
         hasObservedSupervisor = true
     }
-    func start() async throws { try await control(.resume) }
+    func start() async throws -> Bool { try await control(.resume).mode == .paused }
     func stop() async throws { try await control(.pause) }
     func reload() async throws { try await control(.reload) }
 

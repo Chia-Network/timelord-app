@@ -206,7 +206,11 @@ final class TimelordModel: ObservableObject {
         defer { controlOperation = nil; updateSnapshot() }
         do {
             switch operation {
-            case .start: try await controller.start()
+            case .start:
+                if try await controller.start() {
+                    // Only a fresh Resume applies the saved configuration.
+                    configurationNeedsRestart = false; useSavedStatusEndpoint()
+                }
             case .pause:
                 try await controller.stop()
                 liveStatus = nil; history = nil

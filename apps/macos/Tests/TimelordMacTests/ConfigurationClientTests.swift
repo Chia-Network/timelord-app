@@ -84,6 +84,34 @@ final class ConfigurationClientTests: XCTestCase {
     }
 
     @MainActor
+    func testRunAppliesSettingsSavedWhilePausedWithoutRestartingAgain() async throws {
+        let fixture = try SupervisedFixture()
+        defer { fixture.close() }
+        let saved = AppConfiguration()
+        try await fixture.launch(saved)
+        try await fixture.controller.stop()
+        let model = TimelordModel(controller: fixture.controller, initialConfiguration: saved, monitoringEnabled: false)
+        model.configuration.service.statusListen = "127.0.0.1:18190"
+        await model.saveConfiguration()
+        XCTAssertTrue(model.configurationNeedsRestart)
+
+        model.startService()
+        try await fixture.waitForWorker()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while model.isBusy && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(model.isBusy)
+        XCTAssertFalse(model.configurationNeedsRestart)
+        XCTAssertEqual(model.statusURL.absoluteString, "http://127.0.0.1:18190/v1/status")
+        let generation = try XCTUnwrap(fixture.controller.supervisor?.workerGeneration)
+        let dismissed = await model.finishSettings()
+        XCTAssertTrue(dismissed)
+        await fixture.controller.refresh()
+        XCTAssertEqual(fixture.controller.supervisor?.workerGeneration, generation)
+    }
+
+    @MainActor
     func testSaveAndRestartPersistsBeforeReplacingOnlyTheOwnedFixtureProcess() async throws {
         let fixture = try SupervisedFixture()
         defer { fixture.close() }
