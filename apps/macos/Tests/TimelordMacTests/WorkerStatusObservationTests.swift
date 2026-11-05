@@ -34,7 +34,7 @@ final class WorkerStatusObservationTests: XCTestCase {
         for instant in [deadline, deadline.advanced(by: .seconds(30))] {
             // Discovery/settings may rebuild presentation before another fetch finishes.
             let snapshot = LivePresentation.snapshot(status: nil,
-                starting: observation.isStarting(at: instant), error: observation.failure(at: instant))
+                controlOperation: observation.isStarting(at: instant) ? .start : nil, error: observation.failure(at: instant))
             XCTAssertEqual(snapshot.phase, .serviceUnavailable)
             XCTAssertFalse(snapshot.readyToRun)
             XCTAssertEqual(snapshot.explanation, "The local service did not respond within 60 seconds. Check its log.")

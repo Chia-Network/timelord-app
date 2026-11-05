@@ -29,7 +29,7 @@ actor ConfigurationClient {
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
         return try decoder.decode(T.self, from: data)
     }
-    private func run(_ arguments: [String]) async throws -> Data {
+    func run(_ arguments: [String]) async throws -> Data {
         try Task.checkCancellation()
         guard FileManager.default.isExecutableFile(atPath: helper.path) else { throw ConfigurationError.message("The service helper could not be found.") }
         let process = Process(); process.executableURL = helper; process.arguments = arguments

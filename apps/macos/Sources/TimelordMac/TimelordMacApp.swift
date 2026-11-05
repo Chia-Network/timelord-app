@@ -25,7 +25,7 @@ private struct TimelordScenes: Scene {
         MenuBarExtra {
             MenuStatus(model: model)
         } label: {
-            Image(nsImage: MenuBarIcon.image(for: MenuBarGlyph(phase: model.snapshot.phase)))
+            Image(nsImage: MenuBarIcon.image(for: MenuBarGlyph(snapshot: model.snapshot)))
                 .renderingMode(.template)
                 .accessibilityLabel("Timelord, \(model.snapshot.phase.title)")
         }

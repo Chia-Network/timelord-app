@@ -1,11 +1,11 @@
 # Architecture
 
 ```text
-SwiftUI app + menu bar → Rust coordinator ↔ existing Chia full node
-                                 ↕ local TCP
-                         native chiavdf clients
-                                 ↕ USB
-                             ASIC boards
+macOS launchd → independent Rust supervisor → Rust coordinator ↔ Chia full node
+                       ↑                            ↕ local TCP
+                SwiftUI / SSH CLI           native chiavdf clients
+                                                    ↕ USB
+                                                 ASIC boards
 ```
 
 `apps/macos` contains the interface and pure presentation model. `timelord-core`
@@ -27,17 +27,21 @@ without an active trial.
 
 ## Process ownership
 
-One coordinator owns its native clients. The UI starts and stops only its own
-coordinator, and matches status/history by service PID. It may observe an external
-service without taking ownership. All configured listeners are bound before work
-starts, and board initialization is sequential. A configured board or connected
-socket is not evidence of functioning hardware.
+The non-root boot supervisor owns durable Run/Pause intent, exclusive coordinator
+ownership and crash replacement. The GUI is an optional same-user control client;
+quitting it never sends Pause. Mutating commands use revisions to reject stale
+intent updates. Pause is persisted before acknowledgment and survives reboot.
+Reload retires the worker family without changing desired Run/Pause.
 
-App startup waits for configuration, physical enumeration and a confirmed absent
-status listener. Invalid/stale/timed-out responses do not establish absence.
-It makes one startup attempt per app launch and respects Pause, unsaved settings
-and shutdown. Starting at macOS login and crash-independent launch-agent ownership
-are outside the current implementation.
+Each worker owns a process group. Normal replacement terminates descendants before
+reaping the leader; a dedicated lifetime-pipe thread terminates a worker whose
+supervisor disappears and hard-kills its group after 30 seconds even if its async
+runtime is wedged. Neither mechanism establishes USB hardware quiescence under a
+wedged driver; native and physical fault qualification are separate requirements.
+Exclusive worker locks prevent a second coordinator from starting. Installation
+refuses an existing legacy listener instead of terminating arbitrary processes.
+All configured listeners are bound before work starts, and board initialization is
+sequential. Worker presence, configured hardware and sockets are not productivity.
 
 Discovery calls only D2XX inventory APIs in a disposable helper process; it sends
 no engine, voltage or clock commands. The proof service never loads the USB driver.

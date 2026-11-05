@@ -5,6 +5,43 @@ import XCTest
 final class PresentationTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_000_000)
 
+    func testPauseCleanupIsDistinctFromStartingAndCompletedPause() throws {
+        let status = try operationalStatus()
+        let pausing = LivePresentation.snapshot(status: status, controlOperation: .pause, now: now)
+        XCTAssertEqual(pausing.phase, .pausing)
+        XCTAssertEqual(pausing.phase.title, "Pausing")
+        XCTAssertEqual(pausing.timelord.title, "Stopping")
+        XCTAssertEqual(pausing.explanation, "Pausing Timelord; waiting for the worker to stop.")
+        let paused = LivePresentation.snapshot(status: nil, paused: true, now: now)
+        XCTAssertEqual(paused.phase, .paused)
+        let starting = LivePresentation.snapshot(status: nil, controlOperation: .start, now: now)
+        XCTAssertEqual(starting.phase, .starting)
+        let runningReload = LivePresentation.snapshot(status: status, controlOperation: .reload, now: now)
+        XCTAssertEqual(runningReload.phase, .restarting)
+        XCTAssertEqual(runningReload.explanation, "Restarting Timelord; waiting for the previous worker to stop.")
+        let pausedReload = LivePresentation.snapshot(status: nil, paused: true, controlOperation: .reload, now: now)
+        XCTAssertEqual(pausedReload.phase, .paused)
+    }
+
+    func testResponsiveFaultIsNotPresentedAsAnUnresponsiveWorker() throws {
+        let data = Data("""
+        {"api_version":1,"service_pid":123,"timelord_state":"fault","message":"Proof verification failed","production_enabled":true,"full_node":{"host":"localhost","state":"ready"},"boards":[],"started_unix":999000,"timestamp_unix":1000000,"proofs_delivered":0,"tuning_paused":false}
+        """.utf8)
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let status = try decoder.decode(ServiceStatus.self, from: data)
+        let snapshot = LivePresentation.snapshot(status: status, workerPID: status.servicePid, now: now)
+        XCTAssertEqual(snapshot.phase, .serviceUnavailable)
+        XCTAssertEqual(snapshot.timelord.title, "Stopped")
+    }
+
+    func testUnresponsiveWorkerIsNotPresentedAsStoppedUntilAbsent() {
+        let existing = LivePresentation.snapshot(status: nil, workerPID: 123, error: "Status unavailable", now: now)
+        XCTAssertEqual(existing.phase, .serviceUnavailable)
+        XCTAssertEqual(existing.timelord.title, "Not responding")
+        let absent = LivePresentation.snapshot(status: nil, error: "Status unavailable", now: now)
+        XCTAssertEqual(absent.timelord.title, "Stopped")
+    }
+
     func testServiceUptimeSurvivesAnEngineSessionRestart() throws {
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
         func status(sessionStart: Double) throws -> ServiceStatus {
@@ -353,11 +390,10 @@ extension PresentationTests {
         config.hardware = BoardDiscovery.reconcile([device], hardware: config.hardware)
         let ready = LivePresentation.snapshot(status: nil, configuration: config, detectedDevices: [device], now: now)
         XCTAssertEqual(ready.runningTitle, "Ready to run")
-        XCTAssertTrue(ready.explanation.contains("Press Run"))
-        XCTAssertTrue(ready.explanation.contains("Automatic tuning"))
+        XCTAssertTrue(ready.explanation.contains("Enable the background service"))
         config.service.startAutomatically = true
         let automaticStart = LivePresentation.snapshot(status: nil, configuration: config, detectedDevices: [device], now: now)
-        XCTAssertTrue(automaticStart.explanation.contains("starts automatically"))
+        XCTAssertEqual(automaticStart.explanation, ready.explanation, "Legacy app-start preference cannot override durable intent")
         XCTAssertNil(ready.proofsToday)
         let paused = LivePresentation.snapshot(status: nil, configuration: config, detectedDevices: [device], paused: true, now: now)
         XCTAssertEqual(paused.runningTitle, "Paused")

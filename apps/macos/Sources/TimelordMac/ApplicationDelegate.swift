@@ -7,18 +7,15 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate {
     private let reply: (Bool) -> Void
     private var terminating = false
     private var readyToTerminate = false
-    private let shutdownTimeout: TimeInterval
 
     override init() {
         model = TimelordModel()
-        shutdownTimeout = 30
         reply = { NSApplication.shared.reply(toApplicationShouldTerminate: $0) }
         super.init()
     }
 
-    init(model: TimelordModel, shutdownTimeout: TimeInterval = 30, reply: @escaping (Bool) -> Void) {
+    init(model: TimelordModel, reply: @escaping (Bool) -> Void) {
         self.model = model
-        self.shutdownTimeout = shutdownTimeout
         self.reply = reply
         super.init()
     }
@@ -28,10 +25,9 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate {
         guard !terminating else { return .terminateLater }
         terminating = true
         Task {
-            let stopped = await model.prepareForTermination(timeout: shutdownTimeout)
-            readyToTerminate = stopped
-            terminating = false
-            reply(stopped)
+            await model.prepareForTermination()
+            readyToTerminate = true
+            reply(true)
         }
         return .terminateLater
     }

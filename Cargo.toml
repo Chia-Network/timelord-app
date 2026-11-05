@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/timelord-core", "crates/vdf-client-protocol", "crates/timelord-service"]
+members = ["crates/timelord-core", "crates/vdf-client-protocol", "crates/timelord-service", "crates/timelord-supervisor"]
 resolver = "3"
 
 [workspace.package]

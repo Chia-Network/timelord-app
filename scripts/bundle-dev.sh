@@ -13,7 +13,7 @@ DRIVERS="${CHIAVDF_DRIVERS:-$(dirname "$CLIENT")/hw/libft4222}"
 for name in libft4222.dylib libftd2xx.dylib; do
   [[ -f "$DRIVERS/$name" ]] || { echo "Missing FTDI library: $DRIVERS/$name" >&2; exit 1; }
 done
-cargo build --release --locked -p timelord-service
+cargo build --release --locked -p timelord-service -p timelord-supervisor
 swift build --configuration release --package-path apps/macos --scratch-path build/swift
 SWIFT_BIN_DIR="$(swift build --configuration release --package-path apps/macos --scratch-path build/swift --show-bin-path)"
 APP="${TIMELORD_APP_BUNDLE:-$PROJECT_ROOT/build/Timelord.app}"
@@ -22,6 +22,8 @@ APP="${TIMELORD_APP_BUNDLE:-$PROJECT_ROOT/build/Timelord.app}"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$APP/Contents/Frameworks" "$APP/Contents/Resources/ThirdParty"
 cp "$SWIFT_BIN_DIR/TimelordMac" "$APP/Contents/MacOS/TimelordMac"
 cp build/rust/release/timelord-service "$APP/Contents/Helpers/timelord-service"
+cp build/rust/release/timelord-supervisor "$APP/Contents/Helpers/timelord-supervisor"
+cp scripts/install-service.sh "$APP/Contents/Resources/install-service.sh"
 cp "$CLIENT" "$APP/Contents/Helpers/hw_vdf_client"
 cp "$DRIVERS/libft4222.dylib" "$DRIVERS/libftd2xx.dylib" "$APP/Contents/Frameworks/"
 # GMP is dynamically linked by chiavdf. Include the actual linked versions.
@@ -80,12 +82,13 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST
-for binary in "$APP/Contents/MacOS/TimelordMac" "$APP/Contents/Helpers/timelord-service"; do
+for binary in "$APP/Contents/MacOS/TimelordMac" "$APP/Contents/Helpers/timelord-service" "$APP/Contents/Helpers/timelord-supervisor"; do
   while IFS= read -r dependency; do
     case "$dependency" in /usr/lib/*|/System/Library/*) ;; *) echo "Unbundled application dependency: $dependency" >&2; exit 1 ;; esac
   done < <(dependencies "$binary")
 done
 codesign --force --sign - "$APP/Contents/Helpers/timelord-service"
+codesign --force --sign - "$APP/Contents/Helpers/timelord-supervisor"
 codesign --force --sign - "$APP"
 codesign --verify --deep --strict "$APP"
 "$APP/Contents/Helpers/hw_vdf_client" --control-version

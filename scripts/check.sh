@@ -12,7 +12,9 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 if [[ "$(uname -s)" == Darwin ]]; then
-  cargo build --locked -p timelord-service
+  cargo build --locked -p timelord-service -p timelord-supervisor
+  bash scripts/installer-inputs-test.sh
+  bash scripts/installer-remove-test.sh
   swift build --package-path apps/macos --scratch-path build/swift
   swift test --package-path apps/macos --scratch-path build/swift
 fi
