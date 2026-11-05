@@ -75,6 +75,7 @@ pub(super) async fn supervise_board(
     mut budget: RestartBackoff,
 ) {
     let mut ready = Some(ready);
+    let mut previous_failure = crate::observability::RestartReason::Topology;
     loop {
         if *shutdown.borrow() {
             return;
@@ -88,6 +89,7 @@ pub(super) async fn supervise_board(
             hardware.generation += 1;
             hardware.started_unix = crate::unix_now();
             hardware.state = "starting".into();
+            hardware.native_initialized = false;
             hardware.raw_speeds.clear();
             hardware.temperature_unix = 0;
             hardware.temperature_c = None;
@@ -123,6 +125,13 @@ pub(super) async fn supervise_board(
         let result = match preparation {
             Ok(()) => match launch(&shared, &board).await {
                 Ok(child) => {
+                    {
+                        let metrics = shared.process.metrics.clone();
+                        metrics.client_started(
+                            &crate::observability::board(&shared.config, &board.id),
+                            previous_failure,
+                        );
+                    }
                     supervise(
                         shared.clone(),
                         board.clone(),
@@ -149,6 +158,16 @@ pub(super) async fn supervise_board(
             return;
         }
         let error = result.unwrap_err();
+        previous_failure = crate::observability::restart_reason(&error);
+        {
+            let state = shared.runtime.lock().expect("runtime");
+            let label = crate::observability::board(&shared.config, &board.id);
+            if thermal_rejection(&error)
+                && !state.boards.get(&board.id).is_some_and(|b| b.latched_fault)
+            {
+                shared.process.metrics.thermal_stopped(&label);
+            }
+        }
         let delay = budget.next(established(
             &shared,
             &board,

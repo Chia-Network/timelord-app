@@ -6,25 +6,30 @@ async fn control_accept_errors_back_off_and_keep_listener_and_worker() {
     let helper = dir.join("worker");
     fs::write(&helper, "#!/bin/sh\ncat >/dev/null\n").unwrap();
     fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
-    let worker = Worker::spawn(&helper, &dir.join("config.toml")).unwrap();
+    let worker = Worker::spawn(
+        &helper,
+        &dir.join("config.toml"),
+        &dir.join("progress.sock"),
+        1,
+    )
+    .unwrap();
     let pid = worker.process.pid() as i32;
     let socket = dir.join("control.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let inode = fs::symlink_metadata(&socket).unwrap().ino();
     let mut state = SupervisorState::new(Ok(Intent::default()));
-    state.lifecycle = Lifecycle::Running(worker);
-    let (snapshots, current) = watch::channel(state.snapshot());
+    state.lifecycle = Lifecycle::Running(Box::new(worker));
+    let (snapshots, current) = watch::channel(state.published());
     let (tx, _rx) = mpsc::channel(16);
     let started = Instant::now();
-    let acceptor = tokio::spawn(accept_controls(
+    let acceptor = tokio::spawn(accept_controls_with(
+        AcceptBackoff::with_injected([
+            std::io::Error::from_raw_os_error(libc::ECONNABORTED),
+            std::io::Error::from_raw_os_error(libc::EMFILE),
+        ]),
         listener,
         current,
         tx,
-        [
-            std::io::Error::from_raw_os_error(libc::ECONNABORTED),
-            std::io::Error::from_raw_os_error(libc::EMFILE),
-        ]
-        .into(),
     ));
     let mut stream = UnixStream::connect(&socket).await.unwrap();
     stream
@@ -61,7 +66,13 @@ async fn interrupted_wait_retains_worker_identity_and_graceful_cleanup() {
     let helper = dir.join("worker");
     fs::write(&helper, "#!/bin/sh\ncat >/dev/null\n").unwrap();
     fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
-    let worker = Worker::spawn(&helper, &dir.join("config.toml")).unwrap();
+    let worker = Worker::spawn(
+        &helper,
+        &dir.join("config.toml"),
+        &dir.join("progress.sock"),
+        1,
+    )
+    .unwrap();
     let pid = worker.process.pid() as i32;
     worker
         .process
@@ -70,11 +81,16 @@ async fn interrupted_wait_retains_worker_identity_and_graceful_cleanup() {
         .unwrap()
         .extend([libc::EINTR, libc::EINTR]);
     let mut state = SupervisorState::new(Ok(Intent::default()));
-    state.lifecycle = Lifecycle::Running(worker);
-    let (snapshots, _) = watch::channel(state.snapshot());
+    state.lifecycle = Lifecycle::Running(Box::new(worker));
+    let (snapshots, _) = watch::channel(state.published());
     for _ in 0..2 {
         state
-            .tick(&helper, &dir.join("config.toml"), &snapshots)
+            .tick(
+                &helper,
+                &dir.join("config.toml"),
+                &dir.join("progress.sock"),
+                &snapshots,
+            )
             .await
             .unwrap();
         assert_eq!(state.snapshot().worker_pid, Some(pid as u32));
@@ -119,12 +135,13 @@ async fn failed_pause_retains_owner_and_power_until_confirmed_cleanup() {
     fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
     let paths = Paths::for_config(&dir.join("config.toml")).unwrap();
     for resume in [false, true] {
-        let mut worker = Worker::spawn(&helper, &paths.config).unwrap();
+        let mut worker =
+            Worker::spawn(&helper, &paths.config, &dir.join("progress.sock"), 1).unwrap();
         let pid = worker.process.pid() as i32;
         worker.stop_failures = if resume { 2 } else { 1 };
         let mut state = SupervisorState::new(Ok(Intent::default()));
-        state.lifecycle = Lifecycle::Running(worker);
-        let (snapshots, _) = watch::channel(state.snapshot());
+        state.lifecycle = Lifecycle::Running(Box::new(worker));
+        let (snapshots, _) = watch::channel(state.published());
         let request = |command| Request {
             command,
             expected_revision: None,
@@ -143,7 +160,12 @@ async fn failed_pause_retains_owner_and_power_until_confirmed_cleanup() {
         assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
         // No replacement is admitted while the cleanup retry is pending.
         state
-            .tick(&helper, &paths.config, &snapshots)
+            .tick(
+                &helper,
+                &paths.config,
+                &dir.join("progress.sock"),
+                &snapshots,
+            )
             .await
             .unwrap();
         assert_eq!(state.snapshot().worker_pid, Some(pid as u32));
@@ -168,7 +190,12 @@ async fn failed_pause_retains_owner_and_power_until_confirmed_cleanup() {
             };
             *next = Instant::now();
             state
-                .tick(&helper, &paths.config, &snapshots)
+                .tick(
+                    &helper,
+                    &paths.config,
+                    &dir.join("progress.sock"),
+                    &snapshots,
+                )
                 .await
                 .unwrap();
         }
@@ -201,7 +228,7 @@ async fn explicit_resume_retries_paused_start_backoff_but_repeated_resume_does_n
         next: Instant::now() + Duration::from_secs(120),
         error: "Worker start failed".into(),
     };
-    let (snapshots, _) = watch::channel(state.snapshot());
+    let (snapshots, _) = watch::channel(state.published());
     let resume = || Request {
         command: Control::Resume,
         expected_revision: None,

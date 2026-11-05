@@ -309,8 +309,11 @@ pub(crate) fn connected_plan(mut config: Config, devices: Vec<Device>) -> Result
         if config.hardware.boards.len() == 3 {
             break;
         }
-        let port = (18110..=18112)
-            .find(|p| !config.hardware.boards.iter().any(|b| b.client_port == *p))
+        let reserved = config.service.reserved_ports();
+        let port = (18110..=u16::MAX)
+            .find(|p| {
+                !reserved.contains(p) && !config.hardware.boards.iter().any(|b| b.client_port == *p)
+            })
             .context("No board port available")?;
         let mut board: timelord_core::BoardConfig = toml::from_str(&format!(
             "id='usb-{}'\nname='ASIC {}'\nclient_port={port}\ndevice_location={}\nprofile='automatic'",
@@ -404,6 +407,14 @@ pub async fn live_configuration(shared: &crate::Shared) -> Result<Config> {
         return Ok(shared.config.clone());
     }
     let _initialization = crate::hardware::INITIALIZATION.lock().await;
+    // Waiting for a native owner is not a stalled enumeration operation.
+    let process = shared.process.clone();
+    let _discovery = process.progress.begin(
+        timelord_supervisor::progress::Resource::Topology,
+        0,
+        0,
+        timelord_supervisor::progress::Stage::Discovery,
+    );
     let mut devices = discover(&shared.config).await?;
     preserve_managed_boards(
         &shared.config,
@@ -467,6 +478,46 @@ fn preserve_device_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn initialization_wait_does_not_arm_discovery_watchdog() {
+        let metrics = crate::observability::Metrics::new(timelord_core::Network::Mainnet).unwrap();
+        let mut config = Config::default();
+        config.hardware.client_binary = Some("/not-present/client".into());
+        config.hardware.driver_library = Some("/not-present/driver".into());
+        let process = crate::operational::State::new(metrics.clone());
+        let state = crate::runtime::RuntimeState::new(false);
+        let shared = crate::Shared {
+            native: None,
+            config,
+            assignments: vec![],
+            clients: Default::default(),
+            process,
+            runtime: std::sync::Arc::new(std::sync::Mutex::new(state)),
+            started_unix: 0,
+            service_started_unix: 0,
+        };
+        let topology = |sequence| {
+            shared
+                .process
+                .progress
+                .snapshot(0, sequence)
+                .unwrap()
+                .slot(timelord_supervisor::progress::Resource::Topology)
+        };
+        let initialization = crate::hardware::INITIALIZATION.lock().await;
+        let pending = live_configuration(&shared);
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut pending)
+                .await
+                .is_err()
+        );
+        assert!(topology(1).is_none());
+        drop(initialization);
+        assert!(pending.await.is_err());
+        assert!(topology(2).is_none());
+    }
+
     fn configured() -> Config {
         let mut config = Config::default();
         config.hardware.boards = (0..3).map(|i| toml::from_str(&format!(
@@ -484,6 +535,34 @@ mod tests {
                 serial: Some(format!("serial-{i}")),
             })
             .collect()
+    }
+    #[test]
+    fn automatic_ports_skip_http_listeners_across_hotplug() {
+        let mut config = Config::default();
+        config.service.status_listen = "127.0.0.1:18111".parse().unwrap();
+        config.service.observability_listen = Some("[::]:18110".parse().unwrap());
+        config.service.allow_remote_observability = true;
+        config.service.supervisor_observability_listen = "127.0.0.1:18112".parse().unwrap();
+        config.validate().unwrap();
+        for present in [&[0, 1, 2][..], &[], &[0], &[0, 1, 2]] {
+            config = connected_plan(config, devices(present)).unwrap();
+            config.validate().unwrap();
+            assert_eq!(config.hardware.boards.len(), present.len());
+            let ports: std::collections::BTreeSet<_> = config
+                .hardware
+                .boards
+                .iter()
+                .map(|b| b.client_port)
+                .collect();
+            assert_eq!(ports.len(), present.len());
+            assert!(!ports.contains(&18110));
+            assert!(!ports.contains(&18111));
+            assert!(!ports.contains(&18112));
+            assert_eq!(
+                config.assignments().unwrap().len(),
+                if present.is_empty() { 0 } else { 3 }
+            );
+        }
     }
     #[test]
     fn automatic_topology_survives_three_one_zero_two_three_and_remembers_settings() {

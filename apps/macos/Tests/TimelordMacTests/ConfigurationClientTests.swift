@@ -17,6 +17,8 @@ final class ConfigurationClientTests: XCTestCase {
         let client = ConfigurationClient(helper: helper, config: config)
         var value = try await client.load()
         XCTAssertEqual(value.node.host, "localhost")
+        value.service.observabilityListen = "0.0.0.0:9258"
+        value.service.allowRemoteObservability = true
         value.node.host = "fixture.invalid"; value.node.port = 18444; value.node.network = "testnet11"
         value.hardware.boards = (0..<3).map { index in
             var board = ConfiguredBoard(id: "b\(index)", name: "Board \(index)", port: 18110 + index, location: 1 + index)
@@ -28,6 +30,8 @@ final class ConfigurationClientTests: XCTestCase {
         let saved = try await client.load()
         XCTAssertEqual(saved.node.host, "fixture.invalid")
         XCTAssertEqual(saved.node.port, 18444)
+        XCTAssertEqual(saved.service.observabilityListen, "0.0.0.0:9258")
+        XCTAssertTrue(saved.service.allowRemoteObservability)
         XCTAssertEqual(saved.hardware.chainAssignments, value.hardware.chainAssignments)
         XCTAssertEqual(saved.hardware.boards[0].automatic.retestAfterSeconds, 0)
         value.node.host = ""

@@ -387,7 +387,7 @@ extension PresentationTests {
         config.node.certificate = "/fixture/cert"; config.node.privateKey = "/fixture/key"; config.node.caCertificate = "/fixture/ca"
         config.hardware.clientBinary = "/fixture/client"
         let device = DiscoveredDevice(name: "Fixture", location: 1, serial: "fixture-only")
-        config.hardware = BoardDiscovery.reconcile([device], hardware: config.hardware)
+        config.hardware = BoardDiscovery.reconcile([device], hardware: config.hardware, service: config.service)
         let ready = LivePresentation.snapshot(status: nil, configuration: config, detectedDevices: [device], now: now)
         XCTAssertEqual(ready.runningTitle, "Ready to run")
         XCTAssertTrue(ready.explanation.contains("Enable the background service"))
@@ -422,34 +422,51 @@ extension PresentationTests {
             XCTAssertEqual(result.first { $0.serial == "A" }?.location, 8)
             XCTAssertEqual(result.first { $0.location == 7 }?.serial, nil)
         }
-        let reconciled = BoardDiscovery.reconcile(merged, hardware: HardwareConfiguration())
+        let reconciled = BoardDiscovery.reconcile(merged, hardware: HardwareConfiguration(), service: ServiceConfiguration())
         XCTAssertEqual(reconciled.boards.count, 1)
         XCTAssertEqual(reconciled.boards.first?.serial, "A")
     }
 
     func testDetectedBoardsUseAutomaticSeedAndRememberProfilesAcrossUsbPorts() {
         var hardware=HardwareConfiguration()
-        hardware=BoardDiscovery.reconcile([DiscoveredDevice(name:"Chia VDF A",location:4113,serial:"one")],hardware:hardware)
+        hardware=BoardDiscovery.reconcile([DiscoveredDevice(name:"Chia VDF A",location:4113,serial:"one")],hardware:hardware,service:ServiceConfiguration())
         let first=hardware.boards[0]
         XCTAssertEqual(first.profileName,"Automatic")
         XCTAssertEqual(first.frequencyMhz,1450);XCTAssertEqual(first.voltageV,1.0)
         hardware.boards[0].profile="manual";hardware.boards[0].frequencyMhz=1540
-        hardware=BoardDiscovery.reconcile([],hardware:hardware)
+        hardware=BoardDiscovery.reconcile([],hardware:hardware,service:ServiceConfiguration())
         XCTAssertTrue(hardware.boards.isEmpty);XCTAssertEqual(hardware.rememberedBoards.count,1)
-        hardware=BoardDiscovery.reconcile([DiscoveredDevice(name:"Chia VDF A",location:9001,serial:"one")],hardware:hardware)
+        hardware=BoardDiscovery.reconcile([DiscoveredDevice(name:"Chia VDF A",location:9001,serial:"one")],hardware:hardware,service:ServiceConfiguration())
         XCTAssertEqual(hardware.boards[0].id,first.id)
         XCTAssertEqual(hardware.boards[0].profileName,"Manual")
         XCTAssertEqual(hardware.boards[0].frequencyMhz,1540)
         XCTAssertEqual(hardware.boards[0].deviceLocation,9001)
-        hardware=BoardDiscovery.reconcile([DiscoveredDevice(name:"Chia VDF A",location:9001,serial:"replacement")],hardware:hardware)
+        hardware=BoardDiscovery.reconcile([DiscoveredDevice(name:"Chia VDF A",location:9001,serial:"replacement")],hardware:hardware,service:ServiceConfiguration())
         XCTAssertEqual(hardware.boards[0].profileName,"Automatic")
         XCTAssertNotEqual(hardware.boards[0].id,first.id)
+    }
+    func testAutomaticPortsSkipHTTPListenersAcrossHotplug() {
+        var config=AppConfiguration()
+        config.service.statusListen="127.0.0.1:18111"
+        config.service.observabilityListen="[::]:18110"
+        config.service.supervisorObservabilityListen="127.0.0.1:18112"
+        let devices=(0..<3).map {DiscoveredDevice(name:"ASIC",location:4113+$0,serial:"serial-\($0)")}
+        // Also repair remembered client ports when HTTP configuration changes.
+        config.hardware=BoardDiscovery.reconcile(devices,hardware:config.hardware,service:config.service)
+        for count in [3,0,1,3] {
+            config.hardware=BoardDiscovery.reconcile(Array(devices.prefix(count)),hardware:config.hardware,service:config.service)
+            let ports=Set(config.hardware.boards.map(\.clientPort))
+            XCTAssertEqual(ports.count,count)
+            XCTAssertFalse(ports.contains(18110))
+            XCTAssertFalse(ports.contains(18111))
+            XCTAssertFalse(ports.contains(18112))
+        }
     }
     func testAutomaticEngineAssignmentsAndNoConfiguredGhostCards() {
         var config=AppConfiguration()
         let devices=(0..<3).map {DiscoveredDevice(name:"ASIC",location:4113+$0,serial:"serial-\($0)")}
         for (count,expected) in [(1,[3]),(2,[2,1]),(3,[1,1,1])] {
-            config.hardware=BoardDiscovery.reconcile(Array(devices.prefix(count)),hardware:config.hardware)
+            config.hardware=BoardDiscovery.reconcile(Array(devices.prefix(count)),hardware:config.hardware,service:config.service)
             XCTAssertEqual(BoardTopology.counts(config.hardware.boards),expected)
             let snapshot=LivePresentation.snapshot(status:nil,configuration:config,detectedDevices:Array(devices.prefix(count)),now:now)
             XCTAssertEqual(snapshot.boards.count,count)
@@ -459,7 +476,7 @@ extension PresentationTests {
         config.hardware.chainAssignments = ChainAssignments(challenge: "serial-2", reward: "serial-0", infusedChallenge: "serial-1")
         let mapped = LivePresentation.snapshot(status:nil,configuration:config,detectedDevices:devices,now:now)
         XCTAssertEqual(mapped.boards.map { $0.histories.map(\.chain) }, [[.reward], [.infusedChallenge], [.challenge]])
-        let pinned = BoardDiscovery.reconcile([DiscoveredDevice(name: "ASIC", location: 999, serial: "serial-2")], hardware: config.hardware)
+        let pinned = BoardDiscovery.reconcile([DiscoveredDevice(name: "ASIC", location: 999, serial: "serial-2")], hardware: config.hardware, service: config.service)
         XCTAssertEqual(pinned.boards.count, 3)
         XCTAssertEqual(pinned.boards.map(\.serial), config.hardware.boards.map(\.serial))
         XCTAssertEqual(pinned.boards[2].deviceLocation, 999)
@@ -554,7 +571,7 @@ extension PresentationTests {
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
         var restored = try decoder.decode(AppConfiguration.self, from: encoder.encode(config))
         restored.node.host = "another-node"
-        restored.hardware = BoardDiscovery.reconcile([DiscoveredDevice(name: "ASIC", location: 99, serial: "serial-c")], hardware: restored.hardware)
+        restored.hardware = BoardDiscovery.reconcile([DiscoveredDevice(name: "ASIC", location: 99, serial: "serial-c")], hardware: restored.hardware, service: restored.service)
         let saved = try decoder.decode(AppConfiguration.self, from: encoder.encode(restored))
         XCTAssertEqual(saved.hardware.chainAssignments, config.hardware.chainAssignments)
         var json = try XCTUnwrap(JSONSerialization.jsonObject(with: encoder.encode(saved)) as? [String: Any])

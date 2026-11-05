@@ -54,6 +54,12 @@ Status reports supervisor/worker process identity and recovery state. It is **no
 a claim that ASICs are connected or verified proofs are being submitted. Worker
 status/history and the upcoming work watchdog distinguish those stages. A CLI
 request timing out has an unknown outcome: reread status before retrying mutation.
+The supervisor's read-only monitoring listener defaults to `127.0.0.1:9259` and
+stays up while paused or replacing a worker. Choose a reachable
+`service.supervisor_observability_listen` for remote monitoring and re-register
+after changing this address or the network label. See [observability](observability.md)
+for the separate worker metrics, alert matching and readiness semantics.
+
 Logs currently go to `supervisor.log` beside config; bounded log rotation belongs
 to the operational-hardening PR. The supervisor retains idle-sleep protection
 through worker recovery and releases it after Pause cleanup or shutdown.

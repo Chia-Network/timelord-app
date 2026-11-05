@@ -39,13 +39,18 @@ while :; do printf '%s\n' 'ASIC Temp = 40.0 C; Frequency = 1500.0 MHz; freq_idx 
         assignments: config.assignments().unwrap(),
         config,
         clients: Default::default(),
+        process: crate::operational::State::fixture(),
         runtime: Default::default(),
         started_unix: crate::unix_now(),
         service_started_unix: crate::unix_now(),
     });
-    let (backend, _offers) =
-        crate::asic::AsicBackend::new(&shared.config, &shared.assignments, shared.runtime.clone())
-            .unwrap();
+    let (backend, _offers) = crate::asic::AsicBackend::new(
+        &shared.config,
+        &shared.assignments,
+        shared.runtime.clone(),
+        shared.process.clone(),
+    )
+    .unwrap();
     let backend = Arc::new(backend);
     let (stop, rx) = watch::channel(false);
     let (tx, _) = oneshot::channel();

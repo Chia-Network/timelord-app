@@ -10,7 +10,10 @@ c++ -std=c++17 -Wall -Wextra -Werror integrations/chiavdf/tests/live_control_tes
 build/native-control-test
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+TIMELORD_TEST_EXPOSITION="$PROJECT_ROOT/build/observability.prom" cargo test --workspace --locked
+promtool check metrics < build/observability.prom
+promtool check rules monitoring/alerts.yml
+promtool test rules monitoring/alerts.test.yml
 if [[ "$(uname -s)" == Darwin ]]; then
   cargo build --locked -p timelord-service -p timelord-supervisor
   bash scripts/installer-inputs-test.sh

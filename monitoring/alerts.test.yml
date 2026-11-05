@@ -1,0 +1,303 @@
+---
+rule_files:
+- alerts.yml
+evaluation_interval: 30s
+tests:
+- name: constant held IPS, verified progress, ordinary recoveries, idle ICC and paused
+    tuning are healthy
+  interval: 1m
+  input_series:
+  - series: up{job="timelord-app",instance="fixture:9258",network="mainnet"}
+    values: 1+0x130
+  - series: chia_timelord_healthy{job="timelord-app",instance="fixture:9258",network="mainnet"}
+    values: 1+0x130
+  - series: chia_timelord_node_connected{job="timelord-app",instance="fixture:9258",network="mainnet"}
+    values: 1+0x130
+  - series: chia_timelord_estimated_ips{job="timelord-app",instance="fixture:9258",network="mainnet"}
+    values: 1000000+0x130
+  - series: chia_timelord_proofs_verified_total{job="timelord-app",instance="fixture:9258",network="mainnet",chain="challenge"}
+    values: 0+12x130
+  - series: chia_timelord_work_pending{job="timelord-app",instance="fixture:9258",network="mainnet",chain="challenge"}
+    values: 1+0x130
+  - series: chia_timelord_chain_required{job="timelord-app",instance="fixture:9258",network="mainnet",chain="challenge"}
+    values: 1+0x130
+  - series: chia_timelord_chain_available{job="timelord-app",instance="fixture:9258",network="mainnet",chain="challenge"}
+    values: 1+0x130
+  - series: chia_timelord_chain_required{job="timelord-app",instance="fixture:9258",network="mainnet",chain="infused_challenge"}
+    values: 0+0x130
+  - series: chia_timelord_chain_available{job="timelord-app",instance="fixture:9258",network="mainnet",chain="infused_challenge"}
+    values: 0+0x130
+  - series: chia_timelord_work_pending{job="timelord-app",instance="fixture:9258",network="mainnet",chain="infused_challenge"}
+    values: 0+0x130
+  - series: chia_timelord_tuning_paused{job="timelord-app",instance="fixture:9258",network="mainnet"}
+    values: 1+0x130
+  - series: chia_timelord_asic_recoveries_total{job="timelord-app",instance="fixture:9258",network="mainnet",board="serial-a",engine="1"}
+    values: 0+2x130
+  alert_rule_test:
+  - eval_time: 125m
+    alertname: TimelordScrapeFailed
+    exp_alerts: []
+  - eval_time: 125m
+    alertname: TimelordInternalFailure
+    exp_alerts: []
+  - eval_time: 125m
+    alertname: TimelordMetricsMissing
+    exp_alerts: []
+  - eval_time: 125m
+    alertname: TimelordNodeDisconnected
+    exp_alerts: []
+  - eval_time: 125m
+    alertname: TimelordRequiredEngineMissing
+    exp_alerts: []
+  - eval_time: 125m
+    alertname: TimelordProofVerificationFailed
+    exp_alerts: []
+  - eval_time: 125m
+    alertname: TimelordThermalStop
+    exp_alerts: []
+  - eval_time: 125m
+    alertname: TimelordNoVerifiedProgressMainnet
+    exp_alerts: []
+  - eval_time: 125m
+    alertname: TimelordNoVerifiedProgressTestnet
+    exp_alerts: []
+- name: mainnet stall retains the fifteen minute pending interval
+  interval: 1m
+  input_series:
+  - series: up{job="timelord-app",instance="fixture:9258",network="mainnet"}
+    values: 1+0x130
+  - series: chia_timelord_healthy{job="timelord-app",instance="fixture:9258",network="mainnet"}
+    values: 1+0x130
+  - series: chia_timelord_node_connected{job="timelord-app",instance="fixture:9258",network="mainnet"}
+    values: 1+0x130
+  - series: chia_timelord_work_pending{job="timelord-app",instance="fixture:9258",network="mainnet",chain="reward"}
+    values: 1+0x30
+  - series: chia_timelord_proofs_verified_total{job="timelord-app",instance="fixture:9258",network="mainnet",chain="reward"}
+    values: 0+0x30
+  alert_rule_test:
+  - eval_time: 10m
+    alertname: TimelordNoVerifiedProgressMainnet
+    exp_alerts: []
+  - eval_time: 21m
+    alertname: TimelordNoVerifiedProgressMainnet
+    exp_alerts:
+    - exp_labels:
+        job: timelord-app
+        instance: fixture:9258
+        network: mainnet
+        chain: reward
+        severity: warning
+      exp_annotations:
+        summary: Pending VDF work has no verified progress
+- name: missing required engines alert but idle ICC does not
+  interval: 1m
+  input_series:
+  - series: up{job="timelord-app",instance="fixture:9258",network="mainnet"}
+    values: 1+0x130
+  - series: chia_timelord_healthy{job="timelord-app",instance="fixture:9258",network="mainnet"}
+    values: 1+0x130
+  - series: chia_timelord_node_connected{job="timelord-app",instance="fixture:9258",network="mainnet"}
+    values: 1+0x130
+  - series: chia_timelord_chain_required{job="timelord-app",instance="fixture:9258",network="mainnet",chain="reward"}
+    values: 1+0x10
+  - series: chia_timelord_chain_available{job="timelord-app",instance="fixture:9258",network="mainnet",chain="reward"}
+    values: 0+0x10
+  - series: chia_timelord_chain_required{job="timelord-app",instance="fixture:9258",network="mainnet",chain="infused_challenge"}
+    values: 0+0x10
+  - series: chia_timelord_chain_available{job="timelord-app",instance="fixture:9258",network="mainnet",chain="infused_challenge"}
+    values: 0+0x10
+  alert_rule_test:
+  - eval_time: 3m
+    alertname: TimelordRequiredEngineMissing
+    exp_alerts:
+    - exp_labels:
+        job: timelord-app
+        instance: fixture:9258
+        network: mainnet
+        chain: reward
+        severity: warning
+      exp_annotations:
+        summary: A required VDF chain has no usable client
+- name: external node failures do not fail liveness
+  interval: 1m
+  input_series:
+  - series: up{job="timelord-app",instance="fixture:9258",network="mainnet"}
+    values: 1+0x10
+  - series: chia_timelord_healthy{job="timelord-app",instance="fixture:9258",network="mainnet"}
+    values: 1+0x10
+  - series: chia_timelord_node_connected{job="timelord-app",instance="fixture:9258",network="mainnet"}
+    values: 0+0x10
+  alert_rule_test:
+  - eval_time: 6m
+    alertname: TimelordNodeDisconnected
+    exp_alerts:
+    - exp_labels:
+        job: timelord-app
+        instance: fixture:9258
+        network: mainnet
+        severity: warning
+      exp_annotations:
+        summary: Timelord is disconnected from its full node
+  - eval_time: 6m
+    alertname: TimelordInternalFailure
+    exp_alerts: []
+- name: internal failure and scrape failures
+  interval: 1m
+  input_series:
+  - series: up{job="timelord-app",instance="fixture:9258",network="mainnet"}
+    values: 0+0x10
+  - series: chia_timelord_healthy{job="timelord-app",instance="fixture:9258",network="mainnet"}
+    values: 0+0x10
+  alert_rule_test:
+  - eval_time: 3m
+    alertname: TimelordInternalFailure
+    exp_alerts:
+    - exp_labels:
+        job: timelord-app
+        instance: fixture:9258
+        network: mainnet
+        severity: critical
+      exp_annotations:
+        summary: Timelord supervision is unhealthy
+  - eval_time: 3m
+    alertname: TimelordScrapeFailed
+    exp_alerts:
+    - exp_labels:
+        job: timelord-app
+        instance: fixture:9258
+        network: mainnet
+        severity: critical
+      exp_annotations:
+        summary: Timelord metrics cannot be scraped
+- name: verification and thermal events
+  interval: 1m
+  input_series:
+  - series: chia_timelord_proof_verification_failures_total{job="timelord-app",instance="fixture:9258",network="mainnet",chain="reward"}
+    values: 0 0 1 1
+  - series: chia_timelord_thermal_stops_total{job="timelord-app",instance="fixture:9258",network="mainnet",board="serial-a"}
+    values: 0 0 1 1
+  alert_rule_test:
+  - eval_time: 3m
+    alertname: TimelordProofVerificationFailed
+    exp_alerts:
+    - exp_labels:
+        job: timelord-app
+        instance: fixture:9258
+        network: mainnet
+        chain: reward
+        severity: critical
+      exp_annotations:
+        summary: Native VDF proof verification failed
+  - eval_time: 3m
+    alertname: TimelordThermalStop
+    exp_alerts:
+    - exp_labels:
+        job: timelord-app
+        instance: fixture:9258
+        network: mainnet
+        board: serial-a
+        severity: critical
+      exp_annotations:
+        summary: An ASIC stopped at its temperature guard
+- name: counter resets with continuing work do not look like stalls
+  interval: 1m
+  input_series:
+  - series: up{job="timelord-app",instance="fixture:9258",network="mainnet"}
+    values: 1+0x130
+  - series: chia_timelord_healthy{job="timelord-app",instance="fixture:9258",network="mainnet"}
+    values: 1+0x130
+  - series: chia_timelord_node_connected{job="timelord-app",instance="fixture:9258",network="mainnet"}
+    values: 1+0x130
+  - series: chia_timelord_proofs_verified_total{job="timelord-app",instance="fixture:9258",network="mainnet",chain="challenge"}
+    values: 100+1x10 0+1x30
+  - series: chia_timelord_work_pending{job="timelord-app",instance="fixture:9258",network="mainnet",chain="challenge"}
+    values: 1+0x45
+  alert_rule_test:
+  - eval_time: 35m
+    alertname: TimelordNoVerifiedProgressMainnet
+    exp_alerts: []
+- name: missing metrics are detected
+  interval: 1m
+  input_series:
+  - series: up{job="timelord-app",instance="fixture:9258",network="mainnet"}
+    values: 1+0x5
+  alert_rule_test:
+  - eval_time: 3m
+    alertname: TimelordMetricsMissing
+    exp_alerts:
+    - exp_labels:
+        job: timelord-app
+        instance: fixture:9258
+        network: mainnet
+        severity: warning
+      exp_annotations:
+        summary: Timelord health metric is missing
+- name: testnet retains two hour no-progress interval
+  interval: 1m
+  input_series:
+  - series: chia_timelord_node_connected{job="timelord-app",instance="fixture:9258",network="testnet11"}
+    values: 1+0x130
+  - series: chia_timelord_work_pending{job="timelord-app",instance="fixture:9258",network="testnet11",chain="challenge"}
+    values: 1+0x130
+  - series: chia_timelord_proofs_verified_total{job="timelord-app",instance="fixture:9258",network="testnet11",chain="challenge"}
+    values: 0+0x130
+  alert_rule_test:
+  - eval_time: 30m
+    alertname: TimelordNoVerifiedProgressTestnet
+    exp_alerts: []
+  - eval_time: 125m
+    alertname: TimelordNoVerifiedProgressTestnet
+    exp_alerts:
+    - exp_labels:
+        job: timelord-app
+        instance: fixture:9258
+        network: testnet11
+        chain: challenge
+        severity: warning
+      exp_annotations:
+        summary: Pending VDF work has no verified progress
+
+- name: durable Pause suppresses worker scrape alerts while supervisor remains monitored
+  interval: 30s
+  input_series:
+  - series: up{job="timelord-app",instance="fixture:9258",network="mainnet",region="msp",instance_name="mac-01"}
+    values: 0+0x20
+  - series: up{job="timelord-supervisor",instance="fixture:9259",network="mainnet",region="msp",instance_name="mac-01"}
+    values: 1+0x20
+  - series: chia_timelord_supervisor_desired_running{job="timelord-supervisor",instance="fixture:9259",network="mainnet",region="msp",instance_name="mac-01"}
+    values: 0+0x20
+  - series: chia_timelord_supervisor_worker_up{job="timelord-supervisor",instance="fixture:9259",network="mainnet",region="msp",instance_name="mac-01"}
+    values: 0+0x20
+  - series: chia_timelord_supervisor_healthy{job="timelord-supervisor",instance="fixture:9259",network="mainnet",region="msp",instance_name="mac-01"}
+    values: 1+0x20
+  alert_rule_test:
+  - eval_time: 10m
+    alertname: TimelordScrapeFailed
+    exp_alerts: []
+  - eval_time: 10m
+    alertname: TimelordSupervisorScrapeFailed
+    exp_alerts: []
+  - eval_time: 10m
+    alertname: TimelordSupervisorUnhealthy
+    exp_alerts: []
+  - eval_time: 10m
+    alertname: TimelordWorkerUnavailable
+    exp_alerts: []
+- name: desired Run with no worker is an availability failure
+  interval: 30s
+  input_series:
+  - series: chia_timelord_supervisor_desired_running{job="timelord-supervisor",instance="fixture:9259",network="mainnet"}
+    values: 1+0x10
+  - series: chia_timelord_supervisor_worker_up{job="timelord-supervisor",instance="fixture:9259",network="mainnet"}
+    values: 0+0x10
+  alert_rule_test:
+  - eval_time: 3m
+    alertname: TimelordWorkerUnavailable
+    exp_alerts:
+    - exp_labels:
+        job: timelord-supervisor
+        instance: fixture:9259
+        network: mainnet
+        severity: warning
+      exp_annotations:
+        summary: Timelord is requested to run but has no worker

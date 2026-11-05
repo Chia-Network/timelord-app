@@ -45,8 +45,22 @@ impl Fixture {
         path
     }
     fn supervisor(&self, helper: &Path) -> Child {
-        Command::new(env!("CARGO_BIN_EXE_timelord-supervisor"))
-            .arg("run")
+        self.supervisor_with_monitor(helper, None)
+    }
+    fn supervisor_with_monitor(&self, helper: &Path, monitor: Option<u16>) -> Child {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_timelord-supervisor"));
+        if let Some(port) = monitor {
+            command.args([
+                "run",
+                "--monitor-listen",
+                &format!("127.0.0.1:{port}"),
+                "--network",
+                "testnet11",
+            ]);
+        } else {
+            command.arg("run");
+        }
+        command
             .arg("--config")
             .arg(self.config())
             .arg("--worker")
@@ -449,6 +463,157 @@ fn concurrent_first_status_and_start_create_private_state_atomically() {
     });
 }
 
+#[tokio::test]
+async fn progress_reporter_fixture() {
+    if std::env::var_os("TIMELORD_PROGRESS_FIXTURE").is_none() {
+        return;
+    }
+    let progress = std::sync::Arc::new(timelord_supervisor::progress::Progress::default());
+    let _reporter = timelord_supervisor::progress::Reporter::from_environment(progress).unwrap();
+    loop {
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
+#[tokio::test]
+async fn independent_watchdog_reaps_and_replaces_a_stopped_worker_without_gui() {
+    let fixture = Fixture::new();
+    let executable = std::env::current_exe().unwrap();
+    let helper = fixture.helper(&format!("export TIMELORD_PROGRESS_FIXTURE=1\nexec '{}' --exact progress_reporter_fixture --nocapture", executable.display()));
+    let supervisor = fixture.supervisor(&helper);
+    let first = fixture.status(|s| s.progress.is_some()).await;
+    let pid = first.worker_pid.unwrap() as i32;
+    unsafe {
+        assert_eq!(libc::kill(pid, libc::SIGSTOP), 0);
+    }
+    let replacement = tokio::time::timeout(Duration::from_secs(55), async {
+        loop {
+            let status = request(&fixture.config(), Control::Status, None)
+                .await
+                .unwrap();
+            if status.worker_pid.is_some_and(|next| next != pid as u32) {
+                break status;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("watchdog did not replace its stopped worker");
+    assert!(replacement.worker_generation > first.worker_generation);
+    assert!(replacement.restarts >= 1);
+    assert!(
+        replacement
+            .recoveries
+            .last()
+            .unwrap()
+            .reason
+            .contains("heartbeat"),
+        "unexpected restart: {:?}",
+        replacement.recoveries
+    );
+    unsafe {
+        assert_eq!(
+            libc::kill(pid, 0),
+            -1,
+            "old worker must be reaped before replacement"
+        );
+    }
+    request(&fixture.config(), Control::Pause, None)
+        .await
+        .unwrap();
+    fixture.terminate(supervisor).await;
+}
+
+async fn monitor_get(port: u16, path: &str, method: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    socket.write_all(format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").as_bytes()).await.unwrap();
+    let mut bytes = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), socket.read_to_end(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    String::from_utf8(bytes).unwrap()
+}
+#[tokio::test]
+async fn deployment_monitor_survives_pause_and_never_confuses_worker_presence_with_readiness() {
+    let fixture = Fixture::new();
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = reserved.local_addr().unwrap().port();
+    drop(reserved);
+    let helper = fixture.helper("exec /bin/sleep 60");
+    let supervisor = fixture.supervisor_with_monitor(&helper, Some(port));
+    fixture.status(|s| s.worker_pid.is_some()).await;
+    assert!(
+        monitor_get(port, "/healthz", "GET")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    assert!(
+        monitor_get(port, "/readyz", "GET")
+            .await
+            .starts_with("HTTP/1.1 503")
+    );
+    let body = monitor_get(port, "/metrics", "GET").await;
+    assert!(body.contains("chia_timelord_supervisor_worker_up{network=\"testnet11\"} 1"));
+    assert!(body.contains("chia_timelord_supervisor_worker_ready{network=\"testnet11\"} 0"));
+    if let Some(path) = std::env::var_os("TIMELORD_SUPERVISOR_TEST_EXPOSITION") {
+        fs::write(path, body.split_once("\r\n\r\n").unwrap().1).unwrap();
+    }
+    let running = request(&fixture.config(), Control::Status, None)
+        .await
+        .unwrap();
+    unsafe {
+        libc::kill(running.worker_pid.unwrap() as i32, libc::SIGKILL);
+    }
+    fixture
+        .status(|s| s.phase == timelord_supervisor::SupervisorPhase::Recovering)
+        .await;
+    let recovering = monitor_get(port, "/metrics", "GET").await;
+    assert!(
+        recovering.contains("chia_timelord_supervisor_desired_running{network=\"testnet11\"} 1")
+    );
+    assert!(recovering.contains("chia_timelord_supervisor_worker_up{network=\"testnet11\"} 0"));
+    request(&fixture.config(), Control::Pause, None)
+        .await
+        .unwrap();
+    assert!(
+        monitor_get(port, "/healthz", "GET")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    assert!(
+        monitor_get(port, "/readyz", "GET")
+            .await
+            .starts_with("HTTP/1.1 503")
+    );
+    assert!(
+        monitor_get(port, "/metrics", "GET")
+            .await
+            .contains("chia_timelord_supervisor_desired_running{network=\"testnet11\"} 0")
+    );
+    assert!(
+        monitor_get(port, "/resume", "POST")
+            .await
+            .starts_with("HTTP/1.1 404")
+    );
+    assert!(
+        monitor_get(port, "/metrics", "POST")
+            .await
+            .starts_with("HTTP/1.1 405")
+    );
+    assert_eq!(
+        request(&fixture.config(), Control::Status, None)
+            .await
+            .unwrap()
+            .mode,
+        Mode::Paused
+    );
+    fixture.terminate(supervisor).await;
+}
+
 #[test]
 fn check_owner_rejects_supervisor_or_worker_ownership() {
     let fixture = Fixture::new();
@@ -526,7 +691,10 @@ async fn fresh_status_readers_observe_durable_pause_before_cleanup_acknowledges(
         "trap 'sleep 2; exit 0' TERM\ntouch '{}'\nwhile :; do sleep 1; done",
         ready.display()
     ));
-    let supervisor = fixture.supervisor(&helper);
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = reserved.local_addr().unwrap().port();
+    drop(reserved);
+    let supervisor = fixture.supervisor_with_monitor(&helper, Some(port));
     let running = fixture.status(|s| s.worker_pid.is_some()).await;
     tokio::time::timeout(Duration::from_secs(2), async {
         while !ready.exists() {
@@ -535,6 +703,33 @@ async fn fresh_status_readers_observe_durable_pause_before_cleanup_acknowledges(
     })
     .await
     .unwrap();
+    let report = timelord_supervisor::progress::Snapshot {
+        worker_pid: running.worker_pid.unwrap(),
+        generation: running.worker_generation,
+        sequence: 1,
+        ready: true,
+        failed: false,
+        work: [None; timelord_supervisor::progress::SLOTS],
+    };
+    let socket = tokio::net::UnixDatagram::unbound().unwrap();
+    socket
+        .send_to(
+            &serde_json::to_vec(&report).unwrap(),
+            Paths::for_config(&fixture.config())
+                .unwrap()
+                .directory
+                .join("progress.sock"),
+        )
+        .await
+        .unwrap();
+    fixture
+        .status(|s| s.progress.as_ref().is_some_and(|p| p.ready))
+        .await;
+    assert!(
+        monitor_get(port, "/readyz", "GET")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
     let config = fixture.config();
     let pause = tokio::spawn(async move { request(&config, Control::Pause, None).await });
     let stopping = tokio::time::timeout(
@@ -546,6 +741,17 @@ async fn fresh_status_readers_observe_durable_pause_before_cleanup_acknowledges(
     assert_eq!(stopping.mode, Mode::Paused);
     assert_eq!(stopping.revision, running.revision + 1);
     assert_eq!(stopping.worker_pid, running.worker_pid);
+    assert!(stopping.progress.is_none());
+    assert!(
+        monitor_get(port, "/readyz", "GET")
+            .await
+            .starts_with("HTTP/1.1 503")
+    );
+    assert!(
+        monitor_get(port, "/metrics", "GET")
+            .await
+            .contains("chia_timelord_supervisor_worker_ready{network=\"testnet11\"} 0")
+    );
     assert_eq!(
         Paths::for_config(&fixture.config())
             .unwrap()

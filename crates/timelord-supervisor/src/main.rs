@@ -1,3 +1,4 @@
+mod monitor;
 mod process;
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
@@ -11,12 +12,12 @@ use std::{
     time::Duration,
 };
 use timelord_supervisor::{
-    Control, InstanceLock, Intent, Mode, Paths, Request, Response, Status, SupervisorPhase,
-    peer_is_owner,
+    AcceptBackoff, Control, InstanceLock, Intent, Mode, Network, Paths, Request, Response, Status,
+    SupervisorPhase, peer_is_owner,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{UnixListener, UnixStream},
+    net::{UnixDatagram, UnixListener, UnixStream},
     process::Command,
     sync::{mpsc, oneshot, watch},
     task::JoinSet,
@@ -42,6 +43,10 @@ enum Action {
         config: PathBuf,
         #[arg(long)]
         user: String,
+        #[arg(long)]
+        monitor_listen: Option<std::net::SocketAddr>,
+        #[arg(long, value_enum, default_value_t = Network::Mainnet)]
+        network: Network,
     },
     /// Refuse migration while an existing coordinator holds its ownership lock.
     CheckOwner {
@@ -53,6 +58,10 @@ enum Action {
         config: PathBuf,
         #[arg(long)]
         worker: Option<PathBuf>,
+        #[arg(long)]
+        monitor_listen: Option<std::net::SocketAddr>,
+        #[arg(long, value_enum, default_value_t = Network::Mainnet)]
+        network: Network,
     },
     Status {
         #[arg(long)]
@@ -80,10 +89,22 @@ enum Action {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
-        Action::LaunchdPlist { app, config, user } => {
+        Action::LaunchdPlist {
+            app,
+            config,
+            user,
+            monitor_listen,
+            network,
+        } => {
             print!(
                 "{}",
-                timelord_supervisor::launchd_plist(&app, &config, &user)?
+                timelord_supervisor::launchd_plist_with_monitor(
+                    &app,
+                    &config,
+                    &user,
+                    monitor_listen,
+                    network
+                )?
             );
             Ok(())
         }
@@ -94,10 +115,15 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::json!({"available":true}));
             Ok(())
         }
-        Action::Run { config, worker } => {
+        Action::Run {
+            config,
+            worker,
+            monitor_listen,
+            network,
+        } => {
             let helper =
                 worker.unwrap_or(std::env::current_exe()?.with_file_name("timelord-service"));
-            run(Paths::for_config(&config)?, helper).await
+            run(Paths::for_config(&config)?, helper, monitor_listen, network).await
         }
         action => {
             let (config, command, revision) = match action {
@@ -153,18 +179,22 @@ fn retry_delay(failures: &mut usize, elapsed: Option<Duration>) -> u64 {
 
 struct Worker {
     process: OwnedProcess,
+    watchdog: timelord_supervisor::progress::Watchdog,
     started: Instant,
+    progress: Option<(timelord_supervisor::progress::Snapshot, std::time::Instant)>,
     #[cfg(test)]
     stop_failures: usize,
 }
 impl Worker {
-    fn spawn(helper: &Path, config: &Path) -> Result<Self> {
+    fn spawn(helper: &Path, config: &Path, progress: &Path, generation: u64) -> Result<Self> {
         let process = OwnedProcess::spawn(
             Command::new(helper)
                 .arg("serve")
                 .arg("--supervised")
                 .arg("--config")
                 .arg(config)
+                .env("TIMELORD_SUPERVISOR_PROGRESS", progress)
+                .env("TIMELORD_SUPERVISOR_GENERATION", generation.to_string())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit()),
@@ -172,7 +202,9 @@ impl Worker {
         .context("Starting timelord worker")?;
         Ok(Self {
             process,
+            watchdog: timelord_supervisor::progress::Watchdog::new(std::time::Instant::now()),
             started: Instant::now(),
+            progress: None,
             #[cfg(test)]
             stop_failures: 0,
         })
@@ -192,7 +224,40 @@ struct Envelope {
     request: Request,
     reply: oneshot::Sender<Response>,
 }
-type Snapshot = watch::Receiver<Status>;
+/// Monotonic receipt/publication times stay internal; public JSON remains stable.
+#[derive(Clone)]
+struct Published {
+    status: Status,
+    published_at: std::time::Instant,
+    progress_received_at: Option<std::time::Instant>,
+}
+impl Published {
+    fn status_at(&self, now: std::time::Instant) -> Status {
+        let mut status = self.status.clone();
+        status.progress_age_seconds = self
+            .progress_received_at
+            .map(|received| now.saturating_duration_since(received).as_secs());
+        status
+    }
+    fn healthy(&self, now: std::time::Instant) -> bool {
+        now.saturating_duration_since(self.published_at) <= Duration::from_secs(30)
+    }
+    fn ready(&self, now: std::time::Instant) -> bool {
+        self.healthy(now)
+            && self.progress_received_at.is_some_and(|received| {
+                now.saturating_duration_since(received) <= Duration::from_secs(3)
+            })
+            && self.status.mode == Mode::Running
+            && self.status.phase == SupervisorPhase::WorkerStarted
+            && self.status.progress.as_ref().is_some_and(|progress| {
+                Some(progress.worker_pid) == self.status.worker_pid
+                    && progress.generation == self.status.worker_generation
+                    && progress.ready
+                    && !progress.failed
+            })
+    }
+}
+type Snapshot = watch::Receiver<Published>;
 async fn handle(mut socket: UnixStream, state: Snapshot, tx: mpsc::Sender<Envelope>) -> Result<()> {
     peer_is_owner(&socket)?;
     let mut line = String::new();
@@ -208,7 +273,7 @@ async fn handle(mut socket: UnixStream, state: Snapshot, tx: mpsc::Sender<Envelo
     let request: Request = serde_json::from_str(&line)?;
     let response = if matches!(request.command, Control::Status) {
         Response {
-            status: state.borrow().clone(),
+            status: state.borrow().status_at(std::time::Instant::now()),
             error: None,
         }
     } else {
@@ -225,32 +290,26 @@ async fn accept_controls(
     listener: UnixListener,
     current: Snapshot,
     tx: mpsc::Sender<Envelope>,
-    #[cfg(test)] mut accept_errors: std::collections::VecDeque<std::io::Error>,
+) -> Result<()> {
+    accept_controls_with(AcceptBackoff::new(), listener, current, tx).await
+}
+
+async fn accept_controls_with(
+    mut backoff: AcceptBackoff,
+    listener: UnixListener,
+    current: Snapshot,
+    tx: mpsc::Sender<Envelope>,
 ) -> Result<()> {
     let mut handlers = JoinSet::new();
-    let mut failures: u32 = 0;
-    let mut retry_at = Instant::now();
     loop {
         tokio::select! {
             Some(_) = handlers.join_next(), if !handlers.is_empty() => {},
-            accepted = async {
-                tokio::time::sleep_until(retry_at).await;
-                #[cfg(test)]
-                if let Some(error) = accept_errors.pop_front() { return Err(error); }
-                listener.accept().await
-            } => {
-                let (socket, _) = match accepted {
-                    Ok(accepted) => { failures = 0; accepted }
-                    Err(error) => {
-                        // An aborted peer or descriptor pressure does not revoke
-                        // this listener or the healthy worker it controls.
-                        failures = failures.saturating_add(1);
-                        let delay = Duration::from_millis(50 * (1u64 << failures.saturating_sub(1).min(5))).min(Duration::from_secs(1));
-                        let _ = writeln!(std::io::stderr(), "Supervisor control accept failed ({failures} consecutive): {error}; retry in {delay:?}");
-                        retry_at = Instant::now() + delay;
-                        continue;
-                    }
-                };
+            accepted = backoff.accept(listener.accept(), |error, failures, delay| {
+                // An aborted peer or descriptor pressure does not revoke
+                // this listener or the healthy worker it controls.
+                let _ = writeln!(std::io::stderr(), "Supervisor control accept failed ({failures} consecutive): {error}; retry in {delay:?}");
+            }) => {
+                let Some((socket, _)) = accepted else { continue };
                 if handlers.len() < 16 {
                     let (current, tx) = (current.clone(), tx.clone());
                     handlers.spawn(async move { let _ = handle(socket, current, tx).await; });
@@ -270,12 +329,12 @@ enum Lifecycle {
     Paused,
     StateError(String),
     Starting,
-    Running(Worker),
+    Running(Box<Worker>),
     Stopping {
         pid: u32,
     },
     CleanupFailed {
-        worker: Worker,
+        worker: Box<Worker>,
         next: Instant,
         error: String,
     },
@@ -284,6 +343,20 @@ enum Lifecycle {
         error: String,
     },
 }
+impl Lifecycle {
+    fn worker(&self) -> Option<&Worker> {
+        match self {
+            Self::Running(worker) | Self::CleanupFailed { worker, .. } => Some(worker),
+            _ => None,
+        }
+    }
+    fn worker_mut(&mut self) -> Option<&mut Worker> {
+        match self {
+            Self::Running(worker) | Self::CleanupFailed { worker, .. } => Some(worker),
+            _ => None,
+        }
+    }
+}
 struct SupervisorState {
     intent: Intent,
     lifecycle: Lifecycle,
@@ -291,6 +364,8 @@ struct SupervisorState {
     restarts: u64,
     failures: usize,
     power: timelord_supervisor::power::Assertion,
+    recoveries: Vec<timelord_supervisor::Recovery>,
+    monitor_error: Option<String>,
 }
 impl SupervisorState {
     fn new(loaded: Result<Intent>) -> Self {
@@ -318,9 +393,14 @@ impl SupervisorState {
             restarts: 0,
             failures: 0,
             power: Default::default(),
+            recoveries: Vec::new(),
+            monitor_error: None,
         }
     }
     fn snapshot(&self) -> Status {
+        self.published().status_at(std::time::Instant::now())
+    }
+    fn published(&self) -> Published {
         let (phase, worker_pid, error) = match &self.lifecycle {
             Lifecycle::Paused => (SupervisorPhase::Paused, None, None),
             Lifecycle::StateError(error) => {
@@ -342,7 +422,11 @@ impl SupervisorState {
                 (SupervisorPhase::Recovering, None, Some(error.clone()))
             }
         };
-        Status {
+        let progress = self
+            .lifecycle
+            .worker()
+            .and_then(|worker| worker.progress.as_ref());
+        let status = Status {
             api_version: 1,
             supervisor_pid: std::process::id(),
             worker_pid,
@@ -351,7 +435,27 @@ impl SupervisorState {
             worker_generation: self.generation,
             restarts: self.restarts,
             phase,
-            error,
+            error: error.or_else(|| self.monitor_error.clone()),
+            progress: progress.map(|(snapshot, _)| snapshot.clone()),
+            // Derived from progress_received_at by Published::status_at.
+            progress_age_seconds: None,
+            recoveries: self.recoveries.clone(),
+        };
+        Published {
+            status,
+            published_at: std::time::Instant::now(),
+            progress_received_at: progress.map(|(_, received)| *received),
+        }
+    }
+    fn observe(&mut self, snapshot: timelord_supervisor::progress::Snapshot) {
+        if let Some(worker) = self.lifecycle.worker_mut()
+            && snapshot.worker_pid == worker.process.pid()
+            && snapshot.generation == self.generation
+        {
+            let now = std::time::Instant::now();
+            if worker.watchdog.observe(snapshot.clone(), now) {
+                worker.progress = Some((snapshot, now));
+            }
         }
     }
     fn needs_power(&self) -> bool {
@@ -363,7 +467,7 @@ impl SupervisorState {
                     | Lifecycle::CleanupFailed { .. }
             )
     }
-    fn publish(&mut self, snapshots: &watch::Sender<Status>) {
+    fn publish(&mut self, snapshots: &watch::Sender<Published>) {
         // Keep the machine awake through backoff and until a paused worker has
         // actually stopped. Interface lifetime has no part in this ownership.
         let previous = self.power.error.clone();
@@ -373,16 +477,13 @@ impl SupervisorState {
         {
             eprintln!("{error}");
         }
-        snapshots.send_replace(self.snapshot());
+        snapshots.send_replace(self.published());
     }
     async fn retire(
         &mut self,
-        snapshots: &watch::Sender<Status>,
+        snapshots: &watch::Sender<Published>,
     ) -> Result<Option<(Duration, std::process::ExitStatus)>> {
-        if !matches!(
-            self.lifecycle,
-            Lifecycle::Running(_) | Lifecycle::CleanupFailed { .. }
-        ) {
+        if self.lifecycle.worker().is_none() {
             return Ok(None);
         }
         let mut worker = match std::mem::replace(&mut self.lifecycle, Lifecycle::Starting) {
@@ -394,7 +495,7 @@ impl SupervisorState {
             pid: worker.process.pid(),
         };
         self.publish(snapshots);
-        let exit = match worker.stop().await {
+        let exit = match (*worker).stop().await {
             Ok(exit) => exit,
             Err(error) => {
                 // Keep the child handle and reserved process-group identity:
@@ -420,7 +521,7 @@ impl SupervisorState {
         &mut self,
         paths: &Paths,
         request: Request,
-        snapshots: &watch::Sender<Status>,
+        snapshots: &watch::Sender<Published>,
     ) -> Result<()> {
         if let Some(revision) = request.expected_revision {
             ensure!(
@@ -478,38 +579,67 @@ impl SupervisorState {
         self.publish(snapshots);
         Ok(())
     }
+    fn record_recovery(&mut self, worker_pid: Option<u32>, reason: &str) {
+        self.restarts += 1;
+        self.recoveries.push(timelord_supervisor::Recovery {
+            timestamp_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            worker_pid,
+            reason: reason.chars().take(512).collect(),
+        });
+        if self.recoveries.len() > 32 {
+            self.recoveries.remove(0);
+        }
+    }
     async fn tick(
         &mut self,
         helper: &Path,
         config: &Path,
-        snapshots: &watch::Sender<Status>,
+        progress_path: &Path,
+        snapshots: &watch::Sender<Published>,
     ) -> Result<()> {
         if matches!(self.lifecycle, Lifecycle::CleanupFailed { next, .. } if Instant::now() >= next)
         {
-            // Cleanup failure is recoverable without relinquishing ownership or
-            // exiting the supervisor (which would release its sleep assertion).
+            // Keep failed cleanup owned and monitored until retirement succeeds.
             let _ = self.retire(snapshots).await;
             return Ok(());
         }
-        if matches!(&self.lifecycle, Lifecycle::Running(worker) if worker.process.exited()?) {
+        let watchdog_failure = match &self.lifecycle {
+            Lifecycle::Running(worker) => worker.watchdog.failure(std::time::Instant::now()),
+            _ => None,
+        };
+        if watchdog_failure.is_some()
+            || matches!(&self.lifecycle, Lifecycle::Running(worker) if worker.process.exited()?)
+        {
+            let previous_pid = self.snapshot().worker_pid;
             let (elapsed, exit) = match self.retire(snapshots).await {
-                Ok(retired) => retired.expect("exited worker"),
-                Err(_) => return Ok(()), // CleanupFailed retains ownership and retries.
+                Ok(retired) => retired.expect("failed worker"),
+                Err(error) => {
+                    let reason = watchdog_failure
+                        .unwrap_or_else(|| format!("Worker exited; cleanup failed: {error:#}"));
+                    self.record_recovery(previous_pid, &reason);
+                    self.publish(snapshots);
+                    return Ok(()); // CleanupFailed retains ownership and retries.
+                }
             };
             let delay = retry_delay(&mut self.failures, Some(elapsed));
-            self.restarts += 1;
+            let reason = watchdog_failure.unwrap_or_else(|| format!("Worker exited: {exit}"));
+            self.record_recovery(previous_pid, &reason);
             self.lifecycle = Lifecycle::Backoff {
                 next: Instant::now() + Duration::from_secs(delay),
-                error: format!("Worker exited: {exit}; retry in {delay}s"),
+                error: format!("{reason}; retry in {delay}s"),
             };
         }
         let ready = matches!(self.lifecycle, Lifecycle::Starting)
             || matches!(self.lifecycle, Lifecycle::Backoff { next, .. } if Instant::now() >= next);
         if self.intent.mode == Mode::Running && ready {
-            self.lifecycle = match Worker::spawn(helper, config) {
+            self.lifecycle = match Worker::spawn(helper, config, progress_path, self.generation + 1)
+            {
                 Ok(worker) => {
                     self.generation += 1;
-                    Lifecycle::Running(worker)
+                    Lifecycle::Running(Box::new(worker))
                 }
                 Err(error) => {
                     let delay = retry_delay(&mut self.failures, None);
@@ -524,7 +654,29 @@ impl SupervisorState {
         Ok(())
     }
 }
-async fn run(paths: Paths, helper: PathBuf) -> Result<()> {
+async fn monitoring_exit(
+    monitor: &mut Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+    state: &mut SupervisorState,
+    snapshots: &watch::Sender<Published>,
+) {
+    let result = monitor.as_mut().expect("monitor").await;
+    monitor.take();
+    state.monitor_error = Some(
+        format!("Supervisor monitoring exited unexpectedly: {result:?}")
+            .chars()
+            .take(512)
+            .collect(),
+    );
+    eprintln!("{}", state.monitor_error.as_deref().expect("monitor error"));
+    state.publish(snapshots);
+}
+
+async fn run(
+    paths: Paths,
+    helper: PathBuf,
+    monitor_listen: Option<std::net::SocketAddr>,
+    network: Network,
+) -> Result<()> {
     let _owner = InstanceLock::acquire(&paths.lock)?;
     if let Ok(meta) = fs::symlink_metadata(&paths.socket) {
         ensure!(
@@ -539,18 +691,41 @@ async fn run(paths: Paths, helper: PathBuf) -> Result<()> {
         path: paths.socket.clone(),
         inode: fs::symlink_metadata(&paths.socket)?.ino(),
     };
+    // Worker progress socket. It is created 0600 and an existing path is
+    // removed only if it is a socket owned by this user. Processes running
+    // under the same UID are trusted peers, as with the control socket.
+    let progress_path = paths.directory.join("progress.sock");
+    if let Ok(meta) = fs::symlink_metadata(&progress_path) {
+        ensure!(
+            meta.file_type().is_socket() && meta.uid() == unsafe { libc::geteuid() },
+            "Invalid progress socket owner"
+        );
+        fs::remove_file(&progress_path)?;
+    }
+    let progress = UnixDatagram::bind(&progress_path)?;
+    fs::set_permissions(&progress_path, fs::Permissions::from_mode(0o600))?;
+    let _progress_guard = SocketGuard {
+        path: progress_path.clone(),
+        inode: fs::symlink_metadata(&progress_path)?.ino(),
+    };
+    let mut buffer = [0u8; 4096];
     let mut state = SupervisorState::new(paths.load_intent());
-    let (snapshots, current) = watch::channel(state.snapshot());
+    let (snapshots, current) = watch::channel(state.published());
     state.publish(&snapshots);
+    let mut monitor = if let Some(address) = monitor_listen {
+        let listener = tokio::net::TcpListener::bind(address)
+            .await
+            .context("Binding supervisor monitoring")?;
+        let app = monitor::routes(current.clone(), network);
+        Some(tokio::spawn(
+            async move { axum::serve(listener, app).await },
+        ))
+    } else {
+        None
+    };
     let (tx, mut rx) = mpsc::channel::<Envelope>(16);
     // Accept status readers independently of graceful worker cleanup.
-    let mut controls = tokio::spawn(accept_controls(
-        listener,
-        current,
-        tx,
-        #[cfg(test)]
-        Default::default(),
-    ));
+    let mut controls = tokio::spawn(accept_controls(listener, current, tx));
     let mut timer = tokio::time::interval(Duration::from_millis(100));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let stop = signal();
@@ -559,13 +734,22 @@ async fn run(paths: Paths, helper: PathBuf) -> Result<()> {
         loop {
             tokio::select! {
                 _ = &mut stop => break,
+                _ = monitoring_exit(&mut monitor, &mut state, &snapshots), if monitor.is_some() => {},
+                received = progress.recv(&mut buffer) => {
+                    let size = received.context("Reading worker progress")?;
+                    if size < buffer.len()
+                        && let Ok(report) = serde_json::from_slice::<timelord_supervisor::progress::Snapshot>(&buffer[..size]) {
+                        state.observe(report);
+                        state.publish(&snapshots);
+                    }
+                },
                 result = &mut controls => { result??; break; },
                 Some(envelope) = rx.recv() => {
                     let error = state.control(&paths, envelope.request, &snapshots).await
                         .err().map(|error| format!("{error:#}"));
                     let _ = envelope.reply.send(Response { status: state.snapshot(), error });
                 },
-                _ = timer.tick() => state.tick(&helper, &paths.config, &snapshots).await?,
+                _ = timer.tick() => state.tick(&helper, &paths.config, &progress_path, &snapshots).await?,
             }
         }
         Ok(())
@@ -574,6 +758,9 @@ async fn run(paths: Paths, helper: PathBuf) -> Result<()> {
     // Shutdown never changes durable intent. Retire the family while retaining
     // its sleep assertion, then RAII releases power protection on loop exit.
     let cleanup = state.retire(&snapshots).await;
+    if let Some(monitor) = monitor {
+        monitor.abort();
+    }
     controls.abort();
     // A completed accept task has already been consumed by select above.
     if !controls.is_finished() {

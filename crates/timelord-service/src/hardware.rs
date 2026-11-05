@@ -132,8 +132,8 @@ pub async fn run(
             child_shutdown.clone(),
             RestartBackoff::default(),
         ));
-        // Keep normal USB initialization sequential, but one broken board must
-        // not prevent the next board from starting or bring down existing owners.
+        // Keep USB initialization sequential. Ordinary board startup failures
+        // must not prevent the next board from starting or stop existing owners.
         tokio::select! {
             _ = shutdown.changed() => break,
             initialized = tokio::time::timeout(Duration::from_secs(30), rx) => {
@@ -150,7 +150,14 @@ pub async fn run(
         tokio::select! {
             _ = shutdown.changed() => break,
             Some(result) = children.join_next(), if !children.is_empty() => {
-                if let Err(error) = result { tracing::error!(%error, "ASIC supervisor task failed"); }
+                if let Err(error) = result {
+                    shared.process.essential_failure();
+                    // A panic loses trusted native-owner cleanup (and may poison
+                    // shared state). Replace the worker rather than reopening USB
+                    // while the failed owner's retirement remains unconfirmed.
+                    tracing::error!(%error, "ASIC supervisor task failed");
+                    return Err(error.into());
+                }
             }
         }
     }

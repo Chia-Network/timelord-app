@@ -47,6 +47,14 @@ Physical installation, boot/logout and hardware qualification remain separate ga
   paused. A submitted message is not evidence of global acceptance or winning.
 - Never restore old gauges, proof counters or safety readiness as current health.
 
+Current PR 2 progress: the existing observability branch is integrated with the
+independent supervisor. Essential-task exits now retire the worker. Private
+identity-fenced work reports, workload-sized deadlines and bounded tracked
+arithmetic jobs are implemented. A persistent deployment listener remains available
+during Pause. Eligibility/discovery detail and staged deadline tests are covered; physical
+fault-injection qualification remains required;
+see docs/observability.md for current deadline semantics and limitations.
+
 ## 3. Board fault containment and recovery
 
 - Reconcile eligible healthy capacity into 3, 2+1, or 1+1+1 engines; physical presence

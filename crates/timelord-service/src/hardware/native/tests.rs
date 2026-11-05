@@ -80,6 +80,7 @@ done
         assignments: config.assignments().unwrap(),
         config,
         clients: Default::default(),
+        process: crate::operational::State::fixture(),
         runtime: Default::default(),
         started_unix: crate::unix_now(),
         service_started_unix: crate::unix_now(),
@@ -146,14 +147,19 @@ async fn temperature_guard_stops_only_the_owned_fixture() {
         assignments: config.assignments().unwrap(),
         config,
         clients: Arc::new(std::sync::Mutex::new(Default::default())),
+        process: crate::operational::State::fixture(),
         runtime: Default::default(),
         started_unix: crate::unix_now(),
         service_started_unix: crate::unix_now(),
     });
     let (stop, receiver) = watch::channel(false);
-    let (backend, _offers) =
-        crate::asic::AsicBackend::new(&shared.config, &shared.assignments, shared.runtime.clone())
-            .unwrap();
+    let (backend, _offers) = crate::asic::AsicBackend::new(
+        &shared.config,
+        &shared.assignments,
+        shared.runtime.clone(),
+        shared.process.clone(),
+    )
+    .unwrap();
     let task = tokio::spawn(run(shared.clone(), Arc::new(backend), receiver));
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -217,6 +223,7 @@ async fn temperature_releases_usb_initialization_without_claiming_network_readin
         config: Default::default(),
         assignments: vec![],
         clients: Default::default(),
+        process: crate::operational::State::fixture(),
         runtime: Default::default(),
         started_unix: crate::unix_now(),
         service_started_unix: crate::unix_now(),
@@ -313,6 +320,7 @@ cat >/dev/null
         assignments: config.assignments().unwrap(),
         config,
         clients: Default::default(),
+        process: crate::operational::State::fixture(),
         runtime: Default::default(),
         started_unix: crate::unix_now(),
         service_started_unix: crate::unix_now(),

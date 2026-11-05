@@ -310,6 +310,22 @@ impl AutomaticOwner {
                     .change_with_logs(point, 5, log, shared, board)
                     .await
                     .with_context(|| board.name.clone())?;
+                let metrics = shared.process.metrics.clone();
+                let kind = match reason.kind {
+                    automatic::ChangeKind::Trial => {
+                        crate::observability::OperatingPointReason::Trial
+                    }
+                    automatic::ChangeKind::Restore => {
+                        crate::observability::OperatingPointReason::Restore
+                    }
+                    automatic::ChangeKind::Backoff => {
+                        crate::observability::OperatingPointReason::Backoff
+                    }
+                };
+                metrics.operating_point_changed(
+                    &crate::observability::board(&shared.config, &board.id),
+                    kind,
+                );
                 self.policy
                     .applied(actual, crate::unix_now(), reason.message);
                 self.policy.synchronize_recoveries(

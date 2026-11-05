@@ -1,5 +1,10 @@
 //! Small control plane: no USB driver, node protocol, or proof arithmetic.
+pub mod accept_backoff;
 pub mod power;
+pub mod progress;
+
+pub use accept_backoff::AcceptBackoff;
+
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -195,6 +200,12 @@ pub enum SupervisorPhase {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Recovery {
+    pub timestamp_unix: u64,
+    pub worker_pid: Option<u32>,
+    pub reason: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
     pub api_version: u32,
     pub supervisor_pid: u32,
@@ -205,6 +216,9 @@ pub struct Status {
     pub restarts: u64,
     pub phase: SupervisorPhase,
     pub error: Option<String>,
+    pub progress: Option<progress::Snapshot>,
+    pub progress_age_seconds: Option<u64>,
+    pub recoveries: Vec<Recovery>,
 }
 #[derive(Serialize, Deserialize)]
 pub struct Response {
@@ -303,9 +317,42 @@ pub fn watch_parent() -> Result<()> {
     Ok(())
 }
 
+/// Network label for supervisor monitoring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Network {
+    Mainnet,
+    Testnet11,
+}
+impl Network {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mainnet => "mainnet",
+            Self::Testnet11 => "testnet11",
+        }
+    }
+}
+
 /// Generate a system-domain job without installing or loading it. The installer
 /// validates the selected account's numeric UID before performing privileged work.
 pub fn launchd_plist(app: &Path, config: &Path, user: &str) -> Result<String> {
+    launchd_plist_with_monitor(app, config, user, None, Network::Mainnet)
+}
+pub fn launchd_plist_with_monitor(
+    app: &Path,
+    config: &Path,
+    user: &str,
+    monitor: Option<std::net::SocketAddr>,
+    network: Network,
+) -> Result<String> {
+    let monitor_args = if let Some(address) = monitor {
+        ensure!(address.port() > 0, "Monitoring port must be nonzero");
+        format!(
+            "<string>--monitor-listen</string><string>{address}</string><string>--network</string><string>{}</string>",
+            network.label()
+        )
+    } else {
+        String::new()
+    };
     ensure!(
         app.is_absolute() && config.is_absolute(),
         "App and configuration paths must be absolute"
@@ -351,7 +398,7 @@ pub fn launchd_plist(app: &Path, config: &Path, user: &str) -> Result<String> {
 <key>Label</key><string>net.chia.timelord.supervisor</string>
 <key>AssociatedBundleIdentifiers</key><string>net.chia.timelord.mac</string>
 <key>UserName</key><string>{user}</string>
-<key>ProgramArguments</key><array><string>{helper}</string><string>run</string><string>--config</string><string>{config_text}</string></array>
+<key>ProgramArguments</key><array><string>{helper}</string><string>run</string><string>--config</string><string>{config_text}</string>{monitor_args}</array>
 <key>WorkingDirectory</key><string>/</string>
 <key>RunAtLoad</key><true/>
 <key>KeepAlive</key><true/>

@@ -42,8 +42,11 @@ HELPER="$APP/Contents/Helpers/timelord-supervisor"
 run_as_owner() {
   if [[ "$EUID" == "$SERVICE_UID" ]]; then "$@"; else sudo -H -u "$SERVICE_USER" "$@"; fi
 }
+CONFIG_JSON="$(run_as_owner "$APP/Contents/Helpers/timelord-service" configuration --config "$CONFIG")" || exit 1
+MONITOR="$(printf '%s' "$CONFIG_JSON" | plutil -extract service.supervisor_observability_listen raw -o - -)" || exit 1
+NETWORK="$(printf '%s' "$CONFIG_JSON" | plutil -extract node.network raw -o - -)" || exit 1
 if [[ "$MODE" == plan ]]; then
-  run_as_owner "$HELPER" launchd-plist --app "$APP" --config "$CONFIG" --user "$SERVICE_USER" || exit $?
+  run_as_owner "$HELPER" launchd-plist --app "$APP" --config "$CONFIG" --user "$SERVICE_USER" --monitor-listen "$MONITOR" --network "$NETWORK" || exit $?
   exit 0
 fi
 [[ "$EUID" == 0 && "$APP" == /Applications/Timelord.app ]] || { echo 'Installation requires administrator approval and /Applications/Timelord.app.' >&2; exit 1; }
@@ -68,7 +71,7 @@ cleanup() {
   exit "$result"
 }
 trap cleanup EXIT
-run_as_owner "$HELPER" launchd-plist --app "$APP" --config "$CONFIG" --user "$SERVICE_USER" > "$STAGE/new.plist" || exit 1
+run_as_owner "$HELPER" launchd-plist --app "$APP" --config "$CONFIG" --user "$SERVICE_USER" --monitor-listen "$MONITOR" --network "$NETWORK" > "$STAGE/new.plist" || exit 1
 plutil -lint "$STAGE/new.plist" || exit 1
 LISTEN="$(run_as_owner "$APP/Contents/Helpers/timelord-service" configuration --config "$CONFIG" | plutil -extract service.status_listen raw -o - -)"
 PORT="${LISTEN##*:}"

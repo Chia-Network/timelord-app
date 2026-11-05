@@ -1,6 +1,6 @@
 //! Explicit hardware diagnostic. Never runs as part of normal startup or tests.
 use crate::{
-    Shared, asic::AsicBackend, client_listener, hardware, runtime::RuntimeState, unix_now,
+    Shared, asic::AsicBackend, hardware, runtime::RuntimeState, service::client_listener, unix_now,
 };
 use anyhow::{Context, Result, bail};
 use dg_xch_core::blockchain::{class_group_element::ClassgroupElement, sized_bytes::Bytes32};
@@ -50,14 +50,18 @@ pub async fn check(mut config: Config) -> Result<Vec<CheckedProof>> {
             listeners.push((board.id.clone(), capacity, listener));
         }
     }
-    let runtime = Arc::new(Mutex::new(RuntimeState::default()));
-    let (backend, offers) = AsicBackend::new(&config, &assignments, runtime.clone())?;
+    let process =
+        crate::operational::State::new(crate::observability::Metrics::new(config.node.network)?);
+    let runtime = Arc::new(Mutex::new(RuntimeState::new(false)));
+    let (backend, offers) =
+        AsicBackend::new(&config, &assignments, runtime.clone(), process.clone())?;
     let backend = Arc::new(backend);
     let shared = Arc::new(Shared {
         native: None,
         config,
         assignments,
         clients: Arc::new(Mutex::new(BTreeSet::new())),
+        process,
         runtime,
         started_unix: unix_now(),
         service_started_unix: crate::unix_now(),
@@ -119,7 +123,7 @@ pub async fn check(mut config: Config) -> Result<Vec<CheckedProof>> {
                 Ok(Ok(())) => Err(anyhow::anyhow!("ASIC supervisor stopped before the check finished")),
             }
         },
-        _ = crate::shutdown_signal() => Err(anyhow::anyhow!("Hardware check interrupted")),
+        _ = crate::service::shutdown_signal() => Err(anyhow::anyhow!("Hardware check interrupted")),
     };
     backend.stop_all().await;
     let _ = stop.send(true);

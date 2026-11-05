@@ -30,7 +30,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install build dependencies
-        run: brew install cmake gmp boost
+        run: brew install cmake gmp boost prometheus
       - name: Set up Rust
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy

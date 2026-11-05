@@ -20,6 +20,11 @@ ca_certificate = "identity/ca.crt"
 
 [service]
 status_listen = "127.0.0.1:9257"
+# Optional read-only deployment endpoints; disabled when omitted.
+# observability_listen = "0.0.0.0:9258"
+# allow_remote_observability = true # Explicit opt-in: no built-in authentication/TLS.
+# Persistent supervisor listener; re-register after changing it.
+supervisor_observability_listen = "127.0.0.1:9259"
 # Legacy app-launch preference; durable supervisor Run/Pause is authoritative.
 start_automatically = true
 tuning_paused = false
@@ -332,3 +337,6 @@ outage. The full-node connection remains open to receive progress from other
 timelords. The service never submits an incomplete combined proof or treats an
 unavailable board as productive. History gaps apply to the affected board; healthy
 boards' verified samples remain available.
+
+See [deployment health and metrics](observability.md) for optional Prometheus,
+liveness/readiness endpoints and deployment examples.

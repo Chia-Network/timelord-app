@@ -16,8 +16,13 @@ supervision, telemetry and Automatic tuning. The optimized prover and USB driver
 remain in the pinned public chiavdf dependency; only the live-control integration
 is maintained here. The app has no Python, wallet, full node or software-VDF mode.
 
-Within the service, `main.rs` owns topology and task lifetimes; `status_api.rs`
-projects that state into HTTP responses. `hardware/board.rs` owns each board's
+Within the service, `main.rs` handles CLI/configuration and `service.rs` owns
+topology generations, listeners and task lifetimes. `status_api.rs` projects
+that state into HTTP responses. Each runtime requires the existing
+`operational::State` at construction: it owns the process health latch, progress
+tracking and telemetry registry across topology replacements. HTTP endpoints
+resolve that owner through the current runtime rather than carrying independent
+process or registry handles. `hardware/board.rs` owns each board's
 retry loop, `hardware/native.rs` its subprocess and telemetry, and
 `hardware/tuning.rs` the acknowledged native control session. `automatic.rs` is
 pure tuning policy; `automatic/profiles.rs` owns saved evidence and machine identity.

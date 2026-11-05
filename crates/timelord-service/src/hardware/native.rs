@@ -141,9 +141,16 @@ impl ClientLog {
                 hardware.state = "connected".into();
             }
             if temp >= board.temperature_limit_c {
+                let first = !hardware.latched_fault;
                 hardware.state = "thermal_stop".into();
                 hardware.latched_fault = true;
                 state.event(Some(board.id.clone()), "thermal_stop");
+                if first {
+                    shared
+                        .process
+                        .metrics
+                        .thermal_stopped(&crate::observability::board(&shared.config, &board.id));
+                }
                 return Err(NativeFailure::new(
                     NativeFailureKind::Thermal,
                     "ASIC reached its configured temperature limit",
@@ -159,8 +166,17 @@ impl ClientLog {
             tracing::debug!(engine = event.engine, "Native engine recovered");
             state.boards.entry(board.id.clone()).or_default().recoveries += 1;
             state.event(Some(board.id.clone()), "recovery");
+            shared.process.metrics.asic_recovered(
+                &crate::observability::board(&shared.config, &board.id),
+                event.engine,
+            );
         }
         if line.contains("Connected to timelord, waiting for challenge") {
+            state
+                .boards
+                .entry(board.id.clone())
+                .or_default()
+                .native_initialized = true;
             self.initialization.take();
             if let Some(ready) = self.ready.take() {
                 let _ = ready.send(());

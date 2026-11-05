@@ -1,17 +1,16 @@
 //! Versioned HTTP snapshots of the current topology; never owns service lifecycle.
-use crate::{Shared, automatic, history_store, runtime, unix_now};
+use crate::{automatic, history_store, observability, runtime, unix_now};
 use axum::{Json, Router, extract::State, routing::get};
 use serde::Serialize;
-use std::sync::Arc;
 use timelord_core::{Chain, Network};
-use tokio::sync::watch;
 
-pub fn router(current: watch::Receiver<Arc<Shared>>) -> Router {
+pub fn router(http: observability::HttpState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/status", get(status))
         .route("/v3/history", get(history))
-        .with_state(current)
+        .merge(observability::routes())
+        .with_state(http)
 }
 
 #[derive(Serialize)]
@@ -63,15 +62,15 @@ struct BoardStatus {
     latest_proof_unix: Option<u64>,
 }
 
-async fn health(State(current): State<watch::Receiver<Arc<Shared>>>) -> Json<serde_json::Value> {
-    let shared = current.borrow().clone();
+async fn health(State(http): State<observability::HttpState>) -> Json<serde_json::Value> {
+    let shared = http.current.borrow().clone();
     Json(
         serde_json::json!({"service":"timelord-service","api_version":1,"production_enabled":shared.config.node.certificate.is_some()}),
     )
 }
 
-async fn status(State(current): State<watch::Receiver<Arc<Shared>>>) -> Json<Status> {
-    let shared = current.borrow().clone();
+async fn status(State(http): State<observability::HttpState>) -> Json<Status> {
+    let shared = http.current.borrow().clone();
     let clients = shared.clients.lock().expect("client state lock");
     let runtime = shared.runtime.lock().expect("runtime");
     Json(Status {
@@ -167,8 +166,8 @@ async fn status(State(current): State<watch::Receiver<Arc<Shared>>>) -> Json<Sta
     })
 }
 
-async fn history(State(current): State<watch::Receiver<Arc<Shared>>>) -> Json<serde_json::Value> {
-    let shared = current.borrow().clone();
+async fn history(State(http): State<observability::HttpState>) -> Json<serde_json::Value> {
+    let shared = http.current.borrow().clone();
     let scope =
         history_store::scope(&shared.config, &shared.assignments).expect("validated history scope");
     let saved = {

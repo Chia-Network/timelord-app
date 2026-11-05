@@ -34,6 +34,7 @@ done
         assignments: prepared.assignments,
         native: prepared.native,
         clients: Default::default(),
+        process: crate::operational::State::fixture(),
         runtime: Default::default(),
         started_unix: crate::unix_now(),
         service_started_unix: crate::unix_now(),

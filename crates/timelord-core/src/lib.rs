@@ -72,10 +72,23 @@ pub enum Network {
     Testnet11,
 }
 
+impl Network {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mainnet => "mainnet",
+            Self::Testnet11 => "testnet11",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServiceConfig {
     pub status_listen: SocketAddr,
+    pub observability_listen: Option<SocketAddr>,
+    /// Explicitly allow unauthenticated deployment probes outside loopback.
+    pub allow_remote_observability: bool,
+    pub supervisor_observability_listen: SocketAddr,
     pub control_socket: Option<PathBuf>,
     pub tuning_paused: bool,
     pub start_automatically: bool,
@@ -85,10 +98,25 @@ impl Default for ServiceConfig {
     fn default() -> Self {
         Self {
             status_listen: SocketAddr::from(([127, 0, 0, 1], 9257)),
+            observability_listen: None,
+            allow_remote_observability: false,
+            supervisor_observability_listen: SocketAddr::from(([127, 0, 0, 1], 9259)),
             control_socket: None,
             tuning_paused: false,
             start_automatically: true,
         }
+    }
+}
+
+impl ServiceConfig {
+    /// Ports owned by service endpoints; board client ports must avoid them.
+    pub fn reserved_ports(&self) -> HashSet<u16> {
+        let mut ports = HashSet::from([
+            self.status_listen.port(),
+            self.supervisor_observability_listen.port(),
+        ]);
+        ports.extend(self.observability_listen.map(|a| a.port()));
+        ports
     }
 }
 
@@ -311,8 +339,44 @@ impl Config {
         if self.hardware.boards.len() > 3 {
             return Err("This version supports up to three configured boards".into());
         }
+        if self
+            .service
+            .observability_listen
+            .is_some_and(|a| a.port() == 0 || a.port() == self.service.status_listen.port())
+        {
+            return Err(
+                "Observability requires a nonzero port distinct from status and client ports"
+                    .into(),
+            );
+        }
+        if !self.service.allow_remote_observability
+            && (self
+                .service
+                .observability_listen
+                .is_some_and(|a| !a.ip().is_loopback())
+                || !self
+                    .service
+                    .supervisor_observability_listen
+                    .ip()
+                    .is_loopback())
+        {
+            return Err("Remote observability requires explicit allow_remote_observability = true (no built-in authentication or TLS)".into());
+        }
+        let supervisor = self.service.supervisor_observability_listen;
+        if supervisor.port() == 0
+            || supervisor.port() == self.service.status_listen.port()
+            || self
+                .service
+                .observability_listen
+                .is_some_and(|a| a.port() == supervisor.port())
+        {
+            return Err(
+                "Supervisor observability must use a nonzero port distinct from worker endpoints"
+                    .into(),
+            );
+        }
         let mut ids = HashSet::new();
-        let mut ports = HashSet::from([self.service.status_listen.port()]);
+        let mut ports = self.service.reserved_ports();
         let mut locations = HashSet::new();
         let mut serials = HashSet::new();
         for b in &self.hardware.boards {
@@ -437,6 +501,39 @@ mod tests {
             temperature_limit_c: default_temperature_limit(),
         }
     }
+    #[test]
+    fn deployment_listener_is_optional_and_cannot_collide_with_local_endpoints() {
+        let mut c = Config::default();
+        assert!(c.service.observability_listen.is_none());
+        c.service.observability_listen = Some("0.0.0.0:9258".parse().unwrap());
+        assert!(c.validate().is_err());
+        c.service.allow_remote_observability = true;
+        assert!(c.validate().is_ok());
+        c.service.observability_listen = Some("0.0.0.0:9257".parse().unwrap());
+        assert!(c.validate().is_err());
+        c.service.observability_listen = Some("127.0.0.1:0".parse().unwrap());
+        assert!(c.validate().is_err());
+        c.service.observability_listen = Some("[::]:18110".parse().unwrap());
+        c.hardware.boards.push(board("a", 18110));
+        assert!(c.validate().is_err());
+        c.service.observability_listen = Some("[::]:9258".parse().unwrap());
+        assert!(c.validate().is_ok());
+        c.service.status_listen = "0.0.0.0:9257".parse().unwrap();
+        assert!(c.validate().is_err());
+    }
+    #[test]
+    fn remote_supervisor_probes_also_require_explicit_opt_in() {
+        let mut config = Config::default();
+        config.service.supervisor_observability_listen = "[::]:9259".parse().unwrap();
+        assert!(config.validate().is_err());
+        config.service.allow_remote_observability = true;
+        assert!(config.validate().is_ok());
+        let serialized = toml::to_string(&config).unwrap();
+        let restored: Config = toml::from_str(&serialized).unwrap();
+        assert!(restored.service.allow_remote_observability);
+        assert!(restored.validate().is_ok());
+    }
+
     #[test]
     fn old_voltage_search_key_is_read_only_and_recovery_limits_are_validated() {
         let value: AutomaticConfig = toml::from_str("voltage_after_seconds=3600").unwrap();

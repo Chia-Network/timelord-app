@@ -29,6 +29,9 @@ public struct NodeRPCConfiguration: Codable, Sendable, Equatable {
 }
 public struct ServiceConfiguration: Codable, Sendable, Equatable {
     public var statusListen = "127.0.0.1:9257"
+    public var observabilityListen: String?
+    public var allowRemoteObservability = false
+    public var supervisorObservabilityListen = "127.0.0.1:9259"
     public var controlSocket: String?
     public var tuningPaused = false
     public var startAutomatically = true
@@ -125,8 +128,11 @@ public enum BoardDiscovery {
         }
         return result
     }
-    public static func reconcile(_ devices:[DiscoveredDevice], hardware:HardwareConfiguration) -> HardwareConfiguration {
+    public static func reconcile(_ devices:[DiscoveredDevice], hardware:HardwareConfiguration, service:ServiceConfiguration) -> HardwareConfiguration {
         var result=hardware
+        let reservedPorts=Set([service.statusListen,service.observabilityListen,service.supervisorObservabilityListen].compactMap { address in
+            address.flatMap { Int($0.split(separator:":").last.map(String.init) ?? "") }
+        })
         if hardware.chainAssignments != nil {
             // Keep serial-pinned owners even while unplugged. The service retries
             // their connections without reallocating a healthy board's chain.
@@ -145,10 +151,10 @@ public enum BoardDiscovery {
         let candidates=hardware.boards+remembered
         var selected:[ConfiguredBoard]=[]
         for device in devices.prefix(3) {
-            let port=(18110...18112).first { p in !selected.contains {$0.clientPort==p} }!
+            let port=(18110...65535).first { p in !reservedPorts.contains(p) && !selected.contains {$0.clientPort==p} }!
             var board=BoardTopology.matching(device,in:candidates) ?? ConfiguredBoard(id:UUID().uuidString,name:"ASIC \(selected.count+1)",port:port,location:device.location)
             board.deviceLocation=device.location;board.serial=device.serial ?? board.serial
-            if selected.contains(where:{$0.clientPort==board.clientPort}) {board.clientPort=port}
+            if reservedPorts.contains(board.clientPort) || selected.contains(where:{$0.clientPort==board.clientPort}) {board.clientPort=port}
             selected.append(board)
         }
         result.boards=selected

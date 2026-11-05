@@ -2,7 +2,7 @@
 use crate::{
     Shared,
     asic::{AsicBackend, AsicFailure, ProofTiming},
-    unix_now,
+    observability::{PeakResult, ProofStage, SubmissionKind},
 };
 use anyhow::{Context, Result, bail};
 use dg_xch_core::{
@@ -15,7 +15,6 @@ use dg_xch_servers::transport::{
 };
 use dg_xch_timelord::scheduler::{Output, Scheduler, WorkPlan, WorkResult};
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -29,181 +28,9 @@ use tokio_tungstenite::{
 };
 
 pub type Socket = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Observation {
-    pub id: u64,
-    pub chain: Chain,
-    pub timestamp_unix: u64,
-    pub work_started_unix: u64,
-    pub ips: f64,
-}
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Event {
-    pub id: u64,
-    pub timestamp_unix: u64,
-    pub board_id: Option<String>,
-    pub kind: String,
-    pub end_unix: Option<u64>,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RawState {
-    Running,
-    Sampling,
-    Idle,
-}
-#[derive(Clone, Serialize)]
-pub struct RawSpeed {
-    pub state: RawState,
-    pub engine: usize,
-    pub ips: f64,
-    pub timestamp_unix: u64,
-}
-#[derive(Clone, Default, Serialize)]
-pub struct HardwareState {
-    #[serde(skip)]
-    pub generation: u64,
-    pub device_location: Option<u32>,
-    #[serde(skip)]
-    pub started_unix: u64,
-    #[serde(skip)]
-    pub latched_fault: bool,
-    // Set only by discovery while this board's native owner is closed.
-    #[serde(skip)]
-    pub usb_present: Option<bool>,
-    #[serde(skip)]
-    pub fault_reason: Option<String>,
-    #[serde(skip)]
-    pub fault_kind: Option<crate::hardware::NativeFailureKind>,
-    pub raw_speeds: Vec<RawSpeed>,
-    pub temperature_c: Option<f64>,
-    pub frequency_mhz: Option<f64>,
-    pub voltage_v: Option<f64>,
-    pub state: String,
-    pub recoveries: u64,
-    pub temperature_unix: u64,
-    pub automatic: Option<crate::automatic::Status>,
-}
-impl HardwareState {
-    pub fn fault(&mut self, error: &anyhow::Error) {
-        self.fault_reason = Some(error.to_string());
-        self.fault_kind = error
-            .downcast_ref::<crate::hardware::NativeFailure>()
-            .map(|e| e.kind);
-    }
-    pub fn raw_sample(&mut self, engine: usize, ips: f64, state: RawState, now: u64) {
-        if let Some(sample) = self.raw_speeds.iter_mut().find(|s| s.engine == engine) {
-            sample.state = state;
-            if state == RawState::Running {
-                sample.ips = ips;
-                sample.timestamp_unix = now;
-            }
-        } else {
-            self.raw_speeds.push(RawSpeed {
-                engine,
-                ips,
-                state,
-                timestamp_unix: now,
-            });
-        }
-    }
-}
-pub struct RuntimeState {
-    pub phase: String,
-    pub node: String,
-    pub message: String,
-    pub observations: crate::history_buffer::History<Observation>,
-    pub estimated_observations: crate::history_buffer::History<Observation>,
-    pub events: crate::history_buffer::History<Event>,
-    pub proofs_delivered: u64,
-    pub failed_proofs: u64,
-    pub tuning_paused: bool,
-    pub(crate) events_created: u64,
-    pub(crate) observations_created: u64,
-    pub(crate) archive: Option<crate::history_store::Snapshot>,
-    pub boards: std::collections::HashMap<String, HardwareState>,
-}
-impl Default for RuntimeState {
-    fn default() -> Self {
-        Self {
-            phase: "setup_required".into(),
-            node: "not_configured".into(),
-            message: "Connect a full node to get started.".into(),
-            observations: Default::default(),
-            estimated_observations: Default::default(),
-            events: Default::default(),
-            proofs_delivered: 0,
-            failed_proofs: 0,
-            tuning_paused: false,
-            events_created: 0,
-            observations_created: 0,
-            archive: None,
-            boards: Default::default(),
-        }
-    }
-}
-impl RuntimeState {
-    pub fn with_tuning_paused(tuning_paused: bool) -> Self {
-        Self {
-            tuning_paused,
-            ..Default::default()
-        }
-    }
-    pub fn transition(&mut self, phase: &str, node: &str, message: &str) {
-        self.phase = phase.into();
-        self.node = node.into();
-        self.message = message.into();
-    }
-    pub fn event(&mut self, board_id: Option<String>, kind: &str) {
-        self.events_created += 1;
-        self.events.push(Event {
-            id: self.events_created,
-            timestamp_unix: unix_now(),
-            board_id,
-            kind: kind.into(),
-            end_unix: None,
-        });
-        self.events
-            .expire_front(|e| e.timestamp_unix < unix_now().saturating_sub(86400));
-    }
-    fn connected(&mut self) {
-        for event in self.events.iter_mut() {
-            if event.kind == "node_unavailable" && event.end_unix.is_none() {
-                event.end_unix = Some(unix_now());
-            }
-        }
-    }
-    pub fn estimated(&mut self, chain: Chain, ips: f64, work_started_unix: u64) {
-        self.observations_created += 1;
-        self.estimated_observations.push(Observation {
-            id: self.observations_created,
-            chain,
-            ips,
-            timestamp_unix: unix_now(),
-            work_started_unix,
-        });
-        self.estimated_observations
-            .expire_front(|o| o.timestamp_unix < unix_now().saturating_sub(86400));
-    }
-    fn delivered(&mut self, speeds: Vec<(Chain, ProofTiming)>) {
-        for (chain, timing) in speeds {
-            let ips = timing.delivered_ips();
-            self.observations_created += 1;
-            self.observations.push(Observation {
-                id: self.observations_created,
-                chain,
-                ips,
-                timestamp_unix: unix_now(),
-                work_started_unix: timing.started_unix(),
-            });
-            self.proofs_delivered += 1;
-        }
-        self.observations
-            .expire_front(|e| e.timestamp_unix < unix_now().saturating_sub(86400));
-        self.phase = "running".into();
-        self.message = "Producing verified proofs for your full node.".into();
-    }
-}
+mod state;
+pub use state::{Event, HardwareState, Observation, RawSpeed, RawState, RuntimeState};
+
 pub fn chain(config: &Config) -> Result<ChainSelection> {
     let name = match config.node.network {
         timelord_core::Network::Mainnet => "mainnet",
@@ -323,6 +150,23 @@ async fn send(socket: &mut Socket, message: Message) -> Result<()> {
         .context("Node send timed out")??;
     Ok(())
 }
+async fn submit(
+    shared: &Shared,
+    kind: SubmissionKind,
+    stage: Option<&timelord_supervisor::progress::Guard>,
+    sending: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    if let Some(stage) = stage {
+        stage.stage(timelord_supervisor::progress::Stage::Submitting);
+    }
+    let started = Instant::now();
+    sending.await?;
+    {
+        let metrics = shared.process.metrics.clone();
+        metrics.submitted(kind, started.elapsed());
+    }
+    Ok(())
+}
 fn proof_digest(
     proof: &dg_xch_core::blockchain::vdf_proof::VdfProof,
 ) -> Result<dg_xch_core::blockchain::sized_bytes::Bytes32> {
@@ -415,6 +259,11 @@ async fn execute(backend: Arc<AsicBackend>, plan: WorkPlan) -> Result<Completed>
     }
     let bundle_ready = Instant::now();
     for (chain, timing) in &speeds {
+        backend.observe_duration(
+            *chain,
+            ProofStage::BundleWait,
+            bundle_ready.saturating_duration_since(timing.ready_at),
+        );
         tracing::info!(
             ?chain,
             generation = plan.generation,
@@ -459,6 +308,15 @@ fn waiting_for_infusion_confirmation(
     Ok(true)
 }
 async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
+    let process = shared.process.clone();
+    let metrics = process.metrics.clone();
+    {
+        let mut state = shared.runtime.lock().expect("runtime");
+        state.metric_epoch = metrics.begin_session();
+        state.scheduler_initialized = false;
+        state.scheduler_height = None;
+        state.scheduler_deficit = None;
+    }
     shared.runtime.lock().expect("runtime").transition(
         "waiting_for_node",
         "connecting",
@@ -471,7 +329,11 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
     let bits = resolved.constants.discriminant_size_bits as usize;
     let mut scheduler = Scheduler::new(resolved.constants, resolved.allows_bootstrap, None)?;
     let mut socket = connect(&shared.config).await?;
-    shared.runtime.lock().expect("runtime").connected();
+    {
+        let mut state = shared.runtime.lock().expect("runtime");
+        state.connected();
+        metrics.connected();
+    }
     shared.runtime.lock().expect("runtime").transition(
         "waiting_for_node",
         "authenticated",
@@ -482,12 +344,15 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
     // JoinSet aborts all workers on session exit. Interrupted I/O closes its lease.
     let mut active: Option<WorkPlan> = None;
     let mut ready: Option<Completed> = None;
+    let mut eligibility = None;
+    let progress = &process.progress;
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
     let mut last_message = Instant::now();
     let connected = Instant::now();
     let mut infusion_submitted_at = None;
+    let mut last_initialized = false;
     loop {
         let awaiting_confirmation = waiting_for_infusion_confirmation(
             scheduler.needs_resync(),
@@ -499,6 +364,15 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
         } else {
             scheduler.next_plan()?
         };
+        let initialized = scheduler.initialized();
+        if initialized != last_initialized {
+            shared
+                .runtime
+                .lock()
+                .expect("runtime")
+                .scheduler_initialized = initialized;
+            last_initialized = initialized;
+        }
         if active.as_ref().is_some_and(|current| {
             next.as_ref().is_none_or(|next| {
                 current.generation != next.generation
@@ -510,6 +384,7 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
             while workers.join_next().await.is_some() {}
             active = None;
             ready = None;
+            eligibility = None;
         }
         if active.is_none()
             && let Some(plan) = next
@@ -532,6 +407,13 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
             .is_some_and(|r| Instant::now() >= r.plan.not_before)
             && let Some(completed) = ready.take()
         {
+            eligibility.take();
+            let stage = Some(progress.begin(
+                timelord_supervisor::progress::Resource::Scheduler,
+                completed.plan.generation,
+                completed.plan.challenge.iterations,
+                timelord_supervisor::progress::Stage::Scheduler,
+            ));
             // finish independently verifies full checkpointed proofs and request identity.
             if let Some(output) = scheduler.finish(completed.plan, completed.result)? {
                 let next_infused = match &output {
@@ -545,6 +427,11 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                         Some(input)
                     }
                     _ => None,
+                };
+                let kind = match &output {
+                    Output::SignagePoint(_) => SubmissionKind::Signage,
+                    Output::InfusionPoint(_) => SubmissionKind::Infusion,
+                    Output::EndOfSubSlot(_) => SubmissionKind::EndOfSubSlot,
                 };
                 let infusion = matches!(&output, Output::InfusionPoint(_));
                 let message = match output {
@@ -560,7 +447,7 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                         encode(ProtocolMessageTypes::NewEndOfSubSlotVdf, &value, None)?
                     }
                 };
-                send(&mut socket, message).await?;
+                submit(&shared, kind, stage.as_ref(), send(&mut socket, message)).await?;
                 if infusion {
                     infusion_submitted_at = Some(Instant::now());
                 }
@@ -588,17 +475,36 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                 match completed { Ok(result) => result?, Err(error) if error.is_cancelled() => {}, Err(error) => return Err(error.into()) }
             }
             Some(completed) = workers.join_next(), if !workers.is_empty() => {
-                match completed { Ok(Ok(result)) if result.plan.generation == scheduler.generation() => ready = Some(result), Ok(Ok(_)) => {}, Ok(Err(error)) => return Err(error), Err(error) if error.is_cancelled() => {}, Err(error) => return Err(error.into()) }
+                match completed { Ok(Ok(result)) if result.plan.generation == scheduler.generation() => {
+                    let wait_seconds = result.plan.not_before.saturating_duration_since(Instant::now()).as_secs().saturating_add(1);
+                    eligibility=Some(progress.begin(timelord_supervisor::progress::Resource::Eligibility,result.plan.generation,result.plan.challenge.iterations,timelord_supervisor::progress::Stage::Eligibility{wait_seconds}));
+                    ready = Some(result);
+                }, Ok(Ok(_)) => {}, Ok(Err(error)) => return Err(error), Err(error) if error.is_cancelled() => {}, Err(error) => return Err(error.into()) }
             }
             incoming = socket.next() => {
                 last_message = Instant::now();
+                if incoming.as_ref().is_some_and(|r|r.is_ok()) {metrics.node_message_received();}
                 match incoming.context("Node disconnected")?? {
                     Message::Binary(bytes) => {
                         let message: ChiaMessage = decode_exact(&bytes)?;
                         match message.msg_type {
                             ProtocolMessageTypes::NewPeakTimelord => {
                                 let peak: dg_xch_core::protocols::timelord::NewPeakTimelord=decode_exact(message.data.as_slice())?;
-                                if scheduler.set_peak(peak.clone())? {
+                                metrics.peak_received();
+                                let result = scheduler.set_peak(peak.clone());
+                                metrics.peak_updated(match &result {
+                                    Ok(true) => PeakResult::Accepted,
+                                    Ok(false) => PeakResult::Ignored,
+                                    Err(_) => PeakResult::Rejected,
+                                });
+                                let accepted = result?;
+                                if accepted {
+                                    {
+                                        let mut state=shared.runtime.lock().expect("runtime");
+                                        state.scheduler_initialized=scheduler.initialized();
+                                        state.scheduler_height=Some(peak.reward_chain_block.height);
+                                        state.scheduler_deficit=Some(peak.deficit);
+                                    }
                                     infusion_submitted_at = None;
                                     let work=infused_from_peak(&peak,scheduler.generation(),bits,minimum_deficit)?;
                                     prime_infused(&mut primers,backend.clone(),work);
@@ -638,6 +544,8 @@ pub async fn run(
                 }
                 state.event(Some(failure.board_id.clone()), "board_fault");
             }
+            shared.process.metrics.disconnect(state.metric_epoch);
+            state.scheduler_initialized = false;
             state.transition("waiting_for_node", "disconnected", &error.to_string());
             state.event(None, "node_unavailable");
         }
@@ -650,6 +558,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::unix_now;
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
     use std::{fs, path::PathBuf};
     use tokio::net::TcpListener;
@@ -853,6 +762,7 @@ mod tests {
             config.hardware.boards = vec![toml::from_str(
                 "id='failed'\nname='Failed'\nclient_port=18110",
             )?];
+            let process = crate::operational::State::fixture();
             let runtime = Arc::new(std::sync::Mutex::new(RuntimeState::default()));
             runtime.lock().unwrap().boards.insert(
                 "failed".into(),
@@ -866,12 +776,14 @@ mod tests {
                 &config,
                 &config.assignments().map_err(anyhow::Error::msg)?,
                 runtime.clone(),
+                process.clone(),
             )?;
             let shared = Arc::new(Shared {
                 native: None,
                 assignments: config.assignments().map_err(anyhow::Error::msg)?,
                 config,
                 clients: Default::default(),
+                process,
                 runtime,
                 started_unix: unix_now(),
                 service_started_unix: crate::unix_now(),
@@ -897,6 +809,74 @@ mod tests {
             }
         }
     }
+    #[tokio::test]
+    async fn submissions_count_only_successful_sends() {
+        let metrics = crate::observability::Metrics::new(timelord_core::Network::Mainnet).unwrap();
+        let process = crate::operational::State::new(metrics.clone());
+        let shared = Shared {
+            native: None,
+            config: Config::default(),
+            assignments: vec![],
+            clients: Default::default(),
+            process,
+            runtime: Arc::new(std::sync::Mutex::new(RuntimeState::new(false))),
+            started_unix: unix_now(),
+            service_started_unix: unix_now(),
+        };
+        assert!(
+            submit(&shared, SubmissionKind::Signage, None, async {
+                bail!("fixture send failed")
+            })
+            .await
+            .is_err()
+        );
+        assert_eq!(metrics.counter("submissions_total", &["signage"]), 0);
+        submit(&shared, SubmissionKind::Signage, None, async { Ok(()) })
+            .await
+            .unwrap();
+        assert_eq!(metrics.counter("submissions_total", &["signage"]), 1);
+    }
+    #[tokio::test]
+    async fn submission_transitions_the_scheduler_owner_instead_of_replacing_it() {
+        use timelord_supervisor::progress::{Resource, Stage};
+        let metrics = crate::observability::Metrics::new(timelord_core::Network::Mainnet).unwrap();
+        let process = crate::operational::State::new(metrics.clone());
+        let shared = Shared {
+            native: None,
+            config: Config::default(),
+            assignments: vec![],
+            clients: Default::default(),
+            process,
+            runtime: Arc::new(std::sync::Mutex::new(RuntimeState::new(false))),
+            started_unix: unix_now(),
+            service_started_unix: unix_now(),
+        };
+        let process = shared.process.clone();
+        let guard = process
+            .progress
+            .begin(Resource::Scheduler, 12, 42, Stage::Scheduler);
+        let scheduler = |sequence| {
+            process
+                .progress
+                .snapshot(1, sequence)
+                .unwrap()
+                .slot(Resource::Scheduler)
+        };
+        let previous = scheduler(1).unwrap();
+        submit(&shared, SubmissionKind::Signage, Some(&guard), async {
+            let work = scheduler(2).unwrap();
+            assert_eq!(work.id, previous.id);
+            assert_eq!(work.generation, previous.generation);
+            assert_eq!(work.stage, Stage::Submitting);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(scheduler(3).is_some());
+        drop(guard);
+        assert!(scheduler(4).is_none());
+    }
+
     #[tokio::test]
     async fn authenticates_a_mutual_tls_chia_websocket_with_a_fixture_only_identity() {
         fixture("chia.net", false).await.unwrap();

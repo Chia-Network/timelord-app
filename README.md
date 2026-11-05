@@ -167,3 +167,5 @@ uptime, proof counts and health still start fresh for each service run.
 See [architecture](docs/architecture.md) for process ownership, proof verification
 and tuning behavior. Licensed under [Apache-2.0](LICENSE); dependencies retain their
 own licenses and notices.
+
+Deployment monitoring: [health, readiness and Prometheus metrics](docs/observability.md).
