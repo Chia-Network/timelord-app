@@ -25,6 +25,24 @@ final class WorkerStatusObservationTests: XCTestCase {
         observation.failed(pid: 11, error: URLError(.timedOut), now: later)
         XCTAssertFalse(observation.isStarting(at: later), "An established endpoint outage is immediate")
     }
+    func testMissingSupervisorPollPreservesWorkerFailureUntilConfirmedPause() {
+        let now = ContinuousClock.now
+        let running = SupervisorStatus(apiVersion: 1, supervisorPid: 2, workerPid: 10, mode: .running,
+            revision: 1, workerGeneration: 1, restarts: 0, phase: .workerStarted, error: nil)
+        let paused = SupervisorStatus(apiVersion: 1, supervisorPid: 2, workerPid: nil, mode: .paused,
+            revision: 2, workerGeneration: 1, restarts: 0, phase: .paused, error: nil)
+        var observation = WorkerStatusObservation.absent
+        observation.observe(supervisor: running, now: now)
+        observation.received(pid: 10)
+        observation.failed(pid: 10, error: URLError(.timedOut), now: now)
+        observation.observe(supervisor: nil, now: now)
+        observation.observe(supervisor: running, now: now)
+        XCTAssertNotNil(observation.failure(at: now))
+        XCTAssertFalse(observation.isStarting(at: now))
+        observation.observe(supervisor: paused, now: now)
+        XCTAssertNil(observation.failure(at: now))
+    }
+
     func testGraceExpiryRemainsAFailureWithoutAnotherHTTPPoll() {
         let now = ContinuousClock.now
         var observation = WorkerStatusObservation.absent

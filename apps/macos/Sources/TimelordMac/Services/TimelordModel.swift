@@ -106,7 +106,7 @@ final class TimelordModel: ObservableObject {
         await controller.refresh()
         await refreshNodeSync()
         let expectedPID = controller.processID
-        workerStatus.observe(pid: controller.desiredRunning ? expectedPID : nil)
+        workerStatus.observe(supervisor: controller.supervisor)
         do {
             // No worker is normal during Pause, initial startup, and replacement.
             // Do not query an unrelated or stale HTTP listener without an owned PID.
@@ -253,12 +253,18 @@ final class TimelordModel: ObservableObject {
         return runtimeConfiguration != savedConfiguration
     }
     var settingsDoneTitle: String {
-        canControlService && (hasRuntimeSettingsChanges || configurationNeedsRestart) ? "Save & Restart" : "Done"
+        guard canControlService && (hasRuntimeSettingsChanges || configurationNeedsRestart) else { return "Done" }
+        return controller.desiredRunning ? "Save & Restart" : "Save & Apply"
     }
     var canFinishSettings: Bool {
         configurationLoaded && !operationInProgress && !isBusy
     }
     var settingsCompletionHint: String {
+        if controller.supervisor?.mode == .paused {
+            return hasRuntimeSettingsChanges || configurationNeedsRestart
+                ? "Save & Apply applies your changes. Timelord stays paused."
+                : "Your settings are saved. Timelord is paused."
+        }
         if canControlService {
             return hasRuntimeSettingsChanges || configurationNeedsRestart
                 ? "Save & Restart applies your changes and briefly restarts Timelord."

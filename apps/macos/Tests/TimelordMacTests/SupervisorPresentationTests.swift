@@ -171,6 +171,19 @@ final class SupervisorPresentationTests: XCTestCase {
         XCTAssertEqual(model.snapshot.explanation, "Invalid persisted intent")
     }
 
+    func testPausedSettingsDescribeApplyingChangesWithoutResuming() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        let model = fixture.model(AppConfiguration())
+        try fixture.publish(mode: "paused", phase: "paused")
+        await model.refresh()
+        XCTAssertEqual(model.settingsDoneTitle, "Done")
+        XCTAssertEqual(model.settingsCompletionHint, "Your settings are saved. Timelord is paused.")
+        model.configuration.node.host = "fixture.invalid"
+        XCTAssertEqual(model.settingsDoneTitle, "Save & Apply")
+        XCTAssertTrue(model.settingsCompletionHint.contains("Timelord stays paused."))
+    }
+
     func testPauseFailureStillObservesPersistedIntent() async throws {
         let fixture = try StatusFixture(pauseFails: true)
         defer { fixture.close() }

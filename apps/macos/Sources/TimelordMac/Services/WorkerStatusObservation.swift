@@ -23,6 +23,11 @@ enum WorkerStatusObservation {
         default: return nil
         }
     }
+    mutating func observe(supervisor: SupervisorStatus?, now: ContinuousClock.Instant = .now) {
+        // A failed control poll cannot establish that the last worker stopped.
+        guard let supervisor else { return }
+        observe(pid: supervisor.mode == .running ? supervisor.workerPid : nil, now: now)
+    }
     mutating func observe(pid: Int32?, now: ContinuousClock.Instant = .now) {
         guard pid != self.pid else { return }
         self = pid.map { .awaiting(pid: $0, until: now.advanced(by: .seconds(60))) } ?? .absent
