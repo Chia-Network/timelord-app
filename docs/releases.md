@@ -35,34 +35,54 @@ secrets can also supply these values. Do not commit certificates, private keys
 or account passwords. The pinned Apple signing
 action imports the certificate into a temporary keychain and removes it in its
 post-job cleanup. Exactly one imported Developer ID Application identity must
-match the team. Standard jobs have read-only repository permissions; only the
-draft-release job receives `contents: write`.
+match the team. In the Release workflow, only the draft-release job receives
+`contents: write`; build and signing jobs have read-only repository permissions.
 
-The workflow uses `GITHUB_TOKEN`; no GitHub personal access token is required.
+The workflows use `GITHUB_TOKEN`; no GitHub personal access token is required.
+For **Prepare Release**, enable **Allow GitHub Actions to create and approve pull
+requests** in Settings → Actions → General → Workflow permissions (organization
+policy must also permit this). Preparation requests `contents: write`,
+`pull-requests: write`, and `actions: write` to push the version branch, open its
+PR, and explicitly dispatch CI. It does not approve or merge PRs.
 Missing credentials fail the release before signing. Apple team registration and
 the certificate must permit Developer ID distribution and notarization.
 
 ## Cut a release
 
-1. Merge the intended runtime and build changes into `main`. PR #2 contains the
-   build infrastructure; application changes on other branches must be merged
-   before tagging if they are intended for that release.
-2. Set `[workspace.package].version` in `Cargo.toml`, then run `cargo check` to
-   update workspace package versions in `Cargo.lock`. Commit both. Supported
-   examples: `0.1.0`, `0.2.0-beta.1`, `0.2.0-rc.1`.
-3. Push a tag matching that exact source version, such as `v0.1.0`. A mismatched
+1. Merge the intended runtime and build changes into `main`.
+2. In Actions → **Prepare Release** → **Run workflow**, select `main` and enter
+   the new version without `v`, such as `0.1.1`, `0.2.0-beta.1`, or `0.2.0-rc.1`.
+   Alternatively: `gh workflow run prepare-release.yml --ref main -f version=0.1.1`.
+   The workflow updates `[workspace.package].version` in `Cargo.toml`, runs
+   `cargo check --workspace` to refresh `Cargo.lock`, and opens a PR from
+   `release/vVERSION` to `main`. It explicitly starts CI on that branch using
+   `workflow_dispatch`, so checks do not depend on bot-created PR events.
+   Review the two-file diff, wait for CI, and merge the PR. Preparation creates
+   no tag or release and uses no Apple credentials.
+3. Check out the merged version commit and push a tag matching that exact source
+   version, such as `v0.1.1`. A mismatched
    version, branch ref, unsupported suffix or malformed tag is rejected before
    signing. To rerun manually, dispatch **Release** against that existing tag:
-   `gh workflow run release.yml --ref v0.1.0`.
+   `gh workflow run release.yml --ref v0.1.1`.
 4. After CI succeeds, signing and notarization run automatically and create a draft.
 5. Review and publish the resulting draft in GitHub Releases. Beta/RC tags create
    prerelease drafts. The workflow never publishes a release automatically.
 
-For a stable release, after the version commit is merged and checked out:
+Preparation refuses the current version, malformed versions, existing tags, and
+existing preparation branches; it never force-pushes. For an existing preparation
+PR, continue with that PR. If a run fails after pushing its branch but before
+opening the PR, open a PR from that branch and run CI against it manually. For
+failures before pushing, rerun preparation. To prepare locally instead, run
+`bash scripts/prepare-release.sh VERSION` and commit `Cargo.toml` and `Cargo.lock`.
+The already-configured source version can also be tagged directly for its first
+release without a preparation PR.
+
+For a stable release, after the version commit is merged and checked out (verify
+`HEAD` is the intended release commit before tagging):
 
 ```sh
-git tag -a v0.1.0 -m 'Timelord 0.1.0'
-git push origin v0.1.0
+git tag -a v0.1.1 -m 'Timelord 0.1.1'
+git push origin v0.1.1
 ```
 
 The release workflow reuses CI's app from the **same workflow run**, verifies its
