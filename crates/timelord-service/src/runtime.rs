@@ -15,7 +15,7 @@ use dg_xch_servers::transport::{
 };
 use dg_xch_timelord::scheduler::{Output, Scheduler, WorkPlan, WorkResult};
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -29,7 +29,7 @@ use tokio_tungstenite::{
 };
 
 pub type Socket = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Observation {
     pub id: u64,
     pub chain: Chain,
@@ -37,7 +37,7 @@ pub struct Observation {
     pub work_started_unix: u64,
     pub ips: f64,
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Event {
     pub id: u64,
     pub timestamp_unix: u64,
@@ -45,8 +45,37 @@ pub struct Event {
     pub kind: String,
     pub end_unix: Option<u64>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RawState {
+    Running,
+    Sampling,
+    Idle,
+}
+#[derive(Clone, Serialize)]
+pub struct RawSpeed {
+    pub state: RawState,
+    pub engine: usize,
+    pub ips: f64,
+    pub timestamp_unix: u64,
+}
 #[derive(Clone, Default, Serialize)]
 pub struct HardwareState {
+    #[serde(skip)]
+    pub generation: u64,
+    pub device_location: Option<u32>,
+    #[serde(skip)]
+    pub started_unix: u64,
+    #[serde(skip)]
+    pub latched_fault: bool,
+    // Set only by discovery while this board's native owner is closed.
+    #[serde(skip)]
+    pub usb_present: Option<bool>,
+    #[serde(skip)]
+    pub fault_reason: Option<String>,
+    #[serde(skip)]
+    pub fault_kind: Option<crate::hardware::NativeFailureKind>,
+    pub raw_speeds: Vec<RawSpeed>,
     pub temperature_c: Option<f64>,
     pub frequency_mhz: Option<f64>,
     pub voltage_v: Option<f64>,
@@ -55,16 +84,43 @@ pub struct HardwareState {
     pub temperature_unix: u64,
     pub automatic: Option<crate::automatic::Status>,
 }
+impl HardwareState {
+    pub fn fault(&mut self, error: &anyhow::Error) {
+        self.fault_reason = Some(error.to_string());
+        self.fault_kind = error
+            .downcast_ref::<crate::hardware::NativeFailure>()
+            .map(|e| e.kind);
+    }
+    pub fn raw_sample(&mut self, engine: usize, ips: f64, state: RawState, now: u64) {
+        if let Some(sample) = self.raw_speeds.iter_mut().find(|s| s.engine == engine) {
+            sample.state = state;
+            if state == RawState::Running {
+                sample.ips = ips;
+                sample.timestamp_unix = now;
+            }
+        } else {
+            self.raw_speeds.push(RawSpeed {
+                engine,
+                ips,
+                state,
+                timestamp_unix: now,
+            });
+        }
+    }
+}
 pub struct RuntimeState {
     pub phase: String,
     pub node: String,
     pub message: String,
-    pub observations: Vec<Observation>,
-    pub events: Vec<Event>,
+    pub observations: crate::history_buffer::History<Observation>,
+    pub estimated_observations: crate::history_buffer::History<Observation>,
+    pub events: crate::history_buffer::History<Event>,
     pub proofs_delivered: u64,
     pub failed_proofs: u64,
     pub tuning_paused: bool,
-    events_created: u64,
+    pub(crate) events_created: u64,
+    pub(crate) observations_created: u64,
+    pub(crate) archive: Option<crate::history_store::Snapshot>,
     pub boards: std::collections::HashMap<String, HardwareState>,
 }
 impl Default for RuntimeState {
@@ -73,12 +129,15 @@ impl Default for RuntimeState {
             phase: "setup_required".into(),
             node: "not_configured".into(),
             message: "Connect a full node to get started.".into(),
-            observations: vec![],
-            events: vec![],
+            observations: Default::default(),
+            estimated_observations: Default::default(),
+            events: Default::default(),
             proofs_delivered: 0,
             failed_proofs: 0,
             tuning_paused: false,
             events_created: 0,
+            observations_created: 0,
+            archive: None,
             boards: Default::default(),
         }
     }
@@ -105,20 +164,33 @@ impl RuntimeState {
             end_unix: None,
         });
         self.events
-            .retain(|e| e.timestamp_unix >= unix_now().saturating_sub(86400));
+            .expire_front(|e| e.timestamp_unix < unix_now().saturating_sub(86400));
     }
     fn connected(&mut self) {
-        for event in &mut self.events {
+        for event in self.events.iter_mut() {
             if event.kind == "node_unavailable" && event.end_unix.is_none() {
                 event.end_unix = Some(unix_now());
             }
         }
     }
+    pub fn estimated(&mut self, chain: Chain, ips: f64, work_started_unix: u64) {
+        self.observations_created += 1;
+        self.estimated_observations.push(Observation {
+            id: self.observations_created,
+            chain,
+            ips,
+            timestamp_unix: unix_now(),
+            work_started_unix,
+        });
+        self.estimated_observations
+            .expire_front(|o| o.timestamp_unix < unix_now().saturating_sub(86400));
+    }
     fn delivered(&mut self, speeds: Vec<(Chain, ProofTiming)>) {
         for (chain, timing) in speeds {
             let ips = timing.delivered_ips();
+            self.observations_created += 1;
             self.observations.push(Observation {
-                id: self.proofs_delivered + 1,
+                id: self.observations_created,
                 chain,
                 ips,
                 timestamp_unix: unix_now(),
@@ -126,11 +198,8 @@ impl RuntimeState {
             });
             self.proofs_delivered += 1;
         }
-        if self.observations.len() > 86400 {
-            self.observations.drain(..self.observations.len() - 86400);
-        }
         self.observations
-            .retain(|e| e.timestamp_unix >= unix_now().saturating_sub(86400));
+            .expire_front(|e| e.timestamp_unix < unix_now().saturating_sub(86400));
         self.phase = "running".into();
         self.message = "Producing verified proofs for your full node.".into();
     }
@@ -315,7 +384,7 @@ fn prime_infused(
     primers.abort_all();
     primers.spawn(async move {
         if let Some(work) = work {
-            backend.prove(Chain::InfusedChallenge, work).await?;
+            backend.prime(work).await?;
         } else {
             backend.stop_chain(Chain::InfusedChallenge).await;
         }
@@ -328,12 +397,12 @@ struct Completed {
     speeds: Vec<(Chain, ProofTiming)>,
 }
 async fn execute(backend: Arc<AsicBackend>, plan: WorkPlan) -> Result<Completed> {
-    let cc = backend.prove(Chain::Challenge, plan.challenge.clone());
-    let rc = backend.prove(Chain::Reward, plan.reward.clone());
+    let cc = backend.prove_when_available(Chain::Challenge, plan.challenge.clone(), true);
+    let rc = backend.prove_when_available(Chain::Reward, plan.reward.clone(), true);
     let icc = async {
         match &plan.infused {
             Some(work) => backend
-                .prove(Chain::InfusedChallenge, work.clone())
+                .prove_when_available(Chain::InfusedChallenge, work.clone(), true)
                 .await
                 .map(Some),
             None => Ok(None),
@@ -344,6 +413,20 @@ async fn execute(backend: Arc<AsicBackend>, plan: WorkPlan) -> Result<Completed>
     if let Some((_, speed)) = &icc {
         speeds.push((Chain::InfusedChallenge, *speed));
     }
+    let bundle_ready = Instant::now();
+    for (chain, timing) in &speeds {
+        tracing::info!(
+            ?chain,
+            generation = plan.generation,
+            total_iters = plan.total_iters,
+            ready_unix_ms = timing.ready_unix_ms,
+            bundle_wait_ms = bundle_ready
+                .saturating_duration_since(timing.ready_at)
+                .as_secs_f64()
+                * 1000.,
+            "Verified chain proof ready for bundle"
+        );
+    }
     Ok(Completed {
         plan,
         result: WorkResult {
@@ -353,6 +436,27 @@ async fn execute(backend: Arc<AsicBackend>, plan: WorkPlan) -> Result<Completed>
         },
         speeds,
     })
+}
+// The upstream scheduler asks for resynchronization five seconds after an
+// infusion. Give node validation time to finish without disconnecting or asking
+// the expired scheduler for more work based on the old peak.
+const INFUSION_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(60);
+fn waiting_for_infusion_confirmation(
+    scheduler_expired: bool,
+    submitted_at: Option<Instant>,
+    now: Instant,
+) -> Result<bool> {
+    if !scheduler_expired {
+        return Ok(false);
+    }
+    if submitted_at
+        .is_none_or(|sent| now.saturating_duration_since(sent) >= INFUSION_CONFIRMATION_TIMEOUT)
+    {
+        bail!(
+            "Node has not confirmed the infusion within 60 seconds; reconnecting for chain state"
+        );
+    }
+    Ok(true)
 }
 async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
     shared.runtime.lock().expect("runtime").transition(
@@ -383,21 +487,18 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
     let mut last_message = Instant::now();
     let connected = Instant::now();
+    let mut infusion_submitted_at = None;
     loop {
-        if shared
-            .runtime
-            .lock()
-            .expect("runtime")
-            .boards
-            .values()
-            .any(|b| b.state == "fault" || b.state == "thermal_stop")
-        {
-            bail!("An ASIC client needs attention");
-        }
-        if scheduler.needs_resync() {
-            bail!("Node has not confirmed the infusion; reconnecting for chain state");
-        }
-        let next = scheduler.next_plan()?;
+        let awaiting_confirmation = waiting_for_infusion_confirmation(
+            scheduler.needs_resync(),
+            infusion_submitted_at,
+            Instant::now(),
+        )?;
+        let next = if awaiting_confirmation {
+            None
+        } else {
+            scheduler.next_plan()?
+        };
         if active.as_ref().is_some_and(|current| {
             next.as_ref().is_none_or(|next| {
                 current.generation != next.generation
@@ -445,6 +546,7 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                     }
                     _ => None,
                 };
+                let infusion = matches!(&output, Output::InfusionPoint(_));
                 let message = match output {
                     Output::SignagePoint(value) => {
                         tracing::info!(index=value.index_from_challenge, cc=%value.challenge_chain_sp_vdf.output.hash()?, rc=%value.reward_chain_sp_vdf.output.hash()?, cc_proof=%proof_digest(&value.challenge_chain_sp_proof)?, rc_proof=%proof_digest(&value.reward_chain_sp_proof)?, "Submitting verified signage point");
@@ -459,6 +561,9 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                     }
                 };
                 send(&mut socket, message).await?;
+                if infusion {
+                    infusion_submitted_at = Some(Instant::now());
+                }
                 shared
                     .runtime
                     .lock()
@@ -474,7 +579,6 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
         tokio::select! {
             _ = tick.tick() => {
                 if !scheduler.initialized() && connected.elapsed() > Duration::from_secs(30) { bail!("Node has not supplied chain state yet"); }
-                if shared.runtime.lock().expect("runtime").boards.values().any(|b| b.state == "thermal_stop" || b.state == "fault") { bail!("An ASIC client needs attention"); }
             }
             _ = heartbeat.tick() => {
                 if last_message.elapsed() > Duration::from_secs(90) { bail!("Full-node heartbeat expired"); }
@@ -495,6 +599,7 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                             ProtocolMessageTypes::NewPeakTimelord => {
                                 let peak: dg_xch_core::protocols::timelord::NewPeakTimelord=decode_exact(message.data.as_slice())?;
                                 if scheduler.set_peak(peak.clone())? {
+                                    infusion_submitted_at = None;
                                     let work=infused_from_peak(&peak,scheduler.generation(),bits,minimum_deficit)?;
                                     prime_infused(&mut primers,backend.clone(),work);
                                 }
@@ -533,43 +638,10 @@ pub async fn run(
                 }
                 state.event(Some(failure.board_id.clone()), "board_fault");
             }
-            let hardware_fault = state
-                .boards
-                .values()
-                .any(|b| b.state == "thermal_stop" || b.state == "fault");
-            let message = if hardware_fault
-                && state.phase == "fault"
-                && error.downcast_ref::<AsicFailure>().is_none()
-            {
-                state.message.clone()
-            } else {
-                error.to_string()
-            };
-            state.transition(
-                if hardware_fault {
-                    "fault"
-                } else {
-                    "waiting_for_node"
-                },
-                "disconnected",
-                &message,
-            );
-            if !hardware_fault {
-                state.event(None, "node_unavailable");
-            }
+            state.transition("waiting_for_node", "disconnected", &error.to_string());
+            state.event(None, "node_unavailable");
         }
         backend.stop_all().await;
-        let hardware_fault = shared
-            .runtime
-            .lock()
-            .expect("runtime")
-            .boards
-            .values()
-            .any(|b| b.state == "thermal_stop" || b.state == "fault");
-        if hardware_fault {
-            let _ = shutdown.changed().await;
-            break;
-        }
         tokio::select! { _ = shutdown.changed() => break, _ = tokio::time::sleep(Duration::from_secs(5)) => {} }
     }
     backend.stop_all().await;
@@ -582,6 +654,46 @@ mod tests {
     use std::{fs, path::PathBuf};
     use tokio::net::TcpListener;
     struct Files(PathBuf);
+    #[test]
+    fn busy_node_confirmation_keeps_the_connection_and_withholds_stale_work() {
+        let sent = Instant::now();
+        for seconds in [5, 10, 25, 32, 59] {
+            assert!(
+                waiting_for_infusion_confirmation(
+                    true,
+                    Some(sent),
+                    sent + Duration::from_secs(seconds),
+                )
+                .unwrap(),
+                "Expired scheduler must remain blocked while node validation finishes"
+            );
+        }
+        for seconds in [60, 90] {
+            assert!(
+                waiting_for_infusion_confirmation(
+                    true,
+                    Some(sent),
+                    sent + Duration::from_secs(seconds),
+                )
+                .is_err(),
+                "Repeated node messages must not extend the submission deadline"
+            );
+        }
+        assert!(waiting_for_infusion_confirmation(true, None, sent).is_err());
+        // An accepted peak clears the scheduler's wait and permits fresh work.
+        assert!(!waiting_for_infusion_confirmation(false, None, sent).unwrap());
+        assert!(
+            !waiting_for_infusion_confirmation(false, Some(sent), sent + Duration::from_secs(90))
+                .unwrap()
+        );
+        // A later successful infusion submission gets its own bounded window.
+        let later = sent + Duration::from_secs(100);
+        assert!(
+            waiting_for_infusion_confirmation(true, Some(later), later + Duration::from_secs(5))
+                .unwrap()
+        );
+    }
+
     #[test]
     fn current_unfinished_envelope_is_exact_and_does_not_silently_ignore_mmr() {
         let current = include_bytes!("../tests/fixtures/unfinished-block.bin");
@@ -640,7 +752,7 @@ mod tests {
                 .is_err()
         );
     }
-    async fn fixture(server_name: &str) -> Result<()> {
+    async fn fixture(server_name: &str, board_fault: bool) -> Result<()> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let mut parameters = CertificateParams::new(vec!["fixture-ca".into()])?;
         parameters.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -717,9 +829,60 @@ mod tests {
                     None,
                 )?)
                 .await?;
-            let _ = socket.next().await;
+            if board_fault {
+                socket
+                    .send(Message::Ping(b"board-isolation".to_vec().into()))
+                    .await?;
+                loop {
+                    match socket
+                        .next()
+                        .await
+                        .context("Peer closed during board fault")??
+                    {
+                        Message::Pong(value) if value.as_ref() == b"board-isolation" => break,
+                        Message::Ping(value) => socket.send(Message::Pong(value)).await?,
+                        _ => {}
+                    }
+                }
+            } else {
+                let _ = socket.next().await;
+            }
             Ok::<_, anyhow::Error>(())
         });
+        if board_fault {
+            config.hardware.boards = vec![toml::from_str(
+                "id='failed'\nname='Failed'\nclient_port=18110",
+            )?];
+            let runtime = Arc::new(std::sync::Mutex::new(RuntimeState::default()));
+            runtime.lock().unwrap().boards.insert(
+                "failed".into(),
+                HardwareState {
+                    state: "fault".into(),
+                    latched_fault: true,
+                    ..Default::default()
+                },
+            );
+            let (backend, _offers) = AsicBackend::new(
+                &config,
+                &config.assignments().map_err(anyhow::Error::msg)?,
+                runtime.clone(),
+            )?;
+            let shared = Arc::new(Shared {
+                native: None,
+                assignments: config.assignments().map_err(anyhow::Error::msg)?,
+                config,
+                clients: Default::default(),
+                runtime,
+                started_unix: unix_now(),
+                service_started_unix: crate::unix_now(),
+            });
+            let session = tokio::spawn(session(shared, Arc::new(backend)));
+            let result = tokio::time::timeout(Duration::from_secs(3), task).await;
+            session.abort();
+            let _ = session.await;
+            result???;
+            return Ok(());
+        }
         let result = connect(&config).await;
         match result {
             Ok(mut socket) => {
@@ -736,10 +899,14 @@ mod tests {
     }
     #[tokio::test]
     async fn authenticates_a_mutual_tls_chia_websocket_with_a_fixture_only_identity() {
-        fixture("chia.net").await.unwrap();
+        fixture("chia.net", false).await.unwrap();
     }
     #[tokio::test]
     async fn rejects_an_incorrect_tls_server_name() {
-        assert!(fixture("wrong.invalid").await.is_err());
+        assert!(fixture("wrong.invalid", false).await.is_err());
+    }
+    #[tokio::test]
+    async fn full_node_session_keeps_answering_while_a_board_is_latched_off() {
+        fixture("chia.net", true).await.unwrap();
     }
 }

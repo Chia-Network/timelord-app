@@ -5,6 +5,7 @@ export MACOSX_DEPLOYMENT_TARGET=14.0
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 source "$PROJECT_ROOT/scripts/macho-load-commands.sh"
+source "$PROJECT_ROOT/scripts/bundle-icon.sh"
 [[ "$(uname -s)" == Darwin ]] || { echo 'The Mac app bundle must be built on macOS.' >&2; exit 1; }
 CLIENT="${TIMELORD_ASIC_CLIENT:-$PROJECT_ROOT/build/controlled-native/hw_vdf_client}"
 [[ -x "$CLIENT" ]] || { echo 'Build the native client first: bash scripts/build-native-control.sh' >&2; exit 1; }
@@ -56,7 +57,7 @@ for binary in "$APP/Contents/Frameworks/"*.dylib "$APP/Contents/Helpers/hw_vdf_c
   if [[ "$binary" == "$APP/Contents/Frameworks/"* ]]; then install_name_tool -id "@rpath/$(basename "$binary")" "$binary"; fi
   codesign --force --sign - "$binary"
 done
-cp apps/macos/AppIcon/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+bundle_app_icon "$PROJECT_ROOT/apps/macos/AppIcon" "$APP/Contents/Resources" "$MACOSX_DEPLOYMENT_TARGET"
 cp LICENSE "$APP/Contents/Resources/LICENSE"
 cp integrations/dg-xch/LICENSE "$APP/Contents/Resources/ThirdParty/dg-xch-LICENSE"
 cp integrations/chiavdf/LICENSE "$APP/Contents/Resources/ThirdParty/chiavdf-LICENSE"
@@ -71,6 +72,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>Timelord</string>
   <key>CFBundleDisplayName</key><string>Timelord</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleIconName</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>CFBundleVersion</key><string>1</string>

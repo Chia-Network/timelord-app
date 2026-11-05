@@ -1,0 +1,107 @@
+{
+  "host": "m6mini",
+  "source_commit": "cff2f77",
+  "manifest": {
+    "source_commit": "cff2f77",
+    "native_revision": "446a0e1d118051364742648c7b8f3239b12a3dcb",
+    "source_queue_sha256": "f16b6ed5838ceb0ad383df23145f742932b5f18dd6ebe5f1b9d022097fe9b800",
+    "native_sha256": "dd8cbeae65e0d1dbefb7aae08bfd01b074bea1efa5941ddef9dad592a7a9563e",
+    "baseline_service_sha256": "bc92e1677e1674d300d94ac10ade9fb6f5a6322c791cca3030562d68a97b7ae3",
+    "service_sha256": "d3436d0a2bfa7cade88a7c9268584fe2414dda442483b11b61d1bfed385f6635",
+    "ui_sha256": "f639b3b8a04484d05a71ee3bf1019265b7deafd244aecead8971140ad3259afb",
+    "archive_sha256": "fda1cfd93fe24eff9aef1cace18037e4893b4e27fc2067ab57ee33d17de82e77",
+    "libraries": {
+      "libgmpxx.4.dylib": "875e1391d7c896c64004ada5997a6f3c1fe2ed8f2bc15c36776d76ca86cc4396",
+      "libft4222.dylib": "453b21f3c6dbf89168916be1ea26483084b83314b8d78d7cabd74e82a0202075",
+      "libftd2xx.dylib": "0a3ae31f16da56ec212c60ead43921bca22868cf0c502efdc8105cf017d1c7ad",
+      "libgmp.10.dylib": "bc89479f845374ae610aee6f5758d6e083f55a7c22e684bbb2ecf20f5db6c10b"
+    },
+    "restart_delays_seconds": [
+      1,
+      5,
+      30
+    ],
+    "renewal_minimum_run_seconds": 600,
+    "native_readback_attempts": 3,
+    "readback_delay_ms": 20,
+    "voltage_ceiling_v": 1,
+    "temperature_guard_c": 55,
+    "native_and_prover_unchanged": true,
+    "startup_optimizations_retained": [
+      "hardware SHA",
+      "six-worker canonical discriminant search",
+      "preparation overlaps client retirement"
+    ]
+  },
+  "deployment": {
+    "installed": true,
+    "left_running": true,
+    "opened_unix": 1792774153.294923,
+    "completed_unix": 1792774213.313201,
+    "service_pid": 12803,
+    "proofs_delivered": 14,
+    "failed_proofs": 0,
+    "recoveries": 0,
+    "configuration_unchanged": true,
+    "native_and_prover_unchanged": true
+  },
+  "boards": [
+    {
+      "name": "ASIC 1",
+      "frequency_mhz": 1900.0,
+      "voltage_v": 1.0,
+      "temperature_c": 45.62,
+      "recoveries": 0
+    },
+    {
+      "name": "ASIC 2",
+      "frequency_mhz": 1880.0,
+      "voltage_v": 1.0,
+      "temperature_c": 43.88,
+      "recoveries": 0
+    },
+    {
+      "name": "ASIC 3",
+      "frequency_mhz": 1900.0,
+      "voltage_v": 1.0,
+      "temperature_c": 40.13,
+      "recoveries": 0
+    }
+  ],
+  "policy": {
+    "retry_delays_seconds": [
+      1,
+      5,
+      30
+    ],
+    "restart_scope": "one physical board; unaffected native processes and chain sessions stay alive",
+    "saved_profiles_and_native_identity": "unchanged",
+    "exhausted_retries_require_attention": true,
+    "thermal_and_missing_temperature_stops_require_attention": true,
+    "invalid_verified_proof_requires_attention": true,
+    "shutdown_cancels_backoff": true,
+    "retry_budget_renewal": "at least ten minutes in the process, three verified outputs per assigned chain from that process, and fresh proof/temperature telemetry",
+    "full_node_connection": "hardware failures remain local; continue accepting peer updates",
+    "history": "board-specific interruptions; no unavailable board shown productive"
+  },
+  "validation": {
+    "rust_tests": 70,
+    "swift_tests": 42,
+    "cargo_fmt_clippy": "passed",
+    "native_fixtures": "passed",
+    "swift_build": "passed",
+    "offline_fault_tests": [
+      "flapping board exhausts three retries while healthy sibling process never restarts",
+      "shutdown cancels a 30-second pending restart",
+      "healthy chain verifies two outputs on the same socket while sibling disconnects/reconnects",
+      "stale socket from old process is discarded",
+      "invalid proof latches its board without publishing IPS",
+      "thermal stop preserves other supervision",
+      "mutual-TLS full-node session still answers while a board is latched off",
+      "healthy board gauge and hover survive sibling fault; all stopped boards cannot appear productive"
+    ],
+    "live_check_seconds": 60,
+    "deliberate_live_fault_injection": false
+  },
+  "limitation": "Offline fault injection and short live health validation; no claim of hardware fault reproduction, long-term stability or IPS improvement."
+}

@@ -1,6 +1,12 @@
 --- a/hw/hw_vdf_client.cpp
 +++ b/hw/hw_vdf_client.cpp
-@@ -56,6 +56,7 @@
+@@ -1,4 +1,5 @@
+ #include "hw_interface.hpp"
++#include "timelord_telemetry.hpp"
+ #include "hw_proof.hpp"
+ #include "hw_util.hpp"
+ #include "bqfc.h"
+@@ -57,6 +58,7 @@
      bool do_list;
      bool show_version;
      bool auto_freq;
@@ -8,7 +14,7 @@
      double max_freq; // Used when auto_freq mode is turned on, to limit the max frequency
      struct vdf_proof_opts vpo;
      uint8_t vdfs_mask;
-@@ -77,6 +78,34 @@
+@@ -72,6 +74,39 @@
  void write_data(struct vdf_conn *conn, const char *buf, size_t size);
  
  static volatile bool g_stopping = false;
@@ -18,8 +24,7 @@
 +static timelord_control::Point live_set(struct vdf_client *client, timelord_control::Point target)
 +{
 +    const double temperature = client->drv->GetPvtTemp();
-+    if (!std::isfinite(temperature) || temperature <= 0 || temperature >= 55.)
-+        throw std::runtime_error("temperature_guard");
++    timelord_control::check_temperature(temperature);
 +    uint8_t mask = 0;
 +    for (int i=0; i<N_HW_VDFS; ++i)
 +        if (client->conns[i].state == RUNNING) mask |= 1 << i;
@@ -29,21 +34,48 @@
 +        vdf_usleep(20000);
 +    };
 +    auto frequency = [&](double f) {
-+        uint32_t index = 1;
-+        while (index+1 < VALID_PLL_FREQS && pll_entries[index+1].freq <= f) ++index;
++        const auto index = timelord_control::frequency_index(f,pll_entries,VALID_PLL_FREQS);
 +        if (!client->drv->SetPLLFrequency(0.,index)) throw std::runtime_error("pll_write");
 +    };
 +    auto pause = [&](bool resume) {
 +        if (!hw_vdf_control_checked(client->drv,mask,resume?1:0))
 +            throw std::runtime_error("engine_control");
 +    };
-+    return timelord_control::apply(target,read,voltage,frequency,pause);
++    auto diagnostics = [&]() {
++        return timelord_control::clock_registers(
++            [&](uint32_t address, uint32_t &value) { return client->drv->RegRead(address,value); },
++            {{"control",CLOCK_CONTROL_REG_OFFSET}, {"status",CLOCK_STATUS_REG_OFFSET},
++             {"pre_divide",CLOCK_PRE_DIVIDE_REG_OFFSET}, {"feedback",CLOCK_FB_DIVIDE_INTEGER_REG_OFFSET},
++             {"post_divide",CLOCK_POST_DIVIDE_REG_OFFSET}});
++    };
++    return timelord_control::apply(target,read,voltage,frequency,pause,diagnostics);
 +}
 +#endif
  
  static int vdf_socket_set_nonblock(vdf_socket_t sock)
  {
-@@ -468,6 +497,15 @@
+@@ -374,9 +410,10 @@
+ {
+     uint64_t loop_cnt = 0;
+     uint32_t temp_period = chia_vdf_is_emu ? 200 : 20000;
++    timelord_telemetry::Poll telemetry;
+     while(true) {
+         uint8_t running_mask = 0;
+-        uint8_t temp_flag = loop_cnt % temp_period ? 0 : HW_VDF_TEMP_FLAG;
++        uint8_t temp_flag = telemetry.due(!(loop_cnt % temp_period)) ? HW_VDF_TEMP_FLAG : 0;
+ 
+         for (uint8_t i = 0; i < N_HW_VDFS; i++) {
+             if (!(client->opts.vdfs_mask & (1 << i))) {
+@@ -388,7 +425,7 @@
+             }
+         }
+ 
+-        if (running_mask) {
++        if (running_mask || temp_flag) {
+             read_hw_status(client->drv, running_mask | temp_flag, client->values);
+         } else if (g_stopping) {
+             uint8_t n_closed = 0;
+@@ -432,6 +469,15 @@
              }
          }
  
@@ -59,7 +91,7 @@
          if (client->opts.auto_freq && !(loop_cnt % 256)) {
              uint64_t elapsed = vdf_get_elapsed_us(client->drv->last_freq_update);
              if (elapsed / 1000000 >= client->opts.auto_freq_period) {
-@@ -504,6 +542,7 @@
+@@ -473,6 +519,7 @@
      opts->do_list = false;
      opts->show_version = false;
      opts->auto_freq = false;
@@ -67,7 +99,7 @@
      opts->max_freq = pll_entries[VALID_PLL_FREQS - 1].freq;
      opts->vpo.max_aux_threads = HW_VDF_DEFAULT_MAX_AUX_THREADS;
      opts->vpo.max_proof_threads = 0;
-@@ -540,6 +579,12 @@
+@@ -509,6 +556,12 @@
              value = eq + 1;
          }
  
@@ -80,7 +112,7 @@
          if (!strcmp(name, "list")) {
              if (value) {
                  LOG_SIMPLE("Invalid option");
-@@ -695,6 +740,13 @@
+@@ -670,6 +723,17 @@
  
  int hw_vdf_client_main(int argc, char **argv)
  {
@@ -89,12 +121,16 @@
 +        puts("timelord-live-control-v1");
 +        return 0;
 +    }
++    if (argc == 2 && !strcmp(argv[1], "--control-frequencies")) {
++        timelord_control::print_frequencies(pll_entries,VALID_PLL_FREQS);
++        return 0;
++    }
 +#endif
 +
      struct vdf_client client;
  #ifndef _WIN32
      struct sigaction sa = {};
-@@ -748,6 +800,13 @@
+@@ -726,6 +790,13 @@
          return ret;
      }
  
@@ -120,7 +156,7 @@
  void stop_hw_vdf(ChiaDriver *drv, int idx);
 --- a/hw/hw_interface.cpp
 +++ b/hw/hw_interface.cpp
-@@ -135,6 +135,13 @@
+@@ -134,6 +134,13 @@
             drv->RegWrite(addr, value);
          }
      }

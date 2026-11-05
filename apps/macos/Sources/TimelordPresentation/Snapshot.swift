@@ -50,7 +50,14 @@ public struct BoardSnapshot: Identifiable, Sendable {
     public let voltageV: Double?
     public let histories: [ChainHistory]
     public let lastProof: Date?
+    public var rawSpeeds: [RawSpeed] = []
     public var automatic: AutomaticStatus? = nil
+    public func rawSpeed(for chain: Chain) -> RawSpeed? {
+        guard state == .active || state == .waiting,
+              let index = histories.firstIndex(where: { $0.chain == chain }) else { return nil }
+        let physicalEngine = histories.count == 1 ? 1 : index
+        return rawSpeeds.first { $0.engine == physicalEngine }
+    }
     public var isAutomatic: Bool { profile.lowercased() == "automatic" }
     public var automaticTitle: String {
         guard let automatic else { return "Learning starts with Timelord" }
@@ -72,10 +79,39 @@ public struct AppSnapshot: Sendable {
     public var tuningPaused: Bool = false
     public var automaticActive: Bool { boards.contains { $0.isAutomatic } }
     public var readyToRun = false
-    public var runningTitle: String { readyToRun ? "Ready to run" : phase == .running && !tuningPaused && boards.contains(where: { ["learning","testing"].contains($0.automatic?.state ?? "") }) ? "Running · Optimizing" : phase.title }
+    public var sessionUptimeSeconds: TimeInterval? = nil
+    public var runningTitle: String { phase == .serviceUnavailable && serviceAvailable ? "Proof service stopped" : readyToRun ? "Ready to run" : phase == .running && !tuningPaused && boards.contains(where: { ["learning","testing"].contains($0.automatic?.state ?? "") }) ? "Running · Optimizing" : phase.title }
 
-    public var headlineHistory: ChainHistory? { boards.flatMap(\.histories).first { $0.chain == .challenge } }
-    public var headlineSpeed: String { DisplayFormat.ips(headlineHistory?.statistics(in: HistoryRange.hour.interval(endingAt: now)).average) }
+    public let headlineHistory: ChainHistory?
+    public init(phase: AppPhase, explanation: String, node: ConnectionSnapshot, timelord: ConnectionSnapshot,
+                boards: [BoardSnapshot], proofsToday: Int?, uptimeSeconds: TimeInterval?, now: Date,
+                serviceAvailable: Bool, tuningPaused: Bool = false, readyToRun: Bool = false,
+                sessionUptimeSeconds: TimeInterval? = nil, headlineHistory: ChainHistory? = nil) {
+        self.phase = phase; self.explanation = explanation; self.node = node; self.timelord = timelord
+        self.boards = boards; self.proofsToday = proofsToday; self.uptimeSeconds = uptimeSeconds
+        self.now = now; self.serviceAvailable = serviceAvailable; self.tuningPaused = tuningPaused
+        self.readyToRun = readyToRun; self.sessionUptimeSeconds = sessionUptimeSeconds
+        self.headlineHistory = headlineHistory ?? HistorySelectionCache.merge(boards)
+    }
+    public var headlineSpeed: String {
+        guard phase == .running, let history = headlineHistory,
+              history.hasFreshValue(at: now) else { return "—" }
+        return DisplayFormat.ips(history.statistics(in: HistoryRange.hour.interval(endingAt: now)).average)
+    }
+    /// Historical five-minute statistics remain valid between proofs or during idle.
+    /// The sampled inputs still exclude stale gauges and interruptions.
+    /// Board tiles respond to tuning changes while smoothing individual proof variation.
+    /// Use the same 30-second gauge samples as the headline, over a shorter window.
+    public func recentSpeed(for history: ChainHistory) -> String {
+        guard serviceAvailable, phase != .paused else { return "—" }
+        return DisplayFormat.ips(history.statistics(in: DateInterval(start: now.addingTimeInterval(-300), end: now)).average)
+    }
+    public func recentMedian(for history: ChainHistory) -> String {
+        guard serviceAvailable, phase != .paused else { return "—" }
+        let values = history.sampledObservations(in: DateInterval(start: now.addingTimeInterval(-300), end: now)).map(\.ips).sorted()
+        guard !values.isEmpty else { return "—" }
+        return DisplayFormat.ips((values[(values.count - 1) / 2] + values[values.count / 2]) / 2)
+    }
     public var latestProof: Date? { boards.compactMap(\.lastProof).max() }
     public var proofFreshness: String {
         guard let latestProof else { return "Waiting for the first verified proof" }
@@ -85,7 +121,8 @@ public struct AppSnapshot: Sendable {
     }
     public var chartUpperBound: Double {
         let values = boards.flatMap(\.histories).flatMap { $0.observations(in: HistoryRange.day.interval(endingAt: now)) }.map(\.ips)
-        return max(1_000_000, values.max() ?? 0) * 1.08
+        // Leave visible space above peaks and avoid small scale changes between refreshes.
+        return ceil(max(1_000_000, values.max() ?? 0) * 1.2 / 100_000) * 100_000
     }
 }
 
@@ -99,6 +136,7 @@ public struct ServiceStatus: Decodable, Sendable {
     public let boards: [BoardStatus]
     public let timestampUnix: Double
     public let startedUnix: Double
+    public let serviceStartedUnix: Double?
     public let latestProofUnix: Double?
     public let proofsDelivered: Int
     public let tuningPaused: Bool
@@ -116,6 +154,28 @@ public struct NodeStatus: Decodable, Sendable {
     public let state: String
 }
 
+public struct RawSpeed: Decodable, Sendable {
+    public let engine: Int
+    public let ips: Double
+    public let timestampUnix: Double
+    public let state: String?
+    public func freshIPS(at now: Date) -> Double? {
+        guard state == nil || state == "running" else { return nil }
+        return recentIPS(at: now)
+    }
+    private func recentIPS(at now: Date) -> Double? {
+        guard ips.isFinite, ips >= 0, (0..<6).contains(now.timeIntervalSince1970 - timestampUnix) else { return nil }
+        return ips
+    }
+    public func displayText(at now: Date) -> String {
+        switch state {
+        case "idle": return "Idle"
+        case "sampling": return recentIPS(at: now).map(DisplayFormat.ips) ?? "Starting"
+        default: return freshIPS(at: now).map(DisplayFormat.ips) ?? "—"
+        }
+    }
+}
+
 public struct BoardStatus: Decodable, Identifiable, Sendable {
     public let id: String
     public let name: String
@@ -131,6 +191,8 @@ public struct BoardStatus: Decodable, Identifiable, Sendable {
     public let deviceLocation: Int?
     public let serial: String?
     public let automatic: AutomaticStatus?
+    public let rawSpeeds: [RawSpeed]?
+    public let faultKind: String?
 }
 
 public struct AutomaticStatus: Decodable, Sendable {
@@ -141,7 +203,12 @@ public struct AutomaticStatus: Decodable, Sendable {
 }
 
 public enum LivePresentation {
-    public static func snapshot(status: ServiceStatus?, history: HistoryPayload? = nil, configuration: AppConfiguration? = nil, detectedDevices: [DiscoveredDevice]? = nil, nodeSync: NodeSyncStatus? = nil, paused: Bool = false, starting: Bool = false, error: String? = nil, now: Date = Date()) -> AppSnapshot {
+    public static func snapshot(status: ServiceStatus?, history: HistoryProjection? = nil, configuration: AppConfiguration? = nil, detectedDevices: [DiscoveredDevice]? = nil, nodeSync: NodeSyncStatus? = nil, paused: Bool = false, starting: Bool = false, error: String? = nil, now: Date = Date()) -> AppSnapshot {
+        var cache = HistorySelectionCache()
+        return snapshot(status: status, history: history, historyCache: &cache, configuration: configuration,
+            detectedDevices: detectedDevices, nodeSync: nodeSync, paused: paused, starting: starting, error: error, now: now)
+    }
+    public static func snapshot(status: ServiceStatus?, history: HistoryProjection? = nil, historyCache: inout HistorySelectionCache, configuration: AppConfiguration? = nil, detectedDevices: [DiscoveredDevice]? = nil, nodeSync: NodeSyncStatus? = nil, paused: Bool = false, starting: Bool = false, error: String? = nil, now: Date = Date()) -> AppSnapshot {
         let recent = status.map { now.timeIntervalSince1970 - $0.timestampUnix <= 10 && $0.timestampUnix <= now.timeIntervalSince1970 + 5 } ?? false
         let live = recent ? status : nil
         let hostname = live?.fullNode.host ?? configuration?.node.host
@@ -150,22 +217,26 @@ public enum LivePresentation {
         let nodeDetail = freshSync.map { $0.syncing ? "Syncing" : $0.synced ? "Synced" : "Not synced" } ?? "Sync status unavailable"
         let nodeTone: StatusTone = freshSync.map { $0.synced && !$0.syncing ? .positive : .attention } ?? .neutral
         let nodeReady = ["authenticated", "ready"].contains(live?.fullNode.state ?? "")
-        let productive = live?.productionEnabled == true && live?.timelordState == "running" && live?.latestProofUnix.map { now.timeIntervalSince1970 - $0 < 90 } == true
+        let productive = live?.boards.contains(where: { $0.hardwareState == "connected" }) == true && live?.productionEnabled == true && live?.timelordState == "running" && live?.latestProofUnix.map { now.timeIntervalSince1970 - $0 < 90 } == true
         let thermal = live?.boards.contains { $0.hardwareState == "thermal_stop" } == true
+        let allBoardsFailed = live.map { !$0.boards.isEmpty && $0.boards.allSatisfy { ["fault", "thermal_stop"].contains($0.hardwareState) } } ?? false
         let phase: AppPhase
         if starting { phase = .starting }
-        else if thermal { phase = .temperatureLimit }
-        else if error != nil || live?.timelordState == "fault" { phase = .serviceUnavailable }
+        else if thermal && !productive { phase = .temperatureLimit }
+        else if error != nil || live?.timelordState == "fault" || allBoardsFailed { phase = .serviceUnavailable }
         else if paused { phase = .paused }
         else if productive { phase = .running }
         else if live?.fullNode.state == "disconnected" { phase = .nodeUnreachable }
         else if live?.productionEnabled == true { phase = nodeReady ? .waitingForProofs : .waitingForNode }
         else { phase = .setupRequired }
         let proofCapable = live?.productionEnabled == true
-        let validHistory = history.flatMap { proofCapable && $0.servicePid == live?.servicePid && $0.apiVersion == 1 ? $0 : nil }
+        let validHistory = history.flatMap { proofCapable && $0.servicePid == live?.servicePid && $0.apiVersion == 3 ? $0 : nil }
         var boards: [BoardSnapshot]
         if let live {
             boards = live.boards.filter { board in
+                // Fresh supervised owners are stronger presence evidence than
+                // enumeration, which can hide metadata for open USB interfaces.
+                if board.hardwareState == "connected" || (board.hardwareState == "starting" && board.connectedClients > 0) { return true }
                 guard let detectedDevices else {return true}
                 let configured=configuration?.hardware.boards.first(where:{$0.id==board.id})
                 let location=board.deviceLocation ?? configured?.deviceLocation
@@ -174,27 +245,25 @@ public enum LivePresentation {
             }.map { board in
                 let last = proofCapable ? board.latestProofUnix.map(Date.init(timeIntervalSince1970:)) : nil
                 let freshProof = last.map { now.timeIntervalSince($0) < 90 } ?? false
-                let state: BoardState = board.hardwareState == "thermal_stop" ? .thermalStop : board.hardwareState == "fault" ? .disconnected : productive && freshProof ? .active : board.hardwareState == "connected" ? .waiting : .uninspected
+                let state: BoardState = board.hardwareState == "thermal_stop" ? .thermalStop : ["fault", "reconnecting"].contains(board.hardwareState) ? .disconnected : productive && freshProof && board.hardwareState == "connected" ? .active : board.hardwareState == "connected" ? .waiting : .uninspected
                 let histories = board.assignedChains.compactMap(Chain.init(rawValue:)).map { chain -> ChainHistory in
                     guard let validHistory else { return .empty(chain) }
-                    let end = min(now, Date(timeIntervalSince1970: validHistory.timestampUnix))
-                    let start = min(end, Date(timeIntervalSince1970: validHistory.captureStartUnix))
-                    let samples = validHistory.observations.filter { $0.chain == chain }.map { ProofObservation(date: Date(timeIntervalSince1970: $0.timestampUnix), ips: $0.ips, id: "proof-\($0.id)") }
-                    let events = validHistory.events.filter { $0.boardId == nil || $0.boardId == board.id }.compactMap { event -> HistoryEvent? in
-                        guard let kind = HistoryEventKind(rawValue: event.kind) else { return nil }
-                        let date = Date(timeIntervalSince1970: event.timestampUnix)
-                        return HistoryEvent(date: date, end: kind.interruptsWork ? event.endUnix.map(Date.init(timeIntervalSince1970:)) ?? end : nil, kind: kind, id: "event-\(event.id)")
-                    }
-                    return ChainHistory(chain: chain, samples: samples, captureIntervals: end > start ? [DateInterval(start: start, end: end)] : [], events: events)
+                    return validHistory.history(boardID: board.id, chain: chain, now: now)
                 }
-                return BoardSnapshot(id: board.id, name: board.name, state: state, temperatureC: board.temperatureC, temperatureLimitC: board.temperatureLimitC, profile: board.profile, frequencyMHz: board.frequencyMhz, voltageV: board.voltageV, histories: histories, lastProof: last, automatic: board.automatic)
+                return BoardSnapshot(id: board.id, name: board.name, state: state, temperatureC: board.temperatureC, temperatureLimitC: board.temperatureLimitC, profile: board.profile, frequencyMHz: board.frequencyMhz, voltageV: board.voltageV, histories: histories, lastProof: last, rawSpeeds: board.rawSpeeds ?? [], automatic: board.automatic)
             }
         } else {
             let connected = (detectedDevices ?? []).compactMap { BoardTopology.matching($0,in:configuration?.hardware.boards ?? []) }
             let counts=BoardTopology.counts(connected)
             boards = connected.enumerated().map { index, board in
                 let offset=counts.prefix(index).reduce(0,+)
-                let chains=Array(Chain.allCases.dropFirst(offset).prefix(counts[index]))
+                let chains: [Chain]
+                if let mapping = configuration?.hardware.chainAssignments, let serial = board.serial {
+                    let serials = [mapping.challenge, mapping.reward, mapping.infusedChallenge]
+                    chains = zip(Chain.allCases, serials).compactMap { chain, assigned in assigned == serial ? chain : nil }
+                } else {
+                    chains = Array(Chain.allCases.dropFirst(offset).prefix(counts[index]))
+                }
                 return BoardSnapshot(id: board.id, name: board.name, state: paused ? .paused : .waiting, temperatureC: nil, temperatureLimitC: board.temperatureLimitC, profile: board.profileName, frequencyMHz: nil, voltageV: nil, histories: chains.map(ChainHistory.empty), lastProof: nil)
             }
         }
@@ -204,14 +273,21 @@ public enum LivePresentation {
                 boards.append(BoardSnapshot(id:board.id,name:board.name,state:.waiting,temperatureC:nil,temperatureLimitC:board.temperatureLimitC,profile:board.profileName,frequencyMHz:nil,voltageV:nil,histories:[],lastProof:nil))
             }
         }
+        let faultReason = live.flatMap { status -> String? in
+            guard status.timelordState == "fault" else { return nil }
+            if status.boards.contains(where: { $0.faultKind == "control_closed" }) {
+                return "The ASIC client connection closed unexpectedly. Proof production has stopped. Pause and Run to reconnect. Details: Native control closed before acknowledgement."
+            }
+            return status.message
+        }
         return AppSnapshot(phase: phase,
-            explanation: error ?? (paused ? "Timelord is paused. Resume when you’re ready." : live?.message ?? (configuration?.node.hasIdentity == true && configuration?.hardware.clientBinary != nil && !boards.isEmpty
+            explanation: error ?? faultReason ?? (phase == .starting ? "Starting Timelord; waiting for the service to respond." : paused ? "Timelord is paused. Resume when you’re ready." : live?.message ?? (configuration?.node.hasIdentity == true && configuration?.hardware.clientBinary != nil && !boards.isEmpty
                 ? (configuration?.service.startAutomatically == true
                     ? "Timelord starts automatically when the app opens, once setup and connected boards are ready."
                     : (boards.contains(where: { $0.isAutomatic }) ? "Press Run to start producing proofs. Automatic tuning learns while Timelord runs." : "Press Run to start producing proofs."))
                 : "Connect a full node and plug in your ASIC boards to get started.")),
             node: ConnectionSnapshot(title: nodeTitle, detail: nodeDetail, tone: nodeTone, height: freshSync?.height),
-            timelord: ConnectionSnapshot(title: productive ? "Running" : live != nil ? "Ready" : "Stopped", detail: "On this Mac", tone: productive ? .positive : .neutral),
-            boards: boards, proofsToday: proofCapable ? live?.proofsDelivered : nil, uptimeSeconds: proofCapable ? live.map { max(0, now.timeIntervalSince1970 - $0.startedUnix) } : nil, now: now, serviceAvailable: live != nil, tuningPaused: live?.tuningPaused ?? false, readyToRun: phase == .setupRequired && configuration?.node.hasIdentity == true && configuration?.hardware.clientBinary != nil && !boards.isEmpty)
+            timelord: ConnectionSnapshot(title: phase == .serviceUnavailable ? "Stopped" : productive ? "Running" : live != nil ? "Ready" : "Stopped", detail: "On this Mac", tone: phase == .serviceUnavailable ? .critical : productive ? .positive : .neutral),
+            boards: boards, proofsToday: proofCapable ? live?.proofsDelivered : nil, uptimeSeconds: proofCapable ? live.map { max(0, now.timeIntervalSince1970 - ($0.serviceStartedUnix ?? $0.startedUnix)) } : nil, now: now, serviceAvailable: live != nil, tuningPaused: live?.tuningPaused ?? false, readyToRun: phase == .setupRequired && configuration?.node.hasIdentity == true && configuration?.hardware.clientBinary != nil && !boards.isEmpty, sessionUptimeSeconds: proofCapable ? live.map { max(0, now.timeIntervalSince1970 - $0.startedUnix) } : nil, headlineHistory: historyCache.headline(projection: validHistory, boards: boards, now: now))
     }
 }

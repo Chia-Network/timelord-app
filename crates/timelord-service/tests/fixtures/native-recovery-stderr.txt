@@ -1,0 +1,54 @@
+2026-10-19T14:33:01.323 VDF 0: Allocating intermediate block 0
+2026-10-19T14:33:01.323 VDF 0: Received challenge, running
+2026-10-19T14:33:01.323 VDF 1: Allocating intermediate block 0
+2026-10-19T14:33:01.324 VDF 1: Received challenge, running
+2026-10-19T14:33:01.324 VDF 2: Allocating intermediate block 0
+2026-10-19T14:33:01.324 VDF 2: Received challenge, running
+2026-10-19T14:33:01.329 VDF 0: Warning: Bad VDF value at iters=5885 n_bad=1
+2026-10-19T14:33:01.330 VDF 0: Restarting VDF at 4000 iters
+2026-10-19T14:33:01.356 VDF 0: Warning: Bad VDF value at iters=30618 n_bad=2
+2026-10-19T14:33:01.356 VDF 0: Restarting VDF at 28000 iters
+2026-10-19T14:33:01.367 VDF 0: Warning: Bad VDF value at iters=38166 n_bad=3
+2026-10-19T14:33:01.367 VDF 0: Restarting VDF at 32000 iters
+2026-10-19T14:33:01.423 VDF 0: Queued proofs for iters: [12068056, 499296075]
+2026-10-19T14:33:01.423 VDF 1: Queued proofs for iters: [3843915, 12068056, 13018955, 22193995, 499296075]
+2026-10-19T14:33:07.964 VDF 2: Skipping iters=6985853 n_skipped=9
+2026-10-19T14:33:07.964 VDF 2: Skipping iters=6985853 n_skipped=10
+2026-10-19T14:33:07.965 VDF 2: Skipping iters=6985853 n_skipped=11
+2026-10-19T14:33:07.965 VDF 2: Restarting VDF at 6984000 iters
+2026-10-19T14:33:08.043 VDF 0: Warning: Bad VDF value at iters=6811073 n_bad=34
+2026-10-19T14:33:08.043 VDF 0: Restarting VDF at 6808000 iters
+2026-10-19T14:33:13.773 VDF 0: Connection closed
+2026-10-19T14:33:13.773 VDF 1: Stop requested
+2026-10-19T14:33:13.773 
+2026-10-19T14:33:13.773 VDF 1: 13088117 HW iters done in 12s, HW speed: 1051281 ips
+2026-10-19T14:33:13.773 2026-10-19T14:33:13.773 VDF 1: Proof stopped
+2026-10-19T14:33:13.773 VDF 1: Proof stopped
+VDF 1: 1985119 SW iters done in 9s, SW speed: 215827 ips
+2026-10-19T14:33:13.773 VDF 1: Avg iters per intermediate: 606
+2026-10-19T14:33:13.773 
+2026-10-19T14:33:13.773 VDF 1: Proof stopped
+2026-10-19T14:33:13.784 VDF 1: Stopped at iters=13088117
+2026-10-19T14:33:13.784 Bad data size after stop: -1
+2026-10-19T14:33:13.784 VDF 1: Connection closed
+2026-10-19T14:33:13.784 VDF 2: Stop requested
+2026-10-19T14:33:13.784 
+2026-10-19T14:33:13.784 VDF 2: 13066427 HW iters done in 12s, HW speed: 1048626 ips
+2026-10-19T14:33:13.784 VDF 2: Proof stopped
+2026-10-19T14:33:13.784 2026-10-19T14:33:13.784 VDF 2: Proof stopped
+2026-10-19T14:33:13.784 VDF 2: 2031913 SW iters done in 9s, SW speed: 221835 ips
+2026-10-19T14:33:13.784 VDF 2: Avg iters per intermediate: 621
+2026-10-19T14:33:13.784 
+VDF 2: Proof stopped
+2026-10-19T14:33:13.797 VDF 2: Stopped at iters=13066427
+2026-10-19T14:33:21.793 VDF 0: Warning: Bad VDF value at iters=7930796 n_bad=40
+2026-10-19T14:33:21.793 VDF 0: Restarting VDF at 7928000 iters
+2026-10-19T14:33:21.889 VDF 1: Warning: Bad VDF value at iters=8246376 n_bad=1
+2026-10-19T14:33:21.890 VDF 1: Restarting VDF at 8244000 iters
+2026-10-19T14:33:22.213 VDF 0: Warning: Bad VDF value at iters=8370011 n_bad=41
+2026-10-19T14:33:22.214 VDF 0: Restarting VDF at 8364000 iters
+2026-10-21T16:04:33.428 VDF 1: Starting proof thread 1 for iters=552000, length=276000 [checkpoint]
+2026-10-21T16:04:33.481 VDF 0: Warning: Bad VDF value at iters=8164827 n_bad=1
+2026-10-21T16:04:33.481 VDF 0: Restarting VDF at 8160000 iters
+2026-10-21T16:04:33.614 VDF 0: Proof done for iters=552000, length=276000 in 0.186s [checkpoint]
+2026-10-21T16:04:33.617 VDF 1: Proof done for iters=276000, length=276000 in 0.189s [checkpoint]

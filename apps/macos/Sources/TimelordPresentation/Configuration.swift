@@ -38,9 +38,18 @@ public struct HardwareConfiguration: Codable, Sendable, Equatable {
     public var clientBinary: String?
     public var driverLibrary: String?
     public var automaticState: String?
+    public var chainAssignments: ChainAssignments?
     public var boards: [ConfiguredBoard] = []
     public var rememberedBoards: [ConfiguredBoard] = []
     public init() {}
+}
+public struct ChainAssignments: Codable, Sendable, Equatable {
+    public var challenge: String
+    public var reward: String
+    public var infusedChallenge: String
+    public init(challenge: String, reward: String, infusedChallenge: String) {
+        self.challenge = challenge; self.reward = reward; self.infusedChallenge = infusedChallenge
+    }
 }
 public struct ConfiguredBoard: Codable, Identifiable, Sendable, Equatable {
     public var id: String
@@ -65,11 +74,14 @@ public struct AutomaticConfiguration: Codable, Sendable, Equatable {
     public var startFrequencyMhz = 1450.0
     public var startVoltageV = 1.0
     public var minFrequencyMhz = 1000.0
-    public var maxFrequencyMhz = 1600.0
+    public var maxFrequencyMhz = 2200.0
     public var minVoltageV = 0.9
     public var healthySeconds = 120
     public var cooldownSeconds = 900
-    public var voltageAfterSeconds = 3600
+    public var retestAfterSeconds: Int?
+    public var recoveryWindowSeconds = 300
+    public var recoveryLossPercent = 5.0
+    public var recoveryBadWindows = 2
     public var minimumProofsPerChain = 3
     public init() {}
 }
@@ -96,8 +108,35 @@ public enum BoardTopology {
 }
 
 public enum BoardDiscovery {
+    /// Enrich a metadata-hidden USB row rather than creating another device
+    /// with the same location ID. Fresh conflicting inventory wins over status.
+    public static func includingManagedOwner(_ owner: DiscoveredDevice, in devices: [DiscoveredDevice]) -> [DiscoveredDevice] {
+        // A serial observed at a new port outranks the owner's old location,
+        // regardless of the order in which inventory rows arrived.
+        if let serial = owner.serial, devices.contains(where: { $0.serial == serial }) { return devices }
+        var result = devices
+        if let index = result.firstIndex(where: { $0.location == owner.location }) {
+            let observed = result[index]
+            if observed.serial == nil && observed.location == owner.location {
+                result[index] = DiscoveredDevice(name: observed.name, location: observed.location, serial: owner.serial)
+            }
+        } else {
+            result.append(owner)
+        }
+        return result
+    }
     public static func reconcile(_ devices:[DiscoveredDevice], hardware:HardwareConfiguration) -> HardwareConfiguration {
         var result=hardware
+        if hardware.chainAssignments != nil {
+            // Keep serial-pinned owners even while unplugged. The service retries
+            // their connections without reallocating a healthy board's chain.
+            for device in devices {
+                if let index = result.boards.firstIndex(where: { $0.serial != nil && $0.serial == device.serial }) {
+                    result.boards[index].deviceLocation = device.location
+                }
+            }
+            return result
+        }
         var remembered=hardware.rememberedBoards
         for board in hardware.boards {
             remembered.removeAll { $0.id==board.id || (board.serial != nil && $0.serial==board.serial) }
@@ -121,9 +160,13 @@ public struct HistoryPayload: Decodable, Sendable {
     public let apiVersion: Int
     public let servicePid: Int
     public let timestampUnix: Double
-    public let captureStartUnix: Double
-    public let observations: [RecordedProof]
+    public let captureIntervals: [RecordedCapture]
+    public let estimatedObservations: [RecordedProof]
     public let events: [RecordedEvent]
+}
+public struct RecordedCapture: Decodable, Sendable {
+    public let startUnix: Double
+    public let endUnix: Double
 }
 public struct RecordedProof: Decodable, Sendable {
     public let id: Int

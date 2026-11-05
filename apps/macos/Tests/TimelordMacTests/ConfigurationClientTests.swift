@@ -18,10 +18,18 @@ final class ConfigurationClientTests: XCTestCase {
         var value = try await client.load()
         XCTAssertEqual(value.node.host, "localhost")
         value.node.host = "fixture.invalid"; value.node.port = 18444; value.node.network = "testnet11"
+        value.hardware.boards = (0..<3).map { index in
+            var board = ConfiguredBoard(id: "b\(index)", name: "Board \(index)", port: 18110 + index, location: 1 + index)
+            board.serial = "serial-\(index)"; return board
+        }
+        value.hardware.chainAssignments = ChainAssignments(challenge: "serial-2", reward: "serial-0", infusedChallenge: "serial-1")
+        value.hardware.boards[0].automatic.retestAfterSeconds = 0
         try await client.save(value)
         let saved = try await client.load()
         XCTAssertEqual(saved.node.host, "fixture.invalid")
         XCTAssertEqual(saved.node.port, 18444)
+        XCTAssertEqual(saved.hardware.chainAssignments, value.hardware.chainAssignments)
+        XCTAssertEqual(saved.hardware.boards[0].automatic.retestAfterSeconds, 0)
         value.node.host = ""
         do { try await client.save(value); XCTFail("Invalid config was saved") } catch { XCTAssertFalse(error.localizedDescription.isEmpty) }
         let preserved = try await client.load()
@@ -50,7 +58,7 @@ final class ConfigurationClientTests: XCTestCase {
         let model = TimelordModel(controller: controller, initialConfiguration: saved, monitoringEnabled: false)
         XCTAssertFalse(model.hasUnsavedSettings)
         model.configuration.hardware.boards[0].profile = "automatic"
-        model.configuration.hardware.boards[0].automatic.maxFrequencyMhz = 1700
+        model.configuration.hardware.boards[0].automatic.maxFrequencyMhz = 2201
         XCTAssertTrue(model.hasUnsavedSettings)
         let invalidDismiss = await model.finishSettings()
         XCTAssertFalse(invalidDismiss, "Validation failure must keep the sheet open")
@@ -59,7 +67,7 @@ final class ConfigurationClientTests: XCTestCase {
         let unchanged = try await client.load()
         XCTAssertEqual(unchanged.hardware.boards[0].profile, "manual")
         XCTAssertEqual(model.configuration.hardware.boards[0].profile, "automatic", "Preserve the user's draft for correction")
-        model.configuration.hardware.boards[0].automatic.maxFrequencyMhz = 1600
+        model.configuration.hardware.boards[0].automatic.maxFrequencyMhz = 2200
         let dismiss = await model.finishSettings()
         XCTAssertTrue(dismiss)
         XCTAssertFalse(model.hasUnsavedSettings)
@@ -108,16 +116,17 @@ final class ConfigurationClientTests: XCTestCase {
         let model = TimelordModel(controller: controller, initialConfiguration: saved, monitoringEnabled: false)
         try controller.start()
         defer { controller.stop() }
+        XCTAssertTrue(controller.preventsIdleSleep)
         let oldPid = try XCTUnwrap(controller.processID)
         XCTAssertEqual(model.settingsDoneTitle, "Done")
         model.configuration.hardware.boards[0].profile = "automatic"
-        model.configuration.hardware.boards[0].automatic.maxFrequencyMhz = 1700
+        model.configuration.hardware.boards[0].automatic.maxFrequencyMhz = 2201
         XCTAssertEqual(model.settingsDoneTitle, "Save & Restart")
         let invalidDismiss = await model.finishSettings()
         XCTAssertFalse(invalidDismiss)
         XCTAssertTrue(controller.ownsService, "Invalid edits must not stop the running service")
         XCTAssertEqual(controller.processID, oldPid)
-        model.configuration.hardware.boards[0].automatic.maxFrequencyMhz = 1600
+        model.configuration.hardware.boards[0].automatic.maxFrequencyMhz = 2200
         let dismiss = await model.finishSettings()
         XCTAssertTrue(dismiss)
         let deadline = Date().addingTimeInterval(5)
@@ -139,6 +148,7 @@ final class ConfigurationClientTests: XCTestCase {
         controller.stop()
         while controller.ownsService && Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
         XCTAssertFalse(controller.ownsService)
+        XCTAssertFalse(controller.preventsIdleSleep)
     }
 
     @MainActor

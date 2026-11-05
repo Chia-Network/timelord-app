@@ -1,35 +1,12 @@
 //! Online policy. All USB writes are acknowledged by the native client's owner thread.
-use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-use timelord_core::{AutomaticConfig, Config};
+use std::collections::VecDeque;
+use timelord_core::AutomaticConfig;
 
-pub fn fingerprint(config: &Config) -> Result<String> {
-    let bytes = std::fs::read(
-        config
-            .hardware
-            .client_binary
-            .as_ref()
-            .context("Choose a native client")?,
-    )?;
-    Ok(dg_xch_core::utils::hash_256(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
-}
-pub fn host() -> String {
-    format!(
-        "{}-{}-{}",
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        std::process::Command::new("/usr/sbin/sysctl")
-            .args(["-n", "hw.model"])
-            .output()
-            .ok()
-            .map(|r| String::from_utf8_lossy(&r.stdout).trim().to_string())
-            .unwrap_or_default()
-    )
-}
+mod profiles;
+pub use profiles::{
+    Learned, fingerprint, host, initial, initial_point, learned, save, socket_path,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Point {
@@ -42,16 +19,27 @@ pub struct Status {
     pub message: String,
     pub active_seconds: u64,
     pub cooldown_seconds: u64,
+    pub retest_seconds_remaining: Option<u64>,
 }
-#[derive(Clone, Copy)]
-enum Trial {
-    Frequency,
-    Voltage,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeKind {
+    Trial,
+    Restore,
+    Backoff,
 }
+pub struct Change {
+    pub kind: ChangeKind,
+    pub message: String,
+}
+impl std::fmt::Display for Change {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(f)
+    }
+}
+
 pub enum Action {
-    Set(Point, String),
+    Set(Point, Change),
     Save,
-    Stop(String),
 }
 pub struct Input {
     pub healthy: bool,
@@ -61,39 +49,106 @@ pub struct Input {
     pub temperature_limit: f64,
     pub paused: bool,
 }
+// A severe burst is independent of proof throughput: a storm can starve proofs.
+// Keep only the last 20 events, and allow five seconds after a clock write for
+// settling and pre-write log backlog. Normal recoveries still use the IPS policy.
+const STORM_RECOVERIES: usize = 20;
+const STORM_WINDOW_SECONDS: u64 = 10;
+const SETTLING_SECONDS: u64 = 5;
+#[derive(Default)]
+struct RecoveryBurst {
+    events: VecDeque<u64>,
+    settled_at: u64,
+}
+impl RecoveryBurst {
+    fn reset(&mut self, now: u64) {
+        self.events.clear();
+        self.settled_at = now.saturating_add(SETTLING_SECONDS);
+    }
+    fn observe(&mut self, now: u64, count: u64) -> bool {
+        if now < self.settled_at {
+            self.events.clear();
+            return false;
+        }
+        while self
+            .events
+            .front()
+            .is_some_and(|&t| now.saturating_sub(t) >= STORM_WINDOW_SECONDS)
+        {
+            self.events.pop_front();
+        }
+        for _ in 0..count.min(STORM_RECOVERIES as u64) {
+            if self.events.len() == STORM_RECOVERIES {
+                self.events.pop_front();
+            }
+            self.events.push_back(now);
+        }
+        self.events.len() == STORM_RECOVERIES
+    }
+}
+/// Countdown counts only healthy verified work, never offline wall time.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RetestState {
+    pub attempts: u32,
+    pub remaining_seconds: u64,
+}
+#[derive(Clone)]
+enum TrialKind {
+    Exploration,
+    RetestPending(RetestState),
+    Retest,
+}
+struct Trial {
+    rollback: Point,
+    kind: TrialKind,
+}
+
 pub struct Policy {
     pub point: Point,
     pub status: Status,
     pub epoch: u64,
     pub settings: AutomaticConfig,
-    best: Point,
     baseline: Option<f64>,
     trial: Option<Trial>,
+    retest: RetestState,
     last_tick: u64,
     recoveries: u64,
-    frequency_active: u64,
+    recovery_burst: RecoveryBurst,
+    window_started: u64,
+    window_recoveries: u64,
+    degraded_windows: u32,
     ceiling: f64,
-    voltage_rejected: bool,
     was_paused: bool,
+    frequencies: Vec<f64>,
 }
 impl Policy {
-    pub fn new(settings: AutomaticConfig, point: Point, now: u64) -> Self {
+    pub fn new(settings: AutomaticConfig, point: Point, now: u64, frequencies: Vec<f64>) -> Self {
         Self {
             ceiling: settings.max_frequency_mhz,
+            retest: RetestState {
+                attempts: 0,
+                remaining_seconds: settings.retest_after_seconds,
+            },
             settings,
             point,
-            best: point,
+            baseline: None,
+            trial: None,
             epoch: now,
             last_tick: now,
             recoveries: 0,
-            baseline: None,
-            trial: None,
-            frequency_active: 0,
-            voltage_rejected: false,
+            recovery_burst: RecoveryBurst {
+                settled_at: now.saturating_add(SETTLING_SECONDS),
+                ..Default::default()
+            },
+            window_started: now,
+            window_recoveries: 0,
+            degraded_windows: 0,
             was_paused: false,
+            frequencies,
             status: Status {
                 state: "learning".into(),
-                message: "Observing verified live proofs".into(),
+                message: "Observing delivered proof performance".into(),
                 ..Default::default()
             },
         }
@@ -106,27 +161,56 @@ impl Policy {
                 .max(self.point.frequency_mhz);
         }
         self.status.cooldown_seconds = entry.cooldown_seconds.min(self.settings.cooldown_seconds);
-        self.voltage_rejected = entry.voltage_rejected;
+        if let Some(retest) = &entry.retest {
+            self.retest = RetestState {
+                attempts: retest.attempts.min(16),
+                remaining_seconds: retest.remaining_seconds.min(86400),
+            };
+        }
+        self.status.retest_seconds_remaining = self.retest_remaining();
+    }
+    pub fn is_retest(&self) -> bool {
+        self.trial.as_ref().is_some_and(|trial| {
+            matches!(trial.kind, TrialKind::Retest | TrialKind::RetestPending(_))
+        })
+    }
+    pub fn retest_state(&self) -> RetestState {
+        self.retest.clone()
+    }
+    pub fn retest_remaining(&self) -> Option<u64> {
+        (self.settings.retest_after_seconds > 0
+            && self.ceiling < self.settings.max_frequency_mhz
+            && self
+                .frequencies
+                .iter()
+                .any(|&f| f > self.ceiling && f <= self.settings.max_frequency_mhz))
+        .then_some(self.retest.remaining_seconds)
+    }
+    fn retest_delay(&self) -> u64 {
+        self.settings
+            .retest_after_seconds
+            .saturating_mul(1u64 << self.retest.attempts.min(16))
+            .min(86400)
     }
     pub fn in_trial(&self) -> bool {
         self.trial.is_some()
     }
-    pub fn learned_limits(&self) -> (f64, u64, bool) {
-        (
-            self.ceiling,
-            self.status.cooldown_seconds,
-            self.voltage_rejected,
-        )
+    pub fn learned_limits(&self) -> (f64, u64) {
+        (self.ceiling, self.status.cooldown_seconds)
+    }
+    pub fn synchronize_recoveries(&mut self, count: u64) {
+        self.recoveries = count;
     }
     pub fn applied(&mut self, point: Point, now: u64, reason: String) {
-        if (point.frequency_mhz - self.point.frequency_mhz).abs() > 1. {
-            self.frequency_active = 0;
-        }
         self.point = point;
+        self.recovery_burst.reset(now);
         self.epoch = now;
         self.last_tick = now;
+        self.window_started = now;
+        self.window_recoveries = 0;
+        self.degraded_windows = 0;
         self.status.active_seconds = 0;
-        self.status.state = if self.trial.is_some() {
+        self.status.state = if self.in_trial() {
             "testing"
         } else {
             "learning"
@@ -134,134 +218,246 @@ impl Policy {
         .into();
         self.status.message = reason;
     }
+    fn backoff(&mut self, reason: &str, force_frequency: bool) -> Option<Action> {
+        let target = if !force_frequency && self.point.voltage_v < 1.0 {
+            Point {
+                voltage_v: 1.0,
+                ..self.point
+            }
+        } else if let Some(trial) = &self.trial
+            && trial.rollback.frequency_mhz < self.point.frequency_mhz
+        {
+            trial.rollback
+        } else {
+            let frequency_mhz = self
+                .frequencies
+                .iter()
+                .copied()
+                .rev()
+                .find(|&f| {
+                    f <= self.point.frequency_mhz - 20. && f >= self.settings.min_frequency_mhz
+                })
+                .or_else(|| {
+                    self.frequencies.iter().copied().rev().find(|&f| {
+                        f < self.point.frequency_mhz && f >= self.settings.min_frequency_mhz
+                    })
+                })
+                .unwrap_or(self.point.frequency_mhz);
+            Point {
+                frequency_mhz,
+                ..self.point
+            }
+        };
+        let kind = if self
+            .trial
+            .as_ref()
+            .is_some_and(|trial| trial.rollback == target)
+        {
+            ChangeKind::Restore
+        } else {
+            ChangeKind::Backoff
+        };
+        self.trial = None;
+        self.degraded_windows = 0;
+        self.window_recoveries = 0;
+        self.status.cooldown_seconds = self.settings.cooldown_seconds;
+        if target == self.point {
+            self.status.state = "monitoring".into();
+            self.status.message = format!("{reason}; already at the minimum frequency");
+            return None;
+        }
+        if target.frequency_mhz < self.point.frequency_mhz {
+            self.ceiling = self.point.frequency_mhz - 10.;
+            self.retest.remaining_seconds = self.retest_delay();
+        }
+        self.status.retest_seconds_remaining = self.retest_remaining();
+        self.baseline = None;
+        Some(Action::Set(
+            target,
+            Change {
+                kind,
+                message: reason.into(),
+            },
+        ))
+    }
+    pub fn interrupt_trial(&mut self, now: u64) {
+        let Some(trial) = self.trial.take() else {
+            return;
+        };
+        if let TrialKind::RetestPending(previous) = trial.kind {
+            self.retest = previous;
+            self.status.retest_seconds_remaining = self.retest_remaining();
+        }
+        self.baseline = None;
+        self.epoch = now;
+        self.last_tick = now;
+        self.window_started = now;
+        self.window_recoveries = 0;
+        self.degraded_windows = 0;
+        self.status.active_seconds = 0;
+    }
+    pub fn commit_retest(&mut self) {
+        if let Some(trial) = &mut self.trial
+            && matches!(trial.kind, TrialKind::RetestPending(_))
+        {
+            trial.kind = TrialKind::Retest;
+        }
+    }
     pub fn observe(&mut self, now: u64, input: Input) -> Option<Action> {
+        self.status.retest_seconds_remaining = self.retest_remaining();
+        let clock_reversed = now < self.last_tick;
         let dt = now.saturating_sub(self.last_tick).min(5);
         self.last_tick = now;
-        if now < self.epoch {
+        let reset_counter = input.recoveries < self.recoveries;
+        let mut new_recoveries = input.recoveries.saturating_sub(self.recoveries);
+        if reset_counter {
+            self.recovery_burst.reset(now);
+        }
+        self.window_recoveries = self.window_recoveries.saturating_add(new_recoveries);
+        self.recoveries = input.recoveries;
+        if now < self.epoch || clock_reversed {
+            self.recovery_burst.reset(now);
             self.epoch = now;
+            self.window_started = now;
+            self.window_recoveries = 0;
+            self.degraded_windows = 0;
             self.status.active_seconds = 0;
             self.baseline = None;
             return None;
         }
-        let recovery = input.recoveries > self.recoveries;
-        self.recoveries = input.recoveries;
         if input.paused {
+            self.recovery_burst.reset(now);
             self.status.state = "paused".into();
-            self.status.message = "Automatic tuning is paused".into();
+            self.status.message = "Current settings held; proof production continues".into();
             self.was_paused = true;
-            if self.trial.take().is_some() {
-                return Some(Action::Set(
-                    self.best,
-                    "Holding the previous observed setting".into(),
-                ));
+            if !self.is_retest() {
+                self.trial = None;
             }
             return None;
         }
         if self.was_paused {
+            self.recovery_burst.reset(now);
+            new_recoveries = 0;
             self.was_paused = false;
             self.epoch = now;
+            self.window_started = now;
+            self.window_recoveries = 0;
+            self.degraded_windows = 0;
             self.status.active_seconds = 0;
-            self.baseline = None;
-        }
-        if recovery {
-            let trial = self.trial.take();
-            let target = if matches!(trial, Some(Trial::Voltage)) {
-                self.voltage_rejected = true;
-                self.best
-            } else if trial.is_some() {
-                self.ceiling = self.point.frequency_mhz - 10.;
-                self.best
-            } else if self.point.voltage_v < 1.0
-                && input.healthy
-                && input
-                    .temperature
-                    .is_some_and(|t| t < input.temperature_limit - 3.)
-            {
-                self.voltage_rejected = true;
-                Point {
-                    voltage_v: 1.0,
-                    ..self.point
-                }
-            } else {
-                self.ceiling = self.point.frequency_mhz - 10.;
-                Point {
-                    frequency_mhz: (self.point.frequency_mhz - 20.)
-                        .max(self.settings.min_frequency_mhz),
-                    voltage_v: self.point.voltage_v,
-                }
-            };
-            self.baseline = None;
-            self.status.cooldown_seconds = self.settings.cooldown_seconds;
-            if target == self.point {
-                return Some(Action::Stop(
-                    "Recoveries continue at the minimum Automatic setting".into(),
-                ));
+            if !self.is_retest() {
+                self.baseline = None;
             }
-            let reason = if target.voltage_v > self.point.voltage_v {
-                "Restored higher voltage after a recovery"
-            } else {
-                "Backed off after a recovery"
-            };
-            return Some(Action::Set(target, reason.into()));
+        }
+        if self.recovery_burst.observe(now, new_recoveries) {
+            self.recovery_burst.reset(now);
+            return self.backoff("Recovery storm: 20 restarts within 10 seconds", true);
         }
         if !input.healthy {
             self.status.state = "waiting".into();
             self.status.message = "Waiting for fresh proof work and temperature telemetry".into();
             return None;
         }
+        // Soft thermal backoff supplements the independent hard temperature stop.
+        if input
+            .temperature
+            .is_some_and(|t| t >= input.temperature_limit - 1.)
+        {
+            return self.backoff("Reduced frequency near the temperature limit", true);
+        }
         self.status.active_seconds += dt;
-        self.frequency_active += dt;
         self.status.cooldown_seconds = self.status.cooldown_seconds.saturating_sub(dt);
-        self.status.state = if self.trial.is_some() {
+        self.status.state = if self.in_trial() {
             "testing"
         } else {
             "learning"
         }
         .into();
         let score = input.score.filter(|s| s.is_finite() && *s > 0.)?;
-        if self.status.active_seconds < self.settings.healthy_seconds {
+        if let Some(baseline) = self.baseline
+            && now.saturating_sub(self.window_started) >= self.settings.recovery_window_seconds
+        {
+            let degraded = self.window_recoveries > 0
+                && score < baseline * (1. - self.settings.recovery_loss_percent / 100.);
+            self.degraded_windows = if degraded {
+                self.degraded_windows + 1
+            } else {
+                0
+            };
+            self.window_started = now;
+            self.window_recoveries = 0;
+            if self.degraded_windows >= self.settings.recovery_bad_windows {
+                return self.backoff("Sustained delivered IPS loss with recoveries in consecutive observation windows",false);
+            }
+        }
+        let required_seconds = if self.is_retest() {
+            self.settings.healthy_seconds.max(
+                self.settings.recovery_window_seconds
+                    * u64::from(self.settings.recovery_bad_windows),
+            )
+        } else {
+            self.settings.healthy_seconds
+        };
+        if self.status.active_seconds < required_seconds {
             return None;
         }
-        if let Some(trial) = self.trial.take() {
-            let baseline = self.baseline.expect("trial baseline");
-            let accepted = score
-                >= baseline
-                    * if matches!(trial, Trial::Frequency) {
-                        1.002
-                    } else {
-                        0.998
-                    };
-            if accepted {
-                self.best = self.point;
-                self.baseline = Some(score);
-                self.epoch = now;
-                self.status.active_seconds = 0;
-                self.status.message = "Accepted an observed clean setting".into();
-                return Some(Action::Save);
+        if self.degraded_windows > 0 {
+            self.status.message = "Waiting for a complete recovery-cost observation window".into();
+            return None;
+        }
+        if self.in_trial() {
+            // No rollback merely because an otherwise stable trial missed a tiny gain.
+            // A materially slower recovering trial stays under observation until the
+            // consecutive-window test above can establish a problem.
+            if self
+                .baseline
+                .is_some_and(|b| score < b * (1. - self.settings.recovery_loss_percent / 100.))
+                && self.window_recoveries > 0
+            {
+                self.status.message =
+                    "Observing recovery cost before accepting this setting".into();
+                return None;
             }
-            if matches!(trial, Trial::Voltage) {
-                self.voltage_rejected = true;
-            } else {
-                self.ceiling = self.point.frequency_mhz - 10.;
+            let was_retest = self.is_retest();
+            self.trial = None;
+            if was_retest {
+                self.ceiling = self.settings.max_frequency_mhz;
+                self.retest = RetestState {
+                    attempts: 0,
+                    remaining_seconds: self.settings.retest_after_seconds,
+                };
+                self.status.retest_seconds_remaining = None;
             }
-            self.baseline = None;
-            self.status.cooldown_seconds = self.settings.cooldown_seconds;
-            return Some(Action::Set(
-                self.best,
-                "Restored the previous setting; delivered proof performance did not improve".into(),
-            ));
+            self.baseline = Some(score);
+            self.epoch = now;
+            self.window_started = now;
+            self.window_recoveries = 0;
+            self.degraded_windows = 0;
+            self.status.active_seconds = 0;
+            self.status.message =
+                "Retained higher frequency; continuing to monitor delivered IPS".into();
+            return Some(Action::Save);
         }
         if self.baseline.is_none() {
-            self.best = self.point;
             self.baseline = Some(score);
-            self.status.message = "Saved observed clean settings".into();
+            self.window_started = now;
+            self.window_recoveries = 0;
+            self.degraded_windows = 0;
+            self.status.message =
+                "Saved observed performance baseline; recoveries are permitted".into();
             return Some(Action::Save);
+        }
+        if self.retest_remaining().is_some()
+            && input
+                .temperature
+                .is_some_and(|t| t <= input.temperature_limit - 5.)
+        {
+            self.retest.remaining_seconds = self.retest.remaining_seconds.saturating_sub(dt);
+            self.status.retest_seconds_remaining = self.retest_remaining();
         }
         if self.status.cooldown_seconds > 0 {
             self.status.state = "cooldown".into();
             return None;
         }
-        // Leave thermal headroom for upward exploration; the hard guard still stops at the configured limit.
         if input
             .temperature
             .is_none_or(|t| t >= input.temperature_limit - 3.)
@@ -269,159 +465,74 @@ impl Policy {
             self.status.state = "monitoring".into();
             return None;
         }
-        if self.point.frequency_mhz + 10. <= self.ceiling {
-            self.baseline = Some(score);
-            self.best = self.point;
-            self.trial = Some(Trial::Frequency);
+        if let Some(frequency_mhz) = self
+            .frequencies
+            .iter()
+            .copied()
+            .find(|&f| f >= self.point.frequency_mhz + 10. - 0.000001 && f <= self.ceiling)
+        {
+            self.trial = Some(Trial {
+                rollback: self.point,
+                kind: TrialKind::Exploration,
+            });
             return Some(Action::Set(
                 Point {
-                    frequency_mhz: self.point.frequency_mhz + 10.,
+                    frequency_mhz,
                     ..self.point
                 },
-                "Testing a 10 MHz increase".into(),
+                Change {
+                    kind: ChangeKind::Trial,
+                    message: format!("Testing supported frequency {frequency_mhz:.0} MHz"),
+                },
+            ));
+        }
+        if self.retest_remaining() == Some(0)
+            && input
+                .temperature
+                .is_some_and(|t| t <= input.temperature_limit - 5.)
+            && let Some(frequency_mhz) = self.frequencies.iter().copied().find(|&f| {
+                f >= self.point.frequency_mhz + 10. - 0.000001
+                    && f <= self.settings.max_frequency_mhz
+            })
+        {
+            self.trial = Some(Trial {
+                rollback: self.point,
+                kind: TrialKind::RetestPending(self.retest.clone()),
+            });
+            self.retest.attempts = self.retest.attempts.saturating_add(1).min(16);
+            // Reserve the next wait before touching hardware. A crash or failed
+            // command cannot turn a restart into an immediate repeated test.
+            self.retest.remaining_seconds = self.retest_delay();
+            self.status.retest_seconds_remaining = self.retest_remaining();
+            return Some(Action::Set(
+                Point {
+                    frequency_mhz,
+                    ..self.point
+                },
+                Change {
+                    kind: ChangeKind::Trial,
+                    message: format!(
+                        "Retesting supported frequency {frequency_mhz:.0} MHz after healthy operation"
+                    ),
+                },
             ));
         }
         self.status.state = "monitoring".into();
-        if !self.voltage_rejected
-            && self.frequency_active >= self.settings.voltage_after_seconds
-            && self.point.voltage_v - 0.00625 >= self.settings.min_voltage_v
-        {
-            self.baseline = Some(score);
-            self.best = self.point;
-            self.trial = Some(Trial::Voltage);
-            return Some(Action::Set(
-                Point {
-                    voltage_v: self.point.voltage_v - 0.00625,
-                    ..self.point
-                },
-                "Testing a lower voltage at the settled frequency".into(),
-            ));
-        }
+        self.status.message = match self.retest_remaining() {
+            Some(seconds) => format!(
+                "Monitoring; higher frequency retry after {} more healthy minutes",
+                seconds.div_ceil(60)
+            ),
+            None => {
+                "Holding frequency and voltage; monitoring delivered IPS and recovery cost".into()
+            }
+        };
         None
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Learned {
-    pub serial: String,
-    pub engines: usize,
-    pub host: String,
-    pub client_sha256: String,
-    pub point: Point,
-    pub active_seconds: u64,
-    pub updated_unix: u64,
-    pub ceiling_mhz: f64,
-    pub cooldown_seconds: u64,
-    pub voltage_rejected: bool,
-}
-#[derive(Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Cache {
-    schema_version: u32,
-    entries: Vec<Learned>,
-}
-fn cache(path: &Path) -> Result<Cache> {
-    if !path.exists() {
-        return Ok(Cache {
-            schema_version: 1,
-            ..Default::default()
-        });
-    }
-    let meta = std::fs::symlink_metadata(path)?;
-    if !meta.is_file() || meta.len() > 1024 * 1024 {
-        bail!("Invalid Automatic state file");
-    }
-    let value: Cache = serde_json::from_slice(&std::fs::read(path)?)?;
-    if value.schema_version != 1 {
-        bail!("Unsupported Automatic state version");
-    }
-    Ok(value)
-}
-pub fn learned(
-    config: &Config,
-    board: &timelord_core::BoardConfig,
-    engines: usize,
-    hash: &str,
-    host: &str,
-) -> Result<Option<Learned>> {
-    let Some(path) = config.hardware.automatic_state.as_ref() else {
-        return Ok(None);
-    };
-    Ok(cache(path)?
-        .entries
-        .into_iter()
-        .filter(|e| {
-            Some(&e.serial) == board.serial.as_ref()
-                && e.engines == engines
-                && e.client_sha256 == hash
-                && e.host == host
-                && board
-                    .automatic
-                    .contains(e.point.frequency_mhz, e.point.voltage_v)
-        })
-        .max_by_key(|e| e.updated_unix))
-}
-pub fn initial(
-    config: &Config,
-    board: &timelord_core::BoardConfig,
-    engines: usize,
-    hash: &str,
-    host: &str,
-) -> Result<Point> {
-    Ok(learned(config, board, engines, hash, host)?
-        .map(|e| e.point)
-        .unwrap_or(Point {
-            frequency_mhz: board.automatic.start_frequency_mhz,
-            voltage_v: board.automatic.start_voltage_v,
-        }))
-}
-pub fn save(path: &Path, entry: Learned) -> Result<()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = LOCK
-        .lock()
-        .map_err(|_| anyhow::anyhow!("Automatic state lock failed"))?;
-    let mut value = cache(path)?;
-    value.entries.retain(|e| {
-        !(e.serial == entry.serial
-            && e.engines == entry.engines
-            && e.host == entry.host
-            && e.client_sha256 == entry.client_sha256)
-    });
-    value.entries.push(entry);
-    if value.entries.len() > 128 {
-        value.entries.drain(..value.entries.len() - 128);
-    }
-    let parent = path.parent().context("Automatic state folder missing")?;
-    std::fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(
-        ".automatic-{}-{}.tmp",
-        std::process::id(),
-        crate::unix_now()
-    ));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    use std::io::Write;
-    let result = (|| {
-        let mut file = options.open(&temporary)?;
-        file.write_all(&serde_json::to_vec_pretty(&value)?)?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
-        Ok::<_, anyhow::Error>(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(temporary);
-    }
-    result
-}
-
-pub fn phase_score(
-    observations: &[crate::runtime::Observation],
+pub fn phase_score<'a>(
+    observations: impl DoubleEndedIterator<Item = &'a crate::runtime::Observation> + Clone,
     chains: &[timelord_core::Chain],
     epoch: u64,
     minimum: usize,
@@ -429,7 +540,7 @@ pub fn phase_score(
     let mut score = f64::INFINITY;
     for chain in chains {
         let values: Vec<_> = observations
-            .iter()
+            .clone()
             .rev()
             .take_while(|o| o.timestamp_unix >= epoch)
             .filter(|o| {
@@ -448,335 +559,5 @@ pub fn phase_score(
     score.is_finite().then_some(score)
 }
 
-pub fn socket_path(config_path: &Path, config: &Config) -> PathBuf {
-    config.service.control_socket.clone().unwrap_or_else(|| {
-        let canonical = config_path
-            .canonicalize()
-            .unwrap_or_else(|_| config_path.to_owned());
-        let digest = dg_xch_core::utils::hash_256(canonical.as_os_str().as_encoded_bytes());
-        let suffix: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
-        // macOS limits Unix socket paths to 104 bytes. Long Chia/config roots
-        // therefore use a stable, same-user private temporary socket path.
-        std::env::temp_dir().join(format!("tl-{}-{suffix}.sock", unsafe { libc::geteuid() }))
-    })
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    fn settings() -> AutomaticConfig {
-        AutomaticConfig {
-            healthy_seconds: 30,
-            cooldown_seconds: 30,
-            voltage_after_seconds: 60,
-            ..Default::default()
-        }
-    }
-    fn input() -> Input {
-        Input {
-            healthy: true,
-            recoveries: 0,
-            score: Some(950000.),
-            temperature: Some(40.),
-            temperature_limit: 55.,
-            paused: false,
-        }
-    }
-    fn policy() -> Policy {
-        Policy::new(
-            settings(),
-            Point {
-                frequency_mhz: 1450.,
-                voltage_v: 1.,
-            },
-            0,
-        )
-    }
-    #[test]
-    fn idle_and_unattributed_proofs_cannot_promote_a_setting() {
-        let mut p = policy();
-        for now in 0..300 {
-            let mut i = input();
-            i.healthy = false;
-            assert!(p.observe(now, i).is_none());
-        }
-        assert_eq!(p.status.active_seconds, 0);
-        for now in 300..500 {
-            let mut i = input();
-            i.score = None;
-            assert!(p.observe(now, i).is_none());
-        }
-        assert_eq!(p.point.frequency_mhz, 1450.);
-        use timelord_core::Chain;
-        let observations: Vec<_> = (0..3)
-            .flat_map(|_| [Chain::Challenge, Chain::Reward])
-            .enumerate()
-            .map(|(n, chain)| crate::runtime::Observation {
-                id: n as u64,
-                chain,
-                timestamp_unix: 200 + n as u64,
-                work_started_unix: 50,
-                ips: 950000.,
-            })
-            .collect();
-        assert_eq!(
-            phase_score(&observations, &[Chain::Challenge, Chain::Reward], 100, 3),
-            None
-        );
-        let fresh: Vec<_> = observations
-            .into_iter()
-            .map(|mut o| {
-                o.work_started_unix = 120;
-                o.ips = if o.chain == Chain::Reward {
-                    900000.
-                } else {
-                    1000000.
-                };
-                o
-            })
-            .collect();
-        assert_eq!(
-            phase_score(&fresh, &[Chain::Challenge, Chain::Reward], 100, 3),
-            Some(900000.)
-        );
-        assert_eq!(
-            phase_score(
-                &fresh,
-                &[Chain::Challenge, Chain::Reward, Chain::InfusedChallenge],
-                100,
-                3
-            ),
-            None
-        );
-    }
-    #[test]
-    fn initial_point_backs_off_below_1450_and_trials_revert_before_cooldown() {
-        let mut low_voltage = Policy::new(
-            settings(),
-            Point {
-                frequency_mhz: 1450.,
-                voltage_v: 0.95,
-            },
-            0,
-        );
-        let mut failure = input();
-        failure.recoveries = 1;
-        assert!(matches!(
-            low_voltage.observe(1, failure),
-            Some(Action::Set(
-                Point {
-                    frequency_mhz: 1450.,
-                    voltage_v: 1.0
-                },
-                _
-            ))
-        ));
-        let mut p = policy();
-        let mut i = input();
-        i.recoveries = 1;
-        assert!(matches!(
-            p.observe(1, i),
-            Some(Action::Set(
-                Point {
-                    frequency_mhz: 1430.,
-                    ..
-                },
-                _
-            ))
-        ));
-        let mut p = policy();
-        let mut saved = false;
-        for now in (5..=35).step_by(5) {
-            match p.observe(now, input()) {
-                Some(Action::Save) => saved = true,
-                Some(Action::Set(point, reason)) => {
-                    assert!(saved);
-                    assert_eq!(point.frequency_mhz, 1460.);
-                    p.applied(point, now, reason)
-                }
-                _ => {}
-            }
-        }
-        let mut i = input();
-        i.recoveries = 1;
-        let Some(Action::Set(point, reason)) = p.observe(36, i) else {
-            panic!("must revert")
-        };
-        assert_eq!(point.frequency_mhz, 1450.);
-        p.applied(point, 36, reason);
-        for now in 37..60 {
-            let mut i = input();
-            i.recoveries = 1;
-            assert!(!matches!(p.observe(now, i), Some(Action::Set(..))));
-        }
-    }
-    #[test]
-    fn voltage_trials_restore_voltage_and_pause_discards_trial_evidence() {
-        let mut s = settings();
-        s.max_frequency_mhz = 1450.;
-        let mut p = Policy::new(s, policy().point, 0);
-        for now in (5..=60).step_by(5) {
-            if let Some(Action::Set(point, reason)) = p.observe(now, input()) {
-                assert_eq!(point.voltage_v, 0.99375);
-                p.applied(point, now, reason);
-            }
-        }
-        let mut i = input();
-        i.recoveries = 1;
-        let Some(Action::Set(point, _)) = p.observe(61, i) else {
-            panic!("must restore voltage")
-        };
-        assert_eq!(point.voltage_v, 1.);
-        assert_eq!(point.frequency_mhz, 1450.);
-        let mut p = policy();
-        for now in (5..=35).step_by(5) {
-            if let Some(Action::Set(point, reason)) = p.observe(now, input()) {
-                p.applied(point, now, reason);
-            }
-        }
-        let mut i = input();
-        i.paused = true;
-        assert!(matches!(
-            p.observe(36, i),
-            Some(Action::Set(
-                Point {
-                    frequency_mhz: 1450.,
-                    ..
-                },
-                _
-            ))
-        ));
-        for now in 37..100 {
-            let mut i = input();
-            i.paused = true;
-            assert!(p.observe(now, i).is_none());
-        }
-        assert!(p.observe(100, input()).is_none());
-        assert_eq!(p.status.active_seconds, 1);
-    }
-    #[test]
-    fn heat_and_missing_improvement_stop_upward_exploration() {
-        let mut p = policy();
-        for now in (5..=120).step_by(5) {
-            let mut i = input();
-            i.temperature = Some(53.);
-            assert!(!matches!(p.observe(now, i), Some(Action::Set(..))));
-        }
-        let mut p = policy();
-        for now in (5..=35).step_by(5) {
-            if let Some(Action::Set(point, reason)) = p.observe(now, input()) {
-                p.applied(point, now, reason);
-            }
-        }
-        let mut reverted = false;
-        for now in (40..=70).step_by(5) {
-            let mut i = input();
-            i.score = Some(800000.);
-            if let Some(Action::Set(point, _)) = p.observe(now, i) {
-                assert_eq!(point.frequency_mhz, 1450.);
-                reverted = true;
-                break;
-            }
-        }
-        assert!(reverted);
-    }
-    #[test]
-    fn simultaneous_board_updates_keep_all_learned_profiles() {
-        let path =
-            std::env::temp_dir().join(format!("tl-cache-concurrent-{}.json", std::process::id()));
-        let threads: Vec<_> = (0..8)
-            .map(|n| {
-                let path = path.clone();
-                std::thread::spawn(move || {
-                    save(
-                        &path,
-                        Learned {
-                            serial: format!("board-{n}"),
-                            engines: 1,
-                            host: "mac".into(),
-                            client_sha256: "hash".into(),
-                            point: Point {
-                                frequency_mhz: 1450.,
-                                voltage_v: 1.,
-                            },
-                            active_seconds: 120,
-                            updated_unix: n,
-                            ceiling_mhz: 1600.,
-                            cooldown_seconds: 0,
-                            voltage_rejected: false,
-                        },
-                    )
-                    .unwrap()
-                })
-            })
-            .collect();
-        for thread in threads {
-            thread.join().unwrap();
-        }
-        assert_eq!(cache(&path).unwrap().entries.len(), 8);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn cache_is_bound_to_serial_engine_host_and_binary() {
-        let directory = std::env::temp_dir().join(format!(
-            "automatic-cache-{}-{}",
-            std::process::id(),
-            crate::unix_now()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("state.json");
-        let mut config = Config::default();
-        config.hardware.automatic_state = Some(path.clone());
-        let board: timelord_core::BoardConfig =
-            toml::from_str("id='a'\nname='A'\nclient_port=18110\nserial='a'\nprofile='automatic'")
-                .unwrap();
-        let entry = Learned {
-            serial: "a".into(),
-            engines: 3,
-            host: "mac".into(),
-            client_sha256: "hash".into(),
-            point: Point {
-                frequency_mhz: 1520.,
-                voltage_v: 1.,
-            },
-            active_seconds: 120,
-            updated_unix: 1,
-            ceiling_mhz: 1520.,
-            cooldown_seconds: 30,
-            voltage_rejected: true,
-        };
-        save(&path, entry).unwrap();
-        assert_eq!(
-            initial(&config, &board, 3, "hash", "mac")
-                .unwrap()
-                .frequency_mhz,
-            1520.
-        );
-        let entry = learned(&config, &board, 3, "hash", "mac").unwrap().unwrap();
-        let mut restored = Policy::new(board.automatic.clone(), entry.point, 0);
-        restored.restore(&entry);
-        assert_eq!(restored.learned_limits(), (1520., 30, true));
-        for (engines, hash, host) in [
-            (1, "hash", "mac"),
-            (3, "different", "mac"),
-            (3, "hash", "other"),
-        ] {
-            assert_eq!(
-                initial(&config, &board, engines, hash, host)
-                    .unwrap()
-                    .frequency_mhz,
-                1450.
-            );
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-}
+mod tests;

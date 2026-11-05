@@ -4,7 +4,12 @@ import TimelordPresentation
 
 @main
 struct TimelordMacApp: App {
-    @StateObject private var model = TimelordModel()
+    @NSApplicationDelegateAdaptor(ApplicationDelegate.self) private var delegate
+    var body: some Scene { TimelordScenes(model: delegate.model) }
+}
+
+private struct TimelordScenes: Scene {
+    @ObservedObject var model: TimelordModel
     var body: some Scene {
         WindowGroup("Timelord", id: "main") { Overview(model: model) }
             .defaultSize(width: 1180, height: 820)
@@ -17,7 +22,13 @@ struct TimelordMacApp: App {
                     Button("Settings…") { model.sheet = .settings }.keyboardShortcut(",")
                 }
             }
-        MenuBarExtra("Timelord", systemImage: "clock.arrow.circlepath") { MenuStatus(model: model) }
+        MenuBarExtra {
+            MenuStatus(model: model)
+        } label: {
+            Image(nsImage: MenuBarIcon.image(for: MenuBarGlyph(phase: model.snapshot.phase)))
+                .renderingMode(.template)
+                .accessibilityLabel("Timelord, \(model.snapshot.phase.title)")
+        }
             .menuBarExtraStyle(.window)
     }
 }

@@ -50,14 +50,17 @@ pub async fn check(mut config: Config) -> Result<Vec<CheckedProof>> {
             listeners.push((board.id.clone(), capacity, listener));
         }
     }
-    let (backend, offers) = AsicBackend::new(&config)?;
+    let runtime = Arc::new(Mutex::new(RuntimeState::default()));
+    let (backend, offers) = AsicBackend::new(&config, &assignments, runtime.clone())?;
     let backend = Arc::new(backend);
     let shared = Arc::new(Shared {
+        native: None,
         config,
         assignments,
         clients: Arc::new(Mutex::new(BTreeSet::new())),
-        runtime: Mutex::new(RuntimeState::default()),
+        runtime,
         started_unix: unix_now(),
+        service_started_unix: crate::unix_now(),
     });
     let (stop, shutdown) = watch::channel(false);
     let mut listeners_tasks = JoinSet::new();
@@ -71,7 +74,7 @@ pub async fn check(mut config: Config) -> Result<Vec<CheckedProof>> {
             offers.get(&id).cloned(),
         ));
     }
-    let mut supervisor = tokio::spawn(hardware::run(shared.clone(), shutdown));
+    let mut supervisor = tokio::spawn(hardware::run(shared.clone(), backend.clone(), shutdown));
     let workload = async {
         let mut checked = vec![];
         // Round two must reuse each session; round three must reset it.

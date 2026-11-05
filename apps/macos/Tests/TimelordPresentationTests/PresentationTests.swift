@@ -5,6 +5,186 @@ import XCTest
 final class PresentationTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_000_000)
 
+    func testServiceUptimeSurvivesAnEngineSessionRestart() throws {
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        func status(sessionStart: Double) throws -> ServiceStatus {
+            let original = try operationalStatus()
+            // Preserve the fixture's node/board fields while changing only clocks.
+            let object: [String: Any] = ["api_version":original.apiVersion, "service_pid":original.servicePid,
+                "timelord_state":"running", "message":"", "production_enabled":true,
+                "full_node":["host":"localhost", "state":"ready"], "boards":[],
+                "started_unix":sessionStart, "service_started_unix":900000,
+                "timestamp_unix":1000000, "latest_proof_unix":1000000,
+                "proofs_delivered":0, "tuning_paused":false]
+            return try decoder.decode(ServiceStatus.self, from: JSONSerialization.data(withJSONObject:object))
+        }
+        let before = LivePresentation.snapshot(status:try status(sessionStart:999000), now:now)
+        let after = LivePresentation.snapshot(status:try status(sessionStart:999700), now:now)
+        XCTAssertEqual(before.uptimeSeconds, 100000)
+        XCTAssertEqual(after.uptimeSeconds, before.uptimeSeconds)
+        XCTAssertEqual(before.sessionUptimeSeconds, 1000)
+        XCTAssertEqual(after.sessionUptimeSeconds, 300)
+    }
+
+    func testDeliveredMedianUsesTheSameScrapeWindowAndStopsWhenPaused() {
+        let fixture = PresentationScenario.runningOneBoard.snapshot(now: now)
+        let snapshot = AppSnapshot(phase: .running, explanation: "", node: fixture.node, timelord: fixture.timelord, boards: fixture.boards, proofsToday: nil, uptimeSeconds: nil, now: now, serviceAvailable: true)
+        let history = snapshot.boards[0].histories[0]
+        XCTAssertEqual(fixture.recentMedian(for: history), "—", "An unavailable service must not show historical data as live telemetry")
+        let values = history.sampledObservations(in: DateInterval(start: now.addingTimeInterval(-300), end: now)).map(\.ips).sorted()
+        XCTAssertFalse(values.isEmpty)
+        XCTAssertEqual(snapshot.recentMedian(for: history), DisplayFormat.ips((values[(values.count - 1) / 2] + values[values.count / 2]) / 2))
+        XCTAssertEqual(PresentationScenario.runningOneBoard.snapshot(now: now, paused: true).recentMedian(for: history), "—")
+    }
+
+    func testRawHandoffKeepsOnlyARecentMeasurementAndIdleDoesNotShowItAsActive() throws {
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        func sample(_ state: String, ips: Double = 1055000) throws -> RawSpeed {
+            try decoder.decode(RawSpeed.self, from: Data("{\"engine\":0,\"ips\":\(ips),\"timestamp_unix\":1000000,\"state\":\"\(state)\"}".utf8))
+        }
+        let handoff = try sample("sampling")
+        XCTAssertNil(handoff.freshIPS(at: now))
+        XCTAssertEqual(handoff.displayText(at: now.addingTimeInterval(2)), "1.055M")
+        XCTAssertEqual(handoff.displayText(at: now.addingTimeInterval(6)), "Starting")
+        XCTAssertEqual(try sample("sampling", ips: -1).displayText(at: now), "Starting")
+        let idle = try sample("idle")
+        XCTAssertNil(idle.freshIPS(at: now))
+        XCTAssertEqual(idle.displayText(at: now), "Idle")
+        XCTAssertEqual(try sample("running").displayText(at: now.addingTimeInterval(6)), "—")
+    }
+
+    func testRawSpeedUsesThePhysicalEngineForEachAssignedChain() {
+        let chains: [Chain] = [.challenge, .reward, .infusedChallenge]
+        for count in 1...3 {
+            let histories = Array(chains.prefix(count)).map(ChainHistory.empty)
+            var board = BoardSnapshot(id: "a", name: "A", state: .active, temperatureC: 40,
+                temperatureLimitC: 55, profile: "Automatic", frequencyMHz: 1900,
+                voltageV: 1, histories: histories, lastProof: now,
+                rawSpeeds: (0...2).map { RawSpeed(engine: $0, ips: Double(1_000_000 + $0), timestampUnix: now.timeIntervalSince1970, state: "running") })
+            for (index, history) in histories.enumerated() {
+                let expected = count == 1 ? 1 : index
+                XCTAssertEqual(board.rawSpeed(for: history.chain)?.engine, expected)
+                XCTAssertEqual(board.rawSpeed(for: history.chain)?.ips, Double(1_000_000 + expected))
+            }
+            board.rawSpeeds = []
+            XCTAssertNil(board.rawSpeed(for: histories[0].chain))
+        }
+    }
+
+    func testRawSpeedExpiresAndRejectsInvalidValues() throws {
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let speed = try decoder.decode(RawSpeed.self, from: Data(#"{"engine":2,"ips":1055000,"timestamp_unix":1000000}"#.utf8))
+        XCTAssertEqual(speed.engine, 2)
+        XCTAssertEqual(speed.freshIPS(at: now.addingTimeInterval(5)), 1055000)
+        XCTAssertNil(speed.freshIPS(at: now.addingTimeInterval(6)))
+        XCTAssertNil(speed.freshIPS(at: now.addingTimeInterval(-1)))
+    }
+
+    func testScrapeMeanWeightsTimeInsteadOfProofCountAndKeepsLowRecoveryValues() {
+        // A burst of three fast outputs must not outweigh three scrapes held at 400K.
+        let start = Date(timeIntervalSince1970: 900_000)
+        let window = DateInterval(start: start, duration: 120)
+        let history = ChainHistory(chain: .challenge, samples: [
+            ProofObservation(date: start, ips: 400_000),
+            ProofObservation(date: start.addingTimeInterval(89), ips: 400_000),
+            ProofObservation(date: start.addingTimeInterval(91), ips: 1_000_000),
+            ProofObservation(date: start.addingTimeInterval(92), ips: 1_000_000),
+            ProofObservation(date: start.addingTimeInterval(93), ips: 1_000_000)],
+            captureIntervals: [window], events: [HistoryEvent(date: start, end: nil, kind: .recovery)])
+        XCTAssertEqual(history.sampledObservations(in: window).map(\.ips), [400_000,400_000,400_000,1_000_000])
+        XCTAssertEqual(history.statistics(in: window).average, 550_000)
+    }
+
+    func testNormalHistoryFetchLagDoesNotMakeFreshIPSUnavailable() {
+        let start = Date(timeIntervalSince1970: 900_000)
+        let history = ChainHistory(chain: .challenge, samples: [ProofObservation(date: start.addingTimeInterval(25), ips: 900_000)], captureIntervals: [DateInterval(start: start, duration: 30)], events: [])
+        XCTAssertTrue(history.hasFreshValue(at: start.addingTimeInterval(45)))
+        XCTAssertFalse(history.hasFreshValue(at: start.addingTimeInterval(60)))
+    }
+
+    func testStaleGaugeCreatesGapWithoutInventingZerosOrBridgingTheChart() {
+        let start = Date(timeIntervalSince1970: 900_000)
+        let window = DateInterval(start: start, duration: 180)
+        let history = ChainHistory(chain: .challenge, samples: [
+            ProofObservation(date: start, ips: 900_000),
+            ProofObservation(date: start.addingTimeInterval(150), ips: 1_000_000)],
+            captureIntervals: [window], events: [])
+        XCTAssertFalse(history.hasFreshValue(at: start.addingTimeInterval(90)))
+        XCTAssertEqual(history.sampledObservations(in: window).map(\.ips), [900_000,900_000,1_000_000,1_000_000])
+        XCTAssertEqual(history.plotPoints(in: window).map(\.segment), [0,0,1,1])
+        XCTAssertEqual(history.statistics(in: window).coverage, 1)
+    }
+
+    func testHeadlineUsesLatestOutputFromAnyChainAndExpiresEvenWithHistory() {
+        let end = Date(timeIntervalSince1970: 900_120)
+        let window = DateInterval(start: end.addingTimeInterval(-120), end: end)
+        let cc = ChainHistory(chain: .challenge, samples: [ProofObservation(date: window.start, ips: 400_000, sequence: 1)], captureIntervals: [window], events: [])
+        let rc = ChainHistory(chain: .reward, samples: [ProofObservation(date: window.start.addingTimeInterval(60), ips: 1_000_000, sequence: 2)], captureIntervals: [window], events: [])
+        let board = BoardSnapshot(id: "a", name: "A", state: .active, temperatureC: nil, temperatureLimitC: 55, profile: "Manual", frequencyMHz: nil, voltageV: nil, histories: [rc,cc], lastProof: end)
+        func snapshot(_ now: Date, phase: AppPhase = .running) -> AppSnapshot {
+            AppSnapshot(phase: phase, explanation: "", node: ConnectionSnapshot(title: "", detail: "", tone: .positive), timelord: ConnectionSnapshot(title: "", detail: "", tone: .positive), boards: [board], proofsToday: 2, uptimeSeconds: 120, now: now, serviceAvailable: true)
+        }
+        XCTAssertEqual(snapshot(end).headlineSpeed, "760K")
+        XCTAssertEqual(snapshot(end.addingTimeInterval(30)).headlineSpeed, "—")
+        XCTAssertEqual(snapshot(end, phase: .paused).headlineSpeed, "—")
+        let sameTime = ChainHistory(chain: .challenge, samples: [ProofObservation(date: end, ips: 400_000, sequence: 10), ProofObservation(date: end, ips: 1_000_000, sequence: 2)], captureIntervals: [window], events: [])
+        XCTAssertEqual(sameTime.sampledObservations(in: window).last?.ips, 400_000)
+    }
+
+    func testBoardTileShowsRecentMeanWhileHeadlineKeepsHourlyMean() {
+        let end = Date(timeIntervalSince1970: 900_000)
+        let window = HistoryRange.hour.interval(endingAt: end)
+        let samples = (0...60).map { minute in
+            ProofObservation(date: window.start.addingTimeInterval(Double(minute) * 60), ips: minute < 55 ? 400_000 : 1_000_000)
+        }
+        let history = ChainHistory(chain: .challenge, samples: samples, captureIntervals: [window], events: [])
+        let board = BoardSnapshot(id: "a", name: "A", state: .active, temperatureC: nil, temperatureLimitC: 55, profile: "Manual", frequencyMHz: nil, voltageV: nil, histories: [history], lastProof: end)
+        func snapshot(_ now: Date, phase: AppPhase = .running) -> AppSnapshot {
+            AppSnapshot(phase: phase, explanation: "", node: ConnectionSnapshot(title: "", detail: "", tone: .positive), timelord: ConnectionSnapshot(title: "", detail: "", tone: .positive), boards: [board], proofsToday: 61, uptimeSeconds: 3600, now: now, serviceAvailable: true)
+        }
+        XCTAssertEqual(snapshot(end).recentSpeed(for: history), "1.000M")
+        XCTAssertEqual(snapshot(end).headlineSpeed, "455K")
+        XCTAssertEqual(snapshot(end.addingTimeInterval(90)).recentSpeed(for: history), "1.000M")
+        XCTAssertEqual(snapshot(end.addingTimeInterval(90)).recentMedian(for: history), "1.000M")
+        XCTAssertEqual(snapshot(end.addingTimeInterval(90), phase: .waitingForProofs).recentSpeed(for: history), "1.000M")
+        XCTAssertEqual(snapshot(end.addingTimeInterval(90), phase: .nodeUnreachable).recentMedian(for: history), "1.000M")
+        XCTAssertEqual(snapshot(end.addingTimeInterval(400)).recentSpeed(for: history), "—")
+        XCTAssertEqual(snapshot(end.addingTimeInterval(400)).recentMedian(for: history), "—")
+        XCTAssertEqual(snapshot(end, phase: .paused).recentSpeed(for: history), "—")
+    }
+
+    func testNativeClientFaultShowsReasonWithoutClaimingServiceReady() throws {
+        let view = LivePresentation.snapshot(status: try operationalStatus(state: "fault", message: "Board A needs attention: Board A: Native control closed before acknowledgement", faultKind: "control_closed"), now: now)
+        XCTAssertEqual(view.phase, .serviceUnavailable)
+        XCTAssertEqual(view.runningTitle, "Proof service stopped")
+        XCTAssertTrue(view.explanation.contains("ASIC client connection closed unexpectedly"))
+        XCTAssertTrue(view.explanation.contains("Native control closed before acknowledgement"))
+        XCTAssertEqual(view.timelord.title, "Stopped")
+        XCTAssertEqual(view.timelord.tone, .critical)
+        let other = LivePresentation.snapshot(status: try operationalStatus(state: "fault", message: "Other failure"), now: now)
+        XCTAssertEqual(other.explanation, "Other failure")
+        let untyped = LivePresentation.snapshot(status: try operationalStatus(state: "fault", message: "Board A needs attention: Native control closed before acknowledgement"), now: now)
+        XCTAssertEqual(untyped.explanation, "Board A needs attention: Native control closed before acknowledgement")
+    }
+
+    func testRestoredChartKeepsLowSamplesAndDoesNotBridgeRestartDowntime() throws {
+        let object: [String: Any] = ["api_version":3,"service_pid":42,"timestamp_unix":1000000,
+            "capture_intervals":[["start_unix":999880,"end_unix":999910],["start_unix":999970,"end_unix":1000000]],
+            "estimated_observations":[["id":1,"chain":"challenge","timestamp_unix":999900,"ips":400000],["id":2,"chain":"challenge","timestamp_unix":999990,"ips":1000000]],
+            "events":[["id":1,"timestamp_unix":999910,"kind":"telemetry_gap","end_unix":999970]]]
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let history = try decoder.decode(HistoryPayload.self, from: JSONSerialization.data(withJSONObject: object))
+        let view = LivePresentation.snapshot(status: try operationalStatus(), history: HistoryProjection(payload: history, boards: try operationalStatus().boards), now: now)
+        let chain = try XCTUnwrap(view.headlineHistory)
+        let window = HistoryRange.quarterHour.interval(endingAt: now)
+        let points = chain.plotPoints(in: window)
+        XCTAssertEqual(points.count, 2)
+        XCTAssertNotEqual(points[0].segment, points[1].segment)
+        XCTAssertEqual(chain.statistics(in: window).average, 700000)
+        XCTAssertEqual(chain.statistics(in: window).coverage, 60.0 / 900.0, accuracy: 0.0001)
+        XCTAssertNil(chain.observation(near: Date(timeIntervalSince1970: 999940), in: window))
+    }
+
     func testAutomaticTuningKeepsLiveProofMetricsAndClearsStaleLearningState() throws {
         let status=try operationalStatus()
         let object: [String:Any] = ["api_version":1,"service_pid":42,"service_state":"ready","timelord_state":"running","message":"Producing verified proofs.","production_enabled":true,"started_unix":999000,"timestamp_unix":1000000,"latest_proof_unix":1000000,"proofs_delivered":7,"tuning_paused":false,
@@ -45,7 +225,7 @@ final class PresentationTests: XCTestCase {
     func testRecoveryRetainsObservedSlowProofsInAverage() {
         let window = DateInterval(start: now.addingTimeInterval(-100), end: now)
         let history = ChainHistory(chain: .challenge,
-            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 1_000_000), ProofObservation(date: now.addingTimeInterval(-50), ips: 400_000), ProofObservation(date: now, ips: 1_000_000)],
+            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 1_000_000), ProofObservation(date: now.addingTimeInterval(-50), ips: 400_000), ProofObservation(date: now.addingTimeInterval(-20), ips: 1_000_000)],
             captureIntervals: [window], events: [HistoryEvent(date: now.addingTimeInterval(-50), end: nil, kind: .recovery)])
         let stats = history.statistics(in: window)
         XCTAssertEqual(stats.average, 800_000)
@@ -57,7 +237,7 @@ final class PresentationTests: XCTestCase {
     func testMissingCaptureBreaksLineAndHasSeparateCoverage() {
         let window = DateInterval(start: now.addingTimeInterval(-100), end: now)
         let history = ChainHistory(chain: .reward,
-            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 900_000), ProofObservation(date: now.addingTimeInterval(-10), ips: 950_000)],
+            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 900_000), ProofObservation(date: now.addingTimeInterval(-20), ips: 950_000)],
             captureIntervals: [DateInterval(start: window.start, duration: 40), DateInterval(start: now.addingTimeInterval(-40), end: now)], events: [])
         XCTAssertEqual(history.statistics(in: window).coverage, 0.8, accuracy: 0.0001)
         XCTAssertEqual(history.statistics(in: window).average, 925_000)
@@ -67,7 +247,7 @@ final class PresentationTests: XCTestCase {
     func testKnownWorkOutageDoesNotBecomeMissingTelemetry() {
         let window = DateInterval(start: now.addingTimeInterval(-100), end: now)
         let history = ChainHistory(chain: .reward,
-            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 900_000), ProofObservation(date: now.addingTimeInterval(-10), ips: 950_000)],
+            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 900_000), ProofObservation(date: now.addingTimeInterval(-20), ips: 950_000)],
             captureIntervals: [window], events: [HistoryEvent(date: now.addingTimeInterval(-60), end: now.addingTimeInterval(-30), kind: .nodeUnavailable)])
         XCTAssertEqual(history.statistics(in: window).coverage, 1)
         XCTAssertEqual(history.plotPoints(in: window).map(\.segment), [0, 1])
@@ -83,16 +263,16 @@ final class PresentationTests: XCTestCase {
     func testAdjacentCaptureDoesNotCreateArtificialLineBreaks() {
         let window = DateInterval(start: now.addingTimeInterval(-100), end: now)
         let history = ChainHistory(chain: .challenge,
-            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 900_000), ProofObservation(date: now.addingTimeInterval(-10), ips: 950_000)],
+            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 900_000), ProofObservation(date: now.addingTimeInterval(-20), ips: 950_000)],
             captureIntervals: [DateInterval(start: window.start, duration: 60), DateInterval(start: now.addingTimeInterval(-60), end: now)], events: [])
         XCTAssertEqual(history.statistics(in: window).coverage, 1)
-        XCTAssertEqual(history.plotPoints(in: window).map(\.segment), [0, 0])
+        XCTAssertEqual(history.plotPoints(in: window).map(\.segment), [0, 0, 0])
     }
 
     func testHoverOverUnknownDataDoesNotShowANearbyHealthyValue() {
         let window = DateInterval(start: now.addingTimeInterval(-100), end: now)
         let history = ChainHistory(chain: .challenge,
-            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 900_000), ProofObservation(date: now.addingTimeInterval(-10), ips: 950_000)],
+            samples: [ProofObservation(date: now.addingTimeInterval(-90), ips: 900_000), ProofObservation(date: now.addingTimeInterval(-20), ips: 950_000)],
             captureIntervals: [DateInterval(start: window.start, duration: 40), DateInterval(start: now.addingTimeInterval(-40), end: now)], events: [])
         XCTAssertNil(history.observation(near: now.addingTimeInterval(-50), in: window))
         XCTAssertEqual(history.observation(near: now.addingTimeInterval(-10), in: window)?.ips, 950_000)
@@ -101,7 +281,7 @@ final class PresentationTests: XCTestCase {
     func testInvalidAndOutsideWindowObservationsAreNotPlotted() {
         let window = HistoryRange.hour.interval(endingAt: now)
         let history = ChainHistory(chain: .challenge,
-            samples: [ProofObservation(date: now, ips: .nan), ProofObservation(date: now, ips: -.infinity), ProofObservation(date: now, ips: -1), ProofObservation(date: window.start.addingTimeInterval(-1), ips: 2_000_000), ProofObservation(date: now, ips: 0)], captureIntervals: [window], events: [])
+            samples: [ProofObservation(date: now, ips: .nan), ProofObservation(date: now, ips: -.infinity), ProofObservation(date: now, ips: -1), ProofObservation(date: window.start.addingTimeInterval(-1), ips: 2_000_000), ProofObservation(date: now.addingTimeInterval(-10), ips: 0)], captureIntervals: [window], events: [])
         XCTAssertEqual(history.statistics(in: window).observations, 1)
         XCTAssertEqual(history.statistics(in: window).average, 0)
     }
@@ -187,6 +367,30 @@ extension PresentationTests {
         let incomplete = LivePresentation.snapshot(status: nil, configuration: config, detectedDevices: [device], now: now)
         XCTAssertFalse(incomplete.readyToRun)
     }
+    func testManagedOwnerEnrichesUSBLocationWithoutDuplicateIdentity() {
+        let owner = DiscoveredDevice(name: "Managed", location: 7, serial: "A")
+        let hiddenSerial = DiscoveredDevice(name: "USB", location: 7)
+        let merged = BoardDiscovery.includingManagedOwner(owner, in: [hiddenSerial])
+        XCTAssertEqual(merged.map(\.id), [7])
+        XCTAssertEqual(merged.first?.serial, "A")
+        let repeated = BoardDiscovery.includingManagedOwner(owner, in: merged)
+        XCTAssertEqual(repeated.map(\.id), [7])
+        let replacement = DiscoveredDevice(name: "Fresh", location: 7, serial: "B")
+        XCTAssertEqual(BoardDiscovery.includingManagedOwner(owner, in: [replacement]).first?.serial, "B")
+        let moved = DiscoveredDevice(name: "Fresh", location: 8, serial: "A")
+        XCTAssertEqual(BoardDiscovery.includingManagedOwner(owner, in: [moved]).map(\.id), [8])
+        for inventory in [[hiddenSerial, moved], [moved, hiddenSerial]] {
+            let result = BoardDiscovery.includingManagedOwner(owner, in: inventory)
+            XCTAssertEqual(result.count, 2)
+            XCTAssertEqual(result.filter { $0.serial == "A" }.count, 1)
+            XCTAssertEqual(result.first { $0.serial == "A" }?.location, 8)
+            XCTAssertEqual(result.first { $0.location == 7 }?.serial, nil)
+        }
+        let reconciled = BoardDiscovery.reconcile(merged, hardware: HardwareConfiguration())
+        XCTAssertEqual(reconciled.boards.count, 1)
+        XCTAssertEqual(reconciled.boards.first?.serial, "A")
+    }
+
     func testDetectedBoardsUseAutomaticSeedAndRememberProfilesAcrossUsbPorts() {
         var hardware=HardwareConfiguration()
         hardware=BoardDiscovery.reconcile([DiscoveredDevice(name:"Chia VDF A",location:4113,serial:"one")],hardware:hardware)
@@ -216,29 +420,117 @@ extension PresentationTests {
             XCTAssertEqual(snapshot.boards.map { $0.histories.count },expected)
             XCTAssertEqual(Set(snapshot.boards.flatMap(\.histories).map(\.chain)),Set(Chain.allCases))
         }
+        config.hardware.chainAssignments = ChainAssignments(challenge: "serial-2", reward: "serial-0", infusedChallenge: "serial-1")
+        let mapped = LivePresentation.snapshot(status:nil,configuration:config,detectedDevices:devices,now:now)
+        XCTAssertEqual(mapped.boards.map { $0.histories.map(\.chain) }, [[.reward], [.infusedChallenge], [.challenge]])
+        let pinned = BoardDiscovery.reconcile([DiscoveredDevice(name: "ASIC", location: 999, serial: "serial-2")], hardware: config.hardware)
+        XCTAssertEqual(pinned.boards.count, 3)
+        XCTAssertEqual(pinned.boards.map(\.serial), config.hardware.boards.map(\.serial))
+        XCTAssertEqual(pinned.boards[2].deviceLocation, 999)
         let unplugged=LivePresentation.snapshot(status:nil,configuration:config,detectedDevices:[],now:now)
         XCTAssertTrue(unplugged.boards.isEmpty)
     }
-    private func operationalStatus(production: Bool = true, latest: Double = 1_000_000) throws -> ServiceStatus {
-        let object: [String: Any] = ["api_version":1,"service_pid":42,"service_state":"ready","timelord_state":"running","message":"Producing verified proofs.","production_enabled":production,"started_unix":999000,"timestamp_unix":1000000,"latest_proof_unix":latest,"proofs_delivered":7,"tuning_paused":false,
+    func testSupervisedBoardsRemainVisibleWhenUSBDiscoveryOnlySeesOneBoard() throws {
+        func status(states: [String], clients: [Int]) throws -> ServiceStatus {
+            let boards: [[String: Any]] = states.enumerated().map { index, state in
+                ["id":"board-\(index)", "name":"ASIC \(index)", "serial":"serial-\(index)",
+                 "device_location":index + 1, "assigned_chains":[Chain.allCases[index].rawValue],
+                 "connected_clients":clients[index], "hardware_state":state,
+                 "latest_proof_unix":1000000, "profile":"Automatic"]
+            }
+            let data: [String: Any] = ["api_version":1, "service_pid":42,
+                "timelord_state":"running", "message":"", "production_enabled":true,
+                "started_unix":999000, "timestamp_unix":1000000, "latest_proof_unix":1000000,
+                "proofs_delivered":7, "tuning_paused":false, "connected_client_count":clients.reduce(0,+),
+                "full_node":["host":"localhost", "state":"ready"], "boards":boards]
+            let decoder=JSONDecoder();decoder.keyDecodingStrategy = .convertFromSnakeCase
+            return try decoder.decode(ServiceStatus.self,from:JSONSerialization.data(withJSONObject:data))
+        }
+        let discovered=[DiscoveredDevice(name:"ASIC 0",location:1,serial:"serial-0")]
+        let healthy=try status(states:["connected","connected","connected"],clients:[1,1,1])
+        // Hotplug can leave discovery/configuration with only one active entry,
+        // while the service already owns all three recovered boards.
+        var config=AppConfiguration()
+        var board=ConfiguredBoard(id:"board-0",name:"ASIC 0",port:18110,location:1)
+        board.serial="serial-0";config.hardware.boards=[board]
+        let snapshot=LivePresentation.snapshot(status:healthy,configuration:config,detectedDevices:discovered,now:now)
+        XCTAssertEqual(snapshot.boards.map(\.id),["board-0","board-1","board-2"])
+        XCTAssertEqual(snapshot.boards.map(\.state),[.active,.active,.active])
+
+        let idle=try status(states:["connected","connected","connected"],clients:[1,1,0])
+        XCTAssertEqual(LivePresentation.snapshot(status:idle,detectedDevices:[],now:now).boards.count,3,
+                       "An idle ICC owner's USB metadata can also be hidden")
+        let starting=try status(states:["starting","starting","starting"],clients:[1,0,0])
+        XCTAssertEqual(LivePresentation.snapshot(status:starting,detectedDevices:[],now:now).boards.map(\.id),["board-0"])
+        let absent=try status(states:["fault","reconnecting","starting"],clients:[0,0,0])
+        XCTAssertTrue(LivePresentation.snapshot(status:absent,detectedDevices:[],now:now).boards.isEmpty,
+                      "Configured or unavailable clients alone are not presence evidence")
+        XCTAssertTrue(LivePresentation.snapshot(status:healthy,detectedDevices:[],now:now.addingTimeInterval(15)).boards.isEmpty,
+                      "Stale status cannot preserve board presence")
+    }
+
+    private func operationalStatus(production: Bool = true, latest: Double = 1_000_000, state: String = "running", message: String = "Producing verified proofs.", chains: [String] = ["challenge","reward","infused_challenge"], faultKind: String? = nil) throws -> ServiceStatus {
+        var board: [String: Any] = ["id":"a","name":"A","client_port":18110,"assigned_chains":chains,"connected_clients":3,"hardware_state":"connected","temperature_c":42.5,"temperature_limit_c":55,"frequency_mhz":1540,"voltage_v":1,"recoveries":2,"latest_proof_unix":latest,"profile":"Manual"]
+        if let faultKind { board["fault_kind"] = faultKind }
+        let object: [String: Any] = ["api_version":1,"service_pid":42,"service_state":"ready","timelord_state":state,"message":message,"production_enabled":production,"started_unix":999000,"timestamp_unix":1000000,"latest_proof_unix":latest,"proofs_delivered":7,"tuning_paused":false,
             "full_node":["host":"localhost","port":8444,"network":"mainnet","state":"ready"],
-            "boards":[["id":"a","name":"A","client_port":18110,"assigned_chains":["challenge","reward","infused_challenge"],"connected_clients":3,"hardware_state":"connected","temperature_c":42.5,"temperature_limit_c":55,"frequency_mhz":1540,"voltage_v":1,"recoveries":2,"latest_proof_unix":latest,"profile":"Manual"]],"connected_client_count":3,"delivered_ips":1000000]
+            "boards":[board],"connected_client_count":3,"delivered_ips":1000000]
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
         return try decoder.decode(ServiceStatus.self, from: JSONSerialization.data(withJSONObject: object))
     }
-    private func operationalHistory(pid: Int = 42) throws -> HistoryPayload {
-        let object: [String: Any] = ["api_version":1,"service_pid":pid,"timestamp_unix":1000000,"capture_start_unix":996400,
-            "observations":[["id":1,"chain":"challenge","timestamp_unix":999900,"ips":400000],["id":2,"chain":"challenge","timestamp_unix":1000000,"ips":1000000]],
+    private func operationalHistory(pid: Int = 42, latestIPS: Double = 1_000_000) throws -> HistoryProjection {
+        let object: [String: Any] = ["api_version":3,"service_pid":pid,"timestamp_unix":1000000,"capture_intervals":[["start_unix":996400,"end_unix":1000000]],
+            "estimated_observations":[["id":1,"chain":"challenge","timestamp_unix":999900,"ips":400000],["id":2,"chain":"challenge","timestamp_unix":999970,"ips":latestIPS]],
             "events":[["id":1,"timestamp_unix":999900,"board_id":"a","kind":"recovery"],["id":2,"timestamp_unix":999910,"board_id":NSNull(),"kind":"node_unavailable","end_unix":999920]]]
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
-        return try decoder.decode(HistoryPayload.self, from: JSONSerialization.data(withJSONObject: object))
+        return HistoryProjection(payload: try decoder.decode(HistoryPayload.self, from: JSONSerialization.data(withJSONObject: object)), boards: try operationalStatus().boards)
+    }
+    func testHistoryProjectionReusesArraysWhileFreshnessAndClockClippingStayLive() throws {
+        let history = try operationalHistory()
+        let status = try operationalStatus()
+        var cache = HistorySelectionCache()
+        let first = LivePresentation.snapshot(status: status, history: history, historyCache: &cache, now: now)
+        let second = LivePresentation.snapshot(status: status, history: history, historyCache: &cache, now: now.addingTimeInterval(2))
+        let a = try XCTUnwrap(first.headlineHistory)
+        let b = try XCTUnwrap(second.headlineHistory)
+        a.samples.withUnsafeBufferPointer { first in
+            b.samples.withUnsafeBufferPointer { second in
+                XCTAssertEqual(first.baseAddress, second.baseAddress, "status polling rebuilt the chart observations")
+            }
+        }
+        let changedSelection = LivePresentation.snapshot(status: try operationalStatus(chains: ["reward"]), history: history, historyCache: &cache, now: now)
+        XCTAssertTrue(try XCTUnwrap(changedSelection.headlineHistory).samples.isEmpty, "cache retained an unassigned chain")
+        let newPayload = try operationalHistory(latestIPS: 2_000_000)
+        let updated = LivePresentation.snapshot(status: status, history: newPayload, historyCache: &cache, now: now)
+        XCTAssertEqual(updated.headlineHistory?.samples.last?.ips, 2_000_000, "new payload did not invalidate the selection cache")
+        XCTAssertEqual(first.headlineHistory?.samples.last?.ips, 1_000_000, "cached snapshots must stay immutable")
+        let clockAhead = LivePresentation.snapshot(status: status, history: history, historyCache: &cache, now: now.addingTimeInterval(-2))
+        XCTAssertEqual(try XCTUnwrap(clockAhead.headlineHistory).captureIntervals.last?.end, now.addingTimeInterval(-2))
+        let stale = LivePresentation.snapshot(status: status, history: history, historyCache: &cache, now: now.addingTimeInterval(400))
+        XCTAssertFalse(stale.serviceAvailable)
+        XCTAssertNil(stale.headlineHistory)
+    }
+
+    func testSerialChainOverridesSurviveConfigurationEditsAndDiscovery() throws {
+        var config = AppConfiguration()
+        config.hardware.chainAssignments = ChainAssignments(challenge: "serial-c", reward: "serial-a", infusedChallenge: "serial-b")
+        let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        var restored = try decoder.decode(AppConfiguration.self, from: encoder.encode(config))
+        restored.node.host = "another-node"
+        restored.hardware = BoardDiscovery.reconcile([DiscoveredDevice(name: "ASIC", location: 99, serial: "serial-c")], hardware: restored.hardware)
+        let saved = try decoder.decode(AppConfiguration.self, from: encoder.encode(restored))
+        XCTAssertEqual(saved.hardware.chainAssignments, config.hardware.chainAssignments)
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: encoder.encode(saved)) as? [String: Any])
+        var hardware = try XCTUnwrap(json["hardware"] as? [String: Any]); hardware.removeValue(forKey: "chain_assignments"); json["hardware"] = hardware
+        XCTAssertNil(try decoder.decode(AppConfiguration.self, from: JSONSerialization.data(withJSONObject: json)).hardware.chainAssignments)
     }
     func testDistinctProofsAtTheSameTimestampKeepSeparateChartIdentities() {
-        let history = ChainHistory(chain: .challenge, samples: [ProofObservation(date: now, ips: 900000, id: "proof-1"), ProofObservation(date: now, ips: 900000, id: "proof-2")], captureIntervals: [HistoryRange.hour.interval(endingAt: now)], events: [])
-        XCTAssertEqual(Set(history.plotPoints(in: HistoryRange.hour.interval(endingAt: now)).map(\.id)).count, 2)
-        XCTAssertEqual(history.statistics(in: HistoryRange.hour.interval(endingAt: now)).observations, 2)
+        let history = ChainHistory(chain: .challenge, samples: [ProofObservation(date: now.addingTimeInterval(-10), ips: 900000, id: "proof-1"), ProofObservation(date: now.addingTimeInterval(-10), ips: 900000, id: "proof-2")], captureIntervals: [HistoryRange.hour.interval(endingAt: now)], events: [])
+        XCTAssertEqual(Set(history.observations(in: HistoryRange.hour.interval(endingAt: now)).map(\.id)).count, 2)
+        XCTAssertEqual(history.statistics(in: HistoryRange.hour.interval(endingAt: now)).observations, 1)
     }
-    func testOperationalStatusAndHistoryUseVerifiedSentProofsWithoutSummingChains() throws {
+    func testOperationalStatusAndHistoryUseSampledVerifiedOutputsWithoutSummingChains() throws {
         let snapshot = LivePresentation.snapshot(status: try operationalStatus(), history: try operationalHistory(), now: now)
         XCTAssertEqual(snapshot.phase, .running)
         XCTAssertEqual(snapshot.headlineSpeed, "700K")
@@ -256,6 +548,42 @@ extension PresentationTests {
         XCTAssertEqual(incapable.headlineSpeed, "—")
         XCTAssertNil(incapable.latestProof)
         XCTAssertNil(incapable.proofsToday)
+    }
+    func testBoardFaultDoesNotHideHealthyBoardGaugeOrHover() {
+        let start = Date(timeIntervalSince1970: 0)
+        let window = DateInterval(start: start, duration: 120)
+        let samples = [ProofObservation(date: start.addingTimeInterval(25), ips: 1_100_000, boardID: "healthy"),
+                       ProofObservation(date: start.addingTimeInterval(55), ips: 1_200_000, boardID: "healthy")]
+        let failure = HistoryEvent(date: start.addingTimeInterval(20), end: nil, kind: .boardFault, boardID: "failed")
+        let history = ChainHistory(chain: .challenge, samples: samples, captureIntervals: [window], events: [failure])
+        XCTAssertEqual(history.sampledObservations(in: window).count, 4)
+        XCTAssertNotNil(history.observation(near: start.addingTimeInterval(60), in: window))
+        XCTAssertEqual(Set(history.plotPoints(in: window).map(\.segment)), [0])
+        let ownFailure = HistoryEvent(date: start.addingTimeInterval(20), end: nil, kind: .boardFault, boardID: "healthy")
+        XCTAssertTrue(ChainHistory(chain: .challenge, samples: samples, captureIntervals: [window], events: [ownFailure]).sampledObservations(in: window).isEmpty)
+    }
+    func testOneStoppedBoardDoesNotMakeHealthyBoardOrServiceLookStopped() throws {
+        func status(_ states: [String]) throws -> ServiceStatus {
+            let boards: [[String: Any]] = states.enumerated().map { index, state in
+                ["id": "board-\(index)", "name": "ASIC \(index)", "assigned_chains": [index == 0 ? "challenge" : "infused_challenge"],
+                 "connected_clients": state == "connected" ? 1 : 0, "hardware_state": state, "latest_proof_unix": 1_000_000, "profile": "Automatic"]
+            }
+            let object: [String: Any] = ["api_version": 1, "service_pid": 42, "timestamp_unix": 1_000_000, "started_unix": 999000,
+                "timelord_state": "running", "message": "Producing proofs", "production_enabled": true, "proofs_delivered": 7, "tuning_paused": false,
+                "latest_proof_unix": 1_000_000, "full_node": ["host": "localhost", "port": 8444, "network": "mainnet", "state": "ready"], "boards": boards]
+            let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+            return try decoder.decode(ServiceStatus.self, from: JSONSerialization.data(withJSONObject: object))
+        }
+        for failed in ["fault", "thermal_stop", "starting", "reconnecting"] {
+            let view = LivePresentation.snapshot(status: try status(["connected", failed]), now: now)
+            XCTAssertEqual(view.phase, .running)
+            XCTAssertEqual(view.boards[0].state, .active)
+            XCTAssertNotEqual(view.boards[1].state, .active)
+        }
+        XCTAssertEqual(LivePresentation.snapshot(status: try status(["fault", "fault"]), now: now).phase, .serviceUnavailable)
+        let reconnecting = LivePresentation.snapshot(status: try status(["reconnecting", "reconnecting"]), now: now)
+        XCTAssertEqual(reconnecting.phase, .waitingForProofs)
+        XCTAssertTrue(reconnecting.boards.allSatisfy { $0.state == .disconnected })
     }
 
 }

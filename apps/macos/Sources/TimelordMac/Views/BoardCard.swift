@@ -10,28 +10,34 @@ struct BoardCard: View {
         VStack(alignment: .leading, spacing: 10) {
             Button(action: open) {
                 VStack(alignment: .leading, spacing: 10) {
-                    VStack(alignment: .leading, spacing: 7) {
-                        HStack {
-                            Image(systemName: "cpu").font(.title2).foregroundStyle(board.state.tone.color)
-                            Text(board.name).font(.headline).lineLimit(1)
-                            Spacer()
-                            Text(board.temperatureText).font(.headline).monospacedDigit().foregroundStyle(board.state == .thermalStop ? Color.red : Color.primary)
-                        }
-                        Text(board.state.title).font(.caption).foregroundStyle(.secondary)
+                    HStack {
+                        Image(systemName: "cpu").font(.title2).foregroundStyle(board.state.tone.color)
+                            .help(board.state.title).accessibilityLabel(board.state.title)
+                        Text(board.name).font(.headline).lineLimit(1)
+                        Spacer()
+                        Text(board.temperatureText).font(.headline).monospacedDigit().foregroundStyle(board.state == .thermalStop ? Color.red : Color.primary)
                     }
                     ForEach(board.histories) { history in
                         VStack(alignment: .leading, spacing: 6) {
                             HStack {
                                 Label(history.chain.title, systemImage: "circle.fill").font(.subheadline).foregroundStyle(history.chain.color)
                                 Spacer()
-                                Text(DisplayFormat.ips(history.statistics(in: HistoryRange.hour.interval(endingAt: snapshot.now)).average)).font(.headline).monospacedDigit()
                             }
+                            HStack(spacing: 12) {
+                                let raw = board.rawSpeed(for: history.chain)
+                                Text("Raw \(raw?.displayText(at: snapshot.now) ?? "—")")
+                                    .help(raw?.state == "sampling" ? "Last sample; starting a new chain." : "Recent hardware speed.")
+                                Text("Mean \(snapshot.recentSpeed(for: history))")
+                                    .help("Delivered IPS · 5-minute mean")
+                                Text("Median \(snapshot.recentMedian(for: history))")
+                                    .help("Delivered IPS · 5-minute median")
+                            }.font(.caption).monospacedDigit().foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.85)
                             IPSHistoryChart(history: history, range: .hour, now: snapshot.now, upperBound: snapshot.chartUpperBound, compact: true)
                                 .frame(minHeight: 42, maxHeight: .infinity)
                         }
                     }
                     if board.histories.isEmpty { Text("No chains assigned").font(.callout).foregroundStyle(.secondary).frame(maxHeight: .infinity) }
-                    HStack { Text("1 hour ago"); Spacer(); Text("Last-hour averages · now") }.font(.caption2).foregroundStyle(.secondary)
+                    HStack { Text("1 hour ago"); Spacer(); Text("Now") }.font(.caption2).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }.buttonStyle(.plain)
                 .accessibilityHint("Show \(board.name) history, temperature and profile")

@@ -1,8 +1,50 @@
 #include "../timelord_live_control.hpp"
+#include "../timelord_telemetry.hpp"
 #include <cassert>
 #include <vector>
 using namespace timelord_control;
 int main() {
+    check_temperature(40.);
+    for (double value : {0., -1., double(NAN), double(INFINITY)}) {
+        try { check_temperature(value); assert(false); }
+        catch(const std::runtime_error &e) { assert(std::string(e.what())=="temperature_unavailable"); }
+    }
+    for (double value : {55., 60.}) {
+        try { check_temperature(value); assert(false); }
+        catch(const std::runtime_error &e) { assert(std::string(e.what())=="temperature_limit"); }
+    }
+    // Sparse high-clock PLL entries must not be advertised as exact 10 MHz steps.
+    struct Entry { double freq; };
+    const Entry pll[]={{1490.},{1500.},{1511.111111},{1520.},{1525.},{1533.333333},{1540.},{1560.},{1566.666667},{1571.428571},{1580.},{1600.}};
+    assert(pll[frequency_index(1510.,pll,12)].freq==1500.);
+    for(double f:{1510.,1530.,1570.,1590.}) assert(!supported_frequency(f,pll,12));
+    for(double f:{1500.,1520.,1540.,1560.,1580.,1600.}) assert(supported_frequency(f,pll,12));
+    const Entry upper_pll[]={{1600.},{1620.},{2200.}};
+    assert(supported_frequency(1620.,upper_pll,3));
+    assert(supported_frequency(2200.,upper_pll,3));
+    assert(!supported_frequency(2190.,upper_pll,3));
+    // An idle infused-chain board must keep reporting temperature even when
+    // its iteration counter never reaches the usual active polling interval.
+    using Poll = timelord_telemetry::Poll;
+    const auto start = Poll::Clock::time_point{};
+    Poll telemetry(start);
+    int samples = 0;
+    for (int second = 0; second <= 180; ++second) {
+        if (telemetry.due(false, start + std::chrono::seconds(second))) ++samples;
+        assert(samples == second / 5);
+    }
+    assert(telemetry.due(true, start + std::chrono::seconds(181)));
+    assert(!telemetry.due(false, start + std::chrono::seconds(185)));
+    assert(telemetry.due(false, start + std::chrono::seconds(186)));
+    timelord_telemetry::Speed speed;
+    assert(!speed.update(false,0,0));
+    assert(*speed.update(true,100,100)==-1.);
+    assert(!speed.update(true,500100,500100));
+    assert(*speed.update(true,1000100,1000100)==1000000.);
+    assert(*speed.update(true,500,2000100)==-1.); // recovery rollback
+    assert(*speed.update(true,600,100)==-1.); // new challenge
+    assert(*speed.update(false,0,0)==-1.);
+    assert(!speed.update(false,0,0));
     Point current{1450.,.95};std::vector<std::string> actions;
     auto read=[&](){return current;};
     auto voltage=[&](double v){actions.push_back("voltage");current.voltage=v;};
@@ -13,7 +55,7 @@ int main() {
     actions.clear();apply(Point{1440.,.95},read,voltage,frequency,pause);
     assert((actions==std::vector<std::string>{"pause","frequency","voltage","resume"}));
     actions.clear();
-    try { apply(Point{1601.,1.},read,voltage,frequency,pause);assert(false); } catch(...){}
+    try { apply(Point{2201.,1.},read,voltage,frequency,pause);assert(false); } catch(...){}
     assert(actions.empty());
     try {apply(Point{1450.,1.},read,[](double){throw std::runtime_error("failed");},frequency,pause);assert(false);}catch(...){}
     assert((actions==std::vector<std::string>{"pause"}));
@@ -21,6 +63,55 @@ int main() {
     actions.clear();current=Point{1450.,.95};int reads=0;
     try {apply(Point{1460.,1.},[&](){return ++reads==1?current:Point{1000.,1.};},voltage,frequency,pause);assert(false);}catch(...){}
     assert(actions.back()!="resume");
+    // One bad initial sample can recover, but no write is allowed until a valid read.
+    actions.clear(); current=Point{1900.,1.}; reads=0;
+    unsigned diagnostics=0, waits=0;
+    auto diagnose=[&](){++diagnostics;return std::string("control=0x00000008 status=0x00000001");};
+    auto delay=[&](){++waits;};
+    auto transient=[&](){
+        assert(!actions.empty() && actions.front()=="pause");
+        if (++reads==1) { assert(actions.size()==1); return Point{100.,1.}; }
+        return current;
+    };
+    auto result=apply(Point{1880.,1.},transient,voltage,frequency,pause,diagnose,delay);
+    assert(result.frequency==1880. && reads==3 && diagnostics==1 && waits==1);
+    assert((actions==std::vector<std::string>{"pause","frequency","resume"}));
+    // Persistent unexpected initial state never writes hardware or resumes.
+    for (Point bad : {Point{100.,1.}, Point{0.,1.}, Point{1900.,1.1}, Point{NAN,1.}}) {
+        actions.clear(); reads=0; diagnostics=0; waits=0;
+        try {
+            apply(Point{1880.,1.},[&](){++reads;return bad;},voltage,frequency,pause,diagnose,delay);
+            assert(false);
+        } catch(const std::runtime_error &error) {
+            const std::string reason=error.what();
+            assert(reason.find("initial_readback attempts=3")!=std::string::npos);
+            assert(reason.find("control=0x00000008")!=std::string::npos);
+        }
+        assert(reads==3 && diagnostics==3 && waits==2);
+        assert((actions==std::vector<std::string>{"pause"}));
+    }
+    // Transient final readback retries the read, never the PLL or voltage writes.
+    actions.clear(); current=Point{1900.,1.}; reads=0; diagnostics=0; waits=0;
+    result=apply(Point{1880.,1.},[&](){return ++reads==2?Point{100.,1.}:current;},
+        voltage,frequency,pause,diagnose,delay);
+    assert(result.frequency==1880. && reads==3 && diagnostics==1 && waits==1);
+    assert((actions==std::vector<std::string>{"pause","frequency","resume"}));
+    // In-range but incorrect final frequency is still rejected after the bounded reads.
+    actions.clear(); current=Point{1900.,1.}; reads=0; diagnostics=0; waits=0;
+    try {
+        apply(Point{1880.,1.},[&](){return ++reads==1?current:Point{1800.,1.};},
+            voltage,frequency,pause,diagnose,delay);
+        assert(false);
+    } catch(const std::runtime_error &error) {
+        assert(std::string(error.what()).find("readback attempts=3")!=std::string::npos);
+    }
+    assert(reads==4 && diagnostics==3 && waits==2);
+    assert((actions==std::vector<std::string>{"pause","frequency"}));
+    // Error snapshots must distinguish an unreadable register from a valid zero.
+    const auto registers=clock_registers([](uint32_t address,uint32_t &value){
+        value=address==0?8:0;return address==4?17:0;
+    }, {{"control",0},{"status",4},{"pre_divide",8}});
+    assert(registers=="control=0x00000008 status=error(17) pre_divide=0x00000000");
     auto exchange=[](std::string request, bool accepted) {
         int in[2],out[2];assert(!pipe(in)&&!pipe(out));Channel channel(in[0],out[1]);assert(channel.start());
         int writes=0;assert(write(in[1],request.data(),request.size())==static_cast<ssize_t>(request.size()));
@@ -29,7 +120,10 @@ int main() {
         for(int fd:{in[0],in[1],out[0],out[1]})close(fd);
     };
     exchange("TLSET 1 1 1450 1\n",true);
-    for(auto bad:{"TLSET 1 -1 1450 1\n","TLSET 1 1 1450 1.1\n","TLSET 1 1 nan 1\n","TLSET 1 1 1601 1\n","TLSET 1 1 1450 1 extra\n","TLSET 1 18446744073709551616 1450 1\n"})exchange(bad,false);
+    exchange("TLSET 1 1 2200 1\n",true);
+    assert(valid(Point{2200.,1.}));
+    assert(!valid(Point{2200.,1.01}));
+    for(auto bad:{"TLSET 1 -1 1450 1\n","TLSET 1 1 1450 1.1\n","TLSET 1 1 nan 1\n","TLSET 1 1 2201 1\n","TLSET 1 1 1450 1 extra\n","TLSET 1 18446744073709551616 1450 1\n"})exchange(bad,false);
     int in[2],out[2];assert(!pipe(in)&&!pipe(out));Channel channel(in[0],out[1]);assert(channel.start());int writes=0;
     auto apply=[&](Point p){++writes;return p;};
     assert(write(in[1],"TLSET 1 1 1450",14)==14);assert(channel.poll(apply));assert(writes==0);
@@ -40,5 +134,12 @@ int main() {
     const char* request="TLSET 1 1 1450 1\n";assert(write(in[1],request,strlen(request))>0);
     assert(!lost.poll([](Point p){return p;}));
     for(int fd:{in[0],in[1],out[1]})close(fd);
+    // Preserve the native failure while still rejecting the command and stopping.
+    assert(!pipe(in)&&!pipe(out));Channel rejected(in[0],out[1]);assert(rejected.start());
+    assert(write(in[1],request,strlen(request))>0);
+    assert(!rejected.poll([](Point)->Point{throw std::runtime_error("pll_write");}));
+    char reason[128]{};const auto size=::read(out[0],reason,sizeof(reason)-1);assert(size>0);
+    assert(std::string(reason,static_cast<size_t>(size))=="TLERR 1 1 pll_write\n");
+    for(int fd:{in[0],in[1],out[0],out[1]})close(fd);
     puts("native live-control fixtures passed (no USB)");
 }

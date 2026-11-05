@@ -1,17 +1,19 @@
 mod asic;
+mod assignment;
 mod automatic;
 mod connection;
 mod diagnostics;
 mod hardware;
+mod history_buffer;
+mod history_store;
 mod inventory;
 mod node_status;
 mod private_control;
 mod runtime;
+mod status_api;
 
 use anyhow::{Context, Result, bail};
-use axum::{Json, Router, extract::State, routing::get};
 use clap::{Parser, Subcommand};
-use serde::Serialize;
 use std::{
     collections::BTreeSet,
     net::SocketAddr,
@@ -19,7 +21,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use timelord_core::{Assignment, Chain, Config, Network};
+use timelord_core::{Assignment, Config};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -100,6 +102,12 @@ enum Command {
     Devices {
         #[arg(long)]
         config: PathBuf,
+    },
+    /// Internal disposable driver process; never loads D2XX into the service.
+    #[command(hide = true)]
+    UsbInventory {
+        #[arg(long)]
+        driver_library: PathBuf,
     },
     /// Run a bounded, isolated three-chain ASIC proof check without a full node.
     CheckHardware {
@@ -269,6 +277,12 @@ async fn main() -> Result<()> {
             "{}",
             serde_json::to_string(&inventory::discover(&load(&config)?).await?)?
         ),
+        Command::UsbInventory { driver_library } => {
+            println!(
+                "{}",
+                serde_json::to_string(&inventory::native(&driver_library)?)?
+            );
+        }
         Command::CheckHardware { config } => {
             println!(
                 "{}",
@@ -281,12 +295,19 @@ async fn main() -> Result<()> {
                 "Configuration valid. This does not establish node authentication or hardware readiness."
             );
         }
-        Command::Plan { config } => println!(
-            "{}",
-            serde_json::to_string_pretty(
-                &load(&config)?.assignments().map_err(anyhow::Error::msg)?
-            )?
-        ),
+        Command::Plan { config } => {
+            let mut value = load(&config)?;
+            value.hardware.automatic_state.get_or_insert(
+                config
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .join("automatic-profiles.json"),
+            );
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&assignment::resolve(&value)?)?
+            );
+        }
         Command::Serve { config } => {
             let mut value = load(&config)?;
             value.service.control_socket = Some(automatic::socket_path(&config, &value));
@@ -296,7 +317,7 @@ async fn main() -> Result<()> {
                     .unwrap_or(Path::new("."))
                     .join("automatic-profiles.json"),
             );
-            serve(value).await?;
+            serve(value, config.with_extension("history.json")).await?;
         }
         Command::Tuning { config, paused } => {
             let value = load(&config)?;
@@ -336,58 +357,14 @@ async fn main() -> Result<()> {
 }
 
 struct Shared {
+    native: Option<Arc<hardware::Facts>>,
     config: Config,
     assignments: Vec<Assignment>,
     // These are socket slots, not authenticated board/engine identities.
     clients: Arc<Mutex<BTreeSet<(String, u8)>>>,
-    runtime: Mutex<runtime::RuntimeState>,
+    runtime: Arc<Mutex<runtime::RuntimeState>>,
     started_unix: u64,
-}
-
-#[derive(Serialize)]
-struct Status {
-    api_version: u32,
-    service_pid: u32,
-    service_state: &'static str,
-    timelord_state: String,
-    message: String,
-    production_enabled: bool,
-    started_unix: u64,
-    timestamp_unix: u64,
-    full_node: NodeStatus,
-    boards: Vec<BoardStatus>,
-    connected_client_count: usize,
-    latest_proof_unix: Option<u64>,
-    delivered_ips: Option<f64>,
-    proofs_delivered: u64,
-    failed_proofs: u64,
-    tuning_paused: bool,
-}
-#[derive(Serialize)]
-struct NodeStatus {
-    host: String,
-    port: u16,
-    network: Network,
-    state: String,
-}
-#[derive(Serialize)]
-struct BoardStatus {
-    id: String,
-    name: String,
-    client_port: u16,
-    assigned_chains: Vec<Chain>,
-    connected_clients: usize,
-    hardware_state: String,
-    temperature_c: Option<f64>,
-    temperature_limit_c: f64,
-    frequency_mhz: Option<f64>,
-    voltage_v: Option<f64>,
-    profile: &'static str,
-    device_location: Option<u32>,
-    serial: Option<String>,
-    recoveries: u64,
-    automatic: Option<automatic::Status>,
-    latest_proof_unix: Option<u64>,
+    service_started_unix: u64,
 }
 
 fn unix_now() -> u64 {
@@ -397,106 +374,54 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-async fn health(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
-    Json(
-        serde_json::json!({"service":"timelord-service","api_version":1,"production_enabled":shared.config.node.certificate.is_some()}),
-    )
+struct Run {
+    shared: Arc<Shared>,
+    stop: watch::Sender<bool>,
+    tasks: JoinSet<Result<()>>,
+    store: Arc<history_store::Store>,
+    history_enabled: bool,
 }
 
-async fn status(State(shared): State<Arc<Shared>>) -> Json<Status> {
-    let clients = shared.clients.lock().expect("client state lock");
-    let runtime = shared.runtime.lock().expect("runtime");
-    Json(Status {
-        api_version: 1,
-        service_pid: std::process::id(),
-        service_state: "ready",
-        timelord_state: runtime.phase.clone(),
-        message: runtime.message.clone(),
-        production_enabled: shared.config.node.certificate.is_some(),
-        started_unix: shared.started_unix,
-        timestamp_unix: unix_now(),
-        full_node: NodeStatus {
-            host: shared.config.node.host.clone(),
-            port: shared.config.node.port,
-            network: shared.config.node.network,
-            state: if shared.config.node.certificate.is_none() {
-                "not_connected".into()
-            } else {
-                runtime.node.clone()
-            },
-        },
-        boards: shared
-            .config
-            .hardware
-            .boards
-            .iter()
-            .map(|b| BoardStatus {
-                id: b.id.clone(),
-                name: b.name.clone(),
-                client_port: b.client_port,
-                assigned_chains: shared
-                    .assignments
-                    .iter()
-                    .filter(|a| a.board_id == b.id)
-                    .map(|a| a.chain)
-                    .collect(),
-                connected_clients: clients.iter().filter(|(id, _)| id == &b.id).count(),
-                hardware_state: runtime
-                    .boards
-                    .get(&b.id)
-                    .map(|b| b.state.clone())
-                    .unwrap_or_else(|| "not_inspected".into()),
-                temperature_c: runtime.boards.get(&b.id).and_then(|b| b.temperature_c),
-                temperature_limit_c: b.temperature_limit_c,
-                frequency_mhz: runtime.boards.get(&b.id).and_then(|b| b.frequency_mhz),
-                voltage_v: runtime.boards.get(&b.id).and_then(|b| b.voltage_v),
-                profile: b.profile_name(),
-                device_location: b.device_location,
-                serial: b.serial.clone(),
-                recoveries: runtime.boards.get(&b.id).map(|b| b.recoveries).unwrap_or(0),
-                automatic: runtime.boards.get(&b.id).and_then(|b| b.automatic.clone()),
-                latest_proof_unix: runtime
-                    .observations
-                    .iter()
-                    .rev()
-                    .find(|o| {
-                        shared
-                            .assignments
-                            .iter()
-                            .any(|a| a.board_id == b.id && a.chain == o.chain)
-                    })
-                    .map(|o| o.timestamp_unix),
-            })
-            .collect(),
-        connected_client_count: clients.len(),
-        latest_proof_unix: runtime.observations.last().map(|o| o.timestamp_unix),
-        delivered_ips: runtime
-            .observations
-            .iter()
-            .rev()
-            .find(|o| o.chain == Chain::Challenge && o.timestamp_unix + 90 >= unix_now())
-            .map(|o| o.ips),
-        proofs_delivered: runtime.proofs_delivered,
-        failed_proofs: runtime.failed_proofs,
-        tuning_paused: runtime.tuning_paused,
-    })
+impl Run {
+    async fn stop(mut self) -> Result<()> {
+        let _ = self.stop.send(true);
+        let mut failure = None;
+        while let Some(task) = self.tasks.join_next().await {
+            if let Err(error) = task
+                .context("Client listener stopped unexpectedly")
+                .and_then(|r| r)
+            {
+                failure = Some(error);
+            }
+        }
+        if self.history_enabled {
+            let saved = self.store.capture(
+                &self.shared.runtime.lock().expect("runtime"),
+                self.shared.started_unix,
+                unix_now(),
+            );
+            let saved = saved.pruned(unix_now());
+            let store = self.store.clone();
+            if let Err(error) = tokio::task::spawn_blocking(move || store.save(&saved)).await? {
+                tracing::warn!(%error, "Final chart history checkpoint could not be saved");
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
 }
 
-async fn history(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
-    let runtime = shared.runtime.lock().expect("runtime");
-    Json(
-        serde_json::json!({"api_version":1,"service_pid":std::process::id(),"timestamp_unix":unix_now(),"capture_start_unix":shared.started_unix.max(unix_now().saturating_sub(86400)).max(if runtime.observations.len() >= 86400 { runtime.observations.first().map(|o| o.timestamp_unix).unwrap_or(0) } else { 0 }),"observations":runtime.observations,"events":runtime.events}),
-    )
-}
-
-async fn serve(config: Config) -> Result<()> {
-    let config = inventory::connected_configuration(config).await?;
-    hardware::validate_automatic(&config).await?;
-    let assignments = config.assignments().map_err(anyhow::Error::msg)?;
-    // Bind every requested endpoint before starting any listener task.
-    let http = TcpListener::bind(config.service.status_listen)
-        .await
-        .context("Binding status endpoint")?;
+async fn start_run(
+    config: Config,
+    prepared: hardware::Prepared,
+    history_path: PathBuf,
+    faults: &std::collections::HashMap<String, runtime::HardwareState>,
+    service_started_unix: u64,
+) -> Result<Run> {
+    let hardware::Prepared {
+        assignments,
+        native,
+    } = prepared;
+    tracing::info!(plan=?assignments, "Resolved chain assignments for this run");
     let control = config
         .service
         .control_socket
@@ -514,19 +439,53 @@ async fn serve(config: Config) -> Result<()> {
             .with_context(|| format!("Binding client listener for {}", b.id))?;
         listeners.push((b.id.clone(), capacity, listener));
     }
-    let (backend, offers) = asic::AsicBackend::new(&config)?;
-    let backend = Arc::new(backend);
-    let active = config.node.certificate.is_some();
+    let active = config.node.certificate.is_some() && !assignments.is_empty();
     let tuning_paused = config.service.tuning_paused;
+    let started_unix = unix_now();
+    let store = Arc::new(history_store::Store::new(
+        history_path,
+        &config,
+        &assignments,
+    )?);
+    let mut runtime = runtime::RuntimeState::with_tuning_paused(tuning_paused);
+    // Leave unreadable/corrupt checkpoints untouched and keep proof production
+    // available. A bad history file must not silently be replaced with empty data.
+    let history_enabled = match store.restore(&mut runtime, started_unix) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, "Saved history unavailable; persistence disabled to preserve checkpoint");
+            false
+        }
+    };
+    runtime.boards = faults.clone();
+    if assignments.is_empty() {
+        runtime.transition(
+            "waiting_for_clients",
+            "disconnected",
+            "Connect an ASIC board to resume.",
+        );
+    }
+    let runtime = Arc::new(Mutex::new(runtime));
+    let (backend, offers) = asic::AsicBackend::new(&config, &assignments, runtime.clone())?;
+    let backend = Arc::new(backend);
     let shared = Arc::new(Shared {
+        native,
         config,
         assignments,
         clients: Arc::new(Mutex::new(BTreeSet::new())),
-        runtime: Mutex::new(runtime::RuntimeState::with_tuning_paused(tuning_paused)),
-        started_unix: unix_now(),
+        runtime,
+        started_unix,
+        service_started_unix,
     });
     let (shutdown, receiver) = watch::channel(false);
     let mut tasks = JoinSet::new();
+    if history_enabled {
+        tasks.spawn(history_store::record(
+            shared.clone(),
+            store.clone(),
+            receiver.clone(),
+        ));
+    }
     for (id, capacity, listener) in listeners {
         tasks.spawn(client_listener(
             listener,
@@ -551,10 +510,11 @@ async fn serve(config: Config) -> Result<()> {
         });
     }
     if shared.config.hardware.client_binary.is_some() && active {
+        let backend = backend.clone();
         let shared = shared.clone();
         let shutdown = receiver.clone();
         tasks.spawn(async move {
-            if let Err(error) = hardware::run(shared, shutdown).await {
+            if let Err(error) = hardware::run(shared, backend, shutdown).await {
                 tracing::warn!(%error, "ASIC supervision stopped");
             }
             Ok(())
@@ -565,22 +525,120 @@ async fn serve(config: Config) -> Result<()> {
         let shutdown = receiver.clone();
         tasks.spawn(async move { private_control::run(control, shared, shutdown).await });
     }
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/v1/status", get(status))
-        .route("/v1/history", get(history))
-        .with_state(shared.clone());
-    tracing::info!(address=%shared.config.service.status_listen,"Service ready");
-    let result = axum::serve(http, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            let _ = shutdown.send(true);
-        })
-        .await;
-    while let Some(task) = tasks.join_next().await {
-        task.context("Client listener stopped unexpectedly")??;
+    Ok(Run {
+        shared,
+        stop: shutdown,
+        tasks,
+        store,
+        history_enabled,
+    })
+}
+
+async fn serve(config: Config, history_path: PathBuf) -> Result<()> {
+    let service_started_unix = unix_now();
+    // The status listener outlives each topology. No UI or external supervisor
+    // is required to restart the service after a USB change.
+    let http = TcpListener::bind(config.service.status_listen)
+        .await
+        .context("Binding status endpoint")?;
+    let config = inventory::connected_configuration(config).await?;
+    let mut faults = std::collections::HashMap::new();
+    let prepared = hardware::prepare(&config).await?;
+    let mut run = start_run(
+        config,
+        prepared,
+        history_path.clone(),
+        &faults,
+        service_started_unix,
+    )
+    .await?;
+    let (current, state) = watch::channel(run.shared.clone());
+    let app = status_api::router(state);
+    let (http_stop, mut stopped) = watch::channel(false);
+    let mut server = tokio::spawn(async move {
+        axum::serve(http, app)
+            .with_graceful_shutdown(async move {
+                let _ = stopped.changed().await;
+            })
+            .await
+    });
+    let signal = shutdown_signal();
+    tokio::pin!(signal);
+    let mut poll = tokio::time::interval(Duration::from_secs(5));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut topology = inventory::TopologyChange::default();
+    let result = loop {
+        let candidate = tokio::select! {
+            _ = &mut signal => break Ok(()),
+            result = &mut server => break result.context("Status task failed")?.context("Status server failed"),
+            _ = poll.tick() => {
+                tokio::select! {
+                    _ = &mut signal => break Ok(()),
+                    result = inventory::live_configuration(&run.shared) => result,
+                }
+            }
+        };
+        let Some(mut config) = topology.observe(&run.shared.config, candidate) else {
+            continue;
+        };
+        // Validate the replacement before interrupting healthy work.
+        let prepared = match hardware::prepare(&config).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                tracing::warn!(%error, "Topology replacement rejected; retaining current owners");
+                continue;
+            }
+        };
+        let plan = &prepared.assignments;
+        {
+            let mut runtime = run.shared.runtime.lock().expect("runtime");
+            config.service.tuning_paused = runtime.tuning_paused;
+            runtime.transition(
+                "reconfiguring",
+                "disconnected",
+                "Updating engines for connected ASIC boards.",
+            );
+            runtime.event(None, "topology_change");
+            for board in runtime.boards.values_mut() {
+                board.raw_speeds.clear();
+            }
+        }
+        tracing::info!(plan=?plan, "USB topology changed; replacing chain owners");
+        let previous = run.shared.clone();
+        run.stop().await?;
+        // Collect after shutdown too: verification can finish while tasks drain.
+        faults.extend(
+            previous
+                .runtime
+                .lock()
+                .expect("runtime")
+                .boards
+                .iter()
+                .filter(|(_, b)| b.latched_fault)
+                .map(|(id, b)| {
+                    let mut fault = b.clone();
+                    fault.raw_speeds.clear();
+                    fault.temperature_c = None;
+                    fault.temperature_unix = 0;
+                    (id.clone(), fault)
+                }),
+        );
+        run = start_run(
+            config,
+            prepared,
+            history_path.clone(),
+            &faults,
+            service_started_unix,
+        )
+        .await?;
+        current.send_replace(run.shared.clone());
+    };
+    run.stop().await?;
+    let _ = http_stop.send(true);
+    if !server.is_finished() {
+        server.await.context("Status task failed")??;
     }
-    result.context("Status server failed")
+    result
 }
 
 async fn client_listener(
@@ -601,7 +659,8 @@ async fn client_listener(
                 let slot={let mut connected=shared.clients.lock().expect("client state lock");let slot=(0..capacity).find(|slot|!connected.contains(&(id.clone(),*slot)));if let Some(slot)=slot {connected.insert((id.clone(),slot));}slot};
                 if let Some(slot)=slot {
                     if let Some(offers) = &offers {
-                        let lease = asic::Lease { socket, board: id.clone(), slot, clients: shared.clients.clone() };
+                        let generation = shared.runtime.lock().expect("runtime").boards.get(&id).map(|b| b.generation).unwrap_or(0);
+                        let lease = asic::Lease { socket, board: id.clone(), slot, generation, clients: shared.clients.clone() };
                         if offers.try_send(lease).is_err() { tracing::warn!(board=%id, "ASIC socket queue full"); }
                         continue;
                     }
@@ -651,15 +710,137 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn topology_generations_release_owners_keep_status_and_preserve_faults() {
+        // All ports and files belong to this fixture; no node, native binary or USB.
+        let dir = std::env::temp_dir().join(format!(
+            "topology-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = Config::default();
+        config.service.control_socket = Some(dir.join("control.sock"));
+        let mut reserved = vec![];
+        for i in 0..3 {
+            let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            config.hardware.boards.push(toml::from_str(&format!("id='b{i}'\nname='B{i}'\nserial='s{i}'\nprofile='manual'\ndevice_location={}\nclient_port={}", i+1, port.local_addr().unwrap().port())).unwrap());
+            reserved.push(port);
+        }
+        let mut faults = std::collections::HashMap::new();
+        faults.insert(
+            "b2".into(),
+            runtime::HardwareState {
+                latched_fault: true,
+                state: "thermal_stop".into(),
+                ..Default::default()
+            },
+        );
+        drop(reserved);
+        let mut run = start_run(
+            config.clone(),
+            hardware::prepare(&config).await.unwrap(),
+            dir.join("history.json"),
+            &faults,
+            unix_now() - 3600,
+        )
+        .await
+        .unwrap();
+        let service_started_unix = run.shared.service_started_unix;
+        let (current, state) = watch::channel(run.shared.clone());
+        let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = http.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(http, status_api::router(state)).await.unwrap();
+        });
+        for indices in [vec![0], vec![], vec![0, 1], vec![0, 1, 2]] {
+            let mut socket = if let Some(board) = run.shared.config.hardware.boards.first() {
+                let socket = TcpStream::connect(("127.0.0.1", board.client_port))
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while run.shared.clients.lock().unwrap().is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                Some(socket)
+            } else {
+                None
+            };
+            let devices = indices
+                .iter()
+                .map(|i| inventory::Device {
+                    name: "Chia VDF A".into(),
+                    location: i + 1,
+                    serial: Some(format!("s{i}")),
+                })
+                .collect();
+            let next = inventory::connected_plan(run.shared.config.clone(), devices).unwrap();
+            run.stop().await.unwrap();
+            if let Some(ref mut socket) = socket {
+                let mut byte = [0];
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(2), socket.read(&mut byte))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    0
+                );
+            }
+            assert!(!dir.join("control.sock").exists());
+            run = start_run(
+                next.clone(),
+                hardware::prepare(&next).await.unwrap(),
+                dir.join("history.json"),
+                &faults,
+                service_started_unix,
+            )
+            .await
+            .unwrap();
+            current.send_replace(run.shared.clone());
+            assert!(run.shared.runtime.lock().unwrap().boards["b2"].latched_fault);
+            assert_eq!(
+                run.shared.assignments.len(),
+                if indices.is_empty() { 0 } else { 3 }
+            );
+            let mut status_socket = TcpStream::connect(address).await.unwrap();
+            status_socket
+                .write_all(
+                    b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut response = String::new();
+            status_socket.read_to_string(&mut response).await.unwrap();
+            let (_, body) = response.split_once("\r\n\r\n").unwrap();
+            let value: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(value["boards"].as_array().unwrap().len(), indices.len());
+            assert_eq!(value["connected_client_count"], 0);
+            assert_eq!(value["proofs_delivered"], 0);
+            assert_eq!(value["service_started_unix"], service_started_unix);
+            assert!(value["started_unix"].as_u64().unwrap() >= service_started_unix + 3600);
+        }
+        run.stop().await.unwrap();
+        server.abort();
+        let _ = server.await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
     async fn idle_clients_stop_cleanly_and_release_their_slot() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let shared = Arc::new(Shared {
+            native: None,
             config: Config::default(),
             assignments: vec![],
             clients: Arc::new(Mutex::new(BTreeSet::new())),
-            runtime: Mutex::new(runtime::RuntimeState::default()),
+            runtime: Default::default(),
             started_unix: unix_now(),
+            service_started_unix: crate::unix_now(),
         });
         let (stop, rx) = watch::channel(false);
         let task = tokio::spawn(client_listener(

@@ -1,0 +1,112 @@
+{
+  "host": "m6mini",
+  "source_commit": "c027219",
+  "manifest": {
+    "native_revision": "446a0e1d118051364742648c7b8f3239b12a3dcb",
+    "source_queue_sha256": "f16b6ed5838ceb0ad383df23145f742932b5f18dd6ebe5f1b9d022097fe9b800",
+    "native_sha256": "e7330cf8193fc98e6defb295c88a7219c2501e5b04f727e2fe745e48e18e8325",
+    "service_sha256": "9c07cc8bbb5da5134849ec3a3d837637d0420320c28e09b44ffd31c8f157d84d",
+    "ui_sha256": "b71bdcebc1ad451085f47ba81ebaf74e5c269ac7b3d757a997ea372fc716a42a",
+    "archive_sha256": "9689524d3de56104b65bd1cf198d286e1d3561a7f17e4e816c1c9911194715af",
+    "libraries": {
+      "libgmpxx.4.dylib": "875e1391d7c896c64004ada5997a6f3c1fe2ed8f2bc15c36776d76ca86cc4396",
+      "libft4222.dylib": "453b21f3c6dbf89168916be1ea26483084b83314b8d78d7cabd74e82a0202075",
+      "libftd2xx.dylib": "0a3ae31f16da56ec212c60ead43921bca22868cf0c502efdc8105cf017d1c7ad",
+      "libgmp.10.dylib": "bc89479f845374ae610aee6f5758d6e083f55a7c22e684bbb2ecf20f5db6c10b"
+    },
+    "automatic_max_mhz": 2200,
+    "requested_voltage_ceiling_v": 1,
+    "temperature_guard_c": 55,
+    "startup_optimizations": [
+      "hardware SHA",
+      "six-worker canonical discriminant search",
+      "preparation overlaps client retirement"
+    ],
+    "raw_speed": "one-second counter deltas; explicit running/sampling/idle state; recent raw rate bridges handoffs for less than six seconds; historical five-minute stats survive between proofs",
+    "ui_changes": [
+      "Reduce header-to-connection-row gap from 24 to 12 points"
+    ],
+    "baseline_service_sha256": "d48363eea929fc8ddb0426c2ee64f10a7629c098b726044492691ea4d9520079",
+    "change": "Service-only recovery-storm guard and live-control log draining",
+    "storm_recoveries": 20,
+    "storm_window_seconds": 10,
+    "clock_settling_seconds": 5,
+    "normal_recovery_policy": "unchanged",
+    "recorded_replay_backoff_seconds": 5,
+    "ui_sha256_before_resigning": "faba1824436a97d08242b0c949ddc9a3dcded0b38acd53a827e8da3c7da28ca6",
+    "ui_machine_code_unchanged": true,
+    "ui_signature_note": "Signing the changed app resource seal updates the main executable signature; its __TEXT.__text machine code was checked identical."
+  },
+  "deployment": {
+    "installed": true,
+    "left_running": true,
+    "opened_unix": 1792722979.531262,
+    "completed_unix": 1792723039.56214,
+    "service_pid": 4097,
+    "proofs_delivered": 12,
+    "failed_proofs": 0,
+    "recoveries": 0,
+    "configuration_unchanged": true,
+    "native_and_ui_unchanged": true
+  },
+  "policy": {
+    "severe_burst_recoveries": 20,
+    "rolling_window_seconds": 10,
+    "clock_settling_seconds": 5,
+    "normal_recovery_cost_policy": "unchanged",
+    "pause_tuning": "respected",
+    "proof_score_required_for_storm_backoff": false,
+    "cooldown_blocks_protective_backoff": false,
+    "voltage_ceiling_v": 1,
+    "temperature_guard_c": 55,
+    "frequency_search_ceiling_mhz": 2200
+  },
+  "validation": {
+    "rust_tests": 65,
+    "swift_tests": 40,
+    "fmt": "passed",
+    "clippy_with_warnings_denied": "passed",
+    "recorded_1920_first_second_bins": [
+      14,
+      3,
+      2,
+      5,
+      5,
+      82
+    ],
+    "recorded_replay_backoff_seconds": 5,
+    "recorded_replay_recoveries_seen_before_backoff": 49,
+    "native_pipe_flood_fixture_lines": 5000,
+    "normal_and_moderately_bursty_recoveries": "retained with good delivered performance"
+  },
+  "before_points": {
+    "ASIC 1": 1900.0,
+    "ASIC 2": 1880.0,
+    "ASIC 3": 1800.0
+  },
+  "after_points": {
+    "ASIC 1": 1900.0,
+    "ASIC 2": 1880.0,
+    "ASIC 3": 1800.0
+  },
+  "recoveries_during_final_live_check": {
+    "ASIC 1": 0,
+    "ASIC 2": 0,
+    "ASIC 3": 0
+  },
+  "local_evidence": "/private/tmp/timelord-recovery-storm-20261022",
+  "remote_evidence": "/Users/cameron/timelord-recovery-storm-20261022-v2",
+  "first_install_attempt": "Live proof check passed, then final UI file-hash validation rolled back. Corrected metadata accounts for codesigning the changed resource seal; UI machine code was checked identical before successful reinstall.",
+  "evidence_sha256": {
+    "completed.json": "74e993c78ab0a53cbd5f6d162bada2113fa094c09625afc35da01803963fa7aa",
+    "before-status.json": "2e3b49dbdde0fabc4cc781fb45e28968bb9246afbac0777966cb444e46f36fed",
+    "status-samples.jsonl": "45574b9cc60c4a208e83643d49bdc8e14afc3f692b0ec351d62e95a68ba3c2ef",
+    "tests.log": "fc14ecacfb2da4b6c78f5d1a84c403a0c8f1c20b14fafc230258feeab97d338c",
+    "swift-tests.log": "4dc7eb9be89a13908056c62aceddec7795237f281856b7b8f6dfa883c266f4ac"
+  },
+  "limits": [
+    "Recorded storm was replayed offline; no deliberate 1920 MHz live retry was performed.",
+    "One-minute deployment health check is not a long-term performance or stability result.",
+    "The native client, GMP/FTDI libraries and UI machine code are unchanged; the retained six-worker/startup service optimizations remain present."
+  ]
+}
