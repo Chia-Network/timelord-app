@@ -25,8 +25,8 @@ jobs:
       contents: write
       actions: write
     env:
-      GH_TOKEN: ${{ secrets.RELEASE_PREPARE_TOKEN || github.token }}
-      USE_AUTOMATION_TOKEN: ${{ secrets.RELEASE_PREPARE_TOKEN != '' }}
+      GH_TOKEN: ${{ secrets.REPO_COMMIT || github.token }}
+      USE_AUTOMATION_TOKEN: ${{ secrets.REPO_COMMIT != '' }}
       GH_REPO: ${{ github.repository }}
       VERSION: ${{ inputs.version }}
     steps:
@@ -40,6 +40,19 @@ jobs:
           persist-credentials: false
       - name: Configure authenticated Git access
         run: gh auth setup-git
+      - name: Verify automation account and repository access
+        if: env.USE_AUTOMATION_TOKEN == 'true'
+        run: |
+          account="$(gh api user --jq .login)"
+          if [[ "$account" != ChiaAutomation ]]; then
+            echo "REPO_COMMIT must authenticate as ChiaAutomation for this repository's main branch exception." >&2
+            exit 1
+          fi
+          can_push="$(gh api "repos/$GH_REPO" --jq .permissions.push)"
+          if [[ "$can_push" != true ]]; then
+            echo "REPO_COMMIT does not report repository write access." >&2
+            exit 1
+          fi
       - name: Validate version and require a fresh tag
         run: |
           number='(0|[1-9][0-9]*)'

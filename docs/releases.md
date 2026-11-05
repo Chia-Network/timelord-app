@@ -47,10 +47,12 @@ bypass branch protection. It does not need pull-request permissions.
 
 This repository currently requires reviewed PRs on `main` and permits the
 `ChiaAutomation` account to bypass that requirement. For direct preparation,
-provide a repository or organization secret named `RELEASE_PREPARE_TOKEN` with
+provide a repository or organization secret named `REPO_COMMIT` with
 that account's credential and repository Contents read/write access. Organization
 policy must permit use of that credential. Preparation uses it for Git access;
-its tag push starts Release normally, so the workflow skips explicit dispatch to
+it first checks the authenticated account and reported repository write access.
+The actual push also enforces token permissions and branch rules.
+Its tag push starts Release normally, so the workflow skips explicit dispatch to
 avoid duplicate builds. The credential does not need access to Apple secrets.
 Without this secret, preparation falls back to `GITHUB_TOKEN`; that works only
 where branch rules already permit direct pushes by that token. With the current
