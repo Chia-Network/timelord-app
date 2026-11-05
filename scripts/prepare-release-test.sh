@@ -3,7 +3,8 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FIXTURE="$(mktemp -d)"
-trap 'rm -rf "$FIXTURE"' EXIT
+TEST_GPG_HOME="$FIXTURE/gnupg"
+trap 'if [[ -d "$TEST_GPG_HOME" ]]; then GNUPGHOME="$TEST_GPG_HOME" gpgconf --kill gpg-agent; fi; rm -rf "$FIXTURE"' EXIT
 mkdir -p "$FIXTURE/scripts" "$FIXTURE/crates/example/src" "$FIXTURE/crates/shared/src"
 cp "$ROOT/scripts/prepare-release.sh" "$ROOT/scripts/release-version.sh" \
   "$ROOT/scripts/push-release.sh" "$FIXTURE/scripts/"
@@ -51,6 +52,9 @@ done
 # Exercise remote updates against a local bare repository, never GitHub.
 export GIT_AUTHOR_NAME='Release fixture' GIT_COMMITTER_NAME='Release fixture'
 export GIT_AUTHOR_EMAIL='fixture@example.invalid' GIT_COMMITTER_EMAIL='fixture@example.invalid'
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+export GNUPGHOME="$TEST_GPG_HOME"
+mkdir -m 700 "$GNUPGHOME"
 git init -b main "$FIXTURE"
 git -C "$FIXTURE" add Cargo.toml Cargo.lock crates scripts
 git -C "$FIXTURE" commit -m 'Initial fixture'
@@ -58,9 +62,21 @@ git init --bare --initial-branch=main "$FIXTURE/remote.git"
 git -C "$FIXTURE" remote add origin "$FIXTURE/remote.git"
 git -C "$FIXTURE" push origin main
 bash "$FIXTURE/scripts/prepare-release.sh" 0.3.0
+REMOTE_HEAD="$(git --git-dir="$FIXTURE/remote.git" rev-parse refs/heads/main)"
+if bash "$FIXTURE/scripts/push-release.sh" 0.3.0 > "$FIXTURE/log" 2>&1; then
+  echo 'Unexpectedly created a release without a signing key.' >&2; exit 1
+fi
+[[ "$(git --git-dir="$FIXTURE/remote.git" rev-parse refs/heads/main)" == "$REMOTE_HEAD" ]]
+if git --git-dir="$FIXTURE/remote.git" show-ref --verify --quiet refs/tags/v0.3.0; then
+  echo 'Unsigned release attempt left a tag behind.' >&2; exit 1
+fi
+gpg --batch --pinentry-mode loopback --passphrase '' \
+  --quick-generate-key 'Release fixture <fixture@example.invalid>' ed25519 sign 0
 bash "$FIXTURE/scripts/push-release.sh" 0.3.0
 REMOTE_HEAD="$(git --git-dir="$FIXTURE/remote.git" rev-parse refs/heads/main)"
 [[ "$(git --git-dir="$FIXTURE/remote.git" rev-parse 'refs/tags/v0.3.0^{commit}')" == "$REMOTE_HEAD" ]]
+git --git-dir="$FIXTURE/remote.git" verify-commit "$REMOTE_HEAD"
+git --git-dir="$FIXTURE/remote.git" verify-tag v0.3.0
 git --git-dir="$FIXTURE/remote.git" show main:Cargo.lock > "$FIXTURE/pushed.lock"
 cmp "$FIXTURE/Cargo.lock" "$FIXTURE/pushed.lock"
 

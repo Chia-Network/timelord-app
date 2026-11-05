@@ -54,6 +54,13 @@ it first checks the authenticated account and reported repository write access.
 The actual push also enforces token permissions and branch rules.
 Its tag push starts Release normally, so the workflow skips explicit dispatch to
 avoid duplicate builds. The credential does not need access to Apple secrets.
+Also grant this repository access to `CHIA_AUTOMATION_PRIVATE_GPG_KEY` and
+`CHIA_AUTOMATION_PRIVATE_GPG_PASSPHRASE`. Preparation imports that registered
+ChiaAutomation GPG key with a pinned importer, uses the key's name/email for the
+Git identity, and explicitly signs and verifies the version commit and annotated
+tag before pushing. Missing or unusable signing credentials stop preparation;
+it never falls back to unsigned commits. This satisfies `main`'s signed-commit
+requirement without changing repository protections.
 Without this secret, preparation falls back to `GITHUB_TOKEN`; that works only
 where branch rules already permit direct pushes by that token. With the current
 rules and no automation credential, the push is rejected before any remote
@@ -99,7 +106,8 @@ tag. Do not rerun preparation for an existing tag.
 
 To prepare locally instead, run `bash scripts/prepare-release.sh VERSION`, review
 the two Cargo files, then run `bash scripts/push-release.sh VERSION` from a clean
-checkout of `main` with Git author identity configured. This commits and pushes
+checkout of `main` with a trusted Git signing key and matching identity configured.
+This signs, verifies, and pushes
 `main` and the tag. A tag pushed with your own credentials triggers Release;
 explicitly dispatch Release if using the workflow token. An already-configured
 source version may also be tagged directly for its first release.

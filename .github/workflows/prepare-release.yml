@@ -64,7 +64,16 @@ jobs:
             exit 1
           fi
       - name: Install build dependencies
-        run: brew install cmake gmp boost prometheus
+        run: brew install cmake gmp boost prometheus gnupg
+      # Same importer used by Chia-Network/actions/commit-sign/gpg, pinned here.
+      - name: Set up ChiaAutomation commit and tag signing
+        uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7
+        with:
+          gpg_private_key: ${{ secrets.CHIA_AUTOMATION_PRIVATE_GPG_KEY }}
+          passphrase: ${{ secrets.CHIA_AUTOMATION_PRIVATE_GPG_PASSPHRASE }}
+          git_user_signingkey: true
+          git_commit_gpgsign: true
+          git_tag_gpgsign: true
       - name: Set up Rust
         run: |
           rustup toolchain install stable --profile minimal
@@ -73,8 +82,6 @@ jobs:
         run: bash scripts/prepare-release.sh "$VERSION"
       - name: Commit version and atomically push main and tag
         run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           bash scripts/push-release.sh "$VERSION"
           echo "Created v$VERSION at $(git rev-parse HEAD)." >> "$GITHUB_STEP_SUMMARY"
           echo "To retry Release: gh workflow run release.yml --ref v$VERSION" >> "$GITHUB_STEP_SUMMARY"
