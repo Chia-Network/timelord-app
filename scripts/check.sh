@@ -5,6 +5,7 @@ cd "$PROJECT_ROOT"
 bash scripts/bundle-inputs-test.sh
 bash scripts/bundle-icon-test.sh
 bash scripts/release-inputs-test.sh
+bash scripts/prepare-release-test.sh
 mkdir -p build
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings

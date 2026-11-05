@@ -1,0 +1,82 @@
+name: Prepare Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version without v (for example, 0.1.1 or 0.2.0-rc.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prepare-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Open version bump PR
+    if: github.repository == 'Chia-Network/timelord-app'
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Require main
+        env:
+          SELECTED_REF: ${{ github.ref }}
+        run: test "$SELECTED_REF" = refs/heads/main
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Configure authenticated Git access
+        run: gh auth setup-git
+      - name: Validate version and reserve a fresh branch
+        run: |
+          number='(0|[1-9][0-9]*)'
+          [[ "$VERSION" =~ ^${number}\.${number}\.${number}(-(beta|rc)\.${number})?$ ]]
+          test "$VERSION" != "$(bash scripts/release-version.sh)"
+          existing_refs="$(git ls-remote origin "refs/tags/v$VERSION" "refs/heads/release/v$VERSION")"
+          if [[ -n "$existing_refs" ]]; then
+            echo "Tag v$VERSION or preparation branch release/v$VERSION already exists." >&2
+            exit 1
+          fi
+          git switch -c "release/v$VERSION"
+      - name: Install build dependencies
+        run: brew install cmake gmp boost prometheus
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Update workspace and lockfile versions
+        run: bash scripts/prepare-release.sh "$VERSION"
+      - name: Commit and push version bump
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml Cargo.lock
+          git commit -m "Prepare release v$VERSION"
+          git push origin "HEAD:refs/heads/release/v$VERSION"
+      - name: Open pull request and start CI
+        run: |
+          cat > "$RUNNER_TEMP/release-body.md" <<EOF
+          Prepare Timelord v$VERSION by updating the workspace version and Cargo lockfile.
+
+          After this PR merges and checks pass, tag the merged version commit with
+          \`v$VERSION\` and push the tag to start Release. Review and publish its draft
+          after signing and notarization succeed. See docs/releases.md.
+          EOF
+          url="$(gh pr create --base main --head "release/v$VERSION" \
+            --title "Prepare release v$VERSION" --body-file "$RUNNER_TEMP/release-body.md")"
+          echo "Version bump PR: $url" >> "$GITHUB_STEP_SUMMARY"
+          # Explicit dispatch works with GITHUB_TOKEN without relying on bot PR events.
+          gh workflow run ci.yml --ref "release/v$VERSION"
