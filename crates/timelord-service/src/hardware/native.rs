@@ -665,18 +665,32 @@ pub(super) async fn supervise(
     if !quiesced {
         tracing::warn!(board=%board.name,"Native shutdown lacked confirmed quiescence; owner is unclean");
     }
+    record_retirement(&shared, &board, quiesced, result.as_ref().err());
+    result
+}
+
+pub(super) fn record_retirement(
+    shared: &Shared,
+    board: &BoardConfig,
+    quiesced: bool,
+    error: Option<&anyhow::Error>,
+) {
     let mut state = shared.runtime.lock().expect("runtime");
+    if let Some(error) = error
+        && classify(error) == crate::board_lifecycle::Fault::Thermal
+    {
+        // Live control can reject a setting before stderr supplies a hot sample.
+        // Latch the typed restriction before the caller checkpoints retirement.
+        record_thermal_stop(&mut state, shared, board, error.to_string());
+    }
     let hardware = state.boards.entry(board.id.clone()).or_default();
-    hardware.lifecycle.retired(
-        quiesced,
-        result.as_ref().err().map(ToString::to_string),
-        crate::unix_now(),
-    );
+    hardware
+        .lifecycle
+        .retired(quiesced, error.map(ToString::to_string), crate::unix_now());
     hardware.raw_speeds.clear();
-    if let Err(error) = &result {
+    if let Some(error) = error {
         hardware.fault(error);
     }
-    result
 }
 pub(super) async fn launch(
     shared: &Shared,

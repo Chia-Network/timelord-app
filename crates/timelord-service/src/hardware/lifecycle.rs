@@ -303,7 +303,9 @@ impl BoardLifecycle {
     }
     pub(super) fn quarantined(&mut self, fault: Fault, reason: String, now: u64) {
         self.fault(fault, reason, now);
-        self.phase = Phase::Quarantined;
+        if self.restriction != Some(Fault::Thermal) {
+            self.phase = Phase::Quarantined;
+        }
     }
     pub(super) fn admitted(&mut self, epoch: u64) {
         self.phase = Phase::Admitted;

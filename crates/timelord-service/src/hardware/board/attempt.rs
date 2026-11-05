@@ -201,11 +201,18 @@ impl PreparedAttempt {
             startup,
         )
         .await;
-        if let (Some(store), Some(serial)) = (&supervisor.safety, state.board.serial.as_deref()) {
-            checkpoint_retired(&state.shared, &state.board, store, serial)?;
+        let checkpoint = match (&supervisor.safety, state.board.serial.as_deref()) {
+            (Some(store), Some(serial)) => {
+                checkpoint_retired(&state.shared, &state.board, store, serial)
+            }
+            _ => Ok(()),
+        };
+        if let (Err(error), Err(saved)) = (&result, &checkpoint) {
+            tracing::error!(%error, %saved, "Native retirement could not be checkpointed");
         }
         drop(lease);
-        result
+        // The recovery path needs the typed native fault even if persistence failed.
+        result.and(checkpoint)
     }
 }
 impl BoardAttempt {

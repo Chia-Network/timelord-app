@@ -367,6 +367,54 @@ printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn live_thermal_rejection_survives_retirement_checkpoint_and_policy_restore() {
+    let dir = std::env::temp_dir().join(format!("tl-control-retirement-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let board: BoardConfig =
+        toml::from_str("id='hot'\nname='Hot'\nserial='fixture'\nclient_port=18110").unwrap();
+    let store = crate::safety::Store::open(&dir.join("config.toml")).unwrap();
+    store
+        .begin_owner(
+            "fixture",
+            Point {
+                frequency_mhz: 1450.,
+                voltage_v: 1.,
+            },
+        )
+        .unwrap();
+    let mut config = Config::default();
+    config.hardware.boards.push(board.clone());
+    let shared = Shared {
+        native: None,
+        assignments: config.assignments().unwrap(),
+        config,
+        clients: Default::default(),
+        process: crate::operational::State::fixture(),
+        scope: crate::runtime::RuntimeScope::Production,
+        runtime: Default::default(),
+        started_unix: crate::unix_now(),
+        service_started_unix: crate::unix_now(),
+    };
+
+    let now = crate::unix_now();
+    let error = anyhow::Error::new(NativeFailure::rejection(2, "temperature_guard"));
+    native::record_retirement(&shared, &board, true, Some(&error));
+    checkpoint_retired(&shared, &board, &store, "fixture").unwrap();
+    let record = store.board("fixture").unwrap();
+    assert_eq!(record.quarantine, Some(crate::safety::Reason::Thermal));
+    assert!(record.retry_after_unix >= now + 300);
+    assert!(!record.owner_active);
+    let mut restored = crate::board_lifecycle::BoardLifecycle::default();
+    restored.restore_policy(store.policy(&board), now + 30);
+    assert_eq!(
+        restored.status().phase,
+        crate::board_lifecycle::Phase::ThermalStop
+    );
+    assert!(store.policy(&board).hold_reason(now + 30).is_some());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[tokio::test]
 async fn thermal_shutdown_does_not_wait_for_the_safety_journal() {
     use std::os::unix::fs::PermissionsExt;
