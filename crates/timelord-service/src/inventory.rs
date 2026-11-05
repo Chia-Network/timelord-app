@@ -433,18 +433,34 @@ fn preserve_managed_boards(
                     && state.temperature_unix > 0
                     && now.saturating_sub(state.temperature_unix)
                         <= crate::hardware::TEMPERATURE_TIMEOUT_SECONDS))
-            && !devices.iter().any(|d| {
-                d.serial == board.serial && d.serial.is_some()
-                    || Some(d.location) == state.device_location.or(board.device_location)
-            })
             && let Some(location) = state.device_location.or(board.device_location)
         {
-            devices.push(Device {
-                name: board.name.clone(),
-                serial: board.serial.clone(),
-                location,
-            });
+            preserve_device_identity(devices, board, location);
         }
+    }
+}
+
+// Use a live owner's identity only for an unambiguous anonymous row. A
+// reported serial at the same location may belong to a replacement board.
+fn preserve_device_identity(
+    devices: &mut Vec<Device>,
+    board: &timelord_core::BoardConfig,
+    location: u32,
+) {
+    if board.serial.is_some() && devices.iter().any(|d| d.serial == board.serial) {
+        return;
+    }
+    let mut at_location = devices.iter_mut().filter(|d| d.location == location);
+    match (at_location.next(), at_location.next()) {
+        (None, _) => devices.push(Device {
+            name: board.name.clone(),
+            serial: board.serial.clone(),
+            location,
+        }),
+        (Some(device), None) if device.serial.is_none() => {
+            device.serial.clone_from(&board.serial);
+        }
+        _ => {}
     }
 }
 
@@ -621,6 +637,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn live_owner_preserves_anonymous_usb_row_without_overriding_a_replacement() {
+        let config = configured();
+        let mut runtime = crate::runtime::RuntimeState::default();
+        runtime.boards.insert(
+            "b2".into(),
+            crate::runtime::HardwareState {
+                usb_present: Some(true),
+                ..Default::default()
+            },
+        );
+        let mut detected = devices(&[0, 1, 2]);
+        detected[2].serial = None;
+        preserve_managed_boards(&config, &mut detected, &runtime, 1001);
+        assert_eq!(detected.len(), 3);
+        assert_eq!(detected[2].serial.as_deref(), Some("serial-2"));
+        let next = connected_plan(config.clone(), detected.clone()).unwrap();
+        assert_eq!(next.assignments().unwrap(), config.assignments().unwrap());
+
+        detected[2].serial = Some("replacement".into());
+        preserve_managed_boards(&config, &mut detected, &runtime, 1001);
+        assert_eq!(detected.len(), 3);
+        assert_eq!(detected[2].serial.as_deref(), Some("replacement"));
+    }
     #[test]
     fn closed_owner_confirmed_absence_wins_over_old_socket_or_telemetry() {
         let config = configured();
