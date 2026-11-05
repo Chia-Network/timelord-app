@@ -188,6 +188,7 @@ async fn icc_primer_does_not_supply_unmanaged_readiness_evidence() {
         assignments,
         clients: Default::default(),
         process,
+        scope: crate::runtime::RuntimeScope::Production,
         runtime: runtime.clone(),
         started_unix: crate::unix_now(),
         service_started_unix: crate::unix_now(),
@@ -197,7 +198,10 @@ async fn icc_primer_does_not_supply_unmanaged_readiness_evidence() {
         .unwrap()
         .boards
         .entry("a".into())
-        .or_default();
+        .or_default()
+        .lifecycle
+        .testing()
+        .start_native();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     for (slot, chain, record_metric) in [
         (0, Chain::InfusedChallenge, false),
@@ -238,11 +242,17 @@ async fn icc_primer_does_not_supply_unmanaged_readiness_evidence() {
             let state = runtime.lock().unwrap();
             let board = &state.boards["a"];
             assert!(
-                !board.verified_slots.contains(&0),
+                !board.lifecycle.slot_verified(0),
                 "primer became capacity evidence"
             );
-            assert_eq!(board.verified_slots.len(), usize::from(slot));
-            assert_eq!(board.verified_generation, record_metric.then_some(0));
+            assert_eq!(
+                (0..3).filter(|s| board.lifecycle.slot_verified(*s)).count(),
+                usize::from(slot)
+            );
+            assert_eq!(
+                board.lifecycle.verified_generation(),
+                record_metric.then_some(0)
+            );
         }
         assert_eq!(
             crate::observability::ready(&shared),
@@ -305,7 +315,7 @@ async fn failed_board_reconnects_without_retiring_a_healthy_chain_session() {
                 .unwrap()
                 .boards
                 .get("failed")
-                .is_some_and(|b| b.state == "fault")
+                .is_some_and(|b| b.lifecycle.status().phase == crate::board_lifecycle::Phase::Fault)
             {
                 break;
             }
@@ -334,14 +344,18 @@ async fn failed_board_reconnects_without_retiring_a_healthy_chain_session() {
         .boards
         .get_mut("failed")
         .unwrap()
-        .generation = 1;
+        .lifecycle
+        .testing()
+        .begin_attempt(crate::unix_now());
     runtime
         .lock()
         .unwrap()
         .boards
         .get_mut("failed")
         .unwrap()
-        .state = "starting".into();
+        .lifecycle
+        .testing()
+        .start_native();
     // A queued socket from the dead process is discarded, never assigned to the replacement.
     let stale = TcpStream::connect(listener.local_addr().unwrap())
         .await
@@ -426,7 +440,7 @@ async fn invalid_proof_latches_only_its_board_and_never_publishes_an_ips_sample(
                 .unwrap()
                 .boards
                 .get("a")
-                .is_some_and(|b| b.latched_fault)
+                .is_some_and(|b| b.lifecycle.status().latched_fault)
             {
                 break;
             }
@@ -439,7 +453,7 @@ async fn invalid_proof_latches_only_its_board_and_never_publishes_an_ips_sample(
         let state = backend.runtime.lock().unwrap();
         assert_eq!(state.failed_proofs, 1);
         assert!(state.estimated_observations.is_empty());
-        assert_eq!(state.boards["a"].state, "fault");
+        assert_eq!(state.boards["a"].lifecycle.status().phase.as_str(), "fault");
     }
     assert!(!pending.is_finished());
     pending.abort();

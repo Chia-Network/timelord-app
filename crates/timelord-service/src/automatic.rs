@@ -42,6 +42,7 @@ pub enum Action {
     Save,
 }
 pub struct Input {
+    pub exploration_allowed: bool,
     pub healthy: bool,
     pub recoveries: u64,
     pub score: Option<f64>,
@@ -280,6 +281,8 @@ impl Policy {
             },
         ))
     }
+    /// Admission yields an experiment without changing its current hardware point.
+    /// A fresh full observation is required before retaining learned evidence.
     pub fn interrupt_trial(&mut self, now: u64) {
         let Some(trial) = self.trial.take() else {
             return;
@@ -445,6 +448,12 @@ impl Policy {
             self.status.message =
                 "Saved observed performance baseline; recoveries are permitted".into();
             return Some(Action::Save);
+        }
+        if !input.exploration_allowed {
+            self.status.state = "monitoring".into();
+            self.status.message =
+                "Holding settings while another board recovers or is being evaluated".into();
+            return None;
         }
         if self.retest_remaining().is_some()
             && input

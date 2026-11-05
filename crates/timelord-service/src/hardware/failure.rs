@@ -40,6 +40,25 @@ impl std::fmt::Display for NativeFailure {
 }
 impl std::error::Error for NativeFailure {}
 
+/// The one mapping from a typed failure to its board restriction. Untyped
+/// errors are transport failures and never latch a restriction.
+pub(crate) fn classify(error: &anyhow::Error) -> crate::board_lifecycle::Fault {
+    use crate::board_lifecycle::Fault;
+    if error
+        .downcast_ref::<NativeFailure>()
+        .is_some_and(|failure| failure.kind == NativeFailureKind::Thermal)
+    {
+        Fault::Thermal
+    } else if error
+        .downcast_ref::<crate::asic::AsicFailure>()
+        .is_some_and(|failure| failure.verification)
+    {
+        Fault::InvalidProof
+    } else {
+        Fault::Transport
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,6 +78,29 @@ mod tests {
             let error = anyhow::Error::new(NativeFailure::rejection(3, reason))
                 .context("Board A needs attention");
             assert_eq!(error.downcast_ref::<NativeFailure>().unwrap().kind, kind);
+        }
+    }
+    #[test]
+    fn one_classifier_maps_typed_failures_to_restrictions() {
+        use crate::{board_lifecycle::Fault, safety::Reason};
+        let invalid = anyhow::Error::new(crate::asic::AsicFailure {
+            board_id: "A".into(),
+            verification: true,
+            message: "invalid proof".into(),
+        })
+        .context("Board A");
+        let thermal = anyhow::Error::new(NativeFailure::rejection(1, "temperature_limit"));
+        for (error, fault, reason) in [
+            (invalid, Fault::InvalidProof, Reason::InvalidProof),
+            (thermal, Fault::Thermal, Reason::Thermal),
+            (
+                anyhow::anyhow!("ASIC admission rejected: temperature_limit"),
+                Fault::Transport,
+                Reason::UncleanOwner,
+            ),
+        ] {
+            assert_eq!(classify(&error), fault);
+            assert_eq!(Reason::from(classify(&error)), reason);
         }
     }
     #[test]

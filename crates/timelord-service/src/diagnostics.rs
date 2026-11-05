@@ -62,6 +62,7 @@ pub async fn check(mut config: Config) -> Result<Vec<CheckedProof>> {
         assignments,
         clients: Arc::new(Mutex::new(BTreeSet::new())),
         process,
+        scope: crate::runtime::RuntimeScope::Production,
         runtime,
         started_unix: unix_now(),
         service_started_unix: crate::unix_now(),

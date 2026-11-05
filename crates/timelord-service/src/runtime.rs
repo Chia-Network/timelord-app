@@ -1,7 +1,7 @@
 //! Native coordinator: upstream scheduler/transport, persistent existing ASIC clients.
 use crate::{
     Shared,
-    asic::{AsicBackend, AsicFailure, ProofTiming},
+    asic::{AsicBackend, ProofTiming},
     observability::{PeakResult, ProofStage, SubmissionKind},
 };
 use anyhow::{Context, Result, bail};
@@ -29,6 +29,7 @@ use tokio_tungstenite::{
 
 pub type Socket = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 mod state;
+pub(crate) use state::RuntimeScope;
 pub use state::{Event, HardwareState, Observation, RawSpeed, RawState, RuntimeState};
 
 pub fn chain(config: &Config) -> Result<ChainSelection> {
@@ -153,16 +154,13 @@ async fn send(socket: &mut Socket, message: Message) -> Result<()> {
 async fn submit(
     shared: &Shared,
     kind: SubmissionKind,
-    stage: Option<&timelord_supervisor::progress::Guard>,
+    stage: &timelord_supervisor::progress::Guard,
     sending: impl std::future::Future<Output = Result<()>>,
 ) -> Result<()> {
-    if let Some(stage) = stage {
-        stage.stage(timelord_supervisor::progress::Stage::Submitting);
-    }
+    stage.stage(timelord_supervisor::progress::Stage::Submitting);
     let started = Instant::now();
     sending.await?;
-    {
-        let metrics = shared.process.metrics.clone();
+    if let Some(metrics) = shared.metrics() {
         metrics.submitted(kind, started.elapsed());
     }
     Ok(())
@@ -309,7 +307,10 @@ fn waiting_for_infusion_confirmation(
 }
 async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
     let process = shared.process.clone();
-    let metrics = process.metrics.clone();
+    let metrics = shared
+        .metrics()
+        .cloned()
+        .context("Node session requires a production runtime")?;
     {
         let mut state = shared.runtime.lock().expect("runtime");
         state.metric_epoch = metrics.begin_session();
@@ -408,12 +409,12 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
             && let Some(completed) = ready.take()
         {
             eligibility.take();
-            let stage = Some(progress.begin(
+            let stage = progress.begin(
                 timelord_supervisor::progress::Resource::Scheduler,
                 completed.plan.generation,
                 completed.plan.challenge.iterations,
                 timelord_supervisor::progress::Stage::Scheduler,
-            ));
+            );
             // finish independently verifies full checkpointed proofs and request identity.
             if let Some(output) = scheduler.finish(completed.plan, completed.result)? {
                 let next_infused = match &output {
@@ -447,7 +448,7 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                         encode(ProtocolMessageTypes::NewEndOfSubSlotVdf, &value, None)?
                     }
                 };
-                submit(&shared, kind, stage.as_ref(), send(&mut socket, message)).await?;
+                submit(&shared, kind, &stage, send(&mut socket, message)).await?;
                 if infusion {
                     infusion_submitted_at = Some(Instant::now());
                 }
@@ -533,18 +534,11 @@ pub async fn run(
         if let Err(error) = result {
             tracing::warn!(%error, "Timelord connection stopped");
             let mut state = shared.runtime.lock().expect("runtime");
-            if let Some(failure) = error.downcast_ref::<AsicFailure>() {
-                state
-                    .boards
-                    .entry(failure.board_id.clone())
-                    .or_default()
-                    .state = "fault".into();
-                if failure.verification {
-                    state.failed_proofs += 1;
-                }
-                state.event(Some(failure.board_id.clone()), "board_fault");
+            // AsicBackend records board faults once, with its captured native
+            // generation. A node-session relay must not fault its replacement.
+            if let Some(metrics) = shared.metrics() {
+                metrics.disconnect(state.metric_epoch);
             }
-            shared.process.metrics.disconnect(state.metric_epoch);
             state.scheduler_initialized = false;
             state.transition("waiting_for_node", "disconnected", &error.to_string());
             state.event(None, "node_unavailable");
@@ -767,8 +761,13 @@ mod tests {
             runtime.lock().unwrap().boards.insert(
                 "failed".into(),
                 HardwareState {
-                    state: "fault".into(),
-                    latched_fault: true,
+                    lifecycle: crate::board_lifecycle::BoardLifecycle::fixture(
+                        crate::board_lifecycle::Phase::Fault,
+                        false,
+                        Some(crate::board_lifecycle::Fault::InvalidProof),
+                        None,
+                        0,
+                    ),
                     ..Default::default()
                 },
             );
@@ -784,6 +783,7 @@ mod tests {
                 config,
                 clients: Default::default(),
                 process,
+                scope: crate::runtime::RuntimeScope::Production,
                 runtime,
                 started_unix: unix_now(),
                 service_started_unix: crate::unix_now(),
@@ -819,19 +819,26 @@ mod tests {
             assignments: vec![],
             clients: Default::default(),
             process,
+            scope: crate::runtime::RuntimeScope::Production,
             runtime: Arc::new(std::sync::Mutex::new(RuntimeState::new(false))),
             started_unix: unix_now(),
             service_started_unix: unix_now(),
         };
+        let stage = shared.process.progress.begin(
+            timelord_supervisor::progress::Resource::Scheduler,
+            0,
+            0,
+            timelord_supervisor::progress::Stage::Scheduler,
+        );
         assert!(
-            submit(&shared, SubmissionKind::Signage, None, async {
+            submit(&shared, SubmissionKind::Signage, &stage, async {
                 bail!("fixture send failed")
             })
             .await
             .is_err()
         );
         assert_eq!(metrics.counter("submissions_total", &["signage"]), 0);
-        submit(&shared, SubmissionKind::Signage, None, async { Ok(()) })
+        submit(&shared, SubmissionKind::Signage, &stage, async { Ok(()) })
             .await
             .unwrap();
         assert_eq!(metrics.counter("submissions_total", &["signage"]), 1);
@@ -847,6 +854,7 @@ mod tests {
             assignments: vec![],
             clients: Default::default(),
             process,
+            scope: crate::runtime::RuntimeScope::Production,
             runtime: Arc::new(std::sync::Mutex::new(RuntimeState::new(false))),
             started_unix: unix_now(),
             service_started_unix: unix_now(),
@@ -863,7 +871,7 @@ mod tests {
                 .slot(Resource::Scheduler)
         };
         let previous = scheduler(1).unwrap();
-        submit(&shared, SubmissionKind::Signage, Some(&guard), async {
+        submit(&shared, SubmissionKind::Signage, &guard, async {
             let work = scheduler(2).unwrap();
             assert_eq!(work.id, previous.id);
             assert_eq!(work.generation, previous.generation);

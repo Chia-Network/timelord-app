@@ -2,12 +2,40 @@ use super::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 use timelord_core::Network;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[test]
+fn admitted_board_remains_unavailable_across_reconfiguration_until_fresh_inventory() {
+    let board: timelord_core::BoardConfig =
+        toml::from_str("id='a'\nname='A'\nserial='A'\nclient_port=18110").unwrap();
+    let mut config = Config::default();
+    config.hardware.boards.push(board);
+    let hardware = runtime::HardwareState {
+        lifecycle: {
+            let mut owner = crate::board_lifecycle::BoardLifecycle::default();
+            owner.testing().admitted(1);
+            owner
+        },
+
+        ..Default::default()
+    };
+    let mut hardware = hardware.clone(); // The entire drained state transfers to a replacement run.
+    let mut boards = std::collections::HashMap::from([("a".into(), hardware.clone())]);
+    assert!(hardware::unavailable_for(&config, &boards, None).contains("a"));
+    hardware
+        .lifecycle
+        .testing()
+        .inventory(Some(1), crate::board_lifecycle::Inventory::Present);
+    boards.insert("a".into(), hardware);
+    assert!(!hardware::unavailable_for(&config, &boards, None).contains("a"));
+}
+
 #[tokio::test]
 async fn requested_shutdown_prevents_startup_from_binding_or_opening_hardware() {
     let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut config = Config::default();
     config.service.status_listen = occupied.local_addr().unwrap();
-    serve(config, PathBuf::new(), async {}).await.unwrap();
+    serve(config, PathBuf::new(), PathBuf::new(), false, async {})
+        .await
+        .unwrap();
 }
 #[tokio::test]
 async fn startup_sigterm_is_retained_until_shutdown_is_polled() {
@@ -45,23 +73,45 @@ async fn topology_generations_release_owners_keep_status_and_preserve_faults() {
         config.hardware.boards.push(toml::from_str(&format!("id='b{i}'\nname='B{i}'\nserial='s{i}'\nprofile='manual'\ndevice_location={}\nclient_port={}", i+1, port.local_addr().unwrap().port())).unwrap());
         reserved.push(port);
     }
-    let mut faults = std::collections::HashMap::new();
-    faults.insert(
+    let mut board_states = std::collections::HashMap::new();
+    board_states.insert(
         "b2".into(),
         runtime::HardwareState {
-            latched_fault: true,
-            state: "thermal_stop".into(),
+            lifecycle: crate::board_lifecycle::BoardLifecycle::fixture(
+                crate::board_lifecycle::Phase::ThermalStop,
+                false,
+                Some(crate::board_lifecycle::Fault::Thermal),
+                None,
+                0,
+            ),
+
             ..Default::default()
         },
     );
+    // Fixture restrictions are attached to the same physical serial as production snapshots.
+    let mut preserved = board_states.remove("b2").unwrap();
+    preserved.lifecycle.testing().bind(Some("s2"));
+    preserved.lifecycle.testing().fault(
+        crate::board_lifecycle::Fault::Thermal,
+        "fixture".into(),
+        unix_now(),
+    );
+    board_states.insert("b2".into(), preserved);
     drop(reserved);
+    let prepared = hardware::prepare_for(
+        &config,
+        &hardware::unavailable_for(&config, &board_states, None),
+    )
+    .await
+    .unwrap();
     let mut run = start_run(
-        config.clone(),
-        hardware::prepare(&config).await.unwrap(),
+        config,
+        prepared,
         dir.join("history.json"),
-        &faults,
+        &board_states,
         unix_now() - 3600,
         process.clone(),
+        None,
     )
     .await
     .unwrap();
@@ -118,19 +168,31 @@ async fn topology_generations_release_owners_keep_status_and_preserve_faults() {
             );
         }
         assert!(!dir.join("control.sock").exists());
+        let prepared = hardware::prepare_for(
+            &next,
+            &hardware::unavailable_for(&next, &board_states, None),
+        )
+        .await
+        .unwrap();
         run = start_run(
-            next.clone(),
-            hardware::prepare(&next).await.unwrap(),
+            next,
+            prepared,
             dir.join("history.json"),
-            &faults,
+            &board_states,
             service_started_unix,
             process.clone(),
+            None,
         )
         .await
         .unwrap();
         current.send_replace(run.shared.clone());
         assert_eq!(metrics.counter("topology_changes_total", &[]), 1);
-        assert!(run.shared.runtime.lock().unwrap().boards["b2"].latched_fault);
+        assert!(
+            run.shared.runtime.lock().unwrap().boards["b2"]
+                .lifecycle
+                .status()
+                .latched_fault
+        );
         assert_eq!(
             run.shared.assignments.len(),
             if indices.is_empty() { 0 } else { 3 }
@@ -180,6 +242,7 @@ async fn observability_failures_leave_client_service_running() {
             assignments: vec![],
             clients: Arc::new(Mutex::new(BTreeSet::new())),
             process: process.clone(),
+            scope: crate::runtime::RuntimeScope::Production,
             runtime: Arc::new(Mutex::new(runtime::RuntimeState::new(false))),
             started_unix: unix_now(),
             service_started_unix: unix_now(),
@@ -228,6 +291,7 @@ async fn idle_clients_stop_cleanly_and_release_their_slot() {
         assignments: vec![],
         clients: Arc::new(Mutex::new(BTreeSet::new())),
         process: operational::State::fixture(),
+        scope: crate::runtime::RuntimeScope::Production,
         runtime: Default::default(),
         started_unix: unix_now(),
         service_started_unix: crate::unix_now(),
@@ -259,6 +323,80 @@ async fn idle_clients_stop_cleanly_and_release_their_slot() {
 }
 
 #[tokio::test]
+async fn replacement_excludes_a_board_that_faults_while_its_generation_drains() {
+    let directory = std::env::temp_dir().join(format!(
+        "tl-draining-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let mut config = Config::default();
+    let mut ports = vec![];
+    for i in 0..2 {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        config.hardware.boards.push(toml::from_str(&format!("id='b{i}'\nname='B{i}'\nserial='s{i}'\nprofile='manual'\ndevice_location={}\nclient_port={}", i+1, port.local_addr().unwrap().port())).unwrap());
+        ports.push(port);
+    }
+    let prepared = hardware::prepare_for(&config, &Default::default())
+        .await
+        .unwrap();
+    assert!(prepared.assignments.iter().any(|a| a.board_id == "b0"));
+    drop(ports);
+    let process = operational::State::fixture();
+    let mut run = start_run(
+        config.clone(),
+        prepared,
+        directory.join("history.json"),
+        &Default::default(),
+        unix_now(),
+        process.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let stale_plan = hardware::prepare_for(&config, &Default::default())
+        .await
+        .unwrap();
+    let runtime = run.shared.runtime.clone();
+    let mut shutdown = run.stop.subscribe();
+    run.tasks.spawn(async move {
+        shutdown.changed().await?;
+        runtime
+            .lock()
+            .unwrap()
+            .boards
+            .entry("b0".into())
+            .or_default()
+            .lifecycle
+            .testing()
+            .fault(
+                crate::board_lifecycle::Fault::InvalidProof,
+                "draining verification".into(),
+                unix_now(),
+            );
+        Ok(())
+    });
+    let replacement = run
+        .replace(config, stale_plan, directory.join("history.json"), None)
+        .await
+        .unwrap();
+    assert!(
+        replacement
+            .shared
+            .assignments
+            .iter()
+            .all(|a| a.board_id == "b1")
+    );
+    assert!(!replacement.shared.assignments.is_empty());
+    assert!(Arc::ptr_eq(&replacement.shared.process, &process));
+    replacement.stop().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
 async fn transient_accept_errors_keep_client_listener_available() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -271,6 +409,7 @@ async fn transient_accept_errors_keep_client_listener_available() {
         runtime: Default::default(),
         started_unix: unix_now(),
         service_started_unix: crate::unix_now(),
+        scope: crate::runtime::RuntimeScope::Production,
     });
     let (stop, rx) = watch::channel(false);
     let started = std::time::Instant::now();
@@ -317,6 +456,7 @@ async fn shutdown_interrupts_accept_backoff_promptly() {
         runtime: Default::default(),
         started_unix: unix_now(),
         service_started_unix: crate::unix_now(),
+        scope: crate::runtime::RuntimeScope::Production,
     });
     let (stop, rx) = watch::channel(false);
     let mut task = tokio::spawn(client_listener_with(

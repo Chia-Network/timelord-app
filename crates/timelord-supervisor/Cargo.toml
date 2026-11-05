@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+futures-util.workspace = true
 clap.workspace = true
 libc.workspace = true
 serde.workspace = true

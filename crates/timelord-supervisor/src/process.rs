@@ -25,6 +25,31 @@ impl OwnedProcess {
             wait_errors: Default::default(),
         })
     }
+    pub(super) fn take_output(
+        &mut self,
+    ) -> Result<(tokio::process::ChildStdout, tokio::process::ChildStderr)> {
+        let child = self
+            .child
+            .as_mut()
+            .context("Owned process already retired")?;
+        Ok((
+            child
+                .stdout
+                .take()
+                .context("Process stdout was not piped")?,
+            child
+                .stderr
+                .take()
+                .context("Process stderr was not piped")?,
+        ))
+    }
+    pub(super) fn signal_leader(&self, signal: i32) {
+        if self.child.is_some() {
+            unsafe {
+                libc::kill(self.pid, signal);
+            }
+        }
+    }
     pub(super) fn pid(&self) -> u32 {
         self.pid as u32
     }

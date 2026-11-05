@@ -1,22 +1,32 @@
-//! Native capability validation and coordination of independent board owners.
+//! Supervise only explicitly configured native clients. Initialization is sequential.
+mod admission;
 mod board;
 mod failure;
+pub(crate) mod lifecycle;
+use failure::classify;
 pub use failure::{NativeFailure, NativeFailureKind};
+pub use prepared::{Facts, Prepared, prepare_for};
 mod native;
 mod prepared;
 mod tuning;
-pub use prepared::{Facts, Prepared, prepare};
-
-use crate::{Shared, runtime::HardwareState};
+use crate::{
+    Shared,
+    automatic::{self, Action, Point, Policy},
+    runtime::{HardwareState, RawState},
+};
 use anyhow::{Context, Result, bail};
-use board::{RestartBackoff, supervise_board};
-use std::{sync::Arc, time::Duration};
+use board::*;
+pub(crate) use native::INITIALIZATION;
+use native::*;
+use std::{process::Stdio, sync::Arc, time::Duration};
 use timelord_core::{BoardConfig, Config, ProfileMode};
 use tokio::{
-    process::Command,
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    process::{Child, Command},
     sync::{oneshot, watch},
     task::JoinSet,
 };
+use tuning::*;
 
 pub fn arguments(board: &BoardConfig, engines: usize) -> Result<Vec<String>> {
     let mask = timelord_core::engine_mask(engines).context("Expected one to three engines")?;
@@ -33,6 +43,10 @@ pub fn arguments(board: &BoardConfig, engines: usize) -> Result<Vec<String>> {
         board.client_port.to_string(),
         engines.to_string(),
     ];
+    if let Some(serial) = &board.serial {
+        arguments.extend(["--expected-serial".into(), serial.clone()]);
+    }
+    arguments.push("--raw-speed".into());
     let (frequency, voltage) = board.operating_point();
     arguments.extend([
         "--vdf-threads".into(),
@@ -47,15 +61,11 @@ pub fn arguments(board: &BoardConfig, engines: usize) -> Result<Vec<String>> {
         "--voltage".into(),
         voltage.to_string(),
     ]);
-    if board.profile == ProfileMode::Automatic {
-        arguments.push("--live-control".into());
-    }
+    // Manual profiles retain their requested setting but need the same inherited
+    // controller-lifetime and hardware-readback guard as Automatic profiles.
+    arguments.push("--live-control".into());
     Ok(arguments)
 }
-
-// Serialize discovery and native initialization across independent board owners.
-pub(crate) static INITIALIZATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 async fn supported_frequencies(config: &Config) -> Result<Vec<f64>> {
     let output = tokio::time::timeout(
         Duration::from_secs(3),
@@ -95,6 +105,49 @@ fn decode_frequencies(bytes: &[u8]) -> Result<Vec<f64>> {
 
 pub(crate) const TEMPERATURE_TIMEOUT_SECONDS: u64 = 60;
 
+pub(crate) fn unavailable(shared: &Shared) -> std::collections::HashSet<String> {
+    let (boards, safety) = {
+        let state = shared.runtime.lock().expect("runtime");
+        (state.boards.clone(), state.safety.clone())
+    };
+    unavailable_for(&shared.config, &boards, safety.as_deref())
+}
+pub(crate) fn unavailable_for(
+    config: &Config,
+    boards: &std::collections::HashMap<String, HardwareState>,
+    safety: Option<&crate::safety::Store>,
+) -> std::collections::HashSet<String> {
+    config
+        .hardware
+        .boards
+        .iter()
+        .filter(|board| {
+            let policy = safety.map(|store| store.policy(board)).unwrap_or_default();
+            policy.restriction.is_some()
+                || boards.get(&board.id).is_some_and(|state| {
+                    !state
+                        .lifecycle
+                        .capacity(crate::unix_now(), safety.is_some())
+                        .usable
+                })
+        })
+        .map(|b| b.id.clone())
+        .collect()
+}
+pub(crate) fn restore_lifecycles(
+    config: &Config,
+    boards: &mut std::collections::HashMap<String, HardwareState>,
+    safety: Option<&crate::safety::Store>,
+) {
+    for board in &config.hardware.boards {
+        let lifecycle = &mut boards.entry(board.id.clone()).or_default().lifecycle;
+        lifecycle.bind(board.serial.as_deref());
+        lifecycle.restore_policy(
+            safety.map(|store| store.policy(board)).unwrap_or_default(),
+            crate::unix_now(),
+        );
+    }
+}
 pub async fn run(
     shared: Arc<Shared>,
     backend: Arc<crate::asic::AsicBackend>,
@@ -102,8 +155,9 @@ pub async fn run(
 ) -> Result<()> {
     let mut children = JoinSet::new();
     let (stop, child_shutdown) = watch::channel(false);
+    let managed = shared.runtime.lock().expect("runtime").safety.is_some();
     for board in &shared.config.hardware.boards {
-        if !shared.assignments.iter().any(|a| a.board_id == board.id) {
+        if !shared.assignments.iter().any(|a| a.board_id == board.id) && !managed {
             continue;
         }
         if shared
@@ -112,17 +166,11 @@ pub async fn run(
             .expect("runtime")
             .boards
             .get(&board.id)
-            .is_some_and(|b| b.latched_fault)
+            .is_some_and(|b| b.lifecycle.status().latched_fault)
+            && !managed
         {
             continue;
         }
-        shared.runtime.lock().expect("runtime").boards.insert(
-            board.id.clone(),
-            HardwareState {
-                state: "starting".into(),
-                ..Default::default()
-            },
-        );
         let (tx, rx) = oneshot::channel();
         children.spawn(supervise_board(
             shared.clone(),

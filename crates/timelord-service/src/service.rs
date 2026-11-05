@@ -1,11 +1,11 @@
 //! Service generation ownership, listeners and topology replacement.
 use crate::{
-    Shared, asic, hardware, history_store, inventory, observability, operational, private_control,
-    runtime, status_api, unix_now,
+    Shared, asic, assignment, config_checkpoint, hardware, history_store, inventory, observability,
+    operational, private_control, runtime, safety, status_api, unix_now,
 };
 use anyhow::{Context, Result, bail};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -29,6 +29,33 @@ struct Run {
 }
 
 impl Run {
+    async fn replace(
+        self,
+        config: Config,
+        mut prepared: hardware::Prepared,
+        history_path: PathBuf,
+        safety: Option<Arc<safety::Store>>,
+    ) -> Result<Self> {
+        let previous = self.shared.clone();
+        let process = previous.process.clone();
+        self.stop().await?;
+        // Verification and retirement can change admission while old tasks drain.
+        // Reuse provenance, but never reuse capacity from before retirement.
+        let boards = previous.runtime.lock().expect("runtime").boards.clone();
+        let unavailable = hardware::unavailable_for(&config, &boards, safety.as_deref());
+        prepared.reconcile(&config, &unavailable).await?;
+        start_run(
+            config,
+            prepared,
+            history_path,
+            &boards,
+            previous.service_started_unix,
+            process,
+            safety,
+        )
+        .await
+    }
+
     async fn stop(mut self) -> Result<()> {
         let _ = self.stop.send(true);
         let mut failure = None;
@@ -47,9 +74,9 @@ impl Run {
                 unix_now(),
             );
             let saved = saved.pruned(unix_now());
-            let store = self.store.clone();
-            if let Err(error) = tokio::task::spawn_blocking(move || store.save(&saved)).await? {
-                tracing::warn!(%error, "Final chart history checkpoint could not be saved");
+            let progress = self.shared.process.progress.clone();
+            if let Err(error) = self.store.flush(saved, progress).await {
+                tracing::warn!(%error, "Final chart history checkpoint unavailable; shutdown continues");
             }
         }
         failure.map_or(Ok(()), Err)
@@ -60,9 +87,10 @@ async fn start_run(
     config: Config,
     prepared: hardware::Prepared,
     history_path: PathBuf,
-    faults: &HashMap<String, runtime::HardwareState>,
+    board_states: &HashMap<String, runtime::HardwareState>,
     service_started_unix: u64,
     process: Arc<operational::State>,
+    safety: Option<Arc<safety::Store>>,
 ) -> Result<Run> {
     let hardware::Prepared {
         assignments,
@@ -104,7 +132,9 @@ async fn start_run(
             false
         }
     };
-    runtime.boards = faults.clone();
+    runtime.boards = board_states.clone();
+    hardware::restore_lifecycles(&config, &mut runtime.boards, safety.as_deref());
+    runtime.safety = safety;
     process.metrics.register_boards(&config);
     if assignments.is_empty() {
         runtime.transition(
@@ -118,11 +148,12 @@ async fn start_run(
         asic::AsicBackend::new(&config, &assignments, runtime.clone(), process.clone())?;
     let backend = Arc::new(backend);
     let shared = Arc::new(Shared {
-        config,
         native,
+        config,
         assignments,
         clients: Arc::new(Mutex::new(BTreeSet::new())),
         process,
+        scope: crate::runtime::RuntimeScope::Production,
         runtime,
         started_unix,
         service_started_unix,
@@ -159,7 +190,7 @@ async fn start_run(
             Ok(())
         });
     }
-    if shared.config.hardware.client_binary.is_some() && active {
+    if shared.config.hardware.client_binary.is_some() {
         let backend = backend.clone();
         let shared = shared.clone();
         let shutdown = receiver.clone();
@@ -211,7 +242,7 @@ fn spawn_http(
     mut stopped: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<std::io::Result<()>> {
     tokio::spawn(async move {
-        axum::serve(listener, app)
+        axum::serve(timelord_supervisor::http::Listener::new(listener), app)
             .with_graceful_shutdown(async move {
                 let _ = stopped.changed().await;
             })
@@ -219,22 +250,22 @@ fn spawn_http(
     })
 }
 
-/// Replace the current run for a changed topology. A replacement that fails
-/// validation keeps the current run.
+/// Replace the current run for a changed topology or capacity. A replacement
+/// that fails validation keeps the current run.
 async fn replace(
     run: Run,
     mut config: Config,
-    faults: &mut HashMap<String, runtime::HardwareState>,
+    unavailable: &HashSet<String>,
     history_path: &Path,
-    service_started_unix: u64,
-    process: &Arc<operational::State>,
+    safety: &Option<Arc<safety::Store>>,
     current: &watch::Sender<Arc<Shared>>,
 ) -> Result<Run> {
+    let process = run.shared.process.clone();
     // Validate the replacement before interrupting healthy work.
-    let prepared = match hardware::prepare(&config).await {
+    let prepared = match hardware::prepare_for(&config, unavailable).await {
         Ok(prepared) => prepared,
         Err(error) => {
-            tracing::warn!(%error,"Topology replacement rejected; retaining current owners");
+            tracing::warn!(%error, "Topology replacement rejected; retaining current owners");
             return Ok(run);
         }
     };
@@ -260,34 +291,9 @@ async fn replace(
     process.reconfigure();
     process.metrics.topology_changed();
     tracing::info!(plan=?prepared.assignments, "USB topology changed; replacing chain owners");
-    let previous = run.shared.clone();
-    run.stop().await?;
-    // Collect after shutdown too: verification can finish while tasks drain.
-    faults.extend(
-        previous
-            .runtime
-            .lock()
-            .expect("runtime")
-            .boards
-            .iter()
-            .filter(|(_, b)| b.latched_fault)
-            .map(|(id, b)| {
-                let mut fault = b.clone();
-                fault.raw_speeds.clear();
-                fault.temperature_c = None;
-                fault.temperature_unix = 0;
-                (id.clone(), fault)
-            }),
-    );
-    let run = start_run(
-        config,
-        prepared,
-        history_path.to_path_buf(),
-        faults,
-        service_started_unix,
-        process.clone(),
-    )
-    .await?;
+    let run = run
+        .replace(config, prepared, history_path.to_path_buf(), safety.clone())
+        .await?;
     current.send_replace(run.shared.clone());
     process.resume();
     Ok(run)
@@ -296,18 +302,23 @@ async fn replace(
 pub(crate) async fn serve(
     config: Config,
     history_path: PathBuf,
+    config_path: PathBuf,
+    fallback: bool,
     signal: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     tokio::pin!(signal);
+    let requested_config = config.clone();
     let service_started_unix = unix_now();
-    // Start reporting before discovery or native initialization can wait.
     let process = operational::State::new(observability::Metrics::new(config.node.network)?);
+    process.progress.configuration(fallback);
+    // Start reporting before discovery or native initialization can wait.
     let initial = Arc::new(Shared {
         native: None,
         config: config.clone(),
         assignments: vec![],
         clients: Default::default(),
         process: process.clone(),
+        scope: crate::runtime::RuntimeScope::Production,
         runtime: Arc::new(Mutex::new(runtime::RuntimeState::new(
             config.service.tuning_paused,
         ))),
@@ -322,7 +333,7 @@ pub(crate) async fn serve(
     )?;
     // The status listener outlives each topology. No UI or external supervisor
     // is required to restart the service after a USB change.
-    let mut faults = HashMap::new();
+    let board_states = HashMap::new();
     let startup = async {
         let http = TcpListener::bind(config.service.status_listen)
             .await
@@ -336,6 +347,13 @@ pub(crate) async fn serve(
         } else {
             None
         };
+        let safety = if config.hardware.client_binary.is_some() {
+            Some(Arc::new(
+                safety::Store::open(&config_path)?.monitored(process.progress.clone()),
+            ))
+        } else {
+            None
+        };
         let (config, prepared) = {
             let _discovery = process.progress.begin(
                 timelord_supervisor::progress::Resource::Topology,
@@ -344,75 +362,105 @@ pub(crate) async fn serve(
                 timelord_supervisor::progress::Stage::Discovery,
             );
             let config = inventory::connected_configuration(config).await?;
-            let prepared = hardware::prepare(&config).await?;
+            let unavailable = hardware::unavailable_for(&config, &board_states, safety.as_deref());
+            let prepared = hardware::prepare_for(&config, &unavailable).await?;
             (config, prepared)
         };
         let run = start_run(
             config,
             prepared,
             history_path.clone(),
-            &faults,
+            &board_states,
             service_started_unix,
             process.clone(),
+            safety.clone(),
         )
         .await?;
-        Ok::<_, anyhow::Error>((http, observer, run))
+        Ok::<_, anyhow::Error>((http, observer, safety, run))
     };
-    let (http, observer, mut run) = tokio::select! {
+    let (http, observer, safety, mut run) = tokio::select! {
         biased;
         _ = &mut signal => return Ok(()),
         result = startup => result?,
     };
     current.send_replace(run.shared.clone());
-    let (http_stop, stopped) = watch::channel(false);
     let app = status_api::router(observability::HttpState {
         current: state.clone(),
         process: process.clone(),
     });
+    let (http_stop, stopped) = watch::channel(false);
+    let mut checkpoint = Some(tokio::spawn(config_checkpoint::record(
+        requested_config,
+        config_path,
+        state.clone(),
+        stopped.clone(),
+    )));
     let mut server = spawn_http(http, app, stopped.clone());
     let mut observation_server = observer.map(|listener| {
         let app = observability::routes().with_state(observability::HttpState {
             current: state,
             process: process.clone(),
         });
-        spawn_http(listener, app, stopped)
+        spawn_http(
+            listener,
+            timelord_supervisor::http::protect(app, 16),
+            stopped,
+        )
     });
     let mut poll = tokio::time::interval(Duration::from_secs(5));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut topology = inventory::TopologyChange::default();
+    let mut capacity = assignment::CapacityChange::default();
+    let mut inventory_task: Option<tokio::task::JoinHandle<Result<Config>>> = None;
     let result = loop {
         let candidate = tokio::select! {
             _ = &mut signal => break Ok(()),
+            result=async {checkpoint.as_mut().expect("checkpoint").await},if checkpoint.is_some()=>{
+                match result {Ok(Ok(()))=>{},Ok(Err(error))=>tracing::warn!(%error,"Configuration checkpoint stopped"),Err(error)=>tracing::warn!(%error,"Configuration checkpoint task failed")}
+                checkpoint=None;continue;
+            },
             error = essential_exit(&mut run.tasks, &process), if !run.tasks.is_empty() => break Err(error),
             _ = observation_exit(&mut observation_server, &process), if observation_server.is_some() => continue,
             result = &mut server => break result.context("Status task failed")?.context("Status server failed"),
+            result=async{inventory_task.as_mut().expect("inventory").await}, if inventory_task.is_some()=>{
+                inventory_task.take();
+                result.context("USB reconciliation task failed")?
+            }
             _ = poll.tick() => {
-                tokio::select! {
-                    _ = &mut signal => break Ok(()),
-                    result = inventory::live_configuration(&run.shared) => result,
+                if inventory_task.is_none() {
+                    let shared=run.shared.clone();
+                    inventory_task=Some(tokio::spawn(async move{inventory::live_configuration(&shared).await}));
+
                 }
+                continue;
             }
         };
-        let Some(config) = topology.observe(&run.shared.config, candidate) else {
+        let next = topology.observe(&run.shared.config, candidate);
+        let unavailable = hardware::unavailable(&run.shared);
+        let capacity_changed =
+            capacity.observe(&run.shared.assignments, &run.shared.config, &unavailable);
+        if next.is_none() && !capacity_changed {
             continue;
-        };
-        run = replace(
-            run,
-            config,
-            &mut faults,
-            &history_path,
-            service_started_unix,
-            &process,
-            &current,
-        )
-        .await?;
+        }
+        let config = next.unwrap_or_else(|| run.shared.config.clone());
+        run = replace(run, config, &unavailable, &history_path, &safety, &current).await?;
     };
     process.stop();
     if result.is_err() {
         process.essential_failure();
     }
     run.stop().await?;
+    if let Some(inventory) = inventory_task {
+        let _ = inventory.await;
+    }
     let _ = http_stop.send(true);
+    if let Some(mut checkpoint) = checkpoint
+        && tokio::time::timeout(Duration::from_secs(2), &mut checkpoint)
+            .await
+            .is_err()
+    {
+        checkpoint.abort();
+    }
     if !server.is_finished() {
         server.await.context("Status task failed")??;
     }
@@ -469,8 +517,8 @@ async fn client_listener_with(
                             let mut runtime = shared.runtime.lock().expect("runtime");
                             let hardware = runtime.boards.entry(id.clone()).or_default();
                             // Reusing a slot must never reuse its predecessor's verified readiness.
-                            hardware.verified_slots.remove(&slot);
-                            hardware.generation
+                            hardware.lifecycle.forget_slot(slot);
+                            hardware.lifecycle.status().generation
                         };
                         let lease = asic::Lease { socket, board: id.clone(), slot, generation, clients: shared.clients.clone() };
                         if offers.try_send(lease).is_err() { tracing::warn!(board=%id, "ASIC socket queue full"); }
@@ -515,5 +563,7 @@ pub(crate) async fn shutdown_signal_from(mut term: tokio::signal::unix::Signal) 
     tokio::select! {_=tokio::signal::ctrl_c()=>{},_=term.recv()=>{}}
 }
 
+#[cfg(test)]
+mod operations_tests;
 #[cfg(test)]
 mod tests;

@@ -1,6 +1,7 @@
-//! Cached observations and hardware state, independent of node-session orchestration.
+//! Cached observations and board lifecycle state, independent of node sessions.
 use crate::{asic::ProofTiming, unix_now};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use timelord_core::Chain;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -35,38 +36,23 @@ pub struct RawSpeed {
 }
 #[derive(Clone, Default, Serialize)]
 pub struct HardwareState {
-    #[serde(skip)]
-    pub native_initialized: bool,
-    #[serde(skip)]
-    pub verified_generation: Option<u64>,
-    #[serde(skip)]
-    pub verified_slots: std::collections::BTreeSet<u8>,
-    #[serde(skip)]
-    pub generation: u64,
+    #[serde(flatten)]
+    pub lifecycle: crate::board_lifecycle::BoardLifecycle,
     pub device_location: Option<u32>,
-    #[serde(skip)]
-    pub started_unix: u64,
-    #[serde(skip)]
-    pub latched_fault: bool,
-    // Set only by discovery while this board's native owner is closed.
-    #[serde(skip)]
-    pub usb_present: Option<bool>,
-    #[serde(skip)]
-    pub fault_reason: Option<String>,
     #[serde(skip)]
     pub fault_kind: Option<crate::hardware::NativeFailureKind>,
     pub raw_speeds: Vec<RawSpeed>,
     pub temperature_c: Option<f64>,
     pub frequency_mhz: Option<f64>,
     pub voltage_v: Option<f64>,
-    pub state: String,
     pub recoveries: u64,
     pub temperature_unix: u64,
+    #[serde(skip)]
+    pub temperature_samples: u64,
     pub automatic: Option<crate::automatic::Status>,
 }
 impl HardwareState {
     pub fn fault(&mut self, error: &anyhow::Error) {
-        self.fault_reason = Some(error.to_string());
         self.fault_kind = error
             .downcast_ref::<crate::hardware::NativeFailure>()
             .map(|e| e.kind);
@@ -88,7 +74,37 @@ impl HardwareState {
         }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeScope {
+    Production,
+    Admission,
+}
+impl RuntimeScope {
+    pub(crate) fn io(
+        self,
+        lane: timelord_supervisor::progress::ProofLane,
+    ) -> timelord_supervisor::progress::Resource {
+        use timelord_supervisor::progress::Resource;
+        match self {
+            Self::Production => Resource::ProofIo(lane),
+            Self::Admission => Resource::AdmissionIo(lane),
+        }
+    }
+    pub(crate) fn arithmetic(
+        self,
+        lane: timelord_supervisor::progress::ProofLane,
+    ) -> timelord_supervisor::progress::Resource {
+        use timelord_supervisor::progress::Resource;
+        match self {
+            Self::Production => Resource::Arithmetic(lane),
+            Self::Admission => Resource::AdmissionArithmetic(lane),
+        }
+    }
+}
 pub struct RuntimeState {
+    pub experiments: Arc<crate::experiments::Gate>,
+    pub safety: Option<Arc<crate::safety::Store>>,
+    scope: RuntimeScope,
     pub metric_epoch: u64,
     pub pending: [u32; 3],
     pub scheduler_initialized: bool,
@@ -111,6 +127,9 @@ pub struct RuntimeState {
 impl RuntimeState {
     pub fn new(tuning_paused: bool) -> Self {
         Self {
+            scope: RuntimeScope::Production,
+            experiments: Default::default(),
+            safety: None,
             metric_epoch: 0,
             pending: [0; 3],
             scheduler_initialized: false,
@@ -139,6 +158,14 @@ impl Default for RuntimeState {
     }
 }
 impl RuntimeState {
+    pub(crate) fn admission() -> Self {
+        let mut state = Self::new(false);
+        state.scope = RuntimeScope::Admission;
+        state
+    }
+    pub(crate) fn scope(&self) -> RuntimeScope {
+        self.scope
+    }
     pub fn transition(&mut self, phase: &str, node: &str, message: &str) {
         self.phase = phase.into();
         self.node = node.into();

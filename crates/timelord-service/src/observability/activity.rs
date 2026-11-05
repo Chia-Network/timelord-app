@@ -10,7 +10,7 @@ use timelord_core::Chain;
 pub struct Activity {
     runtime: Arc<Mutex<crate::runtime::RuntimeState>>,
     chain: Chain,
-    metrics: Arc<super::Metrics>,
+    metrics: Option<Arc<super::Metrics>>,
     started: Instant,
     finished: bool,
 }
@@ -18,7 +18,7 @@ impl Activity {
     pub fn new(
         runtime: Arc<Mutex<crate::runtime::RuntimeState>>,
         c: Chain,
-        metrics: Arc<super::Metrics>,
+        metrics: Option<Arc<super::Metrics>>,
     ) -> Self {
         {
             let mut state = runtime.lock().expect("runtime");
@@ -34,11 +34,13 @@ impl Activity {
     }
     pub fn finish(&mut self) {
         self.finished = true;
-        self.metrics.duration(
-            self.chain,
-            ProofStage::RequestToVerified,
-            self.started.elapsed(),
-        );
+        if let Some(metrics) = &self.metrics {
+            metrics.duration(
+                self.chain,
+                ProofStage::RequestToVerified,
+                self.started.elapsed(),
+            );
+        }
     }
 }
 impl Drop for Activity {
@@ -46,8 +48,10 @@ impl Drop for Activity {
         let mut state = self.runtime.lock().expect("runtime");
         state.pending[index(self.chain)] = state.pending[index(self.chain)].saturating_sub(1);
         drop(state);
-        if !self.finished {
-            self.metrics.cancelled(self.chain);
+        if !self.finished
+            && let Some(metrics) = &self.metrics
+        {
+            metrics.cancelled(self.chain);
         }
     }
 }

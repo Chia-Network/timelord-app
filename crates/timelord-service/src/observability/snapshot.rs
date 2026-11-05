@@ -35,25 +35,28 @@ pub struct Readiness {
     pub reason: &'static str,
 }
 fn board_usable(h: &crate::runtime::HardwareState, managed: bool, now: u64) -> bool {
-    !h.latched_fault
+    !h.lifecycle.status().latched_fault
         && if managed {
-            h.state == "connected"
-                && h.native_initialized
+            h.lifecycle.capacity(now, true).exploration_ready
                 && h.temperature_c.is_some_and(f64::is_finite)
                 && h.temperature_unix <= now
                 && now - h.temperature_unix <= 30
         } else {
-            h.verified_generation == Some(h.generation)
+            h.lifecycle.verified_generation() == Some(h.lifecycle.status().generation)
         }
 }
 pub(super) struct Snapshot {
     pub samples: Samples,
     pub readiness: Readiness,
     pub healthy: bool,
+    pub work_ready: bool,
     pub epoch: Option<u64>,
 }
 pub fn ready(shared: &Shared) -> bool {
     snapshot(shared, crate::unix_now()).readiness.ready
+}
+pub(crate) fn work_ready(shared: &Shared) -> bool {
+    snapshot(shared, crate::unix_now()).work_ready
 }
 pub(super) fn snapshot(shared: &Shared, now: u64) -> Snapshot {
     // Capture process and runtime facts once; every projection uses this policy.
@@ -77,6 +80,7 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> Snapshot {
                 reason: incomplete(),
             },
             healthy: process.healthy(),
+            work_ready: false,
             epoch: None,
         };
     }
@@ -107,7 +111,7 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> Snapshot {
                         || state
                             .boards
                             .get(id)
-                            .is_some_and(|h| h.verified_slots.contains(slot)))
+                            .is_some_and(|h| h.lifecycle.slot_verified(*slot)))
             })
             .count()
     };
@@ -167,22 +171,8 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> Snapshot {
         }
         samples.add("board_up", &["board"], &[label], f64::from(up));
         let state_name = hardware
-            .map(|h| h.state.as_str())
+            .map(|h| h.lifecycle.status().phase.as_str())
             .unwrap_or("not_inspected");
-        let state_name = if [
-            "starting",
-            "connected",
-            "reconnecting",
-            "fault",
-            "thermal_stop",
-            "not_inspected",
-        ]
-        .contains(&state_name)
-        {
-            state_name
-        } else {
-            "other"
-        };
         samples.add("board_state", &["board", "state"], &[label, state_name], 1.);
         for assignment in shared.assignments.iter().filter(|a| a.board_id == b.id) {
             samples.add(
@@ -193,7 +183,9 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> Snapshot {
             );
         }
         if let Some(h) = hardware {
-            if h.state == "connected" && !h.latched_fault {
+            if h.lifecycle.status().phase == crate::board_lifecycle::Phase::Connected
+                && !h.lifecycle.status().latched_fault
+            {
                 if h.temperature_unix <= now && now - h.temperature_unix <= 30 {
                     if let Some(value) = h.temperature_c.filter(|v| v.is_finite()) {
                         samples.add("board_temperature_celsius", &["board"], &[label], value);
@@ -262,6 +254,7 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> Snapshot {
     } else {
         "ready"
     };
+    let work_ready = reason == "ready";
     let reason = if !process.ready() {
         incomplete()
     } else {
@@ -274,6 +267,7 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> Snapshot {
             reason,
         },
         healthy: process.healthy(),
+        work_ready,
         epoch: connected.then_some(state.metric_epoch),
     }
 }

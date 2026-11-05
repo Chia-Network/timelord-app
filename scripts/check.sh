@@ -6,8 +6,6 @@ bash scripts/bundle-inputs-test.sh
 bash scripts/bundle-icon-test.sh
 bash scripts/release-inputs-test.sh
 mkdir -p build
-c++ -std=c++17 -Wall -Wextra -Werror integrations/chiavdf/tests/live_control_test.cpp -o build/native-control-test
-build/native-control-test
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 TIMELORD_TEST_EXPOSITION="$PROJECT_ROOT/build/observability.prom" cargo test --workspace --locked

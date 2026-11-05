@@ -1,4 +1,5 @@
 use super::*;
+use crate::hardware::native::NativeOwner;
 use crate::hardware::{arguments, native::terminate};
 use std::process::Stdio;
 use timelord_core::Config;
@@ -36,6 +37,7 @@ done
         config,
         clients: Default::default(),
         process: crate::operational::State::fixture(),
+        scope: crate::runtime::RuntimeScope::Production,
         runtime: Default::default(),
         started_unix: crate::unix_now(),
         service_started_unix: crate::unix_now(),
@@ -55,13 +57,22 @@ done
         .entry(board.id.clone())
         .or_default()
         .recoveries = 20;
-    let mut owner = AutomaticOwner::new(&shared, &board, &mut child)
+    let mut owner = NativeOwner::attach(&board, &mut child).unwrap();
+    let startup = startup(&shared, &board).await.unwrap();
+    let (ready, _rx) = oneshot::channel();
+    let mut log = ClientLog::new(child.stderr.take().unwrap(), ready);
+    owner
+        .initialize(&shared, &board, &mut log, startup)
         .await
         .unwrap();
-    assert_eq!(owner.policy.point.frequency_mhz, 1450.);
+    let (_stop, mut shutdown) = tokio::sync::watch::channel(false);
+    assert_eq!(
+        owner.tuning.as_mut().unwrap().policy.point.frequency_mhz,
+        1450.
+    );
     // Exercise the lifetime baseline after settling and above the lowest point,
     // where an unsynchronized counter really would cause a protective write.
-    owner.policy.applied(
+    owner.tuning.as_mut().unwrap().policy.applied(
         Point {
             frequency_mhz: 1470.,
             voltage_v: 1.,
@@ -71,6 +82,9 @@ done
     );
     assert!(
         owner
+            .tuning
+            .as_mut()
+            .unwrap()
             .policy
             .observe(
                 crate::unix_now(),
@@ -81,6 +95,7 @@ done
                     temperature: Some(40.),
                     temperature_limit: board.temperature_limit_c,
                     paused: false,
+                    exploration_allowed: false,
                 }
             )
             .is_none(),
@@ -88,6 +103,7 @@ done
     );
     assert!(
         owner
+            .control
             .change(
                 Point {
                     frequency_mhz: 2201.,
@@ -100,6 +116,7 @@ done
     );
     assert_eq!(
         owner
+            .control
             .change(
                 Point {
                     frequency_mhz: 1460.,
@@ -114,6 +131,7 @@ done
     );
     assert!(
         owner
+            .control
             .change(
                 Point {
                     frequency_mhz: 1470.,
@@ -128,6 +146,7 @@ done
     );
     assert!(
         owner
+            .control
             .change(
                 Point {
                     frequency_mhz: 1480.,
@@ -142,6 +161,7 @@ done
     );
     assert!(
         owner
+            .control
             .change(
                 Point {
                     frequency_mhz: 1490.,
@@ -154,24 +174,28 @@ done
             .to_string()
             .contains("readback frequency=0.000000")
     );
-    let (ready, _ready) = tokio::sync::oneshot::channel();
-    let mut log = ClientLog::new(child.stderr.take().unwrap(), ready);
     for (index, bytes) in ["not valid JSON", r#"{"schema_version":99,"entries":[]}"#]
         .into_iter()
         .enumerate()
     {
         let path = shared.config.hardware.automatic_state.as_ref().unwrap();
         std::fs::write(path, bytes).unwrap();
-        owner.last_record_unix = 7;
-        let last_success = owner.last_record_unix;
-        assert!(!owner.record(&shared, &board, 0, &mut log).await.unwrap());
-        assert_eq!(owner.last_record_unix, last_success);
-        // A failed checkpoint backs off instead of retrying every watchdog tick.
-        let attempt = owner.last_record_attempt_unix;
-        assert!(attempt > last_success);
-        assert!(!owner.record_due(attempt + RECORD_RETRY_SECONDS - 1));
-        assert!(owner.record_due(attempt + RECORD_RETRY_SECONDS));
-        owner.policy.applied(
+        owner.tuning.as_mut().unwrap().last_record_unix = 7;
+        let last_success = owner.tuning.as_mut().unwrap().last_record_unix;
+        assert!(
+            !owner
+                .tuning
+                .as_mut()
+                .unwrap()
+                .record(&shared, &board, 0, &mut log, &mut shutdown)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            owner.tuning.as_mut().unwrap().last_record_unix,
+            last_success
+        );
+        owner.tuning.as_mut().unwrap().policy.applied(
             Point {
                 frequency_mhz: 1470.,
                 voltage_v: 1.,
@@ -189,20 +213,31 @@ done
             .recoveries = 40 + 20 * index as u64;
         // A genuine new storm must still lower the native setting even though
         // saving the resulting learned limit fails. The owner keeps running.
-        owner.tick(&shared, &board, &mut log).await.unwrap();
-        assert!(owner.policy.point.frequency_mhz < 1470.);
+        owner
+            .tick(&shared, &board, &mut log, &mut shutdown)
+            .await
+            .unwrap();
+        assert!(owner.tuning.as_mut().unwrap().policy.point.frequency_mhz < 1470.);
         assert_eq!(std::fs::read_to_string(path).unwrap(), bytes);
         assert!(child.try_wait().unwrap().is_none());
     }
     let path = shared.config.hardware.automatic_state.as_ref().unwrap();
     std::fs::remove_file(path).unwrap();
-    assert!(owner.record(&shared, &board, 0, &mut log).await.unwrap());
-    assert!(owner.last_record_unix > 7);
+    assert!(
+        owner
+            .tuning
+            .as_mut()
+            .unwrap()
+            .record(&shared, &board, 0, &mut log, &mut shutdown)
+            .await
+            .unwrap()
+    );
+    assert!(owner.tuning.as_mut().unwrap().last_record_unix > 7);
     for (recoveries, kind) in [
         (80, crate::hardware::NativeFailureKind::Thermal),
         (100, crate::hardware::NativeFailureKind::Readback),
     ] {
-        owner.policy.applied(
+        owner.tuning.as_mut().unwrap().policy.applied(
             Point {
                 frequency_mhz: 1470.,
                 voltage_v: 1.,
@@ -218,7 +253,10 @@ done
             .get_mut(&board.id)
             .unwrap()
             .recoveries = recoveries;
-        let error = owner.tick(&shared, &board, &mut log).await.unwrap_err();
+        let error = owner
+            .tick(&shared, &board, &mut log, &mut shutdown)
+            .await
+            .unwrap_err();
         assert_eq!(
             error
                 .downcast_ref::<crate::hardware::NativeFailure>()

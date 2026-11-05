@@ -34,9 +34,13 @@ fn fixture() -> (Arc<Shared>, Arc<Metrics>, HttpState) {
     runtime.boards.insert(
         "a".into(),
         HardwareState {
-            generation: 1,
-            state: "connected".into(),
-            native_initialized: true,
+            lifecycle: crate::board_lifecycle::BoardLifecycle::fixture(
+                crate::board_lifecycle::Phase::Connected,
+                true,
+                None,
+                None,
+                1,
+            ),
             temperature_c: Some(40.),
             temperature_unix: now,
             frequency_mhz: Some(1500.),
@@ -53,6 +57,7 @@ fn fixture() -> (Arc<Shared>, Arc<Metrics>, HttpState) {
             ("a".into(), 1),
         ]))),
         process: process.clone(),
+        scope: crate::runtime::RuntimeScope::Production,
         runtime: Arc::new(Mutex::new(runtime)),
         started_unix: now,
         service_started_unix: now,
@@ -116,6 +121,9 @@ async fn probes_distinguish_internal_failure_dependencies_and_normal_idle() {
             .contains("waiting_for_node")
     );
     shared.process.fail();
+    let body = response(http.clone(), "/metrics").await.2;
+    assert_eq!(value(&body, "chia_timelord_healthy", &[]), Some(0.));
+    assert_eq!(value(&body, "chia_timelord_ready", &[]), Some(0.));
     assert_eq!(
         response(http.clone(), "/healthz").await.0,
         StatusCode::SERVICE_UNAVAILABLE
@@ -164,6 +172,7 @@ async fn readiness_requires_initialization_fresh_managed_telemetry_or_verified_g
         assignments: shared.assignments.clone(),
         clients: shared.clients.clone(),
         process: shared.process.clone(),
+        scope: shared.scope,
         runtime: shared.runtime.clone(),
         started_unix: shared.started_unix,
         service_started_unix: shared.service_started_unix,
@@ -181,7 +190,8 @@ async fn readiness_requires_initialization_fresh_managed_telemetry_or_verified_g
         .boards
         .get_mut("a")
         .unwrap()
-        .verified_generation = Some(1);
+        .lifecycle
+        .verified(1, 0);
     shared
         .runtime
         .lock()
@@ -189,8 +199,8 @@ async fn readiness_requires_initialization_fresh_managed_telemetry_or_verified_g
         .boards
         .get_mut("a")
         .unwrap()
-        .verified_slots
-        .extend([0, 1]);
+        .lifecycle
+        .verified(1, 1);
     assert_eq!(response(http.clone(), "/readyz").await.0, StatusCode::OK);
     // A reused socket slot needs a new proof; a verified predecessor is insufficient.
     shared
@@ -200,8 +210,8 @@ async fn readiness_requires_initialization_fresh_managed_telemetry_or_verified_g
         .boards
         .get_mut("a")
         .unwrap()
-        .verified_slots
-        .remove(&1);
+        .lifecycle
+        .forget_slot(1);
     assert_eq!(
         response(http.clone(), "/readyz").await.0,
         StatusCode::SERVICE_UNAVAILABLE
@@ -213,8 +223,8 @@ async fn readiness_requires_initialization_fresh_managed_telemetry_or_verified_g
         .boards
         .get_mut("a")
         .unwrap()
-        .verified_slots
-        .insert(1);
+        .lifecycle
+        .verified(1, 1);
     shared
         .runtime
         .lock()
@@ -222,7 +232,9 @@ async fn readiness_requires_initialization_fresh_managed_telemetry_or_verified_g
         .boards
         .get_mut("a")
         .unwrap()
-        .generation = 2;
+        .lifecycle
+        .testing()
+        .begin_attempt(crate::unix_now());
     assert_eq!(
         response(http.clone(), "/readyz").await.0,
         StatusCode::SERVICE_UNAVAILABLE
@@ -386,7 +398,9 @@ fn raw_temperature_and_assignments_are_current_and_use_stable_identity() {
         .boards
         .get_mut("a")
         .unwrap()
-        .state = "reconnecting".into();
+        .lifecycle
+        .testing()
+        .retry();
     let body = metrics.render(&shared, now).unwrap();
     assert_eq!(value(&body, "chia_timelord_raw_ips", &[]), None);
     assert_eq!(value(&body, "chia_timelord_board_up", &[]), Some(0.));
@@ -414,6 +428,7 @@ fn serial_identity_survives_owner_change_and_obsolete_gauges_disappear() {
             ("new-owner".into(), 1),
         ]))),
         process: shared.process.clone(),
+        scope: shared.scope,
         runtime: shared.runtime.clone(),
         started_unix: now,
         service_started_unix: now,
@@ -444,6 +459,7 @@ fn serial_identity_survives_owner_change_and_obsolete_gauges_disappear() {
         assignments: vec![],
         clients: Default::default(),
         process: moved.process.clone(),
+        scope: moved.scope,
         runtime: moved.runtime.clone(),
         started_unix: now,
         service_started_unix: now,
@@ -521,10 +537,18 @@ fn process_totals_survive_history_pruning_and_runtime_replacement() {
 #[test]
 fn pending_activity_counts_cancellation_but_not_completed_work() {
     let (shared, metrics, _) = fixture();
-    let activity = Activity::new(shared.runtime.clone(), Chain::Challenge, metrics.clone());
+    let activity = Activity::new(
+        shared.runtime.clone(),
+        Chain::Challenge,
+        Some(metrics.clone()),
+    );
     assert_eq!(shared.runtime.lock().unwrap().pending[0], 1);
     drop(activity);
-    let mut completed = Activity::new(shared.runtime.clone(), Chain::Challenge, metrics.clone());
+    let mut completed = Activity::new(
+        shared.runtime.clone(),
+        Chain::Challenge,
+        Some(metrics.clone()),
+    );
     completed.finish();
     drop(completed);
     assert_eq!(shared.runtime.lock().unwrap().pending[0], 0);
@@ -556,7 +580,7 @@ async fn exposition_isolated_routes_and_concurrent_scrapes_are_consistent() {
         let runtime = shared.runtime.clone();
         let activity_metrics = metrics.clone();
         async move {
-            let mut activity = Activity::new(runtime, Chain::Challenge, activity_metrics);
+            let mut activity = Activity::new(runtime, Chain::Challenge, Some(activity_metrics));
             for _ in 0..50 {
                 metrics.verified(epoch, Chain::Challenge, 999_999.9);
                 tokio::task::yield_now().await;
@@ -606,12 +630,15 @@ fn restart_classification_uses_typed_causes_not_display_text() {
             .context("Board name");
         assert_eq!(restart_reason(&error), expected);
     }
-    assert_eq!(
-        restart_reason(&anyhow::anyhow!(
-            "temperature_limit readback USB verification"
-        )),
-        RestartReason::Process
-    );
+    for text in [
+        "temperature_limit",
+        "temperature_limit readback USB verification",
+    ] {
+        assert_eq!(
+            restart_reason(&anyhow::anyhow!(text)),
+            RestartReason::Process
+        );
+    }
 }
 
 #[test]
@@ -646,4 +673,32 @@ fn incomplete_snapshots_never_republish_a_previous_productive_gauge() {
             .unwrap()
             .contains("chia_timelord_estimated_ips{")
     );
+}
+
+#[test]
+fn productive_work_survives_observer_failure_but_not_essential_failure() {
+    let (shared, _, _) = fixture();
+    let process = shared.process.clone();
+    process.fail();
+    let state = snapshot(&shared, crate::unix_now());
+    assert!(state.work_ready);
+    assert!(!state.healthy);
+    assert!(!state.readiness.ready);
+    assert_eq!(state.readiness.reason, "service_unavailable");
+    process.essential_failure();
+    let state = snapshot(&shared, crate::unix_now());
+    assert!(!state.work_ready);
+    assert_eq!(state.epoch, None);
+}
+#[test]
+fn admission_activity_does_not_emit_production_telemetry() {
+    let metrics = Metrics::new(Network::Mainnet).unwrap();
+    let runtime = Arc::new(Mutex::new(RuntimeState::admission()));
+    let mut completed = Activity::new(runtime.clone(), Chain::Challenge, None);
+    assert_eq!(runtime.lock().unwrap().pending[0], 1);
+    completed.finish();
+    drop(completed);
+    drop(Activity::new(runtime.clone(), Chain::Challenge, None));
+    assert_eq!(runtime.lock().unwrap().pending[0], 0);
+    assert_eq!(metrics.counter("work_cancelled_total", &["challenge"]), 0);
 }

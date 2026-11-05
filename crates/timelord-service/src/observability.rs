@@ -16,6 +16,7 @@ pub use http::{HttpState, routes};
 pub use metrics::Metrics;
 pub use snapshot::ready;
 use snapshot::snapshot;
+pub(crate) use snapshot::work_ready;
 
 #[cfg(test)]
 mod tests;

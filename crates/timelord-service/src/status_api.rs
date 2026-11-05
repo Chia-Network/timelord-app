@@ -5,16 +5,21 @@ use serde::Serialize;
 use timelord_core::{Chain, Network};
 
 pub fn router(http: observability::HttpState) -> Router {
-    Router::new()
+    let status = Router::new()
         .route("/health", get(health))
         .route("/v1/status", get(status))
-        .route("/v3/history", get(history))
-        .merge(observability::routes())
+        .merge(observability::routes());
+    let history = Router::new().route("/v3/history", get(history));
+    // Response budgets belong to the application routes, not the generic HTTP layer.
+    timelord_supervisor::http::protect(status, 16)
+        .merge(timelord_supervisor::http::protect(history, 4))
         .with_state(http)
 }
 
 #[derive(Serialize)]
 struct Status {
+    diagnostic_logging: timelord_supervisor::logging::Stats,
+    configuration_fallback: bool,
     api_version: u32,
     service_pid: u32,
     service_state: &'static str,
@@ -74,6 +79,8 @@ async fn status(State(http): State<observability::HttpState>) -> Json<Status> {
     let clients = shared.clients.lock().expect("client state lock");
     let runtime = shared.runtime.lock().expect("runtime");
     Json(Status {
+        diagnostic_logging: timelord_supervisor::logging::Writer::stderr_stats(),
+        configuration_fallback: shared.process.progress.using_last_good(),
         api_version: 1,
         service_pid: std::process::id(),
         service_state: "ready",
@@ -112,7 +119,7 @@ async fn status(State(http): State<observability::HttpState>) -> Json<Status> {
                 hardware_state: runtime
                     .boards
                     .get(&b.id)
-                    .map(|b| b.state.clone())
+                    .map(|b| b.lifecycle.status().phase.as_str().to_owned())
                     .unwrap_or_else(|| "not_inspected".into()),
                 raw_speeds: runtime
                     .boards
@@ -142,7 +149,7 @@ async fn status(State(http): State<observability::HttpState>) -> Json<Status> {
                             >= runtime
                                 .boards
                                 .get(&b.id)
-                                .map(|h| h.started_unix)
+                                .map(|h| h.lifecycle.status().started_unix)
                                 .unwrap_or(0)
                             && shared
                                 .assignments

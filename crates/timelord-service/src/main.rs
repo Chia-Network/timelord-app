@@ -1,8 +1,12 @@
 mod asic;
 mod assignment;
 mod automatic;
+use hardware::lifecycle as board_lifecycle;
+mod bounded_lines;
+mod config_checkpoint;
 mod connection;
 mod diagnostics;
+mod experiments;
 mod hardware;
 mod history_buffer;
 mod history_store;
@@ -10,9 +14,12 @@ mod inventory;
 mod node_status;
 mod observability;
 mod operational;
+mod optional_io;
 mod private_control;
 mod runtime;
+mod safety;
 mod service;
+mod stable_change;
 mod status_api;
 
 use anyhow::{Context, Result, bail};
@@ -51,6 +58,8 @@ enum Command {
     Validate {
         #[arg(long)]
         config: PathBuf,
+        #[arg(long, hide = true)]
+        supervised: bool,
     },
     /// Print the configured chain plan, without touching hardware.
     Plan {
@@ -131,9 +140,12 @@ enum Command {
 }
 
 fn load(path: &Path) -> Result<Config> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("Reading {}", path.display()))?;
-    let mut config: Config = toml::from_str(&text).context("Parsing configuration")?;
+    let text = config_checkpoint::bounded_text(path, false)
+        .with_context(|| format!("Reading {}", path.display()))?;
+    parse_config(path, &text)
+}
+fn parse_config(path: &Path, text: &str) -> Result<Config> {
+    let mut config: Config = toml::from_str(text).context("Parsing configuration")?;
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -169,6 +181,18 @@ fn load(path: &Path) -> Result<Config> {
     Ok(config)
 }
 
+fn set_default_automatic_state(config: &mut Config, path: &Path) -> Result<()> {
+    if config.hardware.automatic_state.is_none() {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .canonicalize()?;
+        config.hardware.automatic_state = Some(parent.join("automatic-profiles.json"));
+    }
+    Ok(())
+}
+
 fn save(path: &Path, config: &Config) -> Result<()> {
     config.validate().map_err(anyhow::Error::msg)?;
     let parent = path
@@ -176,36 +200,19 @@ fn save(path: &Path, config: &Config) -> Result<()> {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(".timelord-config-{}.tmp", std::process::id()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let result = (|| -> Result<()> {
-        use std::io::Write;
-        let mut file = options.open(&temporary)?;
-        file.write_all(toml::to_string_pretty(config)?.as_bytes())?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
+    timelord_supervisor::atomic::write(path, toml::to_string_pretty(config)?.as_bytes())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let diagnostic_log = timelord_supervisor::logging::Writer::stderr();
+    let tracing_log = diagnostic_log.clone();
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
-        .with_writer(std::io::stderr)
+        .with_writer(move || tracing_log.clone())
         .init();
     match Cli::parse().command {
         Command::Init { config } => {
@@ -291,7 +298,10 @@ async fn main() -> Result<()> {
                 serde_json::to_string_pretty(&diagnostics::check(load(&config)?).await?)?
             );
         }
-        Command::Validate { config } => {
+        Command::Validate { config, supervised } => {
+            if supervised {
+                timelord_supervisor::watch_parent()?;
+            }
             load(&config)?;
             println!(
                 "Configuration valid. This does not establish node authentication or hardware readiness."
@@ -299,12 +309,7 @@ async fn main() -> Result<()> {
         }
         Command::Plan { config } => {
             let mut value = load(&config)?;
-            value.hardware.automatic_state.get_or_insert(
-                config
-                    .parent()
-                    .unwrap_or(Path::new("."))
-                    .join("automatic-profiles.json"),
-            );
+            set_default_automatic_state(&mut value, &config)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&assignment::resolve(&value)?)?
@@ -320,29 +325,29 @@ async fn main() -> Result<()> {
             }
             let paths = timelord_supervisor::Paths::for_config(&config)?;
             let _owner = timelord_supervisor::InstanceLock::acquire(&paths.worker_lock)?;
-            let mut value = load(&config)?;
+            let (mut value, fallback) = config_checkpoint::load_running(&config)?;
             value.service.control_socket = Some(automatic::socket_path(&config, &value));
-            value.hardware.automatic_state.get_or_insert(
-                config
-                    .parent()
-                    .unwrap_or(Path::new("."))
-                    .join("automatic-profiles.json"),
-            );
+            set_default_automatic_state(&mut value, &config)?;
             serve(
                 value,
                 config.with_extension("history.json"),
+                config,
+                fallback,
                 shutdown_signal_from(termination),
             )
             .await?;
         }
         Command::Tuning { config, paused } => {
-            let value = load(&config)?;
+            let value = config_checkpoint::load_running(&config)?.0;
             let result =
                 private_control::request(&automatic::socket_path(&config, &value), paused).await?;
             println!("{}", serde_json::to_string(&result)?);
         }
         Command::Status { config } => {
-            let address = load(&config)?.service.status_listen;
+            let address = config_checkpoint::load_running(&config)?
+                .0
+                .service
+                .status_listen;
             let response = tokio::time::timeout(Duration::from_secs(3), async {
                 let mut socket = TcpStream::connect(address).await?;
                 socket
@@ -379,9 +384,16 @@ struct Shared {
     // These are socket slots, not authenticated board/engine identities.
     clients: Arc<Mutex<BTreeSet<(String, u8)>>>,
     process: Arc<operational::State>,
+    scope: runtime::RuntimeScope,
     runtime: Arc<Mutex<runtime::RuntimeState>>,
     started_unix: u64,
     service_started_unix: u64,
+}
+
+impl Shared {
+    pub(crate) fn metrics(&self) -> Option<&Arc<observability::Metrics>> {
+        (self.scope == runtime::RuntimeScope::Production).then_some(&self.process.metrics)
+    }
 }
 
 fn unix_now() -> u64 {

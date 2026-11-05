@@ -1,27 +1,24 @@
-//! One real arithmetic job per chain, including work whose async caller was
-//! cancelled. Process-wide permits survive replacement backend/topology objects.
+//! Real arithmetic jobs use the process owner's typed-resource capacity, including
+//! jobs whose async callers were cancelled. Replacing a backend cannot reset it.
 use anyhow::Result;
-use std::sync::{Arc, LazyLock};
-use timelord_core::Chain;
-use tokio::{sync::Semaphore, task::JoinHandle};
-
-static CAPACITY: LazyLock<[Arc<Semaphore>; 3]> =
-    LazyLock::new(|| std::array::from_fn(|_| Arc::new(Semaphore::new(1))));
+use std::sync::Arc;
+use timelord_supervisor::progress::{Progress, Resource, Stage};
+use tokio::task::JoinHandle;
 
 pub(super) async fn spawn<T: Send + 'static>(
-    chain: Chain,
+    progress: Arc<Progress>,
+    resource: Resource,
+    generation: u64,
+    iterations: u64,
+    stage: Stage,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<JoinHandle<T>> {
-    let index = match chain {
-        Chain::Challenge => 0,
-        Chain::Reward => 1,
-        Chain::InfusedChallenge => 2,
-    };
-    // Wait before entering the blocking pool. Cancellation of this wait queues
-    // no CPU work; cancellation after spawn leaves the permit in the real job.
-    let permit = CAPACITY[index].clone().acquire_owned().await?;
+    // Waiting for capacity queues no blocking work. Both the permit and progress
+    // guard belong to the actual job, including after caller cancellation.
+    let permit = progress.arithmetic(resource).acquire_owned().await?;
     Ok(tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let _stage = progress.begin(resource, generation, iterations, stage);
         work()
     }))
 }
@@ -33,13 +30,17 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
         time::Duration,
     };
+    use timelord_supervisor::progress::ProofLane;
 
     #[tokio::test]
-    async fn cancelling_callers_cannot_queue_work_behind_a_running_job() {
+    async fn cancelled_callers_cannot_queue_jobs_across_runtime_generations() {
+        let process = crate::operational::State::fixture();
+        let resource = Resource::Arithmetic(ProofLane::Reward);
         let (started, running) = tokio::sync::oneshot::channel();
         let (release, blocked) = std::sync::mpsc::channel();
+        let progress = process.progress.clone();
         let caller = tokio::spawn(async move {
-            spawn(Chain::Reward, move || {
+            spawn(progress, resource, 1, 360, Stage::Preparing, move || {
                 let _ = started.send(());
                 blocked.recv_timeout(Duration::from_secs(5)).unwrap();
             })
@@ -52,14 +53,23 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let snapshot = process.progress.snapshot(1, 1).unwrap();
+        let holder = snapshot
+            .work
+            .iter()
+            .flatten()
+            .find(|w| w.stage == Stage::Preparing)
+            .unwrap()
+            .id;
         caller.abort();
         let _ = caller.await;
         let executed = Arc::new(AtomicUsize::new(0));
         let mut waiters = Vec::new();
         for _ in 0..16 {
             let executed = executed.clone();
+            let progress = process.progress.clone();
             waiters.push(tokio::spawn(async move {
-                spawn(Chain::Reward, move || {
+                spawn(progress, resource, 2, 360, Stage::Verifying, move || {
                     executed.fetch_add(1, Ordering::SeqCst)
                 })
                 .await
@@ -70,26 +80,47 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(executed.load(Ordering::SeqCst), 0);
+        let snapshot = process.progress.snapshot(2, 2).unwrap();
+        let active: Vec<_> = snapshot.work.iter().flatten().collect();
+        assert_eq!(
+            active.len(),
+            1,
+            "queued jobs must not claim actual-job progress"
+        );
+        assert_eq!(active[0].id, holder);
         for waiter in waiters {
             assert!(!waiter.is_finished());
             waiter.abort();
             let _ = waiter.await;
         }
-        // Other chains retain independent capacity.
+        // Other typed resources retain independent capacity on the same process.
         assert_eq!(
-            spawn(Chain::InfusedChallenge, || 7)
-                .await
-                .unwrap()
-                .await
-                .unwrap(),
+            spawn(
+                process.progress.clone(),
+                Resource::AdmissionArithmetic(ProofLane::Reward),
+                2,
+                360,
+                Stage::Preparing,
+                || 7
+            )
+            .await
+            .unwrap()
+            .await
+            .unwrap(),
             7
         );
         release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            spawn(Chain::Reward, || 11).await.unwrap().await.unwrap()
+        let progress = process.progress.clone();
+        let value = tokio::time::timeout(Duration::from_secs(2), async move {
+            spawn(progress, resource, 2, 360, Stage::Verifying, || 11)
+                .await
+                .unwrap()
+                .await
+                .unwrap()
         })
         .await
         .unwrap();
+        assert_eq!(value, 11);
         assert_eq!(
             executed.load(Ordering::SeqCst),
             0,

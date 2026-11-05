@@ -1,6 +1,7 @@
 //! Persistent native-client sessions. No USB or prover implementation lives here.
 mod arithmetic;
 use crate::observability::{ProofStage, SessionReason, proof_lane};
+use crate::runtime::RuntimeScope;
 use anyhow::{Context, Result, bail};
 use dg_xch_core::{
     blockchain::{
@@ -17,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 use timelord_core::{Assignment, Chain, Config};
-use timelord_supervisor::progress::{Resource, Stage};
+use timelord_supervisor::progress::Stage;
 use tokio::{
     io::AsyncWriteExt,
     net::TcpStream,
@@ -109,6 +110,7 @@ pub struct AsicBackend {
     lanes: Vec<(Chain, Lane)>,
     pools: HashMap<String, Mutex<mpsc::Receiver<Lease>>>,
     process: Arc<crate::operational::State>,
+    scope: RuntimeScope,
     runtime: Arc<SyncMutex<crate::runtime::RuntimeState>>,
 }
 impl AsicBackend {
@@ -118,6 +120,7 @@ impl AsicBackend {
         runtime: Arc<SyncMutex<crate::runtime::RuntimeState>>,
         process: Arc<crate::operational::State>,
     ) -> Result<(Self, HashMap<String, mpsc::Sender<Lease>>)> {
+        let scope = runtime.lock().expect("runtime").scope();
         let mut pools = HashMap::new();
         let mut offers = HashMap::new();
         for board in &config.hardware.boards {
@@ -144,14 +147,17 @@ impl AsicBackend {
                 lanes,
                 pools,
                 process,
+                scope,
                 runtime,
             },
             offers,
         ))
     }
+    fn metrics(&self) -> Option<&Arc<crate::observability::Metrics>> {
+        (self.scope == RuntimeScope::Production).then_some(&self.process.metrics)
+    }
     pub fn observe_duration(&self, chain: Chain, stage: ProofStage, duration: Duration) {
-        {
-            let metrics = self.process.metrics.clone();
+        if let Some(metrics) = self.metrics() {
             metrics.duration(chain, stage, duration);
         }
     }
@@ -200,7 +206,7 @@ impl AsicBackend {
             crate::observability::Activity::new(
                 self.runtime.clone(),
                 chain,
-                self.process.metrics.clone(),
+                self.metrics().cloned(),
             )
         });
         loop {
@@ -211,13 +217,13 @@ impl AsicBackend {
                     .get(&lane.board)
                     .map(|b| {
                         (
-                            b.generation,
-                            b.latched_fault
-                                || ["fault", "thermal_stop", "reconnecting"]
-                                    .contains(&b.state.as_str()),
+                            b.lifecycle.status().generation,
+                            !b.lifecycle
+                                .capacity(crate::unix_now(), state.safety.is_some())
+                                .accepts_work,
                         )
                     })
-                    .unwrap_or((0, false))
+                    .unwrap_or((0, state.safety.is_some()))
             };
             if unavailable {
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -229,8 +235,8 @@ impl AsicBackend {
                     loop {
                         tokio::time::sleep(Duration::from_millis(250)).await;
                         let state = self.runtime.lock().expect("runtime");
-                        if state.boards.get(&lane.board).is_some_and(|b| b.generation != generation
-                            || b.latched_fault || ["fault", "thermal_stop", "reconnecting"].contains(&b.state.as_str())) { break; }
+                        if state.boards.get(&lane.board).is_some_and(|b| b.lifecycle.status().generation != generation
+                            || !b.lifecycle.capacity(crate::unix_now(), state.safety.is_some()).accepts_work) { break; }
                     }
                 } => continue,
             };
@@ -254,20 +260,24 @@ impl AsicBackend {
                 Err(error) => {
                     let mut state = self.runtime.lock().expect("runtime");
                     let hardware = state.boards.entry(lane.board.clone()).or_default();
-                    // A delayed EOF from the previous process must not kill its replacement.
-                    if hardware.generation != generation {
-                        continue;
-                    }
                     let verification = error
                         .downcast_ref::<AsicFailure>()
                         .is_some_and(|e| e.verification);
-                    hardware.latched_fault |= verification;
-                    if hardware.state != "thermal_stop" {
-                        hardware.state = "fault".into();
+                    if !hardware.lifecycle.report_fault(
+                        generation,
+                        if verification {
+                            crate::board_lifecycle::Fault::InvalidProof
+                        } else {
+                            crate::board_lifecycle::Fault::Transport
+                        },
+                        error.to_string(),
+                        crate::unix_now(),
+                    ) {
+                        continue;
                     }
                     hardware.fault(&error);
                     hardware.raw_speeds.clear();
-                    let needs_attention = hardware.latched_fault;
+                    let needs_attention = hardware.lifecycle.status().latched_fault;
                     if verification {
                         state.failed_proofs += 1;
                     }
@@ -284,6 +294,10 @@ impl AsicBackend {
                     } else {
                         "Waiting for ASIC recovery.".into()
                     };
+                    // The owner supervisor quiesces before checkpointing this
+                    // restriction. Its durable active-owner marker covers a crash
+                    // or failed fault write; proof verification never waits on disk.
+                    drop(state);
                     tracing::warn!(board=%lane.board, %error, verification, "ASIC proof lane unavailable");
                 }
             }
@@ -311,12 +325,13 @@ impl AsicBackend {
             .find(|(c, _)| *c == chain)
             .context("No board assigned to chain")?
             .1;
-        let process = self.process.clone();
+        let metrics = self.metrics().cloned();
         let epoch = self.runtime.lock().expect("runtime").metric_epoch;
+        let process_progress = self.process.progress.clone();
+        let scope = self.scope;
         let mut owner = lane.active.lock().await;
-        let metrics = process.metrics.clone();
-        let progress = process.progress.begin(
-            Resource::ProofIo(proof_lane(chain)),
+        let progress = process_progress.begin(
+            scope.io(proof_lane(chain)),
             work.generation,
             work.iterations,
             Stage::Preparing,
@@ -329,7 +344,7 @@ impl AsicBackend {
             .expect("runtime")
             .boards
             .get(&lane.board)
-            .map(|b| b.generation)
+            .map(|b| b.lifecycle.status().generation)
             .unwrap_or(0);
         let mut active = owner.take().filter(|a| a.lease.generation == generation);
         // A new discriminant does not depend on the old socket. Start it before
@@ -345,24 +360,23 @@ impl AsicBackend {
             // an async request cannot hide stuck GMP work or queue more of it.
             let seed = work.challenge.const_bytes().to_vec();
             let bits = work.discriminant_bits;
-            let process = process.clone();
-            let generation = work.generation;
-            let iterations = work.iterations;
+            let metrics = metrics.clone();
             Some(
-                arithmetic::spawn(chain, move || {
-                    let _arithmetic = process.progress.begin(
-                        Resource::Arithmetic(proof_lane(chain)),
-                        generation,
-                        iterations,
-                        Stage::Preparing,
-                    );
-                    let started = Instant::now();
-                    let result = create_discriminant_bytes(&seed, bits);
-                    process
-                        .metrics
-                        .duration(chain, ProofStage::Discriminant, started.elapsed());
-                    result
-                })
+                arithmetic::spawn(
+                    process_progress.clone(),
+                    scope.arithmetic(proof_lane(chain)),
+                    work.generation,
+                    work.iterations,
+                    Stage::Preparing,
+                    move || {
+                        let started = Instant::now();
+                        let result = create_discriminant_bytes(&seed, bits);
+                        if let Some(metrics) = metrics {
+                            metrics.duration(chain, ProofStage::Discriminant, started.elapsed());
+                        }
+                        result
+                    },
+                )
                 .await?,
             )
         } else {
@@ -395,7 +409,7 @@ impl AsicBackend {
                             .expect("runtime")
                             .boards
                             .get(&lane.board)
-                            .map(|b| b.generation)
+                            .map(|b| b.lifecycle.status().generation)
                             .unwrap_or(0);
                         if lease.generation == current {
                             return Ok::<_, anyhow::Error>(lease);
@@ -404,7 +418,9 @@ impl AsicBackend {
                 })
                 .await
                 .context("Waiting for ASIC client timed out")??;
-                metrics.duration(chain, ProofStage::ClientWait, waiting.elapsed());
+                if let Some(metrics) = &metrics {
+                    metrics.duration(chain, ProofStage::ClientWait, waiting.elapsed());
+                }
                 // Match Python timelord: start the IPS clock when assigning the
                 // client, even if discriminant preparation is already running.
                 let estimated_started = Instant::now();
@@ -429,7 +445,9 @@ impl AsicBackend {
                     bail!("ASIC client rejected the challenge");
                 }
                 let reason = session_reason(&lane.started_once, changed_input);
-                metrics.session_started(chain, reason);
+                if let Some(metrics) = &metrics {
+                    metrics.session_started(chain, reason);
+                }
                 Active {
                     lease,
                     key: work.clone(),
@@ -455,27 +473,27 @@ impl AsicBackend {
         let checked = work.clone();
         progress.stage(Stage::Verifying);
         let verification_started = Instant::now();
-        let job_process = process.clone();
-        let generation = work.generation;
-        let iterations = work.iterations;
-        let verification = arithmetic::spawn(chain, move || {
-            let _arithmetic = job_process.progress.begin(
-                Resource::Arithmetic(proof_lane(chain)),
-                generation,
-                iterations,
-                Stage::Verifying,
-            );
-            verify(&checked, *proof)
-        })
+        let verification = arithmetic::spawn(
+            process_progress.clone(),
+            scope.arithmetic(proof_lane(chain)),
+            work.generation,
+            work.iterations,
+            Stage::Verifying,
+            move || verify(&checked, *proof),
+        )
         .await?
         .await?;
-        metrics.duration(
-            chain,
-            ProofStage::Verification,
-            verification_started.elapsed(),
-        );
+        if let Some(metrics) = &metrics {
+            metrics.duration(
+                chain,
+                ProofStage::Verification,
+                verification_started.elapsed(),
+            );
+        }
         let result = verification.map_err(|error| {
-            metrics.verification_failed(chain);
+            if let Some(metrics) = &metrics {
+                metrics.verification_failed(chain);
+            }
             AsicFailure {
                 board_id: lane.board.clone(),
                 verification: true,
@@ -497,10 +515,13 @@ impl AsicBackend {
             {
                 let mut state = self.runtime.lock().expect("runtime");
                 let hardware = state.boards.entry(lane.board.clone()).or_default();
-                hardware.verified_generation = Some(active.lease.generation);
-                hardware.verified_slots.insert(active.lease.slot);
+                hardware
+                    .lifecycle
+                    .verified(active.lease.generation, active.lease.slot);
             }
-            metrics.verified(epoch, chain, ips);
+            if let Some(metrics) = &metrics {
+                metrics.verified(epoch, chain, ips);
+            }
             self.runtime.lock().expect("runtime").estimated(
                 chain,
                 ips,

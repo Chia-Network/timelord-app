@@ -171,30 +171,7 @@ pub fn save(path: &Path, entry: Learned) -> Result<()> {
     }
     let parent = path.parent().context("Automatic state folder missing")?;
     std::fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(
-        ".automatic-{}-{}.tmp",
-        std::process::id(),
-        crate::unix_now()
-    ));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    use std::io::Write;
-    let result = (|| {
-        let mut file = options.open(&temporary)?;
-        file.write_all(&serde_json::to_vec_pretty(&value)?)?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
-        Ok::<_, anyhow::Error>(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(temporary);
-    }
-    result
+    timelord_supervisor::atomic::write(path, &serde_json::to_vec_pretty(&value)?)
 }
 
 pub fn socket_path(config_path: &Path, config: &Config) -> PathBuf {

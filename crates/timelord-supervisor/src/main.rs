@@ -67,6 +67,11 @@ enum Action {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Bounded status and file metadata; excludes configuration, keys and log contents.
+    Diagnostics {
+        #[arg(long)]
+        config: PathBuf,
+    },
     Pause {
         #[arg(long)]
         config: PathBuf,
@@ -125,6 +130,19 @@ async fn main() -> Result<()> {
                 worker.unwrap_or(std::env::current_exe()?.with_file_name("timelord-service"));
             run(Paths::for_config(&config)?, helper, monitor_listen, network).await
         }
+        Action::Diagnostics { config } => {
+            let paths = Paths::for_config(&config)?;
+            let result = timelord_supervisor::request(&config, Control::Status, None).await;
+            let files=[("configuration",paths.config.clone()),("last_good",paths.directory.join("last-good.toml")),("worker_log",paths.directory.join("worker.log")),("safety",paths.directory.join("board-safety.json"))].map(|(name,path)|{
+                let meta=fs::symlink_metadata(path).ok();
+                serde_json::json!({"name":name,"present":meta.is_some(),"regular_file":meta.as_ref().is_some_and(|m|m.is_file()),"bytes":meta.map(|m|m.len())})
+            });
+            println!(
+                "{}",
+                serde_json::json!({"schema_version":1,"version":env!("CARGO_PKG_VERSION"),"supervisor_available":result.is_ok(),"status":result.ok(),"files":files})
+            );
+            Ok(())
+        }
         action => {
             let (config, command, revision) = match action {
                 Action::Status { config } => (config, Control::Status, None),
@@ -140,7 +158,10 @@ async fn main() -> Result<()> {
                     config,
                     expected_revision,
                 } => (config, Control::Reload, expected_revision),
-                Action::Run { .. } | Action::LaunchdPlist { .. } | Action::CheckOwner { .. } => {
+                Action::Run { .. }
+                | Action::LaunchdPlist { .. }
+                | Action::CheckOwner { .. }
+                | Action::Diagnostics { .. } => {
                     unreachable!()
                 }
             };
@@ -178,6 +199,7 @@ fn retry_delay(failures: &mut usize, elapsed: Option<Duration>) -> u64 {
 }
 
 struct Worker {
+    log_tasks: Vec<tokio::task::JoinHandle<()>>,
     process: OwnedProcess,
     watchdog: timelord_supervisor::progress::Watchdog,
     started: Instant,
@@ -186,8 +208,14 @@ struct Worker {
     stop_failures: usize,
 }
 impl Worker {
-    fn spawn(helper: &Path, config: &Path, progress: &Path, generation: u64) -> Result<Self> {
-        let process = OwnedProcess::spawn(
+    fn spawn(
+        helper: &Path,
+        config: &Path,
+        progress: &Path,
+        generation: u64,
+        log: &timelord_supervisor::logging::Writer,
+    ) -> Result<Self> {
+        let mut process = OwnedProcess::spawn(
             Command::new(helper)
                 .arg("serve")
                 .arg("--supervised")
@@ -196,11 +224,30 @@ impl Worker {
                 .env("TIMELORD_SUPERVISOR_PROGRESS", progress)
                 .env("TIMELORD_SUPERVISOR_GENERATION", generation.to_string())
                 .stdin(Stdio::piped())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit()),
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
         )
         .context("Starting timelord worker")?;
+        let (stdout, stderr) = process.take_output()?;
+        async fn pump(
+            mut source: impl tokio::io::AsyncRead + Unpin,
+            mut target: timelord_supervisor::logging::Writer,
+        ) {
+            use std::io::Write;
+            let mut bytes = [0u8; 4096];
+            while let Ok(size) = source.read(&mut bytes).await {
+                if size == 0 {
+                    break;
+                }
+                let _ = target.write_all(&bytes[..size]);
+            }
+        }
+        let log_tasks = vec![
+            tokio::spawn(pump(stdout, log.clone())),
+            tokio::spawn(pump(stderr, log.clone())),
+        ];
         Ok(Self {
+            log_tasks,
             process,
             watchdog: timelord_supervisor::progress::Watchdog::new(std::time::Instant::now()),
             started: Instant::now(),
@@ -215,10 +262,57 @@ impl Worker {
             self.stop_failures -= 1;
             anyhow::bail!("Injected worker cleanup failure");
         }
-        self.process.signal_group(libc::SIGTERM);
+        // Let the coordinator close native control channels and drain proof
+        // work first. The group-wide hard stop remains the bounded fallback.
+        self.process.signal_leader(libc::SIGTERM);
         self.process.wait_for_exit(Duration::from_secs(10)).await?;
-        self.process.kill_and_reap(Duration::from_secs(3)).await
+        let result = self.process.kill_and_reap(Duration::from_secs(3)).await?;
+        for task in &mut self.log_tasks {
+            if tokio::time::timeout(Duration::from_secs(1), &mut *task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
+        }
+        Ok(result)
     }
+}
+impl Drop for Worker {
+    fn drop(&mut self) {
+        for task in &self.log_tasks {
+            task.abort();
+        }
+    }
+}
+async fn validate_before_reload(helper: &Path, config: &Path) -> Result<()> {
+    let mut owner = OwnedProcess::spawn(
+        Command::new(helper)
+            .arg("validate")
+            .arg("--supervised")
+            .arg("--config")
+            .arg(config)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .context("Starting configuration validation")?;
+    // Observation never reaps the leader. Retire its family with the reserved
+    // identity before reporting either a timeout, observation error, or result.
+    let completed = owner.wait_for_exit(Duration::from_secs(5)).await;
+    let status = owner
+        .kill_and_reap(Duration::from_secs(3))
+        .await
+        .context("Configuration validator did not retire")?;
+    ensure!(
+        completed?,
+        "Configuration validation timed out; running worker retained"
+    );
+    ensure!(
+        status.success(),
+        "Configuration validation failed; running worker retained. Run timelord-service validate --config to inspect the requested file."
+    );
+    Ok(())
 }
 struct Envelope {
     request: Request,
@@ -290,8 +384,9 @@ async fn accept_controls(
     listener: UnixListener,
     current: Snapshot,
     tx: mpsc::Sender<Envelope>,
+    log: timelord_supervisor::logging::Writer,
 ) -> Result<()> {
-    accept_controls_with(AcceptBackoff::new(), listener, current, tx).await
+    accept_controls_with(AcceptBackoff::new(), listener, current, tx, log).await
 }
 
 async fn accept_controls_with(
@@ -299,6 +394,7 @@ async fn accept_controls_with(
     listener: UnixListener,
     current: Snapshot,
     tx: mpsc::Sender<Envelope>,
+    mut log: timelord_supervisor::logging::Writer,
 ) -> Result<()> {
     let mut handlers = JoinSet::new();
     loop {
@@ -307,7 +403,7 @@ async fn accept_controls_with(
             accepted = backoff.accept(listener.accept(), |error, failures, delay| {
                 // An aborted peer or descriptor pressure does not revoke
                 // this listener or the healthy worker it controls.
-                let _ = writeln!(std::io::stderr(), "Supervisor control accept failed ({failures} consecutive): {error}; retry in {delay:?}");
+                let _ = writeln!(&mut log, "Supervisor control accept failed ({failures} consecutive): {error}; retry in {delay:?}");
             }) => {
                 let Some((socket, _)) = accepted else { continue };
                 if handlers.len() < 16 {
@@ -365,10 +461,11 @@ struct SupervisorState {
     failures: usize,
     power: timelord_supervisor::power::Assertion,
     recoveries: Vec<timelord_supervisor::Recovery>,
+    log: timelord_supervisor::logging::Writer,
     monitor_error: Option<String>,
 }
 impl SupervisorState {
-    fn new(loaded: Result<Intent>) -> Self {
+    fn new(loaded: Result<Intent>, log: timelord_supervisor::logging::Writer) -> Self {
         let (intent, lifecycle) = match loaded {
             Ok(intent) => {
                 let lifecycle = if intent.mode == Mode::Paused {
@@ -394,6 +491,7 @@ impl SupervisorState {
             failures: 0,
             power: Default::default(),
             recoveries: Vec::new(),
+            log,
             monitor_error: None,
         }
     }
@@ -427,6 +525,9 @@ impl SupervisorState {
             .worker()
             .and_then(|worker| worker.progress.as_ref());
         let status = Status {
+            logging: self.log.stats(),
+            sleep_inhibited: self.power.active(),
+            sleep_error: self.power.error.clone(),
             api_version: 1,
             supervisor_pid: std::process::id(),
             worker_pid,
@@ -475,7 +576,8 @@ impl SupervisorState {
         if self.power.error != previous
             && let Some(error) = &self.power.error
         {
-            eprintln!("{error}");
+            use std::io::Write;
+            let _ = writeln!(&mut self.log, "{error}");
         }
         snapshots.send_replace(self.published());
     }
@@ -520,6 +622,7 @@ impl SupervisorState {
     async fn control(
         &mut self,
         paths: &Paths,
+        helper: &Path,
         request: Request,
         snapshots: &watch::Sender<Published>,
     ) -> Result<()> {
@@ -565,6 +668,7 @@ impl SupervisorState {
                 }
             }
             Control::Reload => {
+                validate_before_reload(helper, &paths.config).await?;
                 self.retire(snapshots).await?;
                 if !matches!(self.lifecycle, Lifecycle::StateError(_)) {
                     self.lifecycle = if self.intent.mode == Mode::Paused {
@@ -635,8 +739,13 @@ impl SupervisorState {
         let ready = matches!(self.lifecycle, Lifecycle::Starting)
             || matches!(self.lifecycle, Lifecycle::Backoff { next, .. } if Instant::now() >= next);
         if self.intent.mode == Mode::Running && ready {
-            self.lifecycle = match Worker::spawn(helper, config, progress_path, self.generation + 1)
-            {
+            self.lifecycle = match Worker::spawn(
+                helper,
+                config,
+                progress_path,
+                self.generation + 1,
+                &self.log,
+            ) {
                 Ok(worker) => {
                     self.generation += 1;
                     Lifecycle::Running(Box::new(worker))
@@ -708,8 +817,9 @@ async fn run(
         path: progress_path.clone(),
         inode: fs::symlink_metadata(&progress_path)?.ino(),
     };
-    let mut buffer = [0u8; 4096];
-    let mut state = SupervisorState::new(paths.load_intent());
+    let mut buffer = [0u8; 8192];
+    let log = timelord_supervisor::logging::Writer::rotating(paths.directory.join("worker.log"));
+    let mut state = SupervisorState::new(paths.load_intent(), log);
     let (snapshots, current) = watch::channel(state.published());
     state.publish(&snapshots);
     let mut monitor = if let Some(address) = monitor_listen {
@@ -717,15 +827,19 @@ async fn run(
             .await
             .context("Binding supervisor monitoring")?;
         let app = monitor::routes(current.clone(), network);
-        Some(tokio::spawn(
-            async move { axum::serve(listener, app).await },
-        ))
+        Some(tokio::spawn(async move {
+            axum::serve(
+                timelord_supervisor::http::Listener::new(listener),
+                timelord_supervisor::http::protect(app, 16),
+            )
+            .await
+        }))
     } else {
         None
     };
     let (tx, mut rx) = mpsc::channel::<Envelope>(16);
     // Accept status readers independently of graceful worker cleanup.
-    let mut controls = tokio::spawn(accept_controls(listener, current, tx));
+    let mut controls = tokio::spawn(accept_controls(listener, current, tx, state.log.clone()));
     let mut timer = tokio::time::interval(Duration::from_millis(100));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let stop = signal();
@@ -745,7 +859,7 @@ async fn run(
                 },
                 result = &mut controls => { result??; break; },
                 Some(envelope) = rx.recv() => {
-                    let error = state.control(&paths, envelope.request, &snapshots).await
+                    let error = state.control(&paths, &helper, envelope.request, &snapshots).await
                         .err().map(|error| format!("{error:#}"));
                     let _ = envelope.reply.send(Response { status: state.snapshot(), error });
                 },

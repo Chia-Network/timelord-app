@@ -171,6 +171,7 @@ mod tests {
             assignments: vec![],
             clients: Default::default(),
             process: crate::operational::State::fixture(),
+            scope: crate::runtime::RuntimeScope::Production,
             runtime: Default::default(),
             started_unix: crate::unix_now(),
             service_started_unix: crate::unix_now(),
@@ -210,6 +211,7 @@ mod tests {
             runtime: Default::default(),
             started_unix: crate::unix_now(),
             service_started_unix: crate::unix_now(),
+            scope: crate::runtime::RuntimeScope::Production,
         });
         let (stop, shutdown) = watch::channel(false);
         let started = std::time::Instant::now();

@@ -191,6 +191,57 @@ pub fn resolve_with_identity(
     }
 }
 
+/// Administrator-pinned mappings remain strict. Automatic layouts use only
+/// admitted capacity, while configuration still retains every physical board.
+pub fn resolve_usable_with_identity(
+    config: &Config,
+    unavailable: &std::collections::HashSet<String>,
+    identity: Option<(&str, &str)>,
+) -> Result<Vec<Assignment>> {
+    if config.hardware.chain_assignments.is_some() {
+        return resolve_with_identity(config, identity);
+    }
+    let mut usable = config.clone();
+    usable
+        .hardware
+        .boards
+        .retain(|b| !unavailable.contains(&b.id));
+    resolve_with_identity(&usable, identity)
+}
+#[derive(Default)]
+pub struct CapacityChange(crate::stable_change::StableChange<std::collections::BTreeSet<String>>);
+impl CapacityChange {
+    pub fn observe(
+        &mut self,
+        current: &[Assignment],
+        config: &Config,
+        unavailable: &std::collections::HashSet<String>,
+    ) -> bool {
+        self.observe_at(current, config, unavailable, std::time::Instant::now())
+    }
+    fn observe_at(
+        &mut self,
+        current: &[Assignment],
+        config: &Config,
+        unavailable: &std::collections::HashSet<String>,
+        now: std::time::Instant,
+    ) -> bool {
+        if config.hardware.chain_assignments.is_some() {
+            self.0.reset();
+            return false;
+        }
+        let current = current.iter().map(|a| a.board_id.clone()).collect();
+        let next = config
+            .hardware
+            .boards
+            .iter()
+            .filter(|b| !unavailable.contains(&b.id))
+            .map(|b| b.id.clone())
+            .collect();
+        self.0.observe_at(&current, next, now)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,5 +420,55 @@ mod tests {
             ["board-1", "board-0", "same-serial-new-id"]
         );
         std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn automatic_capacity_fails_over_to_two_plus_one_or_three_without_forgetting_boards() {
+        let config = config();
+        for blocked in [
+            vec!["board-1"],
+            vec!["board-1", "board-2"],
+            vec!["board-0", "board-1", "board-2"],
+        ] {
+            let blocked = blocked.into_iter().map(str::to_owned).collect();
+            let plan = resolve_usable_with_identity(&config, &blocked, None).unwrap();
+            assert!(plan.iter().all(|a| !blocked.contains(&a.board_id)));
+            assert_eq!(plan.len(), if blocked.len() == 3 { 0 } else { 3 });
+            if blocked.len() == 1 {
+                assert_eq!(plan.iter().filter(|a| a.board_id == "board-0").count(), 2);
+            }
+            if blocked.len() == 2 {
+                assert_eq!(plan.iter().filter(|a| a.board_id == "board-0").count(), 3);
+            }
+            assert_eq!(config.hardware.boards.len(), 3);
+        }
+    }
+    #[test]
+    fn usable_capacity_requires_three_consistent_observations_and_honors_strict_mapping() {
+        let mut config = config();
+        let initial = resolve(&config).unwrap();
+        let blocked = std::collections::HashSet::from(["board-1".to_owned()]);
+        let mut changes = CapacityChange::default();
+        assert!(!changes.observe(&initial, &config, &blocked));
+        assert!(!changes.observe(&initial, &config, &blocked));
+        assert!(!changes.observe(&initial, &config, &blocked));
+        assert!(changes.observe_at(
+            &initial,
+            &config,
+            &blocked,
+            std::time::Instant::now() + std::time::Duration::from_secs(10)
+        ));
+        config.hardware.chain_assignments = Some(timelord_core::ChainAssignments {
+            challenge: "serial-0".into(),
+            reward: "serial-1".into(),
+            infused_challenge: "serial-2".into(),
+        });
+        let strict = resolve(&config).unwrap();
+        assert_eq!(
+            resolve_usable_with_identity(&config, &blocked, None).unwrap(),
+            strict
+        );
+        for _ in 0..5 {
+            assert!(!changes.observe(&strict, &config, &blocked));
+        }
     }
 }

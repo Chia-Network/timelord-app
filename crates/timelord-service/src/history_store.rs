@@ -8,7 +8,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -119,35 +119,64 @@ impl Store {
         Snapshot::capture(self.scope.clone(), state, started, now)
     }
 
+    pub fn checkpoint(
+        self: &Arc<Self>,
+        saved: Snapshot,
+        progress: Arc<timelord_supervisor::progress::Progress>,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<()>>> {
+        let permit = progress
+            .arithmetic(timelord_supervisor::progress::Resource::OptionalCheckpoint)
+            .try_acquire_owned()
+            .context("Optional checkpoint writer is busy")?;
+        self.write_checkpoint(saved, progress, permit)
+    }
+
+    pub async fn flush(
+        self: &Arc<Self>,
+        saved: Snapshot,
+        progress: Arc<timelord_supervisor::progress::Progress>,
+    ) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let permit = progress
+                .arithmetic(timelord_supervisor::progress::Resource::OptionalCheckpoint)
+                .acquire_owned()
+                .await?;
+            self.write_checkpoint(saved, progress, permit)?
+                .await
+                .context("History writer stopped")?
+        })
+        .await
+        .context("Final history checkpoint timed out")?
+    }
+
+    fn write_checkpoint(
+        self: &Arc<Self>,
+        saved: Snapshot,
+        progress: Arc<timelord_supervisor::progress::Progress>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<()>>> {
+        let store = self.clone();
+        crate::optional_io::spawn("history-checkpoint", move || {
+            let _permit = permit;
+            let _stage = progress.begin(
+                timelord_supervisor::progress::Resource::OptionalCheckpoint,
+                0,
+                0,
+                timelord_supervisor::progress::Stage::OptionalPersistence,
+            );
+            store.save(&saved)
+        })
+    }
+
     pub fn save(&self, saved: &Snapshot) -> Result<()> {
         let parent = self.path.parent().unwrap_or(Path::new("."));
         fs::create_dir_all(parent)?;
-        let temporary = self
-            .path
-            .with_extension(format!("history-{}.tmp", std::process::id()));
-        let result = (|| -> Result<()> {
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&temporary)?;
-            let bytes = serde_json::to_vec(saved)?;
-            ensure!(
-                bytes.len() as u64 <= MAX_BYTES,
-                "History checkpoint is too large"
-            );
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            fs::rename(&temporary, &self.path)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
+        let bytes = serde_json::to_vec(saved)?;
+        ensure!(
+            bytes.len() as u64 <= MAX_BYTES,
+            "History checkpoint is too large"
+        );
+        timelord_supervisor::atomic::write(&self.path, &bytes)
     }
 }
 
@@ -243,9 +272,21 @@ pub async fn record(
             now,
         );
         let snapshot = snapshot.pruned(now);
-        let target = store.clone();
-        if let Err(error) = tokio::task::spawn_blocking(move || target.save(&snapshot)).await? {
-            tracing::warn!(%error, "Chart history could not be saved");
+        let progress = shared.process.progress.clone();
+        let write = match store.checkpoint(snapshot, progress) {
+            Ok(write) => write,
+            Err(error) => {
+                tracing::warn!(%error, "Chart history checkpoint deferred");
+                continue;
+            }
+        };
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            result = write => {
+                if let Err(error) = result.context("Chart history writer stopped").and_then(|r| r) {
+                    tracing::warn!(%error, "Chart history could not be saved");
+                }
+            }
         }
     }
     Ok(())
@@ -283,14 +324,78 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn final_flush_deadline_includes_waiting_for_an_old_writer() {
+        let path = std::env::temp_dir().join(format!(
+            "tl-history-flush-bound-{}.json",
+            std::process::id()
+        ));
+        let state = RuntimeState::default();
+        let progress = crate::operational::State::fixture().progress.clone();
+        let held = progress
+            .arithmetic(timelord_supervisor::progress::Resource::OptionalCheckpoint)
+            .try_acquire_owned()
+            .unwrap();
+        let store = Arc::new(Store::new(path.clone(), &Config::default(), &[]).unwrap());
+        let started = tokio::time::Instant::now();
+        assert!(
+            store
+                .flush(store.capture(&state, 1, 2), progress)
+                .await
+                .is_err()
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert!(
+            !path.exists(),
+            "timed-out waiter must not launch another writer"
+        );
+        drop(held);
+    }
+    #[tokio::test]
+    async fn old_optional_writer_fences_history_for_replacement_stores() {
+        let dir = std::env::temp_dir().join(format!("tl-history-job-bound-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let config = Config::default();
+        let state = RuntimeState::default();
+        let progress = crate::operational::State::fixture().progress.clone();
+        let old = Arc::new(Store::new(dir.join("history.json"), &config, &[]).unwrap());
+        let replacement = Arc::new(Store::new(dir.join("history.json"), &config, &[]).unwrap());
+        let permit = progress
+            .arithmetic(timelord_supervisor::progress::Resource::OptionalCheckpoint)
+            .try_acquire_owned()
+            .unwrap();
+        let (release, waiting) = std::sync::mpsc::channel();
+        let writing = old.clone();
+        let saved = old.capture(&state, 1, 2);
+        let job = crate::optional_io::spawn("history-bound-fixture", move || {
+            let _permit = permit;
+            let _ = waiting.recv();
+            writing.save(&saved)
+        })
+        .unwrap();
+        assert!(
+            replacement
+                .checkpoint(replacement.capture(&state, 3, 4), progress.clone())
+                .is_err()
+        );
+        release.send(()).unwrap();
+        job.await.unwrap().unwrap();
+        replacement
+            .checkpoint(replacement.capture(&state, 3, 4), progress)
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        let mut restored = RuntimeState::default();
+        replacement.restore(&mut restored, 5).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn restart_restores_records_and_gaps_without_restoring_live_health_or_counts() {
         let (directory, store) = fixture();
-        let mut first = RuntimeState {
-            observations: vec![proof(1, 1002, 1_000_000.), proof(2, 1045, 400_000.)].into(),
-            estimated_observations: vec![proof(3, 1045, 425_000.)].into(),
-            ..Default::default()
-        };
+        let mut first = RuntimeState::default();
+        first.observations = vec![proof(1, 1002, 1_000_000.), proof(2, 1045, 400_000.)].into();
+        first.estimated_observations = vec![proof(3, 1045, 425_000.)].into();
         first.events.push(Event {
             id: 5,
             timestamp_unix: 1040,
@@ -341,16 +446,14 @@ mod tests {
     #[test]
     fn expired_invalid_and_future_observations_are_not_reloaded() {
         let (directory, store) = fixture();
-        let mut state = RuntimeState {
-            observations: vec![
-                proof(1, 100, 1.),
-                proof(2, 99_999, 700_000.),
-                proof(3, 100_001, 900_000.),
-                proof(4, 99_999, f64::NAN),
-            ]
-            .into(),
-            ..Default::default()
-        };
+        let mut state = RuntimeState::default();
+        state.observations = vec![
+            proof(1, 100, 1.),
+            proof(2, 99_999, 700_000.),
+            proof(3, 100_001, 900_000.),
+            proof(4, 99_999, f64::NAN),
+        ]
+        .into();
         state.events.push(Event {
             id: 1,
             timestamp_unix: 100,
@@ -436,10 +539,8 @@ mod tests {
             .pruned(1050);
         store.save(&saved).unwrap();
         let before = fs::read(&store.path).unwrap();
-        let temporary = store
-            .path
-            .with_extension(format!("history-{}.tmp", std::process::id()));
-        fs::write(temporary, "interrupted temporary file").unwrap();
+        let temporary = timelord_supervisor::atomic::pending(&store.path).unwrap();
+        fs::create_dir(temporary).unwrap();
         assert!(store.save(&saved).is_err());
         assert_eq!(fs::read(&store.path).unwrap(), before);
         fs::write(&store.path, b"truncated {").unwrap();

@@ -1,5 +1,8 @@
 //! Small control plane: no USB driver, node protocol, or proof arithmetic.
 pub mod accept_backoff;
+pub mod atomic;
+pub mod http;
+pub mod logging;
 pub mod power;
 pub mod progress;
 
@@ -9,7 +12,6 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
-    io::Write,
     os::unix::{
         fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
         io::AsRawFd,
@@ -150,26 +152,7 @@ impl Paths {
         Ok(value)
     }
     pub fn save_intent(&self, value: &Intent) -> Result<()> {
-        let temporary = self
-            .directory
-            .join(format!("intent-{}.tmp", std::process::id()));
-        let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(&temporary)?;
-            file.write_all(&serde_json::to_vec(value)?)?;
-            file.sync_all()?;
-            fs::rename(&temporary, &self.intent)?;
-            File::open(&self.directory)?.sync_all()?;
-            Ok::<_, anyhow::Error>(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
+        atomic::write(&self.intent, &serde_json::to_vec(value)?)
     }
 }
 
@@ -207,6 +190,12 @@ pub struct Recovery {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
+    #[serde(default)]
+    pub logging: logging::Stats,
+    #[serde(default)]
+    pub sleep_inhibited: bool,
+    #[serde(default)]
+    pub sleep_error: Option<String>,
     pub api_version: u32,
     pub supervisor_pid: u32,
     pub worker_pid: Option<u32>,
@@ -385,12 +374,9 @@ pub fn launchd_plist_with_monitor(
     let config_text = xml(config
         .to_str()
         .context("Configuration path must be UTF-8")?)?;
-    let log = xml(config
-        .parent()
-        .context("Configuration needs a parent")?
-        .join("supervisor.log")
-        .to_str()
-        .context("Log path must be UTF-8")?)?;
+    // Worker diagnostics have their own bounded rotating sink. Do not retain
+    // unlimited launchd stdout/stderr across repeated supervisor failures.
+    let log = "/dev/null";
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

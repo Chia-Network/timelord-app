@@ -36,7 +36,7 @@ impl Fixture {
         fs::write(
             &path,
             format!(
-                "#!/bin/sh\necho $$ >> '{}'\n{body}\n",
+                "#!/bin/sh\nif [ \"$1\" = validate ]; then [ ! -e \"$0.reject\" ]; exit $?; fi\necho $$ >> '{}'\n{body}\n",
                 self.0.join("pids").display()
             ),
         )
@@ -243,9 +243,7 @@ async fn corrupt_intent_never_silently_resumes_and_failed_save_preserves_pause()
         .unwrap();
     let saved = fs::read(&paths.intent).unwrap();
     fs::write(
-        paths
-            .directory
-            .join(format!("intent-{}.tmp", std::process::id())),
+        timelord_supervisor::atomic::pending(&paths.intent).unwrap(),
         b"occupied",
     )
     .unwrap();
@@ -614,6 +612,36 @@ async fn deployment_monitor_survives_pause_and_never_confuses_worker_presence_wi
     fixture.terminate(supervisor).await;
 }
 
+#[tokio::test]
+async fn rejected_reload_keeps_the_useful_worker_and_desired_state_unchanged() {
+    let fixture = Fixture::new();
+    let helper = fixture.helper("exec /bin/sleep 60");
+    let parent = fixture.supervisor(&helper);
+    let before = fixture.status(|s| s.worker_pid.is_some()).await;
+    fs::write(
+        helper.with_extension("reject"),
+        "fixture invalid configuration",
+    )
+    .unwrap();
+    assert!(
+        request(&fixture.config(), Control::Reload, None)
+            .await
+            .is_err()
+    );
+    let after = fixture.status(|s| s.worker_pid == before.worker_pid).await;
+    assert_eq!(after.worker_generation, before.worker_generation);
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.mode, Mode::Running);
+    fs::remove_file(helper.with_extension("reject")).unwrap();
+    request(&fixture.config(), Control::Reload, None)
+        .await
+        .unwrap();
+    fixture
+        .status(|s| s.worker_generation > before.worker_generation)
+        .await;
+    fixture.terminate(parent).await;
+}
+
 #[test]
 fn check_owner_rejects_supervisor_or_worker_ownership() {
     let fixture = Fixture::new();
@@ -709,6 +737,9 @@ async fn fresh_status_readers_observe_durable_pause_before_cleanup_acknowledges(
         sequence: 1,
         ready: true,
         failed: false,
+        configuration_fallback: false,
+        configuration_checkpointed: false,
+
         work: [None; timelord_supervisor::progress::SLOTS],
     };
     let socket = tokio::net::UnixDatagram::unbound().unwrap();

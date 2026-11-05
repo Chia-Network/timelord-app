@@ -73,6 +73,12 @@ see docs/observability.md for current deadline semantics and limitations.
 - Validate native EOF/termination quiescing, driver deadlines, and independent
   board thermal-protection behavior. Do not assume software can stop hung hardware.
 
+Current PR 3 progress: durable per-serial safety state, exclusive owner leases,
+opened-handle native identity checks, isolated verified admission, confirmed EOF
+retirement, usable-capacity reconciliation and coordinated tuning/admission are
+implemented. Emulator and fake-native tests exercise these software boundaries.
+Physical USB/thermal/boot qualification remains a separate deployment gate.
+
 ## 4. Operational hardening
 
 - Bound logs, queues, subprocess output, history and memory growth. Disk/logging
@@ -90,6 +96,13 @@ see docs/observability.md for current deadline semantics and limitations.
 - Package/verify all helper binaries and document launchd permissions, non-root
   deployment identity, FileVault unlock, power restoration and upgrade migration.
 
+Current PR 4 progress: persistent sleep prevention, bounded non-blocking rotating
+logs and native framing, bounded HTTP ownership, private atomic checkpoint staging,
+last-good config promotion/fallback, reload preflight and bounded diagnostics are
+implemented with offline fault fixtures. Optional learning writes no longer stop
+useful proof work; late saves cannot relax a newer owner's safety state. Physical
+boot/power/driver/soak qualification remains explicitly outstanding.
+
 ## Gates for each PR
 
 Run Cargo formatting, clippy with warnings denied, workspace tests, applicable
@@ -100,7 +113,8 @@ system as an implicit test. Preserve unrelated checkout changes.
 Lifecycle fixtures must include restart after crash and shutdown, durable Pause,
 Pause during startup/backoff/cleanup, stale commands, malformed state, duplicate
 owners, parent death, worker descendants and actual worker EOF shutdown.
-Further PRs add stage-specific stalls, task exits, node outage, hotplug, invalid
-proofs, thermal quarantine, full disk and GUI quit/logout fixtures. Hardware smoke
+The stack's fixtures cover stage-specific stalls, task exits, node outage,
+hotplug, invalid proofs, thermal quarantine, simulated ENOSPC/failed persistence,
+and GUI quit/relaunch. Hardware smoke
 tests, boot tests and a 72-hour fault-injection soak / seven-day canary are required
 before claiming unattended production qualification, not substitutes for code gates.

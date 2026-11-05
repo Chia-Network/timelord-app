@@ -12,6 +12,7 @@ fn settings() -> AutomaticConfig {
 }
 fn input() -> Input {
     Input {
+        exploration_allowed: true,
         healthy: true,
         recoveries: 0,
         score: Some(950000.),
@@ -103,6 +104,7 @@ fn retests_only_after_healthy_cool_work_and_honors_disable_and_limits() {
             p.observe(
                 now,
                 Input {
+                    exploration_allowed: true,
                     temperature: Some(51.),
                     ..input()
                 }
@@ -712,5 +714,38 @@ fn sustained_recovery_loss_at_lower_voltage_raises_voltage_before_lowering_frequ
             frequency_mhz: 1450.,
             voltage_v: 1.
         }
+    );
+}
+
+#[test]
+fn recovery_yields_a_trial_without_lowering_a_healthy_clock_or_learning_it_early() {
+    let mut p = capped_retest_policy();
+    start_retest(&mut p, 1);
+    let current = p.point;
+    p.interrupt_trial(2);
+    assert_eq!(p.point, current);
+    assert!(!p.in_trial());
+    assert!(p.baseline.is_none());
+    assert_eq!(p.status.active_seconds, 0);
+    for now in 3..=31 {
+        let mut i = input();
+        i.exploration_allowed = false;
+        assert!(p.observe(now, i).is_none());
+    }
+    let mut i = input();
+    i.exploration_allowed = false;
+    assert!(matches!(p.observe(32, i), Some(Action::Save)));
+    for now in 33..=400 {
+        let mut i = input();
+        i.exploration_allowed = false;
+        assert!(p.observe(now, i).is_none());
+    }
+    assert_eq!(p.point, current);
+    assert!(!p.in_trial());
+    let mut i = input();
+    i.exploration_allowed = false;
+    i.temperature = Some(54.5);
+    assert!(
+        matches!(p.observe(401,i),Some(Action::Set(point,_)) if point.frequency_mhz<current.frequency_mhz)
     );
 }

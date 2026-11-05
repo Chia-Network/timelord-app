@@ -13,7 +13,13 @@ const SCHEDULER: usize = PROOF_IO + ProofLane::COUNT;
 const ARITHMETIC: usize = SCHEDULER + 1;
 const ELIGIBILITY: usize = ARITHMETIC + ProofLane::COUNT;
 const TOPOLOGY: usize = ELIGIBILITY + 1;
-pub const SLOTS: usize = TOPOLOGY + 1;
+const PERSISTENCE: usize = TOPOLOGY + 1;
+const ADMISSION_IO: usize = PERSISTENCE + 1;
+const ADMISSION: usize = ADMISSION_IO + ProofLane::COUNT;
+const ADMISSION_ARITHMETIC: usize = ADMISSION + 1;
+const BOARD_PREPARATION: usize = ADMISSION_ARITHMETIC + ProofLane::COUNT;
+const OPTIONAL_CHECKPOINT: usize = BOARD_PREPARATION + BoardSlot::COUNT;
+pub const SLOTS: usize = OPTIONAL_CHECKPOINT + 1;
 
 /// Resource ownership is typed internally; only this module knows wire-slot positions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,12 +39,42 @@ impl ProofLane {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoardSlot {
+    First,
+    Second,
+    Third,
+}
+impl BoardSlot {
+    const COUNT: usize = 3;
+    pub fn from_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::First),
+            1 => Some(Self::Second),
+            2 => Some(Self::Third),
+            _ => None,
+        }
+    }
+    fn index(self) -> usize {
+        match self {
+            Self::First => 0,
+            Self::Second => 1,
+            Self::Third => 2,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Resource {
     ProofIo(ProofLane),
     Scheduler,
     Arithmetic(ProofLane),
     Eligibility,
     Topology,
+    Persistence,
+    AdmissionIo(ProofLane),
+    Admission,
+    AdmissionArithmetic(ProofLane),
+    BoardPreparation(BoardSlot),
+    OptionalCheckpoint,
 }
 impl Resource {
     fn index(self) -> usize {
@@ -48,6 +84,12 @@ impl Resource {
             Self::Arithmetic(chain) => ARITHMETIC + chain.index(),
             Self::Eligibility => ELIGIBILITY,
             Self::Topology => TOPOLOGY,
+            Self::Persistence => PERSISTENCE,
+            Self::AdmissionIo(chain) => ADMISSION_IO + chain.index(),
+            Self::Admission => ADMISSION,
+            Self::AdmissionArithmetic(chain) => ADMISSION_ARITHMETIC + chain.index(),
+            Self::BoardPreparation(board) => BOARD_PREPARATION + board.index(),
+            Self::OptionalCheckpoint => OPTIONAL_CHECKPOINT,
         };
         assert!(index < SLOTS, "Resource index exceeds the wire layout");
         index
@@ -67,6 +109,12 @@ pub enum Stage {
     Eligibility { wait_seconds: u64 },
     Discovery,
     TopologyChange,
+    Persistence,
+    OptionalPersistence,
+    Admission,
+    BoardPreparation,
+    BoardSetup,
+    BoardReadiness,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Work {
@@ -78,9 +126,13 @@ pub struct Work {
 impl Work {
     fn allowance(self) -> Option<Duration> {
         let seconds = match self.stage {
-            Stage::WaitingForClient => return None, // External capacity outage; native recovery owns it.
+            Stage::WaitingForClient | Stage::OptionalPersistence => return None, // External capacity outage; native recovery owns it.
             Stage::Preparing => 30,
             Stage::Discovery => 15,
+            Stage::Persistence => 10,
+            Stage::Admission => 45,
+            Stage::BoardPreparation | Stage::BoardSetup => 60,
+            Stage::BoardReadiness => 45,
             Stage::TopologyChange => 60,
             Stage::Eligibility { wait_seconds } => wait_seconds.saturating_add(60),
             Stage::Handshake | Stage::Submitting => 15,
@@ -94,6 +146,10 @@ impl Work {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub configuration_fallback: bool,
+    #[serde(default)]
+    pub configuration_checkpointed: bool,
     pub worker_pid: u32,
     pub generation: u64,
     pub sequence: u64,
@@ -101,7 +157,7 @@ pub struct Snapshot {
     pub failed: bool,
     #[serde(default)]
     pub ready: bool,
-    /// CC/RC/ICC I/O, scheduler, CC/RC/ICC arithmetic, eligibility, discovery/topology.
+    /// Production I/O/math, scheduler/eligibility, discovery/persistence, isolated probe I/O/math.
     pub work: [Option<Work>; SLOTS],
 }
 impl Snapshot {
@@ -109,14 +165,43 @@ impl Snapshot {
         self.work[resource.index()]
     }
 }
-#[derive(Default)]
 pub struct Progress {
+    configuration_fallback: AtomicBool,
+    configuration_checkpointed: AtomicBool,
     next: AtomicU64,
     failed: AtomicBool,
     ready: AtomicBool,
     work: Mutex<[Option<Work>; SLOTS]>,
+    arithmetic: [Arc<tokio::sync::Semaphore>; SLOTS],
+}
+impl Default for Progress {
+    fn default() -> Self {
+        Self {
+            configuration_fallback: AtomicBool::new(false),
+            configuration_checkpointed: AtomicBool::new(false),
+            next: AtomicU64::new(0),
+            failed: AtomicBool::new(false),
+            ready: AtomicBool::new(false),
+            work: Mutex::new([None; SLOTS]),
+            arithmetic: std::array::from_fn(|_| Arc::new(tokio::sync::Semaphore::new(1))),
+        }
+    }
 }
 impl Progress {
+    pub fn using_last_good(&self) -> bool {
+        self.configuration_fallback.load(Ordering::Relaxed)
+    }
+    pub fn configuration(&self, fallback: bool) {
+        self.configuration_fallback
+            .store(fallback, Ordering::Relaxed);
+    }
+    pub fn checkpointed(&self) {
+        self.configuration_checkpointed
+            .store(true, Ordering::Relaxed);
+    }
+    pub fn arithmetic(&self, resource: Resource) -> Arc<tokio::sync::Semaphore> {
+        self.arithmetic[resource.index()].clone()
+    }
     pub fn fail(&self) {
         self.failed.store(true, Ordering::Relaxed);
     }
@@ -144,6 +229,8 @@ impl Progress {
     pub fn snapshot(&self, generation: u64, sequence: u64) -> Option<Snapshot> {
         let work = *self.work.try_lock().ok()?;
         Some(Snapshot {
+            configuration_fallback: self.configuration_fallback.load(Ordering::Relaxed),
+            configuration_checkpointed: self.configuration_checkpointed.load(Ordering::Relaxed),
             worker_pid: std::process::id(),
             generation,
             sequence,
@@ -297,51 +384,59 @@ impl Drop for Reporter {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn resource_groups_are_disjoint_contiguous_and_in_bounds() {
-        use super::{ProofLane::*, Resource::*, SLOTS};
-        let resources = [
-            ProofIo(Challenge),
-            ProofIo(Reward),
-            ProofIo(InfusedChallenge),
-            Scheduler,
-            Arithmetic(Challenge),
-            Arithmetic(Reward),
-            Arithmetic(InfusedChallenge),
-            Eligibility,
-            Topology,
-        ];
-        assert_eq!(
-            resources.map(|resource| resource.index()),
-            std::array::from_fn::<_, SLOTS, _>(|index| index)
-        );
-    }
-
     use super::*;
     fn snapshot(sequence: u64, stage: Stage, iterations: u64) -> Snapshot {
+        let mut work = [None; SLOTS];
+        work[0] = Some(Work {
+            id: 1,
+            generation: 1,
+            iterations,
+            stage,
+        });
         Snapshot {
             worker_pid: 1,
             generation: 1,
             sequence,
             failed: false,
             ready: false,
-            work: [
-                Some(Work {
-                    id: 1,
-                    generation: 1,
-                    iterations,
-                    stage,
-                }),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ],
+            configuration_fallback: false,
+            configuration_checkpointed: false,
+            work,
         }
+    }
+    #[test]
+    fn native_phase_progress_resets_watchdog_without_inflating_other_deadlines() {
+        let progress = Arc::new(Progress::default());
+        let guard = progress.begin(
+            Resource::BoardPreparation(BoardSlot::First),
+            1,
+            0,
+            Stage::BoardSetup,
+        );
+        let now = Instant::now();
+        let mut watchdog = Watchdog::new(now);
+        watchdog.observe(progress.snapshot(1, 1).unwrap(), now);
+        watchdog.observe(
+            progress.snapshot(1, 2).unwrap(),
+            now + Duration::from_secs(44),
+        );
+        assert!(watchdog.failure(now + Duration::from_secs(44)).is_none());
+        guard.stage(Stage::BoardReadiness);
+        watchdog.observe(
+            progress.snapshot(1, 3).unwrap(),
+            now + Duration::from_secs(44),
+        );
+        // Reports continue arriving: only the readiness phase deadline applies.
+        watchdog.observe(
+            progress.snapshot(1, 4).unwrap(),
+            now + Duration::from_secs(75),
+        );
+        assert!(watchdog.failure(now + Duration::from_secs(75)).is_none());
+        watchdog.observe(
+            progress.snapshot(1, 5).unwrap(),
+            now + Duration::from_secs(90),
+        );
+        assert!(watchdog.failure(now + Duration::from_secs(90)).is_some());
     }
     #[test]
     fn long_native_work_idle_and_external_capacity_are_not_fixed_proof_timeouts() {
@@ -357,6 +452,35 @@ mod tests {
             later + Duration::from_secs(86400),
         );
         assert!(watch.failure(later + Duration::from_secs(86400)).is_none());
+    }
+    #[test]
+    fn bounded_optional_io_stays_visible_without_restarting_useful_work() {
+        let now = Instant::now();
+        let mut watch = Watchdog::new(now);
+        watch.observe(snapshot(1, Stage::OptionalPersistence, 0), now);
+        watch.observe(
+            snapshot(2, Stage::OptionalPersistence, 0),
+            now + Duration::from_secs(86400),
+        );
+        assert!(watch.failure(now + Duration::from_secs(86400)).is_none());
+        let report = Snapshot {
+            worker_pid: u32::MAX,
+            generation: u64::MAX,
+            sequence: u64::MAX,
+            failed: false,
+            ready: false,
+            configuration_fallback: true,
+            configuration_checkpointed: true,
+            work: [Some(Work {
+                id: u64::MAX,
+                generation: u64::MAX,
+                iterations: u64::MAX,
+                stage: Stage::Eligibility {
+                    wait_seconds: u64::MAX,
+                },
+            }); SLOTS],
+        };
+        assert!(serde_json::to_vec(&report).unwrap().len() < 8192);
     }
     #[test]
     fn healthy_heartbeat_cannot_hide_stuck_verification_and_replays_do_not_extend_liveness() {
@@ -471,7 +595,25 @@ mod tests {
             Resource::Arithmetic(ProofLane::InfusedChallenge),
             Resource::Eligibility,
             Resource::Topology,
+            Resource::Persistence,
+            Resource::AdmissionIo(ProofLane::Challenge),
+            Resource::AdmissionIo(ProofLane::Reward),
+            Resource::AdmissionIo(ProofLane::InfusedChallenge),
+            Resource::Admission,
+            Resource::AdmissionArithmetic(ProofLane::Challenge),
+            Resource::AdmissionArithmetic(ProofLane::Reward),
+            Resource::AdmissionArithmetic(ProofLane::InfusedChallenge),
+            Resource::BoardPreparation(BoardSlot::First),
+            Resource::BoardPreparation(BoardSlot::Second),
+            Resource::BoardPreparation(BoardSlot::Third),
+            Resource::OptionalCheckpoint,
         ];
+        assert_eq!(SLOTS, 21, "Versioned wire layout must stay stable");
+        assert_eq!(
+            resources.map(|resource| resource.index()),
+            std::array::from_fn::<_, SLOTS, _>(|index| index),
+            "All typed resources must cover the complete wire layout exactly once"
+        );
         let guards: Vec<_> = resources
             .into_iter()
             .map(|resource| progress.begin(resource, 7, 42, Stage::Preparing))
@@ -514,6 +656,9 @@ mod tests {
                 sequence: 1,
                 failed: false,
                 ready: false,
+                configuration_fallback: false,
+                configuration_checkpointed: false,
+
                 work: [None; SLOTS],
             },
             now,

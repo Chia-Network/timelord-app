@@ -53,6 +53,41 @@ async fn metrics(State(m): State<Monitor>) -> impl IntoResponse {
         ("worker_up", "gauge", u64::from(status.worker_pid.is_some())),
         ("worker_ready", "gauge", u64::from(published.ready(now))),
         ("worker_restarts_total", "counter", status.restarts),
+        (
+            "log_dropped_bytes_total",
+            "counter",
+            status.logging.dropped_bytes,
+        ),
+        (
+            "log_write_errors_total",
+            "counter",
+            status.logging.write_errors,
+        ),
+        (
+            "sleep_inhibited",
+            "gauge",
+            u64::from(status.sleep_inhibited),
+        ),
+        (
+            "using_last_good_configuration",
+            "gauge",
+            u64::from(
+                status
+                    .progress
+                    .as_ref()
+                    .is_some_and(|p| p.configuration_fallback),
+            ),
+        ),
+        (
+            "configuration_checkpointed",
+            "gauge",
+            u64::from(
+                status
+                    .progress
+                    .as_ref()
+                    .is_some_and(|p| p.configuration_checkpointed),
+            ),
+        ),
         ("healthy", "gauge", u64::from(healthy)),
     ] {
         body.push_str(&format!("# HELP chia_timelord_supervisor_{name} Supervisor {name}\n# TYPE chia_timelord_supervisor_{name} {kind}\nchia_timelord_supervisor_{name}{{network=\"{}\"}} {value}\n",m.network.label()));
@@ -85,7 +120,11 @@ mod tests {
 
     fn publication(progress_age: u64, loop_age: u64) -> Published {
         let now = Instant::now();
-        let mut status = SupervisorState::new(Ok(Intent::default())).snapshot();
+        let mut status = SupervisorState::new(
+            Ok(Intent::default()),
+            timelord_supervisor::logging::Writer::stderr(),
+        )
+        .snapshot();
         status.worker_pid = Some(123);
         status.worker_generation = 7;
         status.phase = timelord_supervisor::SupervisorPhase::WorkerStarted;
@@ -96,7 +135,9 @@ mod tests {
             sequence: 1,
             ready: true,
             failed: false,
-            work: [None; timelord_supervisor::progress::SLOTS],
+            configuration_fallback: false,
+            configuration_checkpointed: false,
+            work: [None; progress::SLOTS],
         });
         Published {
             status,
@@ -114,8 +155,9 @@ mod tests {
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
         let config = dir.join("config.toml");
         let progress = dir.join("progress.sock");
-        let mut state = SupervisorState::new(Ok(Intent::default()));
-        let worker = crate::Worker::spawn(&helper, &config, &progress, 1).unwrap();
+        let log = timelord_supervisor::logging::Writer::stderr();
+        let mut state = SupervisorState::new(Ok(Intent::default()), log.clone());
+        let worker = crate::Worker::spawn(&helper, &config, &progress, 1, &log).unwrap();
         let pid = worker.process.pid();
         state.lifecycle = crate::Lifecycle::Running(Box::new(worker));
         state.generation = 1;
@@ -145,6 +187,7 @@ mod tests {
         state
             .control(
                 &paths,
+                &helper,
                 timelord_supervisor::Request {
                     command: timelord_supervisor::Control::Pause,
                     expected_revision: None,
