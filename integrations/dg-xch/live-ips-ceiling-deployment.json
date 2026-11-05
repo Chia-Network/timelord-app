@@ -1,0 +1,138 @@
+{
+  "host": "m6mini",
+  "source_commit": "f73c935",
+  "ui_source_commit": "f835c83",
+  "manifest": {
+    "native_revision": "446a0e1d118051364742648c7b8f3239b12a3dcb",
+    "source_queue_sha256": "f16b6ed5838ceb0ad383df23145f742932b5f18dd6ebe5f1b9d022097fe9b800",
+    "native_sha256": "5ab3f4ff4c79ab723604039df4ea2ff9b5c19256d7c3ba3d0b9bb17d4c4b3f01",
+    "service_sha256": "9d4d88a668c5279631ab2c991ebbc0522ac973ca296a49c849800362403996f2",
+    "ui_sha256": "4a53cfc54de593d4470ebb7b766f137eea87db51f2373116a87681e22c717eb0",
+    "archive_sha256": "4db019468d8ef6afb7902cac4969e49b62e4598903d58a4bb27019e681791695",
+    "libraries": {
+      "libgmpxx.4.dylib": "875e1391d7c896c64004ada5997a6f3c1fe2ed8f2bc15c36776d76ca86cc4396",
+      "libft4222.dylib": "453b21f3c6dbf89168916be1ea26483084b83314b8d78d7cabd74e82a0202075",
+      "libftd2xx.dylib": "0a3ae31f16da56ec212c60ead43921bca22868cf0c502efdc8105cf017d1c7ad",
+      "libgmp.10.dylib": "bc89479f845374ae610aee6f5758d6e083f55a7c22e684bbb2ecf20f5db6c10b"
+    },
+    "automatic_max_mhz": 2200,
+    "requested_voltage_ceiling_v": 1,
+    "temperature_guard_c": 55,
+    "startup_optimizations": [
+      "hardware SHA",
+      "six-worker canonical discriminant search",
+      "preparation overlaps client retirement"
+    ],
+    "raw_speed": "one-second deltas, no extra USB reads; UI polls every two seconds; invalidates on idle/rollback/challenge change, six-second expiry"
+  },
+  "settings": {
+    "boards": 3,
+    "engines_per_board": 1,
+    "automatic_ceiling_mhz": 2200,
+    "requested_voltage_ceiling_v": 1.0,
+    "temperature_guard_c": 55,
+    "initial_frequency_mhz": 1600,
+    "checkpoint_threshold": 250000,
+    "retain_asic_values": true,
+    "auxiliary_threads": 4,
+    "proof_thread_limit": 3
+  },
+  "initial_validation": {
+    "installed": true,
+    "validation_completed_unix": 1792714094.4020321,
+    "service_pid": 2220,
+    "proofs_delivered": 40,
+    "failed_proofs": 0,
+    "recoveries": 0,
+    "raw_telemetry_seen_on_boards": 3,
+    "left_running": true
+  },
+  "clock_ranges_observed_mhz": {
+    "ASIC 1": [
+      1600.0,
+      1620.0
+    ],
+    "ASIC 2": [
+      1600.0,
+      1620.0
+    ],
+    "ASIC 3": [
+      1600.0
+    ]
+  },
+  "max_temperatures_c": {
+    "ASIC 1": 41.9,
+    "ASIC 2": 41.02,
+    "ASIC 3": 37.9
+  },
+  "checks": {
+    "rust_tests": 56,
+    "swift_tests": 39,
+    "cargo_fmt": "passed",
+    "cargo_clippy_warnings_denied": "passed",
+    "native_no_usb_control_and_counter_fixtures": "passed",
+    "native_build": "passed",
+    "default_native_pin_patch_application": "passed; final shorter diff context produces identical source",
+    "bundle_and_release_input_checks": "passed"
+  },
+  "local_evidence": "/private/tmp/timelord-2200-raw-20261022",
+  "remote_evidence": "/Users/cameron/timelord-2200-raw-20261022-v2",
+  "evidence_sha256": {
+    "completed.json": "4a6d25dcca9093ce5676df3a3d6e4d0707b9c1f95a3d719e9622f25ed042e1b9",
+    "deployment-plan.json": "a8aa0c2ef3963df65bc62d079282de7fbe723af4b1515108d0e3e395d7c86d5c",
+    "status-samples.jsonl": "b69b00b8784a05c84e306eed0da83319d307d1808c9ff33c690808c0f3571b68",
+    "capture.log": "7a2ffec9211093ce5d26efa3b49d9733857b3fb32ad0a338073c70e8f789679a"
+  },
+  "first_attempt": {
+    "result": "Installer restored the previous app and config after startup rejected the larger supported-frequency list",
+    "cause": "The old 141-entry bound remained after raising the frequency range",
+    "remedy": "Accept up to 201 grid entries; regression test covers the complete 200\u20132200 MHz list"
+  },
+  "limits": [
+    "Three-minute health check, not a long-term stability or controlled IPS comparison.",
+    "2200 MHz is an exploration ceiling, not an operating-point recommendation or proven stable clock.",
+    "Raw/delivered IPS differences include startup, USB and proof work, not isolated proof-construction time.",
+    "Retains the explicit PR 450 native and six-worker DG development sources. Normal repository pins remain unchanged."
+  ],
+  "final_ui_deployment": {
+    "installed": true,
+    "left_running": true,
+    "opened_unix": 1792714334.791687,
+    "completed_unix": 1792714394.826868,
+    "service_pid": 2375,
+    "proofs_delivered": 16,
+    "failed_proofs": 0,
+    "recoveries": 0,
+    "configuration_unchanged": true,
+    "service_and_native_unchanged": true
+  },
+  "final_ui_manifest": {
+    "native_revision": "446a0e1d118051364742648c7b8f3239b12a3dcb",
+    "source_queue_sha256": "f16b6ed5838ceb0ad383df23145f742932b5f18dd6ebe5f1b9d022097fe9b800",
+    "native_sha256": "5ab3f4ff4c79ab723604039df4ea2ff9b5c19256d7c3ba3d0b9bb17d4c4b3f01",
+    "service_sha256": "9d4d88a668c5279631ab2c991ebbc0522ac973ca296a49c849800362403996f2",
+    "ui_sha256": "a121019129ae14f19db0f0d9003f4f146c664aeabc15b79772c7853834bb728a",
+    "archive_sha256": "718551b19da05f6419237dc2935c1f1aed517375e5642948b8bdf4a6440b069a",
+    "libraries": {
+      "libgmpxx.4.dylib": "875e1391d7c896c64004ada5997a6f3c1fe2ed8f2bc15c36776d76ca86cc4396",
+      "libft4222.dylib": "453b21f3c6dbf89168916be1ea26483084b83314b8d78d7cabd74e82a0202075",
+      "libftd2xx.dylib": "0a3ae31f16da56ec212c60ead43921bca22868cf0c502efdc8105cf017d1c7ad",
+      "libgmp.10.dylib": "bc89479f845374ae610aee6f5758d6e083f55a7c22e684bbb2ecf20f5db6c10b"
+    },
+    "automatic_max_mhz": 2200,
+    "requested_voltage_ceiling_v": 1,
+    "temperature_guard_c": 55,
+    "startup_optimizations": [
+      "hardware SHA",
+      "six-worker canonical discriminant search",
+      "preparation overlaps client retirement"
+    ],
+    "raw_speed": "one-second deltas, no extra USB reads; UI polls every two seconds; invalidates on idle/rollback/challenge change, six-second expiry",
+    "ui_changes": [
+      "Single Raw / Mean / Median row",
+      "State tooltip on colored ASIC icon",
+      "Time and precise IPS hover callouts on compact and detail charts"
+    ]
+  },
+  "final_ui_remote_evidence": "/Users/cameron/timelord-2200-raw-ui-20261022"
+}

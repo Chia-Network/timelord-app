@@ -5,14 +5,15 @@ export MACOSX_DEPLOYMENT_TARGET=14.0
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 source "$PROJECT_ROOT/scripts/macho-load-commands.sh"
+source "$PROJECT_ROOT/scripts/bundle-icon.sh"
 [[ "$(uname -s)" == Darwin ]] || { echo 'The Mac app bundle must be built on macOS.' >&2; exit 1; }
 CLIENT="${TIMELORD_ASIC_CLIENT:-$PROJECT_ROOT/build/controlled-native/hw_vdf_client}"
-[[ -x "$CLIENT" ]] || { echo 'Build the native client first: bash scripts/build-native-control.sh' >&2; exit 1; }
+[[ -x "$CLIENT" ]] || { echo 'Build the native client first: bash scripts/build-native.sh' >&2; exit 1; }
 DRIVERS="${CHIAVDF_DRIVERS:-$(dirname "$CLIENT")/hw/libft4222}"
 for name in libft4222.dylib libftd2xx.dylib; do
   [[ -f "$DRIVERS/$name" ]] || { echo "Missing FTDI library: $DRIVERS/$name" >&2; exit 1; }
 done
-cargo build --release --locked -p timelord-service
+cargo build --release --locked -p timelord-service -p timelord-supervisor
 swift build --configuration release --package-path apps/macos --scratch-path build/swift
 SWIFT_BIN_DIR="$(swift build --configuration release --package-path apps/macos --scratch-path build/swift --show-bin-path)"
 APP="${TIMELORD_APP_BUNDLE:-$PROJECT_ROOT/build/Timelord.app}"
@@ -21,6 +22,8 @@ APP="${TIMELORD_APP_BUNDLE:-$PROJECT_ROOT/build/Timelord.app}"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$APP/Contents/Frameworks" "$APP/Contents/Resources/ThirdParty"
 cp "$SWIFT_BIN_DIR/TimelordMac" "$APP/Contents/MacOS/TimelordMac"
 cp build/rust/release/timelord-service "$APP/Contents/Helpers/timelord-service"
+cp build/rust/release/timelord-supervisor "$APP/Contents/Helpers/timelord-supervisor"
+cp scripts/install-service.sh "$APP/Contents/Resources/install-service.sh"
 cp "$CLIENT" "$APP/Contents/Helpers/hw_vdf_client"
 cp "$DRIVERS/libft4222.dylib" "$DRIVERS/libftd2xx.dylib" "$APP/Contents/Frameworks/"
 # GMP is dynamically linked by chiavdf. Include the actual linked versions.
@@ -56,7 +59,7 @@ for binary in "$APP/Contents/Frameworks/"*.dylib "$APP/Contents/Helpers/hw_vdf_c
   if [[ "$binary" == "$APP/Contents/Frameworks/"* ]]; then install_name_tool -id "@rpath/$(basename "$binary")" "$binary"; fi
   codesign --force --sign - "$binary"
 done
-cp apps/macos/AppIcon/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+bundle_app_icon "$PROJECT_ROOT/apps/macos/AppIcon" "$APP/Contents/Resources" "$MACOSX_DEPLOYMENT_TARGET"
 cp LICENSE "$APP/Contents/Resources/LICENSE"
 cp integrations/dg-xch/LICENSE "$APP/Contents/Resources/ThirdParty/dg-xch-LICENSE"
 cp integrations/chiavdf/LICENSE "$APP/Contents/Resources/ThirdParty/chiavdf-LICENSE"
@@ -71,6 +74,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>Timelord</string>
   <key>CFBundleDisplayName</key><string>Timelord</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleIconName</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>CFBundleVersion</key><string>1</string>
@@ -78,12 +82,13 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST
-for binary in "$APP/Contents/MacOS/TimelordMac" "$APP/Contents/Helpers/timelord-service"; do
+for binary in "$APP/Contents/MacOS/TimelordMac" "$APP/Contents/Helpers/timelord-service" "$APP/Contents/Helpers/timelord-supervisor"; do
   while IFS= read -r dependency; do
     case "$dependency" in /usr/lib/*|/System/Library/*) ;; *) echo "Unbundled application dependency: $dependency" >&2; exit 1 ;; esac
   done < <(dependencies "$binary")
 done
 codesign --force --sign - "$APP/Contents/Helpers/timelord-service"
+codesign --force --sign - "$APP/Contents/Helpers/timelord-supervisor"
 codesign --force --sign - "$APP"
 codesign --verify --deep --strict "$APP"
 "$APP/Contents/Helpers/hw_vdf_client" --control-version

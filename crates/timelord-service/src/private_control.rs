@@ -7,6 +7,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use timelord_supervisor::AcceptBackoff;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
@@ -103,13 +104,24 @@ async fn handle(mut socket: UnixStream, shared: Arc<Shared>) -> Result<()> {
 pub async fn run(
     control: Listener,
     shared: Arc<Shared>,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    run_with(AcceptBackoff::new(), control, shared, shutdown).await
+}
+
+async fn run_with(
+    mut backoff: AcceptBackoff,
+    control: Listener,
+    shared: Arc<Shared>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     loop {
         tokio::select! {
             _=shutdown.changed()=>break,
-            accepted=control.listener.accept()=> {
-                let(socket,_)=accepted?;
+            accepted=backoff.accept(control.listener.accept(), |error, failures, delay| {
+                tracing::warn!(%error,failures=failures,?delay,"Private control accept failed; retrying");
+            })=> {
+                let Some((socket,_))=accepted else { continue; };
                 // Bounded same-user transaction; no unauthenticated public HTTP mutation.
                 if let Err(error)=tokio::time::timeout(Duration::from_secs(2),handle(socket,shared.clone())).await {tracing::debug!(%error,"Private control timed out");}
             }
@@ -154,11 +166,15 @@ mod tests {
         );
         assert!(bind(&path).is_err());
         let shared = Arc::new(Shared {
+            native: None,
             config: timelord_core::Config::default(),
             assignments: vec![],
             clients: Default::default(),
+            process: crate::operational::State::fixture(),
+            scope: crate::runtime::RuntimeScope::Production,
             runtime: Default::default(),
             started_unix: crate::unix_now(),
+            service_started_unix: crate::unix_now(),
         });
         shared.runtime.lock().unwrap().phase = "running".into();
         let (stop, shutdown) = watch::channel(false);
@@ -181,6 +197,40 @@ mod tests {
         server.await.unwrap().unwrap();
         assert!(!path.exists());
     }
+    #[tokio::test]
+    async fn transient_accept_errors_back_off_then_serve_real_request() {
+        let path =
+            std::env::temp_dir().join(format!("tl-control-backoff-{}.sock", std::process::id()));
+        let control = bind(&path).unwrap();
+        let shared = Arc::new(Shared {
+            native: None,
+            config: timelord_core::Config::default(),
+            assignments: vec![],
+            clients: Default::default(),
+            process: crate::operational::State::fixture(),
+            runtime: Default::default(),
+            started_unix: crate::unix_now(),
+            service_started_unix: crate::unix_now(),
+            scope: crate::runtime::RuntimeScope::Production,
+        });
+        let (stop, shutdown) = watch::channel(false);
+        let started = std::time::Instant::now();
+        let server = tokio::spawn(run_with(
+            AcceptBackoff::with_injected([
+                std::io::Error::from_raw_os_error(libc::ECONNABORTED),
+                std::io::Error::from_raw_os_error(libc::EMFILE),
+            ]),
+            control,
+            shared,
+            shutdown,
+        ));
+        assert!(request(&path, true).await.unwrap().paused);
+        assert!(started.elapsed() >= Duration::from_millis(140));
+        stop.send(true).unwrap();
+        server.await.unwrap().unwrap();
+        assert!(!path.exists());
+    }
+
     #[tokio::test]
     async fn cleanup_never_removes_a_replacement_file() {
         let path = std::env::temp_dir().join(format!("tl-replacement-{}.sock", std::process::id()));

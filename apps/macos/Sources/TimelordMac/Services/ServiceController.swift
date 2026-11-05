@@ -1,28 +1,99 @@
 import Foundation
 
-/// Owns only the helper launched by this app; never an external Chia process.
+/// Controls an independently installed supervisor. The interface never owns or
+/// terminates the worker, and disappearing from the desktop changes no intent.
 @MainActor
 final class ServiceController {
     let configURL: URL
     let logsURL: URL
     let endpoint: URL
-    private let helperOverride: URL?
-    var helperURL: URL { helperOverride ?? ProcessInfo.processInfo.environment["TIMELORD_SERVICE_BINARY"].map { URL(fileURLWithPath: $0) } ?? Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/timelord-service") }
+    let helperURL: URL
+    let supervisorURL: URL
+    private let appURL: URL
     var onChange: (() -> Void)?
     private(set) var errorMessage: String?
-    private var process: Process?
-    private var logHandle: FileHandle?
-    var ownsService: Bool { process?.isRunning == true }
-    var processID: Int32? { process?.processIdentifier }
+    private(set) var supervisor: SupervisorStatus?
+    private var hasObservedSupervisor = false
+    private var changingIntent = false
+    private var controlEpoch: UInt64 = 0
+    // Before the first successful contact, an absent background service is setup.
+    // Once observed, losing contact must remain visible as a runtime failure.
+    var presentationError: String? { hasObservedSupervisor ? errorMessage : nil }
+    var canControlService: Bool { supervisor != nil }
+    var desiredRunning: Bool { supervisor?.mode == .running }
+    var processID: Int32? { supervisor?.workerPid }
+    private var client: SupervisorClient { SupervisorClient(helper: supervisorURL, config: configURL) }
 
-    init(configURL: URL? = nil, logsURL: URL? = nil, helperURL: URL? = nil, endpoint: URL? = nil) {
+    init(configURL: URL? = nil, logsURL: URL? = nil, helperURL: URL? = nil, endpoint: URL? = nil, supervisorURL: URL? = nil, appURL: URL? = nil) {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Timelord", isDirectory: true)
         let environment = ProcessInfo.processInfo.environment
-        self.helperOverride = helperURL
+        self.appURL = appURL ?? Bundle.main.bundleURL
+        self.helperURL = helperURL ?? environment["TIMELORD_SERVICE_BINARY"].map { URL(fileURLWithPath: $0) } ?? Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/timelord-service")
+        self.supervisorURL = supervisorURL ?? environment["TIMELORD_SUPERVISOR_BINARY"].map { URL(fileURLWithPath: $0) } ?? Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/timelord-supervisor")
         self.configURL = configURL ?? environment["TIMELORD_CONFIG"].map { URL(fileURLWithPath: $0) } ?? base.appendingPathComponent("config.toml")
-        self.logsURL = logsURL ?? base.appendingPathComponent("service.log")
-        let defaultEndpoint = URL(string: "http://127.0.0.1:9257/v1/status")!
-        self.endpoint = endpoint ?? environment["TIMELORD_STATUS_URL"].flatMap(URL.init(string:)) ?? defaultEndpoint
+        self.logsURL = logsURL ?? base.appendingPathComponent("supervisor.log")
+        self.endpoint = endpoint ?? environment["TIMELORD_STATUS_URL"].flatMap(URL.init(string:)) ?? URL(string: "http://127.0.0.1:9257/v1/status")!
+    }
+
+    func refresh() async {
+        guard !changingIntent else { return }
+        controlEpoch &+= 1
+        let epoch = controlEpoch
+        do {
+            let current = try await client.send(.status)
+            guard epoch == controlEpoch, !changingIntent else { return }
+            observe(current); errorMessage = current.error
+        } catch {
+            guard epoch == controlEpoch, !changingIntent else { return }
+            supervisor = nil; errorMessage = "Background supervision unavailable: \(error.localizedDescription)"
+        }
+    }
+
+    /// Fresh revision protects a remote administrator's concurrent Pause/Run.
+    @discardableResult
+    private func control(_ command: SupervisorClient.Command) async throws -> SupervisorStatus {
+        guard !changingIntent else { throw ConfigurationError.message("A background service change is already in progress.") }
+        controlEpoch &+= 1
+        changingIntent = true; defer { changingIntent = false; onChange?() }
+        let current: SupervisorStatus
+        do {
+            current = try await client.send(.status)
+        } catch {
+            errorMessage = error.localizedDescription; throw error
+        }
+        observe(current)
+        do {
+            supervisor = try await client.send(command, expectedRevision: current.revision)
+            errorMessage = supervisor?.error
+            return current
+        } catch {
+            if let refreshed = try? await client.send(.status) { observe(refreshed) }
+            errorMessage = error.localizedDescription; throw error
+        }
+    }
+    private func observe(_ status: SupervisorStatus) {
+        supervisor = status
+        hasObservedSupervisor = true
+    }
+    func start() async throws -> Bool { try await control(.resume).mode == .paused }
+    func stop() async throws { try await control(.pause) }
+    func reload() async throws { try await control(.reload) }
+
+    /// Only an explicit setup action opens the macOS administrator approval prompt.
+    /// The installer validates ownership/signatures and refuses competing workers.
+    func install() async throws {
+        let script = appURL.appendingPathComponent("Contents/Resources/install-service.sh")
+        let command = ["/bin/bash", script.path, "install", "--app", appURL.path,
+                       "--config", configURL.path, "--user", NSUserName()]
+            .map(Self.shellQuote).joined(separator: " ")
+        let appleScript = "do shell script \"\(Self.appleScriptQuote(command))\" with administrator privileges"
+        let executor = ConfigurationClient(helper: URL(fileURLWithPath: "/usr/bin/osascript"), config: configURL)
+        _ = try await executor.run(["-e", appleScript])
+        await refresh()
+    }
+    private static func shellQuote(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'" }
+    private static func appleScriptQuote(_ value: String) -> String {
+        value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
     }
 
     func prepareConfig() throws {
@@ -44,43 +115,4 @@ final class ServiceController {
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configURL.path)
     }
 
-    func start() throws {
-        guard !ownsService else { return }
-        // A child can have exited before its main-actor cleanup callback runs.
-        // Retire its handle now; that callback must not clear a replacement child.
-        if process != nil {
-            process = nil; try? logHandle?.close(); logHandle = nil
-        }
-        let helper = helperURL
-        guard FileManager.default.isExecutableFile(atPath: helper.path) else {
-            throw NSError(domain: "Timelord", code: 1, userInfo: [NSLocalizedDescriptionKey: "The service helper is missing. Rebuild the development app bundle."])
-        }
-        try prepareConfig()
-        try FileManager.default.createDirectory(at: logsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if !FileManager.default.fileExists(atPath: logsURL.path) { FileManager.default.createFile(atPath: logsURL.path, contents: nil) }
-        let handle = try FileHandle(forWritingTo: logsURL)
-        try handle.seekToEnd()
-        let child = Process()
-        child.executableURL = helper
-        child.arguments = ["serve", "--config", configURL.path]
-        child.standardOutput = handle
-        child.standardError = handle
-        child.terminationHandler = { [weak self] child in
-            Task { @MainActor in
-                guard let self, self.process === child else { return }
-                self.process = nil
-                try? self.logHandle?.close()
-                self.logHandle = nil
-                self.errorMessage = child.terminationStatus == 0 ? nil : "The local service stopped unexpectedly. Check its configuration and log."
-                self.onChange?()
-            }
-        }
-        do { try child.run() } catch { try? handle.close(); throw error }
-        process = child
-        logHandle = handle
-        errorMessage = nil
-        onChange?()
-    }
-
-    func stop() { if let process, process.isRunning { process.terminate() } }
 }

@@ -13,7 +13,7 @@ struct Overview: View {
                     Label(model.runControlTitle, systemImage: model.canPause ? "pause.fill" : "play.fill")
                 }
                 .labelStyle(.titleAndIcon)
-                .disabled(model.starting || (model.snapshot.serviceAvailable && !model.ownsService))
+                .disabled(model.isBusy || (model.snapshot.serviceAvailable && !model.canControlService))
                 .help(model.canPause ? "Pause Timelord" : "Run Timelord")
             }
             ToolbarItem(placement: .automatic) { Button { model.sheet = .settings } label: { Label("Settings", systemImage: "gearshape") } }
@@ -23,32 +23,36 @@ struct Overview: View {
 
     var content: some View {
         VStack(alignment: .leading, spacing: 20) {
-            HStack(alignment: .center, spacing: 24) {
-                VStack(alignment: .leading, spacing: 12) {
-                    HStack(spacing: 12) {
-                        Image(systemName: "circle.fill").font(.system(size: 12)).foregroundStyle(model.snapshot.phase.tone.color)
-                        Text(model.snapshot.runningTitle).font(.system(size: 30, weight: .semibold))
-                    }
-                    Text(model.snapshot.explanation).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    Text(model.snapshot.proofFreshness)
-                        .font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                }.frame(maxWidth: .infinity, alignment: .leading)
-                HStack(alignment: .top, spacing: 18) {
-                    MetricTile(title: "Delivered speed", value: model.snapshot.headlineSpeed, caption: "Challenge chain · last-hour average")
-                    Divider()
-                    MetricTile(title: "Proofs delivered", value: model.snapshot.proofsToday.map { $0.formatted() } ?? "—", caption: "Verified proofs sent to your node this run")
-                    Divider()
-                    MetricTile(title: "Uptime", value: DisplayFormat.uptime(model.snapshot.uptimeSeconds), caption: "Since the timelord started")
-                }.fixedSize(horizontal: false, vertical: true)
-                    .frame(width: 550).timelordCard(padding: 16)
-            }.padding(.vertical, 4)
-            ConnectionStrip(model: model)
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .center, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack(spacing: 12) {
+                            Image(systemName: "circle.fill").font(.system(size: 12)).foregroundStyle(model.snapshot.phase.tone.color)
+                            Text(model.snapshot.runningTitle).font(.system(size: 30, weight: .semibold))
+                        }
+                        if model.snapshot.phase != .running {
+                            Text(model.snapshot.explanation).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+                        }
+                        Text(model.snapshot.proofFreshness)
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                    HStack(alignment: .top, spacing: 18) {
+                        MetricTile(title: "IPS", value: model.snapshot.headlineSpeed, caption: "Last-hour average")
+                        Divider()
+                        MetricTile(title: "Proofs delivered", value: model.snapshot.proofsToday.map { $0.formatted() } ?? "—", caption: "Verified proofs sent to your node this run")
+                        Divider()
+                        MetricTile(title: "Service uptime", value: DisplayFormat.uptime(model.snapshot.uptimeSeconds), caption: "Engine session: \(DisplayFormat.uptime(model.snapshot.sessionUptimeSeconds))")
+                    }.fixedSize(horizontal: false, vertical: true)
+                        .frame(width: 550).timelordCard(padding: 16)
+                }
+                ConnectionStrip(model: model)
+            }
             HStack {
                 Text("Your boards").font(.title3.weight(.semibold))
                 Spacer()
                 if model.snapshot.automaticActive {
                     Button(model.snapshot.tuningPaused ? "Resume tuning" : "Pause tuning") { Task { await model.toggleTuning() } }
-                        .controlSize(.small).disabled(!model.ownsService || model.operationInProgress)
+                        .controlSize(.small).disabled(!model.canControlService || model.operationInProgress)
                         .help("Holds or resumes Automatic tuning while proof production continues")
                 }
                 Text("Chain assignments").font(.caption).foregroundStyle(.secondary)

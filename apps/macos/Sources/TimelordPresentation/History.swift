@@ -21,7 +21,9 @@ public struct ProofObservation: Identifiable, Sendable {
     public let date: Date
     public let ips: Double
     public let id: String
-    public init(date: Date, ips: Double, id: String? = nil) { self.date = date; self.ips = ips; self.id = id ?? "\(date.timeIntervalSince1970)-\(ips)" }
+    public let sequence: Int
+    public let boardID: String?
+    public init(date: Date, ips: Double, id: String? = nil, sequence: Int = 0, boardID: String? = nil) { self.date = date; self.ips = ips; self.id = id ?? "\(date.timeIntervalSince1970)-\(ips)"; self.sequence = sequence; self.boardID = boardID }
 }
 
 public enum HistoryEventKind: String, Sendable {
@@ -51,8 +53,9 @@ public struct HistoryEvent: Identifiable, Sendable {
     public let date: Date
     public let end: Date?
     public let kind: HistoryEventKind
+    public let boardID: String?
     public let id: String
-    public init(date: Date, end: Date?, kind: HistoryEventKind, id: String? = nil) { self.date = date; self.end = end; self.kind = kind; self.id = id ?? "\(kind.rawValue)-\(date.timeIntervalSince1970)" }
+    public init(date: Date, end: Date?, kind: HistoryEventKind, id: String? = nil, boardID: String? = nil) { self.date = date; self.end = end; self.kind = kind; self.id = id ?? "\(kind.rawValue)-\(date.timeIntervalSince1970)"; self.boardID = boardID }
     public var title: String { kind.title }
 }
 
@@ -86,11 +89,54 @@ public struct ChainHistory: Identifiable, Sendable {
 
     public func observations(in window: DateInterval) -> [ProofObservation] {
         samples.filter { $0.date >= window.start && $0.date <= window.end && $0.ips.isFinite && $0.ips >= 0 }
-            .sorted { $0.date < $1.date }
+            .sorted { $0.date == $1.date ? $0.sequence < $1.sequence : $0.date < $1.date }
+    }
+
+    /// Match the colo Prometheus scrape cadence. Each tick samples the latest
+    /// validated output; independent chains replace the gauge, never sum.
+    public static let scrapeSeconds: TimeInterval = 30
+    public static let staleSeconds: TimeInterval = 90
+
+    private func value(at date: Date, source: ProofObservation?, coverage: [DateInterval]) -> Double? {
+        guard let source, (0..<Self.staleSeconds).contains(date.timeIntervalSince(source.date)),
+              coverage.contains(where: { $0.start <= source.date && $0.end >= date }),
+              !events.contains(where: { $0.kind.interruptsWork && ($0.boardID == nil || source.boardID == nil || $0.boardID == source.boardID) && $0.date <= date && ($0.end ?? date) >= source.date }) else { return nil }
+        return source.ips
+    }
+
+    public func hasFreshValue(at date: Date) -> Bool {
+        let window = DateInterval(start: date.addingTimeInterval(-Self.staleSeconds), end: date)
+        guard let source = observations(in: window).last,
+              (0..<Self.staleSeconds).contains(date.timeIntervalSince(source.date)),
+              let capturedThrough = captureIntervals.map(\.end).max(),
+              date.timeIntervalSince(capturedThrough) < Self.scrapeSeconds else { return false }
+        // History refreshes every 15 seconds. Fresh live status gates the headline;
+        // do not treat the normal delay between history fetches as an outage.
+        return value(at: min(date, capturedThrough), source: source, coverage: mergedCaptureIntervals(in: window)) != nil
+    }
+
+    public func sampledObservations(in window: DateInterval) -> [ProofObservation] {
+        let sources = observations(in: DateInterval(start: window.start.addingTimeInterval(-Self.staleSeconds), end: window.end))
+        let coverage = mergedCaptureIntervals(in: DateInterval(start: window.start.addingTimeInterval(-Self.staleSeconds), end: window.end))
+        var index = 0
+        var source: ProofObservation?
+        var tick = (floor(window.start.timeIntervalSince1970 / Self.scrapeSeconds) + 1) * Self.scrapeSeconds
+        var result: [ProofObservation] = []
+        while tick <= window.end.timeIntervalSince1970 {
+            let date = Date(timeIntervalSince1970: tick)
+            while index < sources.count && sources[index].date <= date {
+                source = sources[index]; index += 1
+            }
+            if let ips = value(at: date, source: source, coverage: coverage) {
+                result.append(ProofObservation(date: date, ips: ips, id: "scrape-\(tick)", boardID: source?.boardID))
+            }
+            tick += Self.scrapeSeconds
+        }
+        return result
     }
 
     public func statistics(in window: DateInterval) -> HistoryStatistics {
-        let values = observations(in: window).map(\.ips)
+        let values = sampledObservations(in: window).map(\.ips)
         // Do not remove observations around recoveries or configuration changes.
         let mean = values.isEmpty ? nil : values.reduce(0, +) / Double(values.count)
         let seconds = mergedCaptureIntervals(in: window).reduce(0) { $0 + $1.duration }
@@ -113,7 +159,7 @@ public struct ChainHistory: Identifiable, Sendable {
     }
 
     public func plotPoints(in window: DateInterval) -> [PlotPoint] {
-        let points = observations(in: window)
+        let points = sampledObservations(in: window)
         let coverage = mergedCaptureIntervals(in: window)
         var previous: Date?
         var segment = 0
@@ -121,9 +167,9 @@ public struct ChainHistory: Identifiable, Sendable {
             if let previous {
                 let capturedContinuously = coverage.contains { $0.start <= previous && $0.end >= sample.date }
                 let interrupted = events.contains {
-                    $0.kind.interruptsWork && $0.date < sample.date && ($0.end ?? $0.date) > previous
+                    $0.kind.interruptsWork && ($0.boardID == nil || sample.boardID == nil || $0.boardID == sample.boardID) && $0.date < sample.date && ($0.end ?? $0.date) > previous
                 }
-                if !capturedContinuously || interrupted { segment += 1 }
+                if !capturedContinuously || interrupted || sample.date.timeIntervalSince(previous) > Self.scrapeSeconds { segment += 1 }
             }
             previous = sample.date
             return PlotPoint(date: sample.date, ips: sample.ips, segment: segment, id: sample.id)
@@ -132,8 +178,9 @@ public struct ChainHistory: Identifiable, Sendable {
 
     public func observation(near date: Date, in window: DateInterval) -> ProofObservation? {
         guard window.contains(date), mergedCaptureIntervals(in: window).contains(where: { $0.contains(date) }) else { return nil }
-        guard !events.contains(where: { $0.kind.interruptsWork && $0.date <= date && ($0.end ?? $0.date) > date }) else { return nil }
-        return observations(in: window).min { abs($0.date.timeIntervalSince(date)) < abs($1.date.timeIntervalSince(date)) }
+        guard let sample = sampledObservations(in: window).filter({ abs($0.date.timeIntervalSince(date)) <= Self.scrapeSeconds / 2 }).min(by: { abs($0.date.timeIntervalSince(date)) < abs($1.date.timeIntervalSince(date)) }) else { return nil }
+        guard !events.contains(where: { $0.kind.interruptsWork && ($0.boardID == nil || sample.boardID == nil || $0.boardID == sample.boardID) && $0.date <= date && ($0.end ?? $0.date) > date }) else { return nil }
+        return sample
     }
 
     public func events(in window: DateInterval) -> [HistoryEvent] {

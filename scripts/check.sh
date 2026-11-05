@@ -3,15 +3,19 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 bash scripts/bundle-inputs-test.sh
+bash scripts/bundle-icon-test.sh
 bash scripts/release-inputs-test.sh
 mkdir -p build
-c++ -std=c++17 -Wall -Wextra -Werror integrations/chiavdf/tests/live_control_test.cpp -o build/native-control-test
-build/native-control-test
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+TIMELORD_TEST_EXPOSITION="$PROJECT_ROOT/build/observability.prom" cargo test --workspace --locked
+promtool check metrics < build/observability.prom
+promtool check rules monitoring/alerts.yml
+promtool test rules monitoring/alerts.test.yml
 if [[ "$(uname -s)" == Darwin ]]; then
-  cargo build --locked -p timelord-service
+  cargo build --locked -p timelord-service -p timelord-supervisor
+  bash scripts/installer-inputs-test.sh
+  bash scripts/installer-remove-test.sh
   swift build --package-path apps/macos --scratch-path build/swift
   swift test --package-path apps/macos --scratch-path build/swift
 fi

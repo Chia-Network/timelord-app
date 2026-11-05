@@ -1,0 +1,22 @@
+# Container fragment; enable observability_listen and allow_remote_observability.
+ports:
+  - name: observability
+    containerPort: 9258
+startupProbe:
+  httpGet:
+    path: /healthz
+    port: observability
+  periodSeconds: 5
+  failureThreshold: 24
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: observability
+  periodSeconds: 10
+  failureThreshold: 3
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: observability
+  periodSeconds: 5
+  failureThreshold: 2

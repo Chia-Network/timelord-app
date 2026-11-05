@@ -27,28 +27,11 @@ struct IPSHistoryChart: View {
                         }
                     }
                     .chartYAxis {
-                        AxisMarks(position: .leading, values: .automatic(desiredCount: 4)) { value in
+                        AxisMarks(position: .leading, values: (0...4).map { upperBound * Double($0) / 4 }) { value in
                             AxisGridLine()
                             AxisValueLabel { if let ips = value.as(Double.self) { Text(DisplayFormat.ips(ips)) } }
                         }
                     }
-                    .chartOverlay { proxy in
-                        GeometryReader { geometry in
-                            Rectangle().fill(.clear).contentShape(Rectangle())
-                                .onContinuousHover { phase in
-                                    switch phase {
-                                    case .active(let location):
-                                        guard let plotFrame = proxy.plotFrame else { hovered = nil; return }
-                                        let frame = geometry[plotFrame]
-                                        guard frame.contains(location), let date: Date = proxy.value(atX: location.x - frame.minX) else { hovered = nil; return }
-                                        hovered = history.observation(near: date, in: window)
-                                    case .ended: hovered = nil
-                                    }
-                                }
-                        }
-                    }
-                Text(hovered.map { "\($0.date.formatted(date: .omitted, time: .shortened)) · \(DisplayFormat.ips($0.ips)) IPS" } ?? "Move over the chart to inspect a recorded proof.")
-                    .font(.caption).foregroundStyle(.secondary).monospacedDigit().frame(height: 18)
             }
         }
         .overlay {
@@ -58,7 +41,7 @@ struct IPSHistoryChart: View {
             }
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(history.chain.title) delivered IPS over \(range.title)")
+        .accessibilityLabel("\(history.chain.title) IPS over \(range.title)")
         .accessibilityValue("Average \(DisplayFormat.ips(history.statistics(in: window).average)); \(Int(history.statistics(in: window).coverage * 100)) percent telemetry coverage")
     }
 
@@ -74,20 +57,46 @@ struct IPSHistoryChart: View {
                 LineMark(x: .value("Time", point.date), y: .value("IPS", point.ips), series: .value("Segment", point.segment))
                     .foregroundStyle(history.chain.color)
                     .lineStyle(StrokeStyle(lineWidth: compact ? 1.6 : 2))
-                    .interpolationMethod(.linear)
+                    .interpolationMethod(.stepEnd)
             }
             if !compact {
                 ForEach(history.events(in: window).filter { $0.kind == .recovery || $0.kind == .profileChange }) { event in
                     RuleMark(x: .value("Event", event.date)).foregroundStyle(Color.orange.opacity(0.6)).lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
                 }
-                if let hovered {
-                    RuleMark(x: .value("Selected time", hovered.date)).foregroundStyle(Color.secondary.opacity(0.5))
-                    PointMark(x: .value("Time", hovered.date), y: .value("IPS", hovered.ips)).foregroundStyle(history.chain.color)
-                }
+            }
+            if let hovered {
+                RuleMark(x: .value("Selected time", hovered.date)).foregroundStyle(Color.secondary.opacity(0.5))
+                PointMark(x: .value("Time", hovered.date), y: .value("IPS", hovered.ips))
+                    .foregroundStyle(history.chain.color)
+                    .annotation(position: .top, spacing: 6, overflowResolution: .init(x: .fit(to: .chart), y: .disabled)) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(hovered.date, format: .dateTime.hour().minute().second()).font(.caption2)
+                            Text("\(Int(hovered.ips).formatted()) IPS").font(.caption.weight(.semibold))
+                        }
+                        .monospacedDigit().padding(8)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                        .shadow(color: .black.opacity(0.12), radius: 3, y: 2)
+                        .fixedSize().allowsHitTesting(false)
+                    }
             }
         }
         .chartXScale(domain: window.start...window.end)
         .chartYScale(domain: 0...upperBound)
         .chartLegend(.hidden)
+        .chartOverlay { proxy in
+            GeometryReader { geometry in
+                Rectangle().fill(.clear).contentShape(Rectangle())
+                    .onContinuousHover { phase in
+                        switch phase {
+                        case .active(let location):
+                            guard let plotFrame = proxy.plotFrame else { hovered = nil; return }
+                            let frame = geometry[plotFrame]
+                            guard frame.contains(location), let date: Date = proxy.value(atX: location.x - frame.minX) else { hovered = nil; return }
+                            hovered = history.observation(near: date, in: window)
+                        case .ended: hovered = nil
+                        }
+                    }
+            }
+        }
     }
 }

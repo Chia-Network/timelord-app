@@ -1,4 +1,7 @@
 //! Persistent native-client sessions. No USB or prover implementation lives here.
+mod arithmetic;
+use crate::observability::{ProofStage, SessionReason, proof_lane};
+use crate::runtime::RuntimeScope;
 use anyhow::{Context, Result, bail};
 use dg_xch_core::{
     blockchain::{
@@ -11,10 +14,11 @@ use dg_xch_timelord::worker::{ProofRequest, ProofResult};
 use dg_xch_vdf::{discriminant::create_discriminant_bytes, proof::verify_vdf_serial};
 use std::{
     collections::{BTreeSet, HashMap},
-    sync::{Arc, Mutex as SyncMutex},
+    sync::{Arc, Mutex as SyncMutex, atomic::AtomicBool},
     time::{Duration, Instant},
 };
-use timelord_core::{Chain, Config};
+use timelord_core::{Assignment, Chain, Config};
+use timelord_supervisor::progress::Stage;
 use tokio::{
     io::AsyncWriteExt,
     net::TcpStream,
@@ -29,6 +33,7 @@ pub struct Lease {
     pub socket: TcpStream,
     pub board: String,
     pub slot: u8,
+    pub generation: u64,
     pub clients: Arc<SyncMutex<BTreeSet<(String, u8)>>>,
 }
 impl Drop for Lease {
@@ -63,6 +68,8 @@ impl Drop for Lease {
 pub struct ProofTiming {
     iterations: u64,
     started: Instant,
+    pub ready_at: Instant,
+    pub ready_unix_ms: u128,
 }
 impl ProofTiming {
     pub fn started_unix(&self) -> u64 {
@@ -72,14 +79,20 @@ impl ProofTiming {
         self.iterations as f64 / self.started.elapsed().as_secs_f64()
     }
 }
+fn estimated_ips(iterations: u64, elapsed: Duration) -> f64 {
+    (iterations as f64 / elapsed.as_secs_f64() * 10.).floor() / 10.
+}
+
 struct Active {
     lease: Lease,
     key: ProofRequest,
     started: Instant,
+    estimated_started: Instant,
 }
 struct Lane {
     board: String,
     active: Mutex<Option<Active>>,
+    started_once: std::sync::atomic::AtomicBool,
 }
 #[derive(Debug)]
 pub struct AsicFailure {
@@ -96,10 +109,18 @@ impl std::error::Error for AsicFailure {}
 pub struct AsicBackend {
     lanes: Vec<(Chain, Lane)>,
     pools: HashMap<String, Mutex<mpsc::Receiver<Lease>>>,
+    process: Arc<crate::operational::State>,
+    scope: RuntimeScope,
+    runtime: Arc<SyncMutex<crate::runtime::RuntimeState>>,
 }
 impl AsicBackend {
-    pub fn new(config: &Config) -> Result<(Self, HashMap<String, mpsc::Sender<Lease>>)> {
-        let assignments = config.assignments().map_err(anyhow::Error::msg)?;
+    pub fn new(
+        config: &Config,
+        assignments: &[Assignment],
+        runtime: Arc<SyncMutex<crate::runtime::RuntimeState>>,
+        process: Arc<crate::operational::State>,
+    ) -> Result<(Self, HashMap<String, mpsc::Sender<Lease>>)> {
+        let scope = runtime.lock().expect("runtime").scope();
         let mut pools = HashMap::new();
         let mut offers = HashMap::new();
         for board in &config.hardware.boards {
@@ -108,25 +129,44 @@ impl AsicBackend {
             pools.insert(board.id.clone(), Mutex::new(rx));
         }
         let lanes = assignments
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|a| {
                 (
                     a.chain,
                     Lane {
                         board: a.board_id,
                         active: Mutex::new(None),
+                        started_once: std::sync::atomic::AtomicBool::new(false),
                     },
                 )
             })
             .collect();
-        Ok((Self { lanes, pools }, offers))
+        Ok((
+            Self {
+                lanes,
+                pools,
+                process,
+                scope,
+                runtime,
+            },
+            offers,
+        ))
+    }
+    fn metrics(&self) -> Option<&Arc<crate::observability::Metrics>> {
+        (self.scope == RuntimeScope::Production).then_some(&self.process.metrics)
+    }
+    pub fn observe_duration(&self, chain: Chain, stage: ProofStage, duration: Duration) {
+        if let Some(metrics) = self.metrics() {
+            metrics.duration(chain, stage, duration);
+        }
     }
     pub async fn prove(
         &self,
         chain: Chain,
         work: ProofRequest,
     ) -> Result<(ProofResult, ProofTiming)> {
-        self.prove_inner(chain, work).await.map_err(|error| {
+        self.prove_inner(chain, work, true).await.map_err(|error| {
             if error.is::<AsicFailure>() {
                 error
             } else {
@@ -144,10 +184,136 @@ impl AsicBackend {
             }
         })
     }
+    // A hardware outage belongs to one physical board. Keep other proof futures
+    // and the authenticated node session alive while that board's supervisor recovers.
+    pub async fn prove_when_available(
+        &self,
+        chain: Chain,
+        work: ProofRequest,
+        record_metric: bool,
+    ) -> Result<(ProofResult, ProofTiming)> {
+        work.validate_regular()?;
+        if work.iterations > MAX_REQUEST_ITERATIONS {
+            bail!("Request exceeds the native challenge iteration limit");
+        }
+        let lane = self
+            .lanes
+            .iter()
+            .find(|(c, _)| *c == chain)
+            .map(|(_, lane)| lane)
+            .context("Chain has no assigned ASIC")?;
+        let mut activity = record_metric.then(|| {
+            crate::observability::Activity::new(
+                self.runtime.clone(),
+                chain,
+                self.metrics().cloned(),
+            )
+        });
+        loop {
+            let (generation, unavailable) = {
+                let state = self.runtime.lock().expect("runtime");
+                state
+                    .boards
+                    .get(&lane.board)
+                    .map(|b| {
+                        (
+                            b.lifecycle.status().generation,
+                            !b.lifecycle
+                                .capacity(crate::unix_now(), state.safety.is_some())
+                                .accepts_work,
+                        )
+                    })
+                    .unwrap_or((0, state.safety.is_some()))
+            };
+            if unavailable {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+            let result = tokio::select! {
+                result = self.prove_inner(chain, work.clone(), record_metric) => result,
+                _ = async {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        let state = self.runtime.lock().expect("runtime");
+                        if state.boards.get(&lane.board).is_some_and(|b| b.lifecycle.status().generation != generation
+                            || !b.lifecycle.capacity(crate::unix_now(), state.safety.is_some()).accepts_work) { break; }
+                    }
+                } => continue,
+            };
+            match result {
+                Ok(proof) => {
+                    let mut state = self.runtime.lock().expect("runtime");
+                    for event in state.events.iter_mut() {
+                        if event.board_id.as_ref() == Some(&lane.board)
+                            && event.kind == "board_fault"
+                            && event.end_unix.is_none()
+                        {
+                            event.end_unix = Some(crate::unix_now());
+                        }
+                    }
+                    drop(state);
+                    if let Some(activity) = &mut activity {
+                        activity.finish();
+                    }
+                    return Ok(proof);
+                }
+                Err(error) => {
+                    let mut state = self.runtime.lock().expect("runtime");
+                    let hardware = state.boards.entry(lane.board.clone()).or_default();
+                    let verification = error
+                        .downcast_ref::<AsicFailure>()
+                        .is_some_and(|e| e.verification);
+                    if !hardware.lifecycle.report_fault(
+                        generation,
+                        if verification {
+                            crate::board_lifecycle::Fault::InvalidProof
+                        } else {
+                            crate::board_lifecycle::Fault::Transport
+                        },
+                        error.to_string(),
+                        crate::unix_now(),
+                    ) {
+                        continue;
+                    }
+                    hardware.fault(&error);
+                    hardware.raw_speeds.clear();
+                    let needs_attention = hardware.lifecycle.status().latched_fault;
+                    if verification {
+                        state.failed_proofs += 1;
+                    }
+                    if !state.events.iter().any(|e| {
+                        e.board_id.as_ref() == Some(&lane.board)
+                            && e.kind == "board_fault"
+                            && e.end_unix.is_none()
+                    }) {
+                        state.event(Some(lane.board.clone()), "board_fault");
+                    }
+                    state.phase = "waiting_for_clients".into();
+                    state.message = if needs_attention {
+                        format!("An ASIC needs attention: {error}")
+                    } else {
+                        "Waiting for ASIC recovery.".into()
+                    };
+                    // The owner supervisor quiesces before checkpointing this
+                    // restriction. Its durable active-owner marker covers a crash
+                    // or failed fault write; proof verification never waits on disk.
+                    drop(state);
+                    tracing::warn!(board=%lane.board, %error, verification, "ASIC proof lane unavailable");
+                }
+            }
+        }
+    }
+    pub async fn prime(&self, work: ProofRequest) -> Result<()> {
+        // A one-iteration primer keeps ICC ready; it is not a scheduled VDF output.
+        self.prove_when_available(Chain::InfusedChallenge, work, false)
+            .await?;
+        Ok(())
+    }
     async fn prove_inner(
         &self,
         chain: Chain,
         work: ProofRequest,
+        record_metric: bool,
     ) -> Result<(ProofResult, ProofTiming)> {
         work.validate_regular()?;
         if work.iterations > MAX_REQUEST_ITERATIONS {
@@ -159,10 +325,63 @@ impl AsicBackend {
             .find(|(c, _)| *c == chain)
             .context("No board assigned to chain")?
             .1;
+        let metrics = self.metrics().cloned();
+        let epoch = self.runtime.lock().expect("runtime").metric_epoch;
+        let process_progress = self.process.progress.clone();
+        let scope = self.scope;
         let mut owner = lane.active.lock().await;
+        let progress = process_progress.begin(
+            scope.io(proof_lane(chain)),
+            work.generation,
+            work.iterations,
+            Stage::Preparing,
+        );
         // Take ownership during I/O. Cancellation retires the socket instead of
         // leaving a partially consumed frame in a reusable session.
-        let mut active = owner.take();
+        let generation = self
+            .runtime
+            .lock()
+            .expect("runtime")
+            .boards
+            .get(&lane.board)
+            .map(|b| b.lifecycle.status().generation)
+            .unwrap_or(0);
+        let mut active = owner.take().filter(|a| a.lease.generation == generation);
+        // A new discriminant does not depend on the old socket. Start it before
+        // retiring that session or waiting for the native client to reconnect.
+        let changed_input = active
+            .as_ref()
+            .is_some_and(|s| !same_challenge(&s.key, &work));
+        let discriminant = if active
+            .as_ref()
+            .is_none_or(|s| !same_challenge(&s.key, &work))
+        {
+            // The permit and stage live in the actual blocking closure. Cancelling
+            // an async request cannot hide stuck GMP work or queue more of it.
+            let seed = work.challenge.const_bytes().to_vec();
+            let bits = work.discriminant_bits;
+            let metrics = metrics.clone();
+            Some(
+                arithmetic::spawn(
+                    process_progress.clone(),
+                    scope.arithmetic(proof_lane(chain)),
+                    work.generation,
+                    work.iterations,
+                    Stage::Preparing,
+                    move || {
+                        let started = Instant::now();
+                        let result = create_discriminant_bytes(&seed, bits);
+                        if let Some(metrics) = metrics {
+                            metrics.duration(chain, ProofStage::Discriminant, started.elapsed());
+                        }
+                        result
+                    },
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         if active
             .as_ref()
             .is_some_and(|s| !same_challenge(&s.key, &work))
@@ -173,23 +392,45 @@ impl AsicBackend {
         let mut active = match active {
             Some(session) => session,
             None => {
+                progress.stage(Stage::WaitingForClient);
+                let waiting = Instant::now();
                 let mut pool = self
                     .pools
                     .get(&lane.board)
                     .context("Missing board listener")?
                     .lock()
                     .await;
-                let mut lease = tokio::time::timeout(Duration::from_secs(30), pool.recv())
-                    .await
-                    .context("Waiting for ASIC client timed out")?
-                    .context("ASIC listener stopped")?;
-                let seed = work.challenge.const_bytes().to_vec();
-                let bits = work.discriminant_bits;
-                let magnitude =
-                    tokio::task::spawn_blocking(move || create_discriminant_bytes(&seed, bits))
-                        .await??;
+                let mut lease = tokio::time::timeout(Duration::from_secs(30), async {
+                    loop {
+                        let lease = pool.recv().await.context("ASIC listener stopped")?;
+                        let current = self
+                            .runtime
+                            .lock()
+                            .expect("runtime")
+                            .boards
+                            .get(&lane.board)
+                            .map(|b| b.lifecycle.status().generation)
+                            .unwrap_or(0);
+                        if lease.generation == current {
+                            return Ok::<_, anyhow::Error>(lease);
+                        }
+                    }
+                })
+                .await
+                .context("Waiting for ASIC client timed out")??;
+                if let Some(metrics) = &metrics {
+                    metrics.duration(chain, ProofStage::ClientWait, waiting.elapsed());
+                }
+                // Match Python timelord: start the IPS clock when assigning the
+                // client, even if discriminant preparation is already running.
+                let estimated_started = Instant::now();
+                progress.stage(Stage::Preparing);
+                let magnitude = discriminant
+                    .expect("A new session needs a discriminant")
+                    .await??;
                 let decimal = format!("-{}", num_bigint::BigUint::from_bytes_be(&magnitude));
                 let started = Instant::now();
+                progress.stage(Stage::Handshake);
                 lease
                     .socket
                     .write_all(&encode_initial(&decimal, &work.input.data.const_bytes())?)
@@ -203,13 +444,19 @@ impl AsicBackend {
                 if &ok != b"OK" {
                     bail!("ASIC client rejected the challenge");
                 }
+                let reason = session_reason(&lane.started_once, changed_input);
+                if let Some(metrics) = &metrics {
+                    metrics.session_started(chain, reason);
+                }
                 Active {
                     lease,
                     key: work.clone(),
                     started,
+                    estimated_started,
                 }
             }
         };
+        progress.stage(Stage::NativeWork);
         request(&mut active.lease.socket, work.iterations).await?;
         let proof = tokio::time::timeout(
             Duration::from_secs(3600),
@@ -220,18 +467,67 @@ impl AsicBackend {
             acknowledge_stop(&mut active.lease.socket).await?;
             bail!("ASIC stopped before returning its proof");
         };
+        // Freeze IPS on receipt, before verification or scheduler/send delays.
+        // Publish only after the proof has passed verification.
+        let ips = estimated_ips(work.iterations, active.estimated_started.elapsed());
         let checked = work.clone();
-        let result = tokio::task::spawn_blocking(move || verify(&checked, *proof))
-            .await?
-            .map_err(|error| AsicFailure {
+        progress.stage(Stage::Verifying);
+        let verification_started = Instant::now();
+        let verification = arithmetic::spawn(
+            process_progress.clone(),
+            scope.arithmetic(proof_lane(chain)),
+            work.generation,
+            work.iterations,
+            Stage::Verifying,
+            move || verify(&checked, *proof),
+        )
+        .await?
+        .await?;
+        if let Some(metrics) = &metrics {
+            metrics.duration(
+                chain,
+                ProofStage::Verification,
+                verification_started.elapsed(),
+            );
+        }
+        let result = verification.map_err(|error| {
+            if let Some(metrics) = &metrics {
+                metrics.verification_failed(chain);
+            }
+            AsicFailure {
                 board_id: lane.board.clone(),
                 verification: true,
                 message: error.to_string(),
-            })?;
+            }
+        })?;
         let timing = ProofTiming {
             iterations: work.iterations,
             started: active.started,
+            ready_at: Instant::now(),
+            ready_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
         };
+        if record_metric {
+            // Primers establish the ICC session but do not prove that a required
+            // chain can serve real work. Keep them out of readiness evidence.
+            {
+                let mut state = self.runtime.lock().expect("runtime");
+                let hardware = state.boards.entry(lane.board.clone()).or_default();
+                hardware
+                    .lifecycle
+                    .verified(active.lease.generation, active.lease.slot);
+            }
+            if let Some(metrics) = &metrics {
+                metrics.verified(epoch, chain, ips);
+            }
+            self.runtime.lock().expect("runtime").estimated(
+                chain,
+                ips,
+                crate::unix_now().saturating_sub(active.estimated_started.elapsed().as_secs()),
+            );
+        }
         *owner = Some(active);
         Ok((result, timing))
     }
@@ -240,6 +536,19 @@ impl AsicBackend {
             && let Some(mut active) = lane.active.lock().await.take()
         {
             let _ = stop(&mut active.lease.socket).await;
+        }
+    }
+    pub async fn stop_board(&self, board: &str) {
+        for (_, lane) in &self.lanes {
+            if lane.board == board
+                && let Some(mut active) = lane.active.lock().await.take()
+            {
+                let _ = stop(&mut active.lease.socket).await;
+            }
+        }
+        if let Some(pool) = self.pools.get(board) {
+            let mut pool = pool.lock().await;
+            while pool.try_recv().is_ok() {}
         }
     }
     pub async fn stop_all(&self) {
@@ -253,6 +562,15 @@ impl AsicBackend {
             let mut pool = pool.lock().await;
             while pool.try_recv().is_ok() {}
         }
+    }
+}
+fn session_reason(started_once: &AtomicBool, changed_input: bool) -> SessionReason {
+    if !started_once.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        SessionReason::Initial
+    } else if changed_input {
+        SessionReason::InputChange
+    } else {
+        SessionReason::Reconnect
     }
 }
 fn same_challenge(a: &ProofRequest, b: &ProofRequest) -> bool {
@@ -316,188 +634,4 @@ pub fn verify(work: &ProofRequest, proof: UnverifiedProof) -> Result<ProofResult
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use dg_xch_core::blockchain::sized_bytes::Bytes32;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use vdf_client_protocol::Checkpoint;
-    fn work(iterations: u64, bits: usize) -> ProofRequest {
-        ProofRequest {
-            generation: 1,
-            challenge: Bytes32::const_new([42; 32]),
-            input: ClassgroupElement::get_default_element(),
-            iterations,
-            discriminant_bits: bits,
-        }
-    }
-    fn canonical() -> UnverifiedProof {
-        let blob = include_bytes!("../tests/fixtures/checkpointed-proof.bin");
-        UnverifiedProof {
-            iterations: 360,
-            output: blob[..100].try_into().unwrap(),
-            witness: blob[100..200].try_into().unwrap(),
-            checkpoints: blob[200..]
-                .as_chunks::<141>()
-                .0
-                .iter()
-                .map(|s| Checkpoint {
-                    iterations: u64::from_be_bytes(s[..8].try_into().unwrap()),
-                    challenge_prime: s[8..41].try_into().unwrap(),
-                    witness: s[41..].try_into().unwrap(),
-                })
-                .collect(),
-        }
-    }
-    #[test]
-    fn converts_and_verifies_canonical_cpp_checkpoints_and_rejects_corruption() {
-        let request = work(360, 1024);
-        let proof = canonical();
-        let verified = verify(&request, proof.clone()).unwrap();
-        assert_eq!(verified.proof.witness_type, 2);
-        assert_eq!(verified.proof.witness.bytes.len(), 382);
-        let mut bad = proof.clone();
-        bad.checkpoints.swap(0, 1);
-        assert!(verify(&request, bad).is_err());
-        let mut bad = proof.clone();
-        bad.checkpoints[0].challenge_prime[3] ^= 1;
-        assert!(verify(&request, bad).is_err());
-        let mut bad = proof.clone();
-        bad.output[5] ^= 1;
-        assert!(verify(&request, bad).is_err());
-        assert!(verify(&work(361, 1024), proof).is_err());
-    }
-    async fn setup() -> (
-        Arc<AsicBackend>,
-        TcpStream,
-        Arc<SyncMutex<BTreeSet<(String, u8)>>>,
-    ) {
-        let config: Config =
-            toml::from_str("[[hardware.boards]]\nid='a'\nname='A'\nclient_port=18110\n").unwrap();
-        let (backend, offers) = AsicBackend::new(&config).unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (socket, _) = listener.accept().await.unwrap();
-        let clients = Arc::new(SyncMutex::new(BTreeSet::from([("a".into(), 0)])));
-        offers["a"]
-            .send(Lease {
-                socket,
-                board: "a".into(),
-                slot: 0,
-                clients: clients.clone(),
-            })
-            .await
-            .ok()
-            .unwrap();
-        (Arc::new(backend), client, clients)
-    }
-    async fn handshake(socket: &mut TcpStream) {
-        let mut header = [0; 4];
-        socket.read_exact(&mut header).await.unwrap();
-        assert_eq!(header[0], b'N');
-        let count: usize = std::str::from_utf8(&header[1..]).unwrap().parse().unwrap();
-        let mut body = vec![0; count + 101];
-        socket.read_exact(&mut body).await.unwrap();
-        socket.write_all(b"OK").await.unwrap();
-    }
-    async fn requested(socket: &mut TcpStream) -> u64 {
-        let mut length = [0; 2];
-        socket.read_exact(&mut length).await.unwrap();
-        let size: usize = std::str::from_utf8(&length).unwrap().parse().unwrap();
-        let mut value = vec![0; size];
-        socket.read_exact(&mut value).await.unwrap();
-        std::str::from_utf8(&value).unwrap().parse().unwrap()
-    }
-    #[tokio::test]
-    async fn successive_requests_share_a_challenge_and_stop_with_ack() {
-        let (backend, mut socket, clients) = setup().await;
-        let fixture = tokio::spawn(async move {
-            handshake(&mut socket).await;
-            for expected in [1, 20] {
-                assert_eq!(requested(&mut socket).await, expected);
-                let request = work(expected, 64);
-                let proof = dg_xch_vdf::proof::prove_result(
-                    request.challenge.as_ref(),
-                    request.input.data.as_ref(),
-                    64,
-                    expected,
-                )
-                .unwrap();
-                let mut raw = expected.to_be_bytes().to_vec();
-                raw.extend(100_u64.to_be_bytes());
-                raw.extend_from_slice(&proof[..100]);
-                raw.push(0);
-                raw.extend_from_slice(&proof[100..]);
-                let hex: Vec<_> = raw
-                    .iter()
-                    .flat_map(|b| format!("{b:02x}").into_bytes())
-                    .collect();
-                socket
-                    .write_all(&(hex.len() as u32).to_be_bytes())
-                    .await
-                    .unwrap();
-                for part in hex.chunks(7) {
-                    socket.write_all(part).await.unwrap();
-                }
-            }
-            assert_eq!(requested(&mut socket).await, 0);
-            socket.write_all(b"STOP").await.unwrap();
-            let mut ack = [0; 3];
-            socket.read_exact(&mut ack).await.unwrap();
-            assert_eq!(&ack, b"ACK");
-        });
-        for n in [1, 20] {
-            assert_eq!(
-                backend
-                    .prove(Chain::InfusedChallenge, work(n, 64))
-                    .await
-                    .unwrap()
-                    .0
-                    .info
-                    .number_of_iterations,
-                n
-            );
-        }
-        backend.stop_all().await;
-        fixture.await.unwrap();
-        assert!(clients.lock().unwrap().is_empty());
-    }
-    #[tokio::test]
-    async fn cancelled_proof_closes_its_partial_frame_and_releases_the_slot() {
-        let (backend, mut socket, clients) = setup().await;
-        let (sent, received) = tokio::sync::oneshot::channel();
-        let fixture = tokio::spawn(async move {
-            handshake(&mut socket).await;
-            requested(&mut socket).await;
-            socket.write_all(&[0, 0]).await.unwrap();
-            sent.send(()).unwrap();
-            let mut byte = [0];
-            match socket.read(&mut byte).await {
-                Ok(0) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
-                result => panic!("Expected closed cancelled session, got {result:?}"),
-            }
-            // Model the native EOF path's final STOP/proof writes. The retiring
-            // server must drain them instead of resetting the peer connection.
-            socket.write_all(b"STOP").await.unwrap();
-            for _ in 0..8 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-                socket.write_all(&[0; 32768]).await.unwrap();
-            }
-        });
-        let proving = tokio::spawn({
-            let backend = backend.clone();
-            async move { backend.prove(Chain::Challenge, work(10, 64)).await }
-        });
-        received.await.unwrap();
-        proving.abort();
-        let _ = proving.await;
-        tokio::time::timeout(Duration::from_secs(2), fixture)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(clients.lock().unwrap().is_empty());
-        backend.stop_all().await;
-    }
-}
+mod tests;

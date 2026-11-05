@@ -1,0 +1,80 @@
+{
+  "host": "m6mini",
+  "manifest": {
+    "native_revision": "446a0e1d118051364742648c7b8f3239b12a3dcb",
+    "native_pr": "https://github.com/Chia-Network/chiavdf/pull/450",
+    "service_sha256": "61764fa999cf39f5cb5a73ec9299d9afdbfbee1758d2a163e07f4fcd2523dd00",
+    "native_sha256": "d4566a2546da398734b281a1f8da124cd44c9fc655b292f920a494a6fcd98377",
+    "source_queue_sha256": "f16b6ed5838ceb0ad383df23145f742932b5f18dd6ebe5f1b9d022097fe9b800",
+    "archive_sha256": "76281dfad50f935c5d2bee1c3e2e8becb19f67dda59ab879bcd4437d4d4b407d",
+    "baseline_native_sha256": "5035bc5dc2eb3fb7e6c31137b1c3b84e73e4777bdd976c4acf1dc48940b49c73",
+    "startup_optimizations": [
+      "hardware SHA",
+      "six-worker canonical discriminant search",
+      "preparation overlaps client retirement"
+    ],
+    "diagnostic_instrumentation": false
+  },
+  "deployment": {
+    "installed": true,
+    "validation_completed_unix": 1792712865.916867,
+    "service_pid": 1834,
+    "proofs_delivered": 23,
+    "failed_proofs": 0,
+    "recoveries": 0,
+    "left_running": true
+  },
+  "opened_unix": 1792712745.805187,
+  "settings": {
+    "boards": 3,
+    "engines_per_board": 1,
+    "frequency_mhz": 1600,
+    "requested_voltage_v": 1.0,
+    "temperature_limit_c": 55,
+    "automatic_tuning_enabled": true,
+    "checkpoint_threshold": 250000,
+    "retain_asic_values": true,
+    "auxiliary_threads": 4,
+    "proof_thread_limit": 3
+  },
+  "config_changes": "Seeded each existing Automatic board start point at its current 1600 MHz / 1.0 V setting because learned state is keyed by the native binary hash. All other parsed settings were checked unchanged.",
+  "validation": {
+    "native_regression_tests_on_merged_source": 34,
+    "status_reported_delivered_proofs": 23,
+    "failed_proofs": 0,
+    "recoveries": 0,
+    "connected_clients": 3,
+    "timelord_state": "running",
+    "latest_proof_age_s": 8,
+    "node_state_resyncs": 1,
+    "aux_queue_warning_lines": 119,
+    "diagnostic_trace_lines": 0,
+    "max_temperatures_c": {
+      "ASIC 1": 42.35,
+      "ASIC 2": 41.68,
+      "ASIC 3": 37.9
+    }
+  },
+  "preserved_libraries": {
+    "Contents/Frameworks/libgmpxx.4.dylib": "875e1391d7c896c64004ada5997a6f3c1fe2ed8f2bc15c36776d76ca86cc4396",
+    "Contents/Frameworks/libft4222.dylib": "453b21f3c6dbf89168916be1ea26483084b83314b8d78d7cabd74e82a0202075",
+    "Contents/Frameworks/libftd2xx.dylib": "0a3ae31f16da56ec212c60ead43921bca22868cf0c502efdc8105cf017d1c7ad",
+    "Contents/Frameworks/libgmp.10.dylib": "bc89479f845374ae610aee6f5758d6e083f55a7c22e684bbb2ecf20f5db6c10b"
+  },
+  "backup_app": "/Users/cameron/timelord-pr450-deploy-20261022/Timelord-before-pr450.app",
+  "old_config_sha256": "61452e563888b88bad2731b0b7d830374f18010a01663ed0d8a82caa1be6f72f",
+  "new_config_sha256": "662b83fa9c195d55f8a5129246feb7a760e058b86fb6a228f71a4a249de8d7a9",
+  "local_evidence": "/private/tmp/timelord-pr450-deploy-20261022",
+  "remote_evidence": "/Users/cameron/timelord-pr450-deploy-20261022",
+  "evidence_sha256": {
+    "deployment-plan.json": "c7b098e0e4431cab3ea81700238d396d109cc52b22a2ac9d62eb08766a23e405",
+    "completed.json": "a3d9a3ff59d52dcda771788f03d1110066531d8dd4e65991760a264ec5a208f2",
+    "capture.log": "41a8adb7cc4afe150e7b78fbc82197502954c193900d7a79b0aa62883261d4a7",
+    "status-samples.jsonl": "75c1d31aa411428e6f5fa06b3327e39bc50e5a9baf3fc306fce6bd732c76fd89"
+  },
+  "limits": [
+    "Two-minute deployment health check, not a sustained IPS comparison or proof of peak performance.",
+    "The runtime uses an explicit PR #450 build. The normal repository native dependency pin remains unchanged until integration.",
+    "Hardware SHA, six-worker discriminant search and startup preparation/retirement overlap are preserved via the unchanged service helper."
+  ]
+}

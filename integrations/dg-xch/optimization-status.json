@@ -1,0 +1,80 @@
+{
+  "focus": "ASIC proof construction and delivered proof latency; preserve startup gains while testing checkpoint reuse",
+  "startup": {
+    "status": "retained; regression baseline for subsequent experiments",
+    "retained": [
+      {
+        "change": "RustCrypto ARM SHA backend",
+        "scope": "normal ARM app builds",
+        "commit": "1b85b41"
+      },
+      {
+        "change": "six-worker canonical discriminant search",
+        "scope": "experimental upstream patch; installed trial only, not applied by normal repo builds",
+        "evidence": "six-worker-trial.json"
+      },
+      {
+        "change": "prepare discriminant while old session retires or native client reconnects",
+        "scope": "normal app adapter",
+        "commit": "6b212cb"
+      }
+    ],
+    "measured_baseline": {
+      "evidence": "six-worker-trial.json",
+      "changed_reward_challenges": 23,
+      "request_to_first_accepted_mean_ms": 3.748913,
+      "request_to_first_accepted_median_ms": 3.637,
+      "prime_compute_mean_ms": 2.852522,
+      "prime_compute_hidden_before_client_mean_ms": 0.947522,
+      "remaining_prime_await_mean_ms": 1.919609,
+      "qualification": "October 22 six-minute instrumented window; first accepted ASIC value, not complete proof or sustained IPS"
+    },
+    "open": [
+      "Replay the same recorded challenges under comparable background proof load; keep measuring client retirement, prime scheduling/compute/overlap and native init separately.",
+      "Recheck startup latency under reduced checkpoint CPU load",
+      "Consider further discriminant predicate/arithmetic optimization only with canonical agreement tests",
+      "Measure spare-engine handoff overlap separately; no production implementation yet"
+    ],
+    "invariants": [
+      "Keep hardware SHA enabled",
+      "Use the same six-worker dependency for comparisons",
+      "Keep preparation overlapped with client retirement",
+      "Exclude process cold starts from warm handoff comparisons",
+      "Preserve canonical discriminant and IPS timer semantics"
+    ],
+    "latest_evidence": "checkpoint-reuse-trial.json",
+    "latest_observed_changed_reward_handoff": {
+      "samples": 8,
+      "median_ms": 5.9085,
+      "qualification": "Different seed/workload window; higher than earlier 3.637 ms baseline, needs paired replay"
+    },
+    "current_deployment": "hotplug-deployment.json; hardware SHA, six workers and startup overlap retained"
+  },
+  "completed_proof": {
+    "status": "Deployed to m6mini at user request; sustained paired IPS and long-chain measurement remain open",
+    "baseline": "proof-path-trial.json",
+    "next": [
+      "Measure sustained paired delivered IPS for the combined deployed build",
+      "Measure long-chain coarsening and large tails",
+      "Keep the structural cost estimate simple unless repeated measurements justify a refinement"
+    ],
+    "invariants": [
+      "No failed or invalid ancestor reuse",
+      "No reuse across native challenge sessions",
+      "At most 61 serialized checkpoints",
+      "Verify complete delivered proofs independently",
+      "Preserve the selected operating points, requested 1.0 V ceiling and 55 C guard"
+    ],
+    "native_pr": "https://github.com/Chia-Network/chiavdf/pull/450",
+    "evidence": "checkpoint-reuse-trial.json",
+    "completed": [
+      "Reuse running and completed checkpoint objects; no second cache",
+      "Exact cached target, out-of-order, ancestor failure and post-reuse failure regressions",
+      "Single and parallel proof-slot selection at the wire checkpoint limit",
+      "34 regressions and 96 independently verified final M6 fixture proofs plus negative controls",
+      "Three-minute final mainnet validation, then original app/configuration restored"
+    ],
+    "deployment_evidence": "hotplug-deployment.json",
+    "deployed_native_revision": "446a0e1d118051364742648c7b8f3239b12a3dcb"
+  }
+}
