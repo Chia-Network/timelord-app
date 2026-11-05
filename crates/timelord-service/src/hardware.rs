@@ -117,6 +117,7 @@ pub(crate) fn unavailable_for(
     boards: &std::collections::HashMap<String, HardwareState>,
     safety: Option<&crate::safety::Store>,
 ) -> std::collections::HashSet<String> {
+    let managed = safety.is_some();
     config
         .hardware
         .boards
@@ -124,11 +125,9 @@ pub(crate) fn unavailable_for(
         .filter(|board| {
             let policy = safety.map(|store| store.policy(board)).unwrap_or_default();
             policy.restriction.is_some()
-                || boards.get(&board.id).is_some_and(|state| {
-                    !state
-                        .lifecycle
-                        .capacity(crate::unix_now(), safety.is_some())
-                        .usable
+                || boards.get(&board.id).map_or(managed, |state| {
+                    (managed && !state.lifecycle.matches_serial(board.serial.as_deref()))
+                        || !state.lifecycle.capacity(crate::unix_now(), managed).usable
                 })
         })
         .map(|b| b.id.clone())

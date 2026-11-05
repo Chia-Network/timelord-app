@@ -138,10 +138,13 @@ impl BoardLifecycle {
             ..Self::default()
         }
     }
+    pub(super) fn matches_serial(&self, serial: Option<&str>) -> bool {
+        self.serial.as_deref() == serial
+    }
     /// Call before transferring a drained run's board into a new configuration.
     /// A different physical serial cannot inherit the old board's admission.
     pub(super) fn bind(&mut self, serial: Option<&str>) {
-        if self.serial.as_deref() != serial {
+        if !self.matches_serial(serial) {
             *self = Self {
                 serial: serial.map(str::to_owned),
                 ..Self::default()
@@ -195,8 +198,15 @@ impl BoardLifecycle {
         }
     }
     pub fn capacity(&self, now: u64, managed: bool) -> Capacity {
+        // Managed boards earn an assignment only after admission and a fresh
+        // inventory. Previously admitted boards can retain that reservation
+        // while rechecking; their phase independently gates proof work.
+        let admitted = match self.admission_inventory {
+            Some(_) => self.inventory == Some(Inventory::Present),
+            None => !managed,
+        };
         let usable = self.restriction.is_none()
-            && (self.admission_inventory.is_none() || self.inventory == Some(Inventory::Present))
+            && admitted
             && self
                 .unavailable_since
                 .is_none_or(|since| now.saturating_sub(since) < 60);

@@ -368,6 +368,50 @@ printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
 }
 
 #[test]
+fn managed_capacity_requires_completed_admission_and_confirmed_inventory() {
+    let dir = std::env::temp_dir().join(format!("tl-admission-capacity-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let store = crate::safety::Store::open(&dir.join("config.toml")).unwrap();
+    let mut config = Config::default();
+    config
+        .hardware
+        .boards
+        .push(toml::from_str("id='new'\nname='New'\nserial='N'\nclient_port=18110").unwrap());
+    let mut boards = std::collections::HashMap::<String, HardwareState>::new();
+    let blocked = |boards: &_| unavailable_for(&config, boards, Some(&store)).contains("new");
+    assert!(blocked(&boards));
+    assert!(!unavailable_for(&config, &boards, None).contains("new"));
+
+    let owner = &mut boards.entry("new".into()).or_default().lifecycle;
+    owner.bind(Some("N"));
+    owner.inventory(None, crate::board_lifecycle::Inventory::Present);
+    assert!(blocked(&boards));
+    boards.get_mut("new").unwrap().lifecycle.checking();
+    assert!(blocked(&boards));
+    boards.get_mut("new").unwrap().lifecycle.admitted(1);
+    assert!(blocked(&boards));
+    boards
+        .get_mut("new")
+        .unwrap()
+        .lifecycle
+        .inventory(Some(1), crate::board_lifecycle::Inventory::Present);
+    assert!(!blocked(&boards));
+    let owner = &mut boards.get_mut("new").unwrap().lifecycle;
+    owner.checking();
+    assert!(
+        !blocked(&boards),
+        "an admitted board keeps its reservation during recheck"
+    );
+    let mut replacement = config.clone();
+    replacement.hardware.boards[0].serial = Some("replacement".into());
+    assert!(
+        unavailable_for(&replacement, &boards, Some(&store)).contains("new"),
+        "a different serial cannot inherit admission through the same board ID"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn live_thermal_rejection_survives_retirement_checkpoint_and_policy_restore() {
     let dir = std::env::temp_dir().join(format!("tl-control-retirement-{}", std::process::id()));
     std::fs::create_dir(&dir).unwrap();
