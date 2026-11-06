@@ -38,12 +38,33 @@ post-job cleanup. Exactly one imported Developer ID Application identity must
 match the team. In the Release workflow, only the draft-release job receives
 `contents: write`; build and signing jobs have read-only repository permissions.
 
-The workflows use `GITHUB_TOKEN`; no GitHub personal access token is required.
-For **Prepare Release**, enable **Allow GitHub Actions to create and approve pull
-requests** in Settings → Actions → General → Workflow permissions (organization
-policy must also permit this). Preparation requests `contents: write`,
-`pull-requests: write`, and `actions: write` to push the version branch, open its
-PR, and explicitly dispatch CI. It does not approve or merge PRs.
+Release uses `GITHUB_TOKEN` and needs no personal access token.
+**Prepare Release** requests `contents: write` and `actions: write` to commit
+both Cargo version files directly to `main`, create the version tag, and dispatch
+Release. Repository and organization rules must permit the workflow token to
+push to `main` and create tags. Preparation respects those rules and does not
+bypass branch protection. It does not need pull-request permissions.
+
+This repository currently requires reviewed PRs on `main` and permits the
+`ChiaAutomation` account to bypass that requirement. For direct preparation,
+provide a repository or organization secret named `REPO_COMMIT` with
+that account's credential and repository Contents read/write access. Organization
+policy must permit use of that credential. Preparation uses it for Git access;
+it first checks the authenticated account and reported repository write access.
+The actual push also enforces token permissions and branch rules.
+Its tag push starts Release normally, so the workflow skips explicit dispatch to
+avoid duplicate builds. The credential does not need access to Apple secrets.
+Also grant this repository access to `CHIA_AUTOMATION_PRIVATE_GPG_KEY` and
+`CHIA_AUTOMATION_PRIVATE_GPG_PASSPHRASE`. Preparation imports that registered
+ChiaAutomation GPG key with a pinned importer, uses the key's name/email for the
+Git identity, and explicitly signs and verifies the version commit and annotated
+tag before pushing. Missing or unusable signing credentials stop preparation;
+it never falls back to unsigned commits. This satisfies `main`'s signed-commit
+requirement without changing repository protections.
+Without this secret, preparation falls back to `GITHUB_TOKEN`; that works only
+where branch rules already permit direct pushes by that token. With the current
+rules and no automation credential, the push is rejected before any remote
+commit or tag changes. No repository protection is relaxed by these workflows.
 Missing credentials fail the release before signing. Apple team registration and
 the certificate must permit Developer ID distribution and notarization.
 
@@ -53,37 +74,43 @@ the certificate must permit Developer ID distribution and notarization.
 2. In Actions → **Prepare Release** → **Run workflow**, select `main` and enter
    the new version without `v`, such as `0.1.1`, `0.2.0-beta.1`, or `0.2.0-rc.1`.
    Alternatively: `gh workflow run prepare-release.yml --ref main -f version=0.1.1`.
-   The workflow updates `[workspace.package].version` in `Cargo.toml`, runs
-   `cargo check --workspace` to refresh `Cargo.lock`, and opens a PR from
-   `release/vVERSION` to `main`. It explicitly starts CI on that branch using
-   `workflow_dispatch`, so checks do not depend on bot-created PR events.
-   Review the two-file diff, wait for CI, and merge the PR. Preparation creates
-   no tag or release and uses no Apple credentials.
-3. Check out the merged version commit and push a tag matching that exact source
-   version, such as `v0.1.1`. A mismatched
-   version, branch ref, unsupported suffix or malformed tag is rejected before
-   signing. To rerun manually, dispatch **Release** against that existing tag:
-   `gh workflow run release.yml --ref v0.1.1`.
-4. After CI succeeds, signing and notarization run automatically and create a draft.
-5. Review and publish the resulting draft in GitHub Releases. Beta/RC tags create
-   prerelease drafts. The workflow never publishes a release automatically.
+   Preparation updates `Cargo.toml`, runs `cargo check --workspace` to refresh
+   `Cargo.lock`, commits both files, and atomically pushes the version commit to
+   `main` together with its matching tag. The automation token's tag push starts
+   **Release**. When using the default `GITHUB_TOKEN`, preparation explicitly
+   dispatches Release instead, because that token's pushes do not trigger other
+   workflows.
+3. Follow **Actions → Release**. That workflow runs CI, builds, signs, notarizes,
+   and creates the draft release. A successful preparation run means Release was
+   started; follow the separate Release run for build and signing results.
+4. Review and publish the resulting draft in GitHub Releases. Beta/RC tags create
+   prerelease drafts. Publishing remains manual.
 
-Preparation refuses the current version, malformed versions, existing tags, and
-existing preparation branches; it never force-pushes. For an existing preparation
-PR, continue with that PR. If a run fails after pushing its branch but before
-opening the PR, open a PR from that branch and run CI against it manually. For
-failures before pushing, rerun preparation. To prepare locally instead, run
-`bash scripts/prepare-release.sh VERSION` and commit `Cargo.toml` and `Cargo.lock`.
-The already-configured source version can also be tagged directly for its first
-release without a preparation PR.
+There is no version-bump PR to merge and no separate tag or release to create in
+the GitHub UI. Preparation itself uses no Apple credentials; Release uses them
+after CI passes.
 
-For a stable release, after the version commit is merged and checked out (verify
-`HEAD` is the intended release commit before tagging):
+Preparation rejects malformed/current versions and existing tags. It never moves
+a tag, force-pushes, or modifies an existing published release. Older preparation
+branches and PRs do not block it and are not merged automatically. Existing
+mismatched tags, including tags created before their version bump landed, still
+require a new version or explicit maintainer-directed recovery.
 
-```sh
-git tag -a v0.1.1 -m 'Timelord 0.1.1'
-git push origin v0.1.1
-```
+If `main` advances during preparation, a tag is created concurrently, or branch
+protection rejects the commit, the atomic push changes neither remote ref. Rerun
+preparation from the updated `main` after resolving the cause. If the push succeeds
+but dispatch fails, the workflow summary contains the commit and tag; run
+`gh workflow run release.yml --ref vVERSION` to retry Release against that existing
+tag. For a later build or notarization failure, rerun Release against the same
+tag. Do not rerun preparation for an existing tag.
+
+To prepare locally instead, run `bash scripts/prepare-release.sh VERSION`, review
+the two Cargo files, then run `bash scripts/push-release.sh VERSION` from a clean
+checkout of `main` with a trusted Git signing key and matching identity configured.
+This signs, verifies, and pushes
+`main` and the tag. A tag pushed with your own credentials triggers Release;
+explicitly dispatch Release if using the workflow token. An already-configured
+source version may also be tagged directly for its first release.
 
 The release workflow reuses CI's app from the **same workflow run**, verifies its
 checksum, stamps the release version/source commit and signs FTDI/GMP, the native
