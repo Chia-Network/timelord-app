@@ -25,6 +25,8 @@ final class ConnectionProfileTests: XCTestCase {
         config.connections = profiles
         let model = TimelordModel(initialConfiguration: config, monitoringEnabled: false)
         model.configuration.node.host = "edited-mainnet.fixture"
+        model.configuration.node.rpc?.host = "corrected-rpc.fixture"
+        model.configuration.node.rpc?.port = 58555
         model.selectConnectionProfile("custom")
         XCTAssertEqual(model.configuration.node, custom)
         XCTAssertNil(model.configuration.node.rpc)
@@ -32,6 +34,7 @@ final class ConnectionProfileTests: XCTestCase {
         XCTAssertTrue(model.hasUnsavedSettings)
         model.selectConnectionProfile("main")
         var expected = mainnet; expected.host = "edited-mainnet.fixture"
+        expected.rpc?.host = "corrected-rpc.fixture"; expected.rpc?.port = 58555
         XCTAssertEqual(model.configuration.node, expected)
         XCTAssertNotNil(model.configuration.node.rpc)
         XCTAssertNil(model.configuration.node.networkDefinition)
@@ -66,6 +69,45 @@ final class ConnectionProfileTests: XCTestCase {
         XCTAssertFalse(model.hasUnsavedSettings)
         await model.saveConfiguration()
         XCTAssertEqual(model.configuration.connections?.profiles.count, 1)
+    }
+
+    func testRemovingProfilesSelectsRemainingConnectionAndLastRemovalReturnsToSetup() throws {
+        var first = NodeConfiguration(); first.host = "first.fixture"
+        first.certificate = "/fixture/first.crt"; first.privateKey = "/fixture/first.key"; first.caCertificate = "/fixture/ca.crt"
+        first.rpc = NodeRPCConfiguration(host: "rpc-first.fixture", certificate: "/fixture/rpc.crt", privateKey: "/fixture/rpc.key", caCertificate: "/fixture/ca.crt")
+        var second = first; second.host = "second.fixture"; second.rpc?.host = "rpc-second.fixture"
+        var profiles = ConnectionProfiles(); profiles.activeId = "first"
+        profiles.profiles = [ConnectionProfile(id: "first", name: "First", node: first), ConnectionProfile(id: "second", name: "Second", node: second)]
+        var config = AppConfiguration(); config.node = first; config.connections = profiles
+        let model = TimelordModel(initialConfiguration: config, monitoringEnabled: false)
+        model.removeConnectionProfile("missing")
+        XCTAssertEqual(model.configuration, config)
+        model.removeConnectionProfile("first")
+        XCTAssertEqual(model.configuration.connections?.activeId, "second")
+        XCTAssertEqual(model.configuration.node, second)
+        XCTAssertTrue(model.hasUnsavedSettings)
+        let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let restored = try decoder.decode(AppConfiguration.self, from: encoder.encode(model.configuration))
+        XCTAssertEqual(restored.connections?.profiles.map(\.id), ["second"])
+        XCTAssertEqual(restored.node.rpc, second.rpc)
+        model.removeConnectionProfile("second")
+        XCTAssertEqual(model.configuration.connections?.profiles.count, 0)
+        XCTAssertNil(model.configuration.connections?.activeId)
+        XCTAssertEqual(model.configuration.node, NodeConfiguration())
+        XCTAssertFalse(model.canStartService)
+    }
+
+    func testRemovingInactiveProfilePreservesActiveEdits() {
+        var profiles = ConnectionProfiles(); profiles.activeId = "keep"
+        profiles.profiles = [ConnectionProfile(id: "keep", name: "Keep", node: NodeConfiguration()), ConnectionProfile(id: "remove", name: "Remove", node: NodeConfiguration())]
+        var config = AppConfiguration(); config.connections = profiles
+        let model = TimelordModel(initialConfiguration: config, monitoringEnabled: false)
+        model.configuration.node.host = "edited.fixture"
+        model.removeConnectionProfile("remove")
+        XCTAssertEqual(model.configuration.node.host, "edited.fixture")
+        XCTAssertEqual(model.configuration.connections?.activeId, "keep")
+        XCTAssertEqual(model.configuration.connections?.profiles.map(\.id), ["keep"])
     }
 
 }

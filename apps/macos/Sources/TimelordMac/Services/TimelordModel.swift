@@ -414,6 +414,20 @@ final class TimelordModel: ObservableObject {
         configuration.node = selected.node
         nodeSync = nil; lastNodeSyncFetch = .distantPast
     }
+    /// Removing a profile edits configuration only; imported identity files can
+    /// still be referenced by other profiles and remain on disk.
+    func removeConnectionProfile(_ id: String) {
+        guard !operationInProgress, !isBusy, var connections = configuration.connections,
+              connections.profiles.contains(where: { $0.id == id }) else { return }
+        connections.profiles.removeAll { $0.id == id }
+        if connections.activeId == id {
+            let next = connections.profiles.first
+            connections.activeId = next?.id
+            configuration.node = next?.node ?? NodeConfiguration()
+            nodeSync = nil; lastNodeSyncFetch = .distantPast
+        }
+        configuration.connections = connections
+    }
     func chooseFile() -> String? {
         let panel = NSOpenPanel(); panel.canChooseFiles = true; panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         return panel.runModal() == .OK ? panel.url?.path : nil

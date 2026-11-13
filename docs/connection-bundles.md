@@ -70,6 +70,16 @@ Every import creates and selects a new **connection profile**. On the first impo
 the app also preserves your existing configured connection (for example Mainnet)
 as its own profile. Repeated imports create separate entries with distinct names.
 
+Use **Full node → Remove selected profile…** to remove obsolete profiles. Removal
+keeps certificate files on disk, since other profiles may reference them. Removing
+the last profile returns to connection setup. Apply the change with **Done** or
+**Save & Restart** (a paused service stays paused).
+
+The **Sync status and height** section lets you edit the selected profile's RPC
+host, port, TLS server name and certificate paths directly. Correct an imported
+endpoint there without creating another profile. Changes apply when saved;
+running Timelord uses **Save & Restart**.
+
 Use **Full node → Connection profile** to switch. Each profile restores its network
 definition, peer host/port, TLS server name, peer identity and optional RPC connection
 together. Changes are applied through **Done** or **Save & Restart**, preserving the

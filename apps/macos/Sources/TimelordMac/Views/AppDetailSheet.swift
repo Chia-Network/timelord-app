@@ -44,6 +44,7 @@ struct OperationFeedback: View {
 struct NodeConnectionSheet: View {
     @ObservedObject var model: TimelordModel
     @State private var location: String
+    @State private var removalTarget: ConnectionProfile?
     init(model: TimelordModel) {
         self.model = model
         _location = State(initialValue: ["localhost", "127.0.0.1", "::1"].contains(model.configuration.node.host) ? "local" : "remote")
@@ -61,6 +62,9 @@ struct NodeConnectionSheet: View {
                         .onChange(of: model.configuration.connections?.activeId) { _, _ in
                             location = ["localhost", "127.0.0.1", "::1"].contains(model.configuration.node.host) ? "local" : "remote"
                         }
+                        Button("Remove selected profile…", role: .destructive) {
+                            removalTarget = connections.profiles.first { $0.id == connections.activeId }
+                        }.disabled(model.isBusy)
                     }
                     Picker("Location", selection: $location) { Text("This Mac").tag("local"); Text("Another computer").tag("remote") }.pickerStyle(.segmented)
                     TextField("Host", text: $model.configuration.node.host)
@@ -97,11 +101,9 @@ struct NodeConnectionSheet: View {
                     TextField("TLS server name", text: Binding(get: { model.configuration.node.serverName ?? "chia.net" }, set: { model.configuration.node.serverName = $0 }))
                 }
                 Section("Sync status and height") {
-                    if let rpc = model.configuration.node.rpc {
-                        LabeledContent("Status connection", value: "\(rpc.host):\(rpc.port)")
-                    } else {
-                        Text("Choose the Chia folder to enable live sync status and height. A remote node’s connection bundle can include its status connection.").font(.callout).foregroundStyle(.secondary)
-                    }
+                    NodeRPCSettings(rpc: $model.configuration.node.rpc,
+                                    defaultHost: model.configuration.node.host,
+                                    chooseFile: model.chooseFile)
                 }
                 Section {
                     HStack {
@@ -112,6 +114,17 @@ struct NodeConnectionSheet: View {
                 }
             }.formStyle(.grouped).disabled(model.operationInProgress)
         }.frame(width: 660, height: 650).interactiveDismissDisabled()
+        .confirmationDialog("Remove connection profile?", isPresented: Binding(
+            get: { removalTarget != nil }, set: { if !$0 { removalTarget = nil } }
+        ), titleVisibility: .visible) {
+            Button("Remove profile", role: .destructive) {
+                if let profile = removalTarget { model.removeConnectionProfile(profile.id) }
+                removalTarget = nil
+            }
+            Button("Cancel", role: .cancel) { removalTarget = nil }
+        } message: {
+            Text("Remove “\(removalTarget?.name ?? "")” from saved settings. Certificate files stay on disk. Removing the last profile returns to connection setup. Use Done or Save & Restart to apply.")
+        }
     }
     private func credential(_ title: String, path: Binding<String?>) -> some View {
         HStack {

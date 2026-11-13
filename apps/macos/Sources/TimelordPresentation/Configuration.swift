@@ -75,6 +75,11 @@ public struct NodeRPCConfiguration: Codable, Sendable, Equatable {
     public var certificate: String
     public var privateKey: String
     public var caCertificate: String
+    public init(host: String = "localhost", port: Int = 8555, serverName: String = "chia.net",
+                certificate: String = "", privateKey: String = "", caCertificate: String = "") {
+        self.host = host; self.port = port; self.serverName = serverName
+        self.certificate = certificate; self.privateKey = privateKey; self.caCertificate = caCertificate
+    }
 }
 public struct ServiceConfiguration: Codable, Sendable, Equatable {
     public var statusListen = "127.0.0.1:9257"
