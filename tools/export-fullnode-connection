@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Export on the node using its existing Chia Python environment."""
+
+import argparse
+import importlib.metadata
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import socket
+import sys
+from datetime import datetime, timezone
+
+
+def detect_host():
+    """Ask the local routing table for a source address; send no traffic."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.connect(("192.0.2.1", 9))
+        address = sock.getsockname()[0]
+    ip = ipaddress.ip_address(address)
+    if ip.is_loopback or ip.is_unspecified or ip.is_link_local:
+        raise ValueError("Cannot suggest a LAN address; supply --node-host")
+    return address
+
+
+def port(value, name):
+    if type(value) is not int or not 1 <= value <= 65535:
+        raise ValueError(f"{name} must be a port between 1 and 65535")
+    return value
+
+
+def export(args, load_yaml, generate_cert):
+    root_value = args.chia_root or os.environ.get("CHIA_ROOT")
+    if not root_value:
+        raise ValueError("Supply --chia-root or set CHIA_ROOT")
+    root = Path(root_value).expanduser().resolve(strict=True)
+    config = load_yaml((root / "config/config.yaml").read_text())
+    node = config["full_node"]
+    network = node.get("selected_network", config.get("selected_network"))
+    if not isinstance(network, str) or not network.strip():
+        raise ValueError("Chia configuration has no selected network")
+    if config.get("selected_network", network) != network:
+        raise ValueError("Full node and root selected_network disagree")
+    peer_port = port(node.get("port"), "Full node port")
+    rpc_port = port(node.get("rpc_port"), "RPC port")
+    try:
+        host = args.node_host or detect_host()
+    except OSError as error:
+        raise ValueError("Cannot suggest a LAN address; supply --node-host") from error
+    if not host.strip() or host in ("0.0.0.0", "::"):
+        raise ValueError("--node-host must be a reachable hostname or address")
+    if not args.node_host:
+        print(f"Suggested node address: {host}; use --node-host to override", file=sys.stderr)
+    slug = re.sub(r"[^A-Za-z0-9._-]", "-", network).strip(".-") or "network"
+    output = Path(args.output or f"fullnode-{slug}-connection").expanduser()
+
+    # Respect this installation's CA paths, including custom peer CAs.
+    public_ca = config.get("chia_ssl_ca", {})
+    private_ca = config.get("private_ssl_ca", {})
+    peer_crt = (root / public_ca.get("crt", "config/ssl/ca/chia_ca.crt")).read_bytes()
+    peer_key = (root / public_ca.get("key", "config/ssl/ca/chia_ca.key")).read_bytes()
+    rpc_crt = (root / private_ca.get("crt", "config/ssl/ca/private_ca.crt")).read_bytes()
+    rpc_key = (root / private_ca.get("key", "config/ssl/ca/private_ca.key")).read_bytes()
+    q = lambda value: json.dumps(value, ensure_ascii=True)
+    # RPC stays on loopback by default; the consumer must establish the tunnel.
+    manifest = (
+        'schema_version = 1\n\n[node]\n'
+        f'host = {q(host)}\nport = {peer_port}\nnetwork = {q(network)}\n'
+        'server_name = "chia.net"\ncertificate = "client.crt"\n'
+        'private_key = "client.key"\nca_certificate = "ca.crt"\n\n'
+        '[node.rpc]\nhost = "127.0.0.1"\nport = 18555\n'
+        'server_name = "chia.net"\ncertificate = "rpc-client.crt"\n'
+        'private_key = "rpc-client.key"\nca_certificate = "private-ca.crt"\n'
+    )
+    overrides = node.get("network_overrides", config.get("network_overrides", {}))
+    provenance = {
+        "schema_version": 1,
+        "network_id": network,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "chia_version": importlib.metadata.version("chia-blockchain"),
+        "constants": overrides.get("constants", {}).get(network, {}),
+        "config_overrides": overrides.get("config", {}).get(network, {}),
+    }
+    # Do not remove an existing destination, including a symlink, on any failure.
+    output.mkdir(mode=0o700, parents=False, exist_ok=False)
+    try:
+        for crt, key, prefix in ((peer_crt, peer_key, "client"), (rpc_crt, rpc_key, "rpc-client")):
+            generate_cert(crt, key, output / f"{prefix}.crt", output / f"{prefix}.key")
+        (output / "ca.crt").write_bytes(peer_crt)
+        (output / "private-ca.crt").write_bytes(rpc_crt)
+        (output / "connection.toml").write_text(manifest)
+        (output / "network.json").write_text(json.dumps(provenance, indent=2) + "\n")
+        (output / "README.txt").write_text(
+            f"Network: {network}\nPeer: {host}:{peer_port}\n\n"
+            "For RPC sync status, establish an SSH tunnel on the Timelord Mac:\n"
+            f"ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:18555:127.0.0.1:{rpc_port} "
+            f"NODE_SSH_LOGIN@{host}\n\n"
+            "network.json preserves the selected network overrides and provenance.\n"
+            "The current app accepts only mainnet/testnet11; custom network import\n"
+            "and scheduler transition support must be implemented before use.\n"
+        )
+        for file in output.iterdir():
+            file.chmod(0o600)
+    except BaseException:
+        shutil.rmtree(output)
+        raise
+    return output
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--chia-root", help="Chia root (default: $CHIA_ROOT)")
+    parser.add_argument("--node-host", help="Address reachable from Timelord (default: suggested local route address)")
+    parser.add_argument("--output", help="New output folder (default: ./fullnode-NETWORK-connection)")
+    args = parser.parse_args()
+    os.umask(0o077)
+    try:
+        import yaml
+        from chia.ssl.create_ssl import generate_ca_signed_cert
+        output = export(args, yaml.safe_load, generate_ca_signed_cert)
+    except ImportError:
+        parser.exit(1, "Run this tool with the node's existing Chia Python environment.\n")
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        parser.exit(1, f"Export failed: {error}\n")
+    print(f"Created {output.resolve()}")
+
+
+if __name__ == "__main__":
+    main()

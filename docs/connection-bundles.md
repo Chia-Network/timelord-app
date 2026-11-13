@@ -34,6 +34,41 @@ and point `[node]` at that tunnel. This avoids changing the node's exemptions.
 
 ## Create a dedicated connection identity
 
+The repository includes `tools/export-fullnode-connection`. Run it on the full-node
+computer with the Python environment from that node's existing Chia installation:
+
+```sh
+export CHIA_ROOT="/Volumes/LaCie/chia/test-2026-11-13-2-chia"
+/path/to/chia/venv/bin/python tools/export-fullnode-connection
+```
+
+All three options are optional:
+
+- `--chia-root PATH` overrides `$CHIA_ROOT`. One of these must be supplied.
+- `--node-host HOST` overrides the suggested local routing address. The tool prints
+  the suggestion; check that the Timelord Mac can reach it, especially with a VPN
+  or multiple interfaces. If detection fails, supply this option explicitly.
+- `--output PATH` overrides `./fullnode-NETWORK-connection`. Existing destinations
+  are never overwritten.
+
+The exporter reads the configured peer/RPC ports and CA paths, generates separate
+peer and RPC leaf identities, and writes an owner-only bundle without changing
+the node configuration. No CA signing keys are exported. `network.json` preserves
+the selected network's consensus/config overrides, Chia version and export time.
+The root itself is not needed on the receiving Mac.
+
+RPC defaults to an SSH tunnel at `127.0.0.1:18555`; the generated `README.txt`
+contains the command with the node's actual RPC port. Replace `NODE_SSH_LOGIN`
+and keep the tunnel running on the Timelord Mac. For direct private-network RPC,
+edit `[node.rpc]` before importing, as described below.
+
+**Custom-network export is preparation only:** the current app importer accepts
+Mainnet and Testnet11. It does not yet consume `network.json`; custom-network
+import and scheduler transition support remain necessary to use ephemeral
+networks. The exporter does not test connections or run hardware.
+
+For a manual bundle instead, follow the steps below.
+
 Use the Python environment from the node's Chia installation. Replace the first
 two values below with that environment's Python executable and the full node's
 address as reachable from the Timelord Mac. This example is for mainnet, port 8444.
