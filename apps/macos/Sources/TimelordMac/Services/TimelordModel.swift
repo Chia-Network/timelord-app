@@ -154,12 +154,12 @@ final class TimelordModel: ObservableObject {
     }
 
     private func refreshNodeSync() async {
-        guard configuration.node == savedConfiguration.node else { nodeSync = nil; return }
+        guard configuration.node == savedConfiguration.node, !configurationNeedsRestart else { nodeSync = nil; return }
         if configurationLoaded && Date().timeIntervalSince(lastNodeSyncFetch) >= 15 {
             lastNodeSyncFetch = Date()
             let expectedNode = savedConfiguration.node
             let result = expectedNode.rpc == nil ? nil : try? await configurationClient.nodeState()
-            if savedConfiguration.node == expectedNode && configuration.node == expectedNode { nodeSync = result }
+            if savedConfiguration.node == expectedNode && configuration.node == expectedNode && !configurationNeedsRestart { nodeSync = result }
         }
     }
 
