@@ -9,6 +9,7 @@ use std::path::PathBuf;
 pub struct Config {
     pub schema_version: u32,
     pub node: NodeConfig,
+    pub connections: ConnectionProfiles,
     pub service: ServiceConfig,
     pub hardware: HardwareConfig,
 }
@@ -18,18 +19,20 @@ impl Default for Config {
         Self {
             schema_version: 1,
             node: NodeConfig::default(),
+            connections: ConnectionProfiles::default(),
             service: ServiceConfig::default(),
             hardware: HardwareConfig::default(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct NodeConfig {
     pub host: String,
     pub port: u16,
     pub network: Network,
+    pub network_definition: Option<NetworkDefinition>,
     pub server_name: Option<String>,
     pub certificate: Option<PathBuf>,
     pub private_key: Option<PathBuf>,
@@ -38,7 +41,7 @@ pub struct NodeConfig {
 }
 
 /// Separate private-service identity for read-only full-node status.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NodeRpcConfig {
     pub host: String,
@@ -55,6 +58,7 @@ impl Default for NodeConfig {
             host: "localhost".into(),
             port: 8444,
             network: Network::Mainnet,
+            network_definition: None,
             server_name: None,
             certificate: None,
             private_key: None,
@@ -64,22 +68,10 @@ impl Default for NodeConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Network {
-    #[default]
-    Mainnet,
-    Testnet11,
-}
-
-impl Network {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Mainnet => "mainnet",
-            Self::Testnet11 => "testnet11",
-        }
-    }
-}
+mod connections;
+pub use connections::{ConnectionProfile, ConnectionProfiles};
+mod network;
+pub use network::{ChainIdentity, Network, NetworkDefinition, NetworkValue};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -299,39 +291,8 @@ impl Config {
         if self.schema_version != 1 {
             return Err("Unsupported schema_version; expected 1".into());
         }
-        if self.node.host.trim().is_empty() || self.node.port == 0 {
-            return Err("Node host and nonzero port are required".into());
-        }
-        if let Some(rpc) = &self.node.rpc
-            && (rpc.host.trim().is_empty()
-                || rpc.port == 0
-                || rpc.server_name.trim().is_empty()
-                || [&rpc.certificate, &rpc.private_key, &rpc.ca_certificate]
-                    .iter()
-                    .any(|p| p.as_os_str().is_empty()))
-        {
-            return Err(
-                "Node RPC requires a host, port, TLS server name and all three credential paths"
-                    .into(),
-            );
-        }
-        let credentials = [
-            &self.node.certificate,
-            &self.node.private_key,
-            &self.node.ca_certificate,
-        ];
-        let supplied = credentials.iter().filter(|p| p.is_some()).count();
-        if supplied != 0 && supplied != 3 {
-            return Err(
-                "Supply all three node credential paths, or omit all three during setup".into(),
-            );
-        }
-        if credentials
-            .iter()
-            .any(|p| p.as_ref().is_some_and(|p| p.as_os_str().is_empty()))
-        {
-            return Err("Node credential paths cannot be empty".into());
-        }
+        self.node.validate()?;
+        self.connections.validate(&self.node)?;
         if !self.service.status_listen.ip().is_loopback() || self.service.status_listen.port() == 0
         {
             return Err("The status endpoint must use a loopback address and nonzero port".into());

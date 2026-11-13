@@ -37,6 +37,7 @@ pub(super) fn temperature(line: &str) -> Option<(f64, f64)> {
     let frequency: f64 = frequency.trim().parse().ok()?;
     (temperature.is_finite() && frequency.is_finite()).then_some((temperature, frequency))
 }
+#[cfg(test)]
 pub(super) async fn terminate(child: &mut Child) {
     if child.try_wait().ok().flatten().is_some() {
         return;
@@ -55,37 +56,6 @@ pub(super) async fn terminate(child: &mut Child) {
         let _ = child.wait().await;
     }
 }
-// Discard bounded raw chunks while retaining the marker plus a possible CR.
-// Native log prefixes are permitted; payload fields and LF/CRLF framing must
-// match exactly. An unterminated or truncated record is never confirmation.
-pub(super) async fn drain_shutdown(
-    source: &mut (impl tokio::io::AsyncRead + Unpin),
-) -> Result<bool> {
-    const MARKER: &[u8] = b"Hardware shutdown: engines_paused=1 safe_point_restored=1";
-    let mut buffer = [0u8; 1024];
-    let retained = MARKER.len() + 1;
-    let mut tail = Vec::with_capacity(buffer.len() + retained);
-    let mut confirmed = false;
-    loop {
-        let count = source.read(&mut buffer).await?;
-        if count == 0 {
-            return Ok(confirmed);
-        }
-        tail.extend_from_slice(&buffer[..count]);
-        confirmed |= tail
-            .windows(MARKER.len())
-            .enumerate()
-            .any(|(offset, candidate)| {
-                candidate == MARKER
-                    && matches!(
-                        &tail[offset + MARKER.len()..],
-                        [b'\n', ..] | [b'\r', b'\n', ..]
-                    )
-            });
-        let discard = tail.len().saturating_sub(retained);
-        tail.drain(..discard);
-    }
-}
 
 // Drain stderr even while control is awaiting its acknowledgement. A recovery
 // flood must not fill the pipe and block the USB owner before it reads TLSET.
@@ -98,6 +68,7 @@ pub(super) struct ClientLog {
     pub(super) preparing: Option<timelord_supervisor::progress::Guard>,
     pub(super) last_temperature: tokio::time::Instant,
     pub(super) recent: std::collections::VecDeque<String>,
+    shutdown_confirmed: bool,
 }
 pub(super) fn record_thermal_stop(
     state: &mut crate::runtime::RuntimeState,
@@ -135,6 +106,7 @@ impl ClientLog {
             preparing: None,
             last_temperature: tokio::time::Instant::now(),
             recent: Default::default(),
+            shutdown_confirmed: false,
         }
     }
     pub(super) async fn read(
@@ -159,6 +131,11 @@ impl ClientLog {
                 return Ok(None);
             }
         };
+        if self.lines.terminated()
+            && line.ends_with("Hardware shutdown: engines_paused=1 safe_point_restored=1")
+        {
+            self.shutdown_confirmed = true;
+        }
         self.recent.push_back(line.chars().take(512).collect());
         if self.recent.len() > 8 {
             self.recent.pop_front();
@@ -261,7 +238,7 @@ pub(super) struct NativeOwner {
 
 pub(super) struct NativeControl {
     pub(super) input: tokio::process::ChildStdin,
-    pub(super) output: BufReader<tokio::process::ChildStdout>,
+    pub(super) output: crate::bounded_lines::Lines<BufReader<tokio::process::ChildStdout>>,
     pub(super) sequence: u64,
     minimum_frequency: f64,
     maximum_frequency: f64,
@@ -274,6 +251,13 @@ impl NativeControl {
             && (self.minimum_frequency..=self.maximum_frequency).contains(&point.frequency_mhz)
             && (self.minimum_voltage..=1.).contains(&point.voltage_v)
     }
+    fn accepts_readback(&self, point: Point) -> bool {
+        point.frequency_mhz.is_finite()
+            && point.voltage_v.is_finite()
+            && (self.minimum_frequency - 1. ..=self.maximum_frequency + 1.)
+                .contains(&point.frequency_mhz)
+            && (self.minimum_voltage - 0.0063..=1.0063).contains(&point.voltage_v)
+    }
 }
 
 pub(super) fn force_safe(shared: &Shared, board: &BoardConfig) -> bool {
@@ -285,9 +269,58 @@ pub(super) fn force_safe(shared: &Shared, board: &BoardConfig) -> bool {
 pub(super) struct Startup {
     pub(super) point: Point,
     learned: Option<automatic::Learned>,
+    resume: Option<Point>,
 }
 pub(super) async fn startup(shared: &Shared, board: &BoardConfig) -> Result<Startup> {
+    let thermal = shared.persistent_owners()
+        && shared
+            .runtime
+            .lock()
+            .expect("runtime")
+            .safety
+            .as_ref()
+            .is_some_and(|store| {
+                store.policy(board).restriction == Some(crate::safety::Reason::Thermal)
+            });
+    if thermal {
+        let engines = shared
+            .assignments()
+            .iter()
+            .filter(|a| a.board_id == board.id)
+            .count()
+            .max(1);
+        let resume = admission::qualification(shared, board, engines)?.point;
+        return Ok(Startup {
+            point: Point {
+                frequency_mhz: 200.,
+                voltage_v: 0.7,
+            },
+            learned: None,
+            resume: Some(resume),
+        });
+    }
     if board.profile != ProfileMode::Automatic {
+        if shared.persistent_owners()
+            && shared
+                .runtime
+                .lock()
+                .expect("runtime")
+                .safety
+                .as_ref()
+                .is_some_and(|store| store.policy(board).restriction.is_some())
+        {
+            let engines = shared
+                .assignments()
+                .iter()
+                .filter(|a| a.board_id == board.id)
+                .count()
+                .max(1);
+            return Ok(Startup {
+                point: admission::qualification(shared, board, engines)?.point,
+                learned: None,
+                resume: None,
+            });
+        }
         let (frequency_mhz, voltage_v) = board.operating_point();
         return Ok(Startup {
             point: Point {
@@ -295,17 +328,20 @@ pub(super) async fn startup(shared: &Shared, board: &BoardConfig) -> Result<Star
                 voltage_v,
             },
             learned: None,
+            resume: None,
         });
     }
     let engines = shared
-        .assignments
+        .assignments()
         .iter()
         .filter(|a| a.board_id == board.id)
-        .count();
+        .count()
+        .max(1);
     if force_safe(shared, board) {
         return Ok(Startup {
             point: admission::qualification(shared, board, engines)?.point,
             learned: None,
+            resume: None,
         });
     }
     let facts = shared
@@ -316,6 +352,7 @@ pub(super) async fn startup(shared: &Shared, board: &BoardConfig) -> Result<Star
     Ok(Startup {
         point: automatic::initial_point(board, learned.as_ref()),
         learned,
+        resume: None,
     })
 }
 
@@ -325,28 +362,21 @@ impl NativeOwner {
         let owner = Self {
             control: NativeControl {
                 input: child.stdin.take().context("Native control input missing")?,
-                output: BufReader::new(
+                output: crate::bounded_lines::Lines::new(BufReader::new(
                     child
                         .stdout
                         .take()
                         .context("Native control output missing")?,
-                ),
+                )),
                 sequence: 0,
-                minimum_frequency: if automatic {
-                    board.automatic.min_frequency_mhz
-                } else {
-                    200.
-                },
+                // The thermal probe must remain possible below tuning minima.
+                minimum_frequency: 200.,
                 maximum_frequency: if automatic {
                     board.automatic.max_frequency_mhz
                 } else {
                     2200.
                 },
-                minimum_voltage: if automatic {
-                    board.automatic.min_voltage_v
-                } else {
-                    0.7
-                },
+                minimum_voltage: 0.7,
             },
             tuning: None,
         };
@@ -359,7 +389,7 @@ impl NativeOwner {
         log: &mut ClientLog,
         startup: Startup,
     ) -> Result<()> {
-        let Startup { point, learned } = startup;
+        let Startup { point, learned, .. } = startup;
         let tuning = if board.profile == ProfileMode::Automatic {
             let facts = shared
                 .native
@@ -452,31 +482,36 @@ impl NativeOwner {
 impl NativeControl {
     pub(super) async fn stop(self, child: &mut Child, log: ClientLog) -> bool {
         let Self {
-            input, mut output, ..
+            mut input,
+            output,
+            sequence,
+            ..
         } = self;
-        drop(input); // EOF asks the USB owner to quiesce before proof threads drain.
+        // Older clients reject an unfamiliar stop command by taking their
+        // existing fail-safe EOF path. The pinned client acknowledges it.
+        let stop_sequence = sequence.saturating_add(1);
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            input.write_all(format!("TLSTOP 1 {stop_sequence}\n").as_bytes()),
+        )
+        .await;
+        drop(input);
         let ClientLog {
             lines,
             initialization,
+            shutdown_confirmed,
             ..
         } = log;
         let _initialization = initialization;
-        let mut stderr = lines.into_inner();
-        let retired = tokio::time::timeout(Duration::from_secs(5), async {
-            let mut sink = tokio::io::sink();
-            let (exit, _, confirmed) = tokio::join!(
-                child.wait(),
-                tokio::io::copy(&mut output, &mut sink),
-                drain_shutdown(&mut stderr)
-            );
-            exit.is_ok() && confirmed.unwrap_or(false)
-        })
-        .await;
-        if let Ok(confirmed) = retired {
-            return confirmed;
-        }
-        terminate(child).await;
-        false
+        super::retirement::retire(
+            child,
+            output.into_inner(),
+            lines.into_inner(),
+            stop_sequence,
+            shutdown_confirmed,
+        )
+        .await
+        .confirmed()
     }
     pub(super) async fn change(&mut self, target: Point, seconds: u64) -> Result<Point> {
         if !self.accepts(target) {
@@ -495,18 +530,19 @@ impl NativeControl {
                 )
                 .await?;
             self.input.flush().await?;
-            let mut line = String::new();
             for _ in 0..16 {
-                line.clear();
-                if (&mut self.output).take(513).read_line(&mut line).await? == 0 {
+                let Some(record) = self.output.next_line().await? else {
                     return Err(NativeFailure::new(
                         NativeFailureKind::ControlClosed,
                         "Native control closed before acknowledgement",
                     )
                     .into());
-                }
-                if line.len() > 512 {
-                    bail!("Native control response too large");
+                };
+                let crate::bounded_lines::Line::Text(line) = record else {
+                    bail!("Native control response too large or invalid");
+                };
+                if line.len() > 512 || !self.output.terminated() {
+                    bail!("Native control response too large or incomplete");
                 }
                 if line.starts_with("TLERR ") {
                     let parts: Vec<_> = line.trim_end().splitn(4, ' ').collect();
@@ -526,7 +562,7 @@ impl NativeControl {
                     frequency_mhz: parts[3].parse()?,
                     voltage_v: parts[4].parse()?,
                 };
-                if !self.accepts(actual)
+                if !self.accepts_readback(actual)
                     || (actual.frequency_mhz - target.frequency_mhz).abs() > 1.
                     || (actual.voltage_v - target.voltage_v).abs() > 0.0063
                 {
@@ -536,7 +572,14 @@ impl NativeControl {
                     )
                     .into());
                 }
-                return Ok(actual);
+                // Store a replayable command point within configured bounds;
+                // physical voltage/frequency telemetry remains measured data.
+                return Ok(Point {
+                    frequency_mhz: actual
+                        .frequency_mhz
+                        .clamp(self.minimum_frequency, self.maximum_frequency),
+                    voltage_v: actual.voltage_v.clamp(self.minimum_voltage, 1.),
+                });
             }
             bail!("Native client did not acknowledge live control")
         })
@@ -574,9 +617,24 @@ pub(super) async fn supervise(
     startup: Startup,
 ) -> Result<()> {
     let setup_deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let recovering = shared.persistent_owners();
+    {
+        let mut state = shared.runtime.lock().expect("runtime");
+        let hardware = state.boards.entry(board.id.clone()).or_default();
+        hardware.native_pid = child.id();
+        if recovering {
+            hardware.lifecycle.checking();
+        }
+    }
+
     // Attach the pipes before polling initialization: cancellation must leave EOF
     // shutdown and its confirmation available to the same owner as normal exit.
+    let resume = startup.resume;
     let mut owner = NativeOwner::attach(&board, &mut child)?;
+    if resume.is_some() {
+        owner.control.minimum_frequency = 200.;
+        owner.control.minimum_voltage = 0.7;
+    }
 
     let output = child.stderr.take().context("ASIC client log unavailable")?;
     let mut log = ClientLog::new(output, ready);
@@ -592,6 +650,12 @@ pub(super) async fn supervise(
             result = tokio::time::timeout_at(setup_deadline, owner.initialize(&shared, &board, &mut log, startup)) => result.context("ASIC initialization timed out").and_then(|r| r).map(|()| true),
             _ = shutdown.changed() => Ok(false),
         }
+    };
+    let initialized = if matches!(initialized, Ok(true)) && recovering {
+        super::recovery::establish(&shared, &board, &mut owner, &mut log, &mut shutdown, resume)
+            .await
+    } else {
+        initialized
     };
     if let Err(error) = &initialized {
         let fault = classify(error);
@@ -688,6 +752,7 @@ pub(super) fn record_retirement(
         .lifecycle
         .retired(quiesced, error.map(ToString::to_string), crate::unix_now());
     hardware.raw_speeds.clear();
+    hardware.native_pid = None;
     if let Some(error) = error {
         hardware.fault(error);
     }
@@ -698,11 +763,22 @@ pub(super) async fn launch(
     startup: &Startup,
 ) -> Result<Child> {
     let engines = shared
-        .assignments
+        .assignments()
         .iter()
         .filter(|a| a.board_id == board.id)
-        .count();
-    let mut args = arguments(board, engines)?;
+        .count()
+        .max(1);
+    let mut args = arguments(
+        board,
+        if shared.persistent_owners() {
+            3
+        } else {
+            engines
+        },
+    )?;
+    if shared.persistent_owners() {
+        args.push("--engine-identity".into());
+    }
     if board.profile == ProfileMode::Automatic {
         let point = startup.point;
         let frequency = args

@@ -62,6 +62,7 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> Snapshot {
     // Capture process and runtime facts once; every projection uses this policy.
     let clients = shared.clients.lock().expect("clients");
     let state = shared.runtime.lock().expect("runtime");
+    let assignments = crate::hardware::continuous::routed_assignments(shared, &state);
     let process = shared.process.snapshot();
     let mut samples = Samples::default();
     let incomplete = || {
@@ -84,12 +85,7 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> Snapshot {
             epoch: None,
         };
     }
-    samples.add(
-        "clients_configured",
-        &[],
-        &[],
-        shared.assignments.len() as f64,
-    );
+    samples.add("clients_configured", &[], &[], assignments.len() as f64);
     samples.add("clients_connected", &[], &[], clients.len() as f64);
     let connected = ["authenticated", "ready"].contains(&state.node.as_str());
     samples.add("node_connected", &[], &[], f64::from(connected));
@@ -124,22 +120,17 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> Snapshot {
         }
     }
     for c in Chain::ALL {
-        let available = shared
-            .assignments
-            .iter()
-            .find(|a| a.chain == c)
-            .is_some_and(|a| {
-                let needed = shared
-                    .assignments
-                    .iter()
-                    .filter(|other| other.board_id == a.board_id && required.contains(&other.chain))
-                    .count();
-                state
-                    .boards
-                    .get(&a.board_id)
-                    .is_some_and(|h| board_usable(h, managed, now))
-                    && sockets(&a.board_id) >= needed.max(1)
-            });
+        let available = assignments.iter().find(|a| a.chain == c).is_some_and(|a| {
+            let needed = assignments
+                .iter()
+                .filter(|other| other.board_id == a.board_id && required.contains(&other.chain))
+                .count();
+            state
+                .boards
+                .get(&a.board_id)
+                .is_some_and(|h| board_usable(h, managed, now))
+                && sockets(&a.board_id) >= needed.max(1)
+        });
         samples.add(
             "chain_required",
             &["chain"],
@@ -158,8 +149,7 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> Snapshot {
         let label = board(&shared.config, &b.id);
         let label = label.as_str();
         let hardware = state.boards.get(&b.id);
-        let needed = shared
-            .assignments
+        let needed = assignments
             .iter()
             .filter(|a| a.board_id == b.id && required.contains(&a.chain))
             .count();
@@ -174,7 +164,7 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> Snapshot {
             .map(|h| h.lifecycle.status().phase.as_str())
             .unwrap_or("not_inspected");
         samples.add("board_state", &["board", "state"], &[label, state_name], 1.);
-        for assignment in shared.assignments.iter().filter(|a| a.board_id == b.id) {
+        for assignment in assignments.iter().filter(|a| a.board_id == b.id) {
             samples.add(
                 "chain_assignment",
                 &["board", "chain"],
@@ -243,7 +233,7 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> Snapshot {
     }
     let reason = if shared.config.node.certificate.is_none() {
         "setup_required"
-    } else if shared.assignments.is_empty() {
+    } else if assignments.is_empty() {
         "waiting_for_clients"
     } else if !connected {
         "waiting_for_node"

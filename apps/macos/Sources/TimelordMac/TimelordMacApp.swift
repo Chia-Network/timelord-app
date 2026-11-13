@@ -11,7 +11,8 @@ struct TimelordMacApp: App {
 private struct TimelordScenes: Scene {
     @ObservedObject var model: TimelordModel
     var body: some Scene {
-        WindowGroup("Timelord", id: "main") { Overview(model: model) }
+        // Menu-bar open requests should focus the single dashboard window.
+        Window("Timelord", id: "main") { Overview(model: model) }
             .defaultSize(width: 1180, height: 820)
             .windowResizability(.contentMinSize)
             .commands {

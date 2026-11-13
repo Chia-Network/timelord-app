@@ -28,6 +28,7 @@ struct BoardDetailSheet: View {
     var content: some View {
                 VStack(alignment: .leading, spacing: 24) {
                     StatusBadge(title: board.state.title, tone: board.state.tone)
+                    if let recovery = board.recoveryText(at: snapshot.now) { Text(recovery).font(.callout).foregroundStyle(.secondary) }
                     VStack(alignment: .leading, spacing: 18) {
                         HStack {
                             Text("IPS").font(.headline)

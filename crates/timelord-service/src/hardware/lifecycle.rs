@@ -269,6 +269,16 @@ impl BoardLifecycle {
             }
         };
     }
+    /// Fresh owner initialization supersedes historical uncertainty. Proofs
+    /// still pass native verification before any production submission.
+    pub(super) fn recovered(&mut self) {
+        self.native = Native::Ready;
+        self.phase = Phase::Connected;
+        self.restriction = None;
+        self.fault_reason = None;
+        self.unavailable_since = None;
+        self.inventory = Some(Inventory::Present);
+    }
     pub(super) fn checking(&mut self) {
         self.phase = Phase::Checking;
     }

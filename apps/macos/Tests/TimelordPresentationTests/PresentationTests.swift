@@ -103,6 +103,11 @@ final class PresentationTests: XCTestCase {
                 XCTAssertEqual(board.rawSpeed(for: history.chain)?.engine, expected)
                 XCTAssertEqual(board.rawSpeed(for: history.chain)?.ips, Double(1_000_000 + expected))
             }
+            if count == 2 {
+                board.assignedEngines = [1, 0]
+                XCTAssertEqual(board.rawSpeed(for: .challenge)?.engine, 1)
+                XCTAssertEqual(board.rawSpeed(for: .reward)?.engine, 0)
+            }
             board.rawSpeeds = []
             XCTAssertNil(board.rawSpeed(for: histories[0].chain))
         }
@@ -522,9 +527,21 @@ extension PresentationTests {
                       "Stale status cannot preserve board presence")
     }
 
-    private func operationalStatus(production: Bool = true, latest: Double = 1_000_000, state: String = "running", message: String = "Producing verified proofs.", chains: [String] = ["challenge","reward","infused_challenge"], faultKind: String? = nil) throws -> ServiceStatus {
+    func testRecoveryRemainsVisibleAndCountsDownWithoutRequiringRun() throws {
+        let status = try operationalStatus(production: false, state: "waiting_for_clients", recoveryReason: "Cooling ASIC", retryAfter: 1_000_010)
+        let snapshot = LivePresentation.snapshot(status: status, detectedDevices: [], now: now)
+        XCTAssertEqual(snapshot.phase, .starting)
+        XCTAssertEqual(snapshot.boards.count, 1)
+        XCTAssertEqual(snapshot.boards.first?.state, .recovering)
+        XCTAssertEqual(snapshot.boards.first?.recoveryText(at: now), "Cooling ASIC · Retrying in 10s")
+        XCTAssertEqual(snapshot.boards.first?.recoveryText(at: now.addingTimeInterval(11)), "Cooling ASIC · Retrying automatically")
+    }
+
+    private func operationalStatus(production: Bool = true, latest: Double = 1_000_000, state: String = "running", message: String = "Producing verified proofs.", chains: [String] = ["challenge","reward","infused_challenge"], faultKind: String? = nil, recoveryReason: String? = nil, retryAfter: Double? = nil) throws -> ServiceStatus {
         var board: [String: Any] = ["id":"a","name":"A","client_port":18110,"assigned_chains":chains,"connected_clients":3,"hardware_state":"connected","temperature_c":42.5,"temperature_limit_c":55,"frequency_mhz":1540,"voltage_v":1,"recoveries":2,"latest_proof_unix":latest,"profile":"Manual"]
         if let faultKind { board["fault_kind"] = faultKind }
+        if let recoveryReason { board["recovery_reason"] = recoveryReason; board["hardware_state"] = "fault" }
+        if let retryAfter { board["retry_after_unix"] = retryAfter }
         let object: [String: Any] = ["api_version":1,"service_pid":42,"service_state":"ready","timelord_state":state,"message":message,"production_enabled":production,"started_unix":999000,"timestamp_unix":1000000,"latest_proof_unix":latest,"proofs_delivered":7,"tuning_paused":false,
             "full_node":["host":"localhost","port":8444,"network":"mainnet","state":"ready"],
             "boards":[board],"connected_client_count":3,"delivered_ips":1000000]
@@ -637,6 +654,37 @@ extension PresentationTests {
         let reconnecting = LivePresentation.snapshot(status: try status(["reconnecting", "reconnecting"]), now: now)
         XCTAssertEqual(reconnecting.phase, .waitingForProofs)
         XCTAssertTrue(reconnecting.boards.allSatisfy { $0.state == .disconnected })
+    }
+
+    func testAdmissionFailureShowsActualReasonInsteadOfNodeOrMissingBoardAdvice() throws {
+        let message = "ASIC 1 needs attention: Admission native owner did not confirm hardware quiescence"
+        func status(_ hardware: String, node: String = "disconnected", state: String = "waiting_for_clients") throws -> ServiceStatus {
+            let object: [String: Any] = ["api_version": 1, "service_pid": 42, "timestamp_unix": 1_000_000, "started_unix": 999000,
+                "timelord_state": state, "message": message, "production_enabled": true, "proofs_delivered": 0, "tuning_paused": false,
+                "full_node": ["host": "fixture", "port": 58445, "network": "ephemeral", "state": node],
+                "boards": [["id": "a", "name": "ASIC 1", "assigned_chains": [], "connected_clients": 0, "hardware_state": hardware, "profile": "Automatic"]]]
+            let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+            return try decoder.decode(ServiceStatus.self, from: JSONSerialization.data(withJSONObject: object))
+        }
+        // An active FTDI owner can hide enumeration metadata. Lifecycle rows
+        // describe checking/failure, without claiming detection or productivity.
+        let failed = LivePresentation.snapshot(status: try status("quarantined"), detectedDevices: [], now: now)
+        XCTAssertEqual(failed.phase, .boardMissing)
+        XCTAssertEqual(failed.explanation, message)
+        XCTAssertEqual(failed.boards.count, 1)
+        XCTAssertEqual(failed.boards.first?.state, .needsAttention)
+        XCTAssertEqual(failed.boards.first?.state.title, "Needs attention")
+        XCTAssertEqual(failed.headlineSpeed, "—")
+        let checking = LivePresentation.snapshot(status: try status("checking", node: "waiting_for_hardware"), detectedDevices: [], now: now)
+        XCTAssertEqual(checking.phase, .starting)
+        XCTAssertEqual(checking.boards.first?.state, .checking)
+        XCTAssertEqual(checking.explanation, message)
+        let unavailable = LivePresentation.snapshot(status: try status("connected", state: "waiting_for_node"), now: now)
+        XCTAssertEqual(unavailable.phase, .nodeUnreachable)
+        let nodeFailure = LivePresentation.snapshot(status: try status("quarantined", state: "waiting_for_node"), now: now)
+        XCTAssertEqual(nodeFailure.phase, .nodeUnreachable, "Admission advice must not mask a real node-session failure")
+        let paused = LivePresentation.snapshot(status: try status("quarantined"), paused: true, now: now)
+        XCTAssertEqual(paused.phase, .paused)
     }
 
 }

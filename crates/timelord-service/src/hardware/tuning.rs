@@ -166,6 +166,32 @@ impl Tuning {
         shutdown: &mut watch::Receiver<bool>,
     ) -> Result<()> {
         let now = crate::unix_now();
+        if shared.persistent_owners() {
+            let engines = shared
+                .assignments()
+                .iter()
+                .filter(|a| a.board_id == board.id)
+                .count();
+            if engines == 0 {
+                self.policy.interrupt_trial(now);
+                self.experiment.take();
+                return Ok(());
+            }
+            if engines != self.engines {
+                self.experiment.take();
+                self.engines = engines;
+                self.raw_window = Default::default();
+                if let Some(facts) = &shared.native {
+                    self.policy = Policy::new(
+                        board.automatic.clone(),
+                        self.policy.point,
+                        now,
+                        facts.frequencies.clone(),
+                    );
+                }
+                self.last_record_unix = now;
+            }
+        }
         let gate = shared.runtime.lock().expect("runtime").experiments.clone();
         if gate.admission_pending() {
             self.policy.interrupt_trial(now);
@@ -192,8 +218,7 @@ impl Tuning {
                     &hardware.raw_speeds,
                 );
             }
-            let chains: Vec<_> = shared
-                .assignments
+            let chains: Vec<_> = crate::hardware::continuous::routed_assignments(shared, &state)
                 .iter()
                 .filter(|a| a.board_id == board.id)
                 .map(|a| a.chain)

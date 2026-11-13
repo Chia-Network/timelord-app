@@ -2567,6 +2567,7 @@ name = "timelord-core"
 version = "1.0.0"
 dependencies = [
  "serde",
+ "serde_json",
  "toml",
 ]
 
@@ -2617,6 +2618,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "timelord-core",
  "tokio",
 ]
 

@@ -9,6 +9,14 @@ helpers and VDF verifier. Our `runtime.rs` owns the node session and injects our
 `asic.rs` backend directly when executing scheduler plans. Upstream's regular
 service/CLI is not used: it constructs a CpuBackend and recomputes each request.
 
+Custom Chia network imports resolve the exact exported network ID and supported
+constant overrides in our `network.rs` adapter, using pinned Mainnet constants as
+the baseline. They do not use upstream's DGX seed-derived chain format. Newer
+constant fields are retained for provenance without changing upstream consensus
+capabilities. The scheduler, PoS2 verifier and message codecs remain at the pin
+above; offline custom import/handshake tests do not establish transition support
+or live consensus acceptance.
+
 The adapter keeps one logical-chain session per assigned board, retains squaring
 across requests with identical generation/challenge/input, primes the validated infused-chain input as soon as
 peak/slot state arrives (including while signage plans omit ICC), prepares the canonical
@@ -20,7 +28,11 @@ request identity and consensus proof validity before sending a node message.
 Normal resets drain proofs through STOP/ACK and close the old connection; timeout
 or cancellation closes the lease. Cancellation cannot leave a partial native frame
 in a reused socket. Node disconnects cancel workers and drain retained sessions.
-Invalid ASIC results latch a hardware fault and stop owned clients.
+Invalid ASIC results stop the affected owner's work, not other owners or the
+node session. Managed owners recover indefinitely with cooldowns, fresh hardware
+initialization and private verification after invalid proofs. Unknown retirement
+evidence requests conservative recovery rather than a permanent admission gate.
+Every production proof still requires native verification and scheduler checks.
 
 The offline checkpoint fixture is generated and independently verified by canonical
 C++ chiavdf. The adapter has tests for persistent successive requests, partial-frame
@@ -118,3 +130,13 @@ restarts, with healthy native sessions and the full-node peer connection retaine
 during an isolated hardware outage. Offline socket/process/TLS fixtures exercise
 recovery, exhaustion and safety latches. The live check verifies deployment health
 only; it does not inject a physical board fault or establish an IPS improvement.
+
+`continuous-recovery-deployment.json` records the user-authorized November 13
+custom-testnet deployment. The injected native SIGTERM recovered automatically
+while retaining the supervisor, worker, healthy owner PIDs and the exact node TCP
+connection through the recovery check. Other chains delivered verified proofs
+during recovery. A separate ASIC 2 native timeout also recurred and recovered;
+a process sample locates the stall in FTDI `BulkOutRequest` during engine enable.
+The other two owners delivered 88 additional proofs in a subsequent 50-second
+capture, with zero verification failures. The USB stall remains unresolved; this
+is not an all-board stability result or a PoS transition test.

@@ -1,4 +1,20 @@
 use super::*;
+#[tokio::test]
+async fn thermal_probe_is_allowed_below_optimization_minima() {
+    let board: BoardConfig = toml::from_str("id='probe'\nname='Probe'\nprofile='automatic'\nclient_port=18110\n[automatic]\nmin_frequency_mhz=1600.0\nmin_voltage_v=0.9").unwrap();
+    let mut child = Command::new("/bin/cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let owner = NativeOwner::attach(&board, &mut child).unwrap();
+    assert!(owner.control.accepts(Point {
+        frequency_mhz: 200.,
+        voltage_v: 0.7
+    }));
+    child.kill().await.unwrap();
+}
 #[test]
 fn recovery_records_are_parsed_once_at_the_native_boundary() {
     assert_eq!(

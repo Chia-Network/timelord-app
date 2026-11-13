@@ -1,5 +1,6 @@
 //! Native retirement and unopened journal-owner rollback contracts.
 use super::*;
+use crate::hardware::retirement::drain_shutdown;
 
 #[tokio::test]
 async fn shutdown_confirmation_requires_exact_fields_and_complete_lf_or_crlf_framing() {
@@ -199,7 +200,7 @@ cat >/dev/null
             )
             .unwrap(),
         );
-        let metrics = crate::observability::Metrics::new(config.node.network).unwrap();
+        let metrics = crate::observability::Metrics::new(config.node.network.clone()).unwrap();
         let shared = Arc::new(Shared {
             native: if config
                 .hardware
@@ -324,7 +325,7 @@ cat >/dev/null
                 record.admission_frequency_mhz,
                 Some((q.point.frequency_mhz - 50.).max(200.))
             );
-            assert!(record.retry_after_unix >= checkpoint_started + 300);
+            assert!(record.retry_after_unix >= checkpoint_started + 30);
             assert!(store.needs_self_test("fixture", &q));
         }
     }

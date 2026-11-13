@@ -50,8 +50,9 @@ pub async fn check(mut config: Config) -> Result<Vec<CheckedProof>> {
             listeners.push((board.id.clone(), capacity, listener));
         }
     }
-    let process =
-        crate::operational::State::new(crate::observability::Metrics::new(config.node.network)?);
+    let process = crate::operational::State::new(crate::observability::Metrics::new(
+        config.node.network.clone(),
+    )?);
     let runtime = Arc::new(Mutex::new(RuntimeState::new(false)));
     let (backend, offers) =
         AsicBackend::new(&config, &assignments, runtime.clone(), process.clone())?;

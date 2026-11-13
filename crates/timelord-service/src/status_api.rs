@@ -52,6 +52,7 @@ struct BoardStatus {
     name: String,
     client_port: u16,
     assigned_chains: Vec<Chain>,
+    assigned_engines: Vec<u8>,
     connected_clients: usize,
     hardware_state: String,
     temperature_c: Option<f64>,
@@ -63,6 +64,9 @@ struct BoardStatus {
     serial: Option<String>,
     recoveries: u64,
     fault_kind: Option<crate::hardware::NativeFailureKind>,
+    recovery_reason: Option<String>,
+    retry_after_unix: Option<u64>,
+    native_pid: Option<u32>,
     automatic: Option<automatic::Status>,
     latest_proof_unix: Option<u64>,
 }
@@ -78,6 +82,7 @@ async fn status(State(http): State<observability::HttpState>) -> Json<Status> {
     let shared = http.current.borrow().clone();
     let clients = shared.clients.lock().expect("client state lock");
     let runtime = shared.runtime.lock().expect("runtime");
+    let assignments = crate::hardware::continuous::routed_assignments(&shared, &runtime);
     Json(Status {
         diagnostic_logging: timelord_supervisor::logging::Writer::stderr_stats(),
         configuration_fallback: shared.process.progress.using_last_good(),
@@ -93,7 +98,7 @@ async fn status(State(http): State<observability::HttpState>) -> Json<Status> {
         full_node: NodeStatus {
             host: shared.config.node.host.clone(),
             port: shared.config.node.port,
-            network: shared.config.node.network,
+            network: shared.config.node.network.clone(),
             state: if shared.config.node.certificate.is_none() {
                 "not_connected".into()
             } else {
@@ -109,11 +114,15 @@ async fn status(State(http): State<observability::HttpState>) -> Json<Status> {
                 id: b.id.clone(),
                 name: b.name.clone(),
                 client_port: b.client_port,
-                assigned_chains: shared
-                    .assignments
+                assigned_chains: assignments
                     .iter()
                     .filter(|a| a.board_id == b.id)
                     .map(|a| a.chain)
+                    .collect(),
+                assigned_engines: assignments
+                    .iter()
+                    .filter(|a| a.board_id == b.id)
+                    .map(|a| a.engine)
                     .collect(),
                 connected_clients: clients.iter().filter(|(id, _)| id == &b.id).count(),
                 hardware_state: runtime
@@ -139,6 +148,12 @@ async fn status(State(http): State<observability::HttpState>) -> Json<Status> {
                 serial: b.serial.clone(),
                 recoveries: runtime.boards.get(&b.id).map(|b| b.recoveries).unwrap_or(0),
                 fault_kind: runtime.boards.get(&b.id).and_then(|b| b.fault_kind),
+                recovery_reason: runtime
+                    .boards
+                    .get(&b.id)
+                    .and_then(|h| h.recovery_reason.clone()),
+                retry_after_unix: runtime.boards.get(&b.id).and_then(|h| h.retry_after_unix),
+                native_pid: runtime.boards.get(&b.id).and_then(|h| h.native_pid),
                 automatic: runtime.boards.get(&b.id).and_then(|b| b.automatic.clone()),
                 latest_proof_unix: runtime
                     .observations
@@ -151,8 +166,7 @@ async fn status(State(http): State<observability::HttpState>) -> Json<Status> {
                                 .get(&b.id)
                                 .map(|h| h.lifecycle.status().started_unix)
                                 .unwrap_or(0)
-                            && shared
-                                .assignments
+                            && assignments
                                 .iter()
                                 .any(|a| a.board_id == b.id && a.chain == o.chain)
                     })
@@ -175,8 +189,8 @@ async fn status(State(http): State<observability::HttpState>) -> Json<Status> {
 
 async fn history(State(http): State<observability::HttpState>) -> Json<serde_json::Value> {
     let shared = http.current.borrow().clone();
-    let scope =
-        history_store::scope(&shared.config, &shared.assignments).expect("validated history scope");
+    let scope = history_store::scope(&shared.config, &shared.assignments())
+        .expect("validated history scope");
     let saved = {
         let runtime = shared.runtime.lock().expect("runtime");
         history_store::Snapshot::capture(scope, &runtime, shared.started_unix, unix_now())

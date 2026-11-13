@@ -1,5 +1,6 @@
 mod monitor;
 mod process;
+mod startup;
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use process::OwnedProcess;
@@ -35,6 +36,19 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Start or reconnect to a user-session supervisor, preserving Run/Pause.
+    EnsureStarted {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        worker: Option<PathBuf>,
+        #[arg(long)]
+        monitor_listen: Option<std::net::SocketAddr>,
+        #[arg(long)]
+        status_listen: Option<std::net::SocketAddr>,
+        #[arg(long, default_value_t = Network::Mainnet)]
+        network: Network,
+    },
     /// Print the system LaunchDaemon registration without installing anything.
     LaunchdPlist {
         #[arg(long)]
@@ -45,7 +59,7 @@ enum Action {
         user: String,
         #[arg(long)]
         monitor_listen: Option<std::net::SocketAddr>,
-        #[arg(long, value_enum, default_value_t = Network::Mainnet)]
+        #[arg(long, default_value_t = Network::Mainnet)]
         network: Network,
     },
     /// Refuse migration while an existing coordinator holds its ownership lock.
@@ -60,7 +74,7 @@ enum Action {
         worker: Option<PathBuf>,
         #[arg(long)]
         monitor_listen: Option<std::net::SocketAddr>,
-        #[arg(long, value_enum, default_value_t = Network::Mainnet)]
+        #[arg(long, default_value_t = Network::Mainnet)]
         network: Network,
     },
     Status {
@@ -94,6 +108,19 @@ enum Action {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
+        Action::EnsureStarted {
+            config,
+            worker,
+            monitor_listen,
+            status_listen,
+            network,
+        } => {
+            let status =
+                startup::ensure_started(config, worker, monitor_listen, status_listen, network)
+                    .await?;
+            println!("{}", serde_json::to_string(&status)?);
+            Ok(())
+        }
         Action::LaunchdPlist {
             app,
             config,
@@ -159,6 +186,7 @@ async fn main() -> Result<()> {
                     expected_revision,
                 } => (config, Control::Reload, expected_revision),
                 Action::Run { .. }
+                | Action::EnsureStarted { .. }
                 | Action::LaunchdPlist { .. }
                 | Action::CheckOwner { .. }
                 | Action::Diagnostics { .. } => {
@@ -265,7 +293,7 @@ impl Worker {
         // Let the coordinator close native control channels and drain proof
         // work first. The group-wide hard stop remains the bounded fallback.
         self.process.signal_leader(libc::SIGTERM);
-        self.process.wait_for_exit(Duration::from_secs(10)).await?;
+        self.process.wait_for_exit(Duration::from_secs(25)).await?;
         let result = self.process.kill_and_reap(Duration::from_secs(3)).await?;
         for task in &mut self.log_tasks {
             if tokio::time::timeout(Duration::from_secs(1), &mut *task)

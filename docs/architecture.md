@@ -59,23 +59,15 @@ A ten-second timeout kills and reaps a stuck helper instead of leaving a blockin
 thread running. Helper crashes, invalid JSON and bounded-output failures are
 inventory errors, not an empty inventory or a reason to stop healthy boards.
 The driver stays loaded until its helper exits, avoiding unload while its USB
-background threads may still be running. Serial identity survives USB-port changes. The active plan includes only
-detected boards; one/two/three boards receive 3 / 2+1 / 1+1+1 engines. The service
-polls USB every five seconds and requires three consistent inventories before
-replacing the layout. Enumeration errors leave the existing layout intact; fresh
-supervised owners cover metadata omitted by open FTDI interfaces. An idle chain
-needs no leased proof socket. Client health and USB presence are separate: a
-known-present board stays in the layout during transport or sensor recovery. Only
-a successful inventory taken after its native owner has closed can confirm that
-its serial is absent. The 60-second sensor watchdog still stops and retries the
-affected client; latched safety faults remain excluded from presence fallback. Old scheduler,
-client listeners and native owners stop before new ones start, while the status
-HTTP listener stays available. Zero boards waits for reconnection. Each layout
-selects its own engine-count/mask tuning profile, and safety faults remain latched
-across transitions. Explicit serial-pinned mappings do not redistribute. A changed
-assignment starts a new chart scope and run counters; old chain samples never
-become observations for another board. The service and UI keep disconnected
-board settings by serial. Configuration edits still require a manual restart.
+background threads may still be running. Serial identity survives USB-port changes. Managed board owners reserve three physically identified engine sockets. Automatic
+layouts route chains over current healthy capacity (3 / 2+1 / 1+1+1 engines),
+without replacing healthy native processes or the node session. USB discovery runs
+every five seconds to find new/returning serials; failed discovery does not remove
+live owners. Known disconnected boards retain independent recovery supervisors.
+Routing observes lifecycle changes every 500 ms. Only a changed chain route is
+cancelled; generation checks reject stale results. Explicit mappings do not
+redistribute. Route changes start a fresh chart scope so old chain samples cannot
+become observations for another board. Configuration edits still require restart.
 
 ## Proof path
 
@@ -146,80 +138,45 @@ The status API reports `service_started_unix` once per coordinator process and
 uptime with the engine-session age beneath it. Topology replacements still reset
 session proof counters and chart scope, but never the displayed service uptime.
 
-## Durable board admission and capacity recovery
+## Durable ownership and continuous recovery
 
-`hardware/lifecycle.rs` owns each physical serial's runtime transitions. Owner
-transitions are private to the hardware module; scheduling and inventory callers
-can report only generation-fenced faults/proofs or epoch-fenced observations.
-Its private state records native readiness/retirement, verified-engine evidence,
-admission awaiting inventory, and restrictions. Readers receive status and capacity
-projections. Only explicit test fixtures can bypass owner access in test builds.
-`BoardSupervisor` owns retry policy; `PreparedAttempt` owns initialization,
-progress, and the serial lease through admission and confirmed native retirement.
-Inventory reports identity observations rather than editing lifecycle flags.
-After old tasks drain, the complete board registry transfers into the replacement
-assignment generation. Rebinding a different serial resets its runtime evidence.
-The coordinator does not select individual fields to preserve. Native sessions and
-transport live in `hardware/native.rs`; optional Automatic policy lives in
-`hardware/tuning.rs`, so Manual sessions do not construct a tuning policy.
+`hardware/lifecycle.rs` owns readiness, faults and generation-fenced proof evidence.
+`BoardSupervisor` owns indefinite retry policy. `PreparedAttempt` retains the serial
+lease through initialization and retirement. Managed production owners initialize
+in place; they do not run a disposable owner and require its successful shutdown
+before reopening USB for production. Manual owners have no tuning policy.
 
-A private safety journal records each serial's active owner before opening USB.
-Confirmed native EOF shutdown clears that marker; forced/unconfirmed shutdown or
-an interrupted worker keeps the board unclean on restart. Thermal and invalid-proof
-quarantine cannot be cleared merely by process replacement. Restrictive updates
-remain in memory even if persistence fails; admission/clearing requires a successful
-atomic checkpoint. Per-serial file locks prevent overlapping native owners. One
-immutable journal policy projects quarantine, safe startup, retry deadlines, and
-Manual point-change requirements to capacity, restoration, and recovery callers;
-capacity calculation never clones and mutates a lifecycle to infer restrictions.
-A qualified unassigned board keeps its closed admission ticket and serial lease
-across layout debounce. Replacements reuse that qualification without reopening
-USB; changed qualification inputs still require a fresh isolated check.
+The private journal records the owner epoch before USB opens. Confirmed shutdown
+and reaping clear it; an interrupted or unconfirmed owner requests conservative
+recovery. Restrictive updates remain in memory if persistence fails; relaxation
+requires a durable epoch-fenced checkpoint. Invalid private journal contents are
+archived and replaced conservatively; insecure paths are rejected. Run/Pause intent
+is separate and an explicit Pause remains durable.
 
-Admission is an isolated runtime with no node task, public listener, history or
-production metrics. It obtains native readback, fresh cool telemetry and verified
-360-iteration canonical test proofs on every selected engine, then requires confirmed
-native quiescence. It is an initialization check, not a long stability benchmark.
-Thermal faults wait five minutes; other unclean owners wait at least 30 seconds.
-All quarantined admission requires fresh extra cooling, including unknown faults
-whose detailed journal write may have failed. Automatic verification/thermal faults lower the admission
-frequency by 50 MHz per failed point, within configured limits. Manual invalid
-proofs require an explicit point change or switching to Automatic. Transport errors
-do not lower the operating point. Requested voltage remains capped at 1.0 V.
+Transport and unknown-owner faults retry after 1, 5, then at most 30 seconds.
+Thermal faults retain a 30-second cooldown, then probe at 200 MHz / 0.7 V and
+require fresh temperature below both the configured limit minus 5°C and 50°C.
+Invalid proofs retain a 10-second cooldown and must pass a private canonical
+360-iteration proof through the same live owner before production routing resumes.
+The private check has no node task, production metrics or public listener. All
+production proofs independently require native verification. No fault exhausts a
+retry budget, including Manual invalid proofs. Repeated real thermal/verification
+failures lower recovery frequency by 50 MHz per failed point, down to 200 MHz;
+recovery can operate below optimization preferences without editing them.
 
-One exploratory clock trial or admission owns the experiment lease at a time.
-Pending admission makes a trial yield at its next policy tick without lowering the
-healthy live point, and requires a fresh full observation before saving it as
-learned evidence. Upward exploration requires the candidate's fresh healthy
-lifecycle and the shared experiment lease; unrelated unavailable boards do not
-freeze a healthy board. Ordinary recovery/thermal backoff remains available. Admission does not hold the
-USB initialization lock while waiting for a trial to yield.
+`hardware/continuous.rs` owns per-board supervisors/listeners and updates routes
+among healthy boards. `asic/pool.rs` parks unused physical engines. Route and owner
+generation fencing prevents stale proofs from entering a new chain assignment.
+Missing temperature or failed control still retires only the affected owner.
+Native retirement keeps stdout/stderr readers and partial records alive across
+soft deadlines, accepts only complete positive evidence, and separately reaps the
+process. Missing confirmation remains unknown and triggers fresh conservative
+initialization. It never certifies physical quiescence of an unresponsive device.
 
-Automatic layouts reconcile usable, admitted capacity after three consistent polls
-and at least ten seconds. Topology and capacity use one clock-injected agreement
-window; failed inventory observations reset agreement instead of implying removal. An unavailable board is retained for supervised recovery;
-it is not silently forgotten. Re-admission requires fresh inventory after its test
-owner closes. Layout replacement retires the old scheduler/owners before installing
-the new 1+1+1, 2+1 or 3-engine generation. Strict mappings never redistribute.
-Public native pins include opened-handle serial validation and pausing all engines
-before applying replacement-owner settings. These mechanisms do not prove physical
-quiescence if the USB stack or power circuitry is unresponsive.
-
-Fault detection quiesces the native owner before fault-journal I/O. Critical
-operating-point writes run off the USB/log control task while telemetry continues
-to drain; safety reads never hold a mutex across filesystem I/O. Optional learning
-and config/history checkpoints share one retained background job/permit. Delayed optional
-I/O is visible but cannot accumulate jobs or trigger proof-worker replacement on
-its own. Critical owner/safety writes retain their independent deadline. Delayed
-saves from an older owner cannot relax a newer owner's safety state. The optional
-disk writer uses a detached thread rather than Tokio's blocking pool: a
-stalled fsync retains its permit, but neither async cancellation nor runtime
-destruction waits for it during service shutdown. Atomic staging limits any
-interrupted write to the existing pending file. Thermal quarantine takes priority
-over invalid proofs and unclean ownership, retaining the five-minute cooldown.
-
-The previously persisted active-owner marker covers a crash or failed fault write;
-unknown/unclean quarantine also requires the extra cooling margin on admission.
+Exploratory tuning still uses the shared experiment lease. Optional persistence
+cannot terminate a healthy owner; critical journal writes retain independent
+watchdogs and epoch fencing. Status exposes the recovery reason, retry deadline
+and actual native PID, separately from verified productivity.
 
 USB serial leases use the service account's private persistent `~/.timelord-usb-locks` directory, resolved through the account database. Deployment accounts need an owned writable home; `HOME` and temporary-directory cleanup do not select or rotate the namespace.
 

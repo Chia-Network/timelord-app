@@ -2,6 +2,7 @@
 set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests
 bash scripts/bundle-inputs-test.sh
 bash scripts/bundle-icon-test.sh
 bash scripts/release-inputs-test.sh
