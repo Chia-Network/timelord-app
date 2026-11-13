@@ -484,30 +484,50 @@ async fn shutdown_interrupts_accept_backoff_promptly() {
 
 #[tokio::test]
 async fn no_admitted_capacity_waits_for_hardware_without_claiming_node_failure() {
-    let directory =
-        std::env::temp_dir().join(format!("tl-waiting-hardware-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).unwrap();
-    let config = Config::default();
-    let prepared = hardware::prepare_for(&config, &HashSet::new())
+    for configured in [false, true] {
+        let directory = std::env::temp_dir().join(format!(
+            "tl-waiting-hardware-{}-{configured}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut config = Config::default();
+        let mut unavailable = HashSet::new();
+        if configured {
+            config.hardware.boards.push(
+                toml::from_str(
+                    "id='a'\nname='A'\nserial='fixture'\nprofile='manual'\nclient_port=18110",
+                )
+                .unwrap(),
+            );
+            unavailable.insert("a".into());
+        }
+        // No native binary, node identity or client listeners are supplied.
+        let prepared = hardware::prepare_for(&config, &unavailable).await.unwrap();
+        let run = start_run(
+            config,
+            prepared,
+            directory.join("history.json"),
+            &HashMap::new(),
+            unix_now(),
+            operational::State::fixture(),
+            None,
+        )
         .await
         .unwrap();
-    let run = start_run(
-        config,
-        prepared,
-        directory.join("history.json"),
-        &HashMap::new(),
-        unix_now(),
-        operational::State::fixture(),
-        None,
-    )
-    .await
-    .unwrap();
-    {
-        let state = run.shared.runtime.lock().unwrap();
-        assert_eq!(state.phase, "waiting_for_clients");
-        assert_eq!(state.node, "waiting_for_hardware");
-        assert_eq!(state.message, "Connect an ASIC board to resume.");
+        {
+            let state = run.shared.runtime.lock().unwrap();
+            assert_eq!(state.phase, "waiting_for_clients");
+            assert_eq!(state.node, "waiting_for_hardware");
+            assert_eq!(
+                state.message,
+                if configured {
+                    "Checking ASIC board admission before connecting to the full node."
+                } else {
+                    "Connect an ASIC board to resume."
+                }
+            );
+        }
+        run.stop().await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
-    run.stop().await.unwrap();
-    std::fs::remove_dir_all(directory).unwrap();
 }

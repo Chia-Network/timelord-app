@@ -140,7 +140,11 @@ async fn start_run(
         runtime.transition(
             "waiting_for_clients",
             "waiting_for_hardware",
-            "Connect an ASIC board to resume.",
+            if config.hardware.boards.is_empty() {
+                "Connect an ASIC board to resume."
+            } else {
+                "Checking ASIC board admission before connecting to the full node."
+            },
         );
     }
     let runtime = Arc::new(Mutex::new(runtime));
