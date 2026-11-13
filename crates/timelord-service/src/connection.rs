@@ -109,7 +109,7 @@ pub fn local(config: &mut Config, root: &Path) -> Result<()> {
         }
     }
     let mut candidate = config.clone();
-    candidate.node = node;
+    candidate.add_connection(node).map_err(anyhow::Error::msg)?;
     candidate.validate().map_err(anyhow::Error::msg)?;
     crate::network::resolve(&candidate.node)?;
     *config = candidate;
@@ -190,9 +190,7 @@ pub fn import(config_path: &Path, manifest: &Path) -> Result<()> {
                 .context("Reading network.json")?;
         node.network_definition = Some(definition);
     }
-    let mut candidate = config.clone();
-    candidate.node = node.clone();
-    candidate.validate().map_err(anyhow::Error::msg)?;
+    node.validate().map_err(anyhow::Error::msg)?;
     crate::network::resolve(&node)?;
     node.certificate = Some(bundled_path(folder, node.certificate.as_ref())?);
     node.private_key = Some(bundled_path(folder, node.private_key.as_ref())?);
@@ -253,7 +251,7 @@ pub fn import(config_path: &Path, manifest: &Path) -> Result<()> {
             }
         }
         validate_identity(&node)?;
-        config.node = node;
+        config.add_connection(node).map_err(anyhow::Error::msg)?;
         crate::save(config_path, &config)
     })();
     if result.is_err() {
@@ -365,6 +363,8 @@ mod tests {
         import(&config_path, &manifest).unwrap();
         let config = crate::load(&config_path).unwrap();
         assert_eq!(config.node.host, "fixture.invalid");
+        let mainnet_id = config.connections.active_id.clone().unwrap();
+        let mainnet_node = config.node.clone();
         assert!(
             config
                 .node
@@ -433,6 +433,9 @@ mod tests {
         assert_eq!(imported.node.network, custom.network);
         assert_eq!(imported.node.port, 58445);
         assert_eq!(imported.node.network_definition, custom.network_definition);
+        assert_eq!(imported.connections.profiles.len(), 2);
+        let custom_id = imported.connections.active_id.clone().unwrap();
+        let custom_node = imported.node.clone();
         fs::remove_dir_all(&source).unwrap();
         let imported = crate::load(&config_path).unwrap();
         assert!(imported.node.certificate.as_ref().unwrap().is_file());
@@ -443,6 +446,14 @@ mod tests {
                 .difficulty_starting,
             250
         );
+        let mut switched = imported;
+        switched.select_connection(&mainnet_id).unwrap();
+        crate::save(&config_path, &switched).unwrap();
+        let mut switched = crate::load(&config_path).unwrap();
+        assert_eq!(switched.node, mainnet_node);
+        switched.select_connection(&custom_id).unwrap();
+        crate::save(&config_path, &switched).unwrap();
+        assert_eq!(crate::load(&config_path).unwrap().node, custom_node);
         fs::remove_dir_all(directory).unwrap();
     }
 }

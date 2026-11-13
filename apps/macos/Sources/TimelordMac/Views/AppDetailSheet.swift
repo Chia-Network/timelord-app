@@ -54,20 +54,31 @@ struct NodeConnectionSheet: View {
             Form {
                 Section {
                     Text("Connect to an existing Chia full node.").foregroundStyle(.secondary)
-                    Picker("Location", selection: $location) { Text("This Mac").tag("local"); Text("Another computer").tag("remote") }.pickerStyle(.segmented)
-                        .onChange(of: location) { _, value in if value == "local" { model.configuration.node.host = "localhost" } }
-                    TextField("Host", text: $model.configuration.node.host)
-                    TextField("Port", value: $model.configuration.node.port, format: .number.grouping(.never))
-                    Picker("Network", selection: $model.configuration.node.network) {
-                        Text("Mainnet").tag("mainnet")
-                        Text("Testnet11").tag("testnet11")
-                        if let definition = model.configuration.node.networkDefinition {
-                            Text(definition.networkId).tag(definition.networkId)
+                    if let connections = model.configuration.connections, !connections.profiles.isEmpty {
+                        Picker("Connection profile", selection: Binding(get: { model.configuration.connections?.activeId ?? "" }, set: { model.selectConnectionProfile($0) })) {
+                            ForEach(connections.profiles) { profile in Text(profile.name).tag(profile.id) }
+                        }
+                        .onChange(of: model.configuration.connections?.activeId) { _, _ in
+                            location = ["localhost", "127.0.0.1", "::1"].contains(model.configuration.node.host) ? "local" : "remote"
                         }
                     }
-                    .onChange(of: model.configuration.node.network) { _, network in
-                        if let definition = model.configuration.node.networkDefinition, definition.networkId != network {
-                            model.configuration.node.networkDefinition = nil
+                    Picker("Location", selection: $location) { Text("This Mac").tag("local"); Text("Another computer").tag("remote") }.pickerStyle(.segmented)
+                    TextField("Host", text: $model.configuration.node.host)
+                    TextField("Port", value: $model.configuration.node.port, format: .number.grouping(.never))
+                    if model.configuration.connections?.activeId != nil {
+                        LabeledContent("Network", value: model.configuration.node.network)
+                    } else {
+                        Picker("Network", selection: $model.configuration.node.network) {
+                            Text("Mainnet").tag("mainnet")
+                            Text("Testnet11").tag("testnet11")
+                            if let definition = model.configuration.node.networkDefinition {
+                                Text(definition.networkId).tag(definition.networkId)
+                            }
+                        }
+                        .onChange(of: model.configuration.node.network) { _, network in
+                            if let definition = model.configuration.node.networkDefinition, definition.networkId != network {
+                                model.configuration.node.networkDefinition = nil
+                            }
                         }
                     }
                     if let definition = model.configuration.node.networkDefinition {

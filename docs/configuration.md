@@ -151,6 +151,18 @@ keep a reference to the transfer folder. Network IDs use 1–64 lowercase letter
 digits or hyphens. Missing or mismatched definitions are rejected before saving.
 Mainnet and Testnet11 continue using their pinned built-in definitions.
 
+Saved connection profiles live in `[connections]` with `active_id` and
+`[[connections.profiles]]` entries containing `id`, `name` and a complete `node`
+table. Existing single-node configurations migrate in memory when read and are persisted
+on the next save or import. The
+top-level `[node]` is the selected profile's runtime projection; saving synchronizes
+its edits into that profile. Imported profiles retain independent credential paths
+and RPC settings. UI selection is staged until saved; a running worker needs
+Save & Restart to change connections. For CLI administration,
+`select-node --config FILE --profile ID` selects and saves an existing profile
+without connecting to a node or touching hardware. Reload the running worker to
+apply it. Unknown IDs or invalid profiles leave the saved file intact.
+
 Raw exported numeric constants are normalized on import. Saved configuration and
 helper JSON represent integers as `{ integer = "decimal digits" }`, preserving
 the full supported `u128` range through TOML and macOS settings edits. This also

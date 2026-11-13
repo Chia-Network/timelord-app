@@ -154,11 +154,12 @@ final class TimelordModel: ObservableObject {
     }
 
     private func refreshNodeSync() async {
+        guard configuration.node == savedConfiguration.node else { nodeSync = nil; return }
         if configurationLoaded && Date().timeIntervalSince(lastNodeSyncFetch) >= 15 {
             lastNodeSyncFetch = Date()
             let expectedNode = savedConfiguration.node
             let result = expectedNode.rpc == nil ? nil : try? await configurationClient.nodeState()
-            if savedConfiguration.node == expectedNode { nodeSync = result }
+            if savedConfiguration.node == expectedNode && configuration.node == expectedNode { nodeSync = result }
         }
     }
 
@@ -274,6 +275,7 @@ final class TimelordModel: ObservableObject {
     private var hasRuntimeSettingsChanges: Bool {
         var runtimeConfiguration = configuration
         runtimeConfiguration.service.startAutomatically = savedConfiguration.service.startAutomatically
+        runtimeConfiguration.connections = savedConfiguration.connections
         return runtimeConfiguration != savedConfiguration
     }
     var settingsDoneTitle: String {
@@ -365,6 +367,10 @@ final class TimelordModel: ObservableObject {
         let panel = NSOpenPanel(); panel.canChooseFiles = !local; panel.canChooseDirectories = true; panel.allowsMultipleSelection = false
         panel.message = local ? "Choose your Chia root folder." : "Choose connection.toml or its connection bundle folder."
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        if hasUnsavedSettings {
+            await saveConfiguration()
+            guard errorMessage == nil else { return }
+        }
         operationInProgress = true; defer { operationInProgress = false }
         do {
             if local { try await configurationClient.localNode(root: url.path) }
@@ -375,9 +381,21 @@ final class TimelordModel: ObservableObject {
             configuration = try await configurationClient.load(); savedConfiguration = configuration; configurationLoaded = true; errorMessage = nil
             nodeSync = nil; lastNodeSyncFetch = .distantPast
             configurationNeedsRestart = canControlService || liveStatus != nil
-            connectionResult = "Connection imported. Test the connection when you’re ready."
+            connectionResult = "Connection profile imported. Save & Restart applies it to a running Timelord."
             updateSnapshot()
         } catch { errorMessage = error.localizedDescription }
+    }
+    func selectConnectionProfile(_ id: String) {
+        guard !operationInProgress, var connections = configuration.connections,
+              let selected = connections.profiles.first(where: { $0.id == id }),
+              connections.activeId != id else { return }
+        if let current = connections.profiles.firstIndex(where: { $0.id == connections.activeId }) {
+            connections.profiles[current].node = configuration.node
+        }
+        connections.activeId = id
+        configuration.connections = connections
+        configuration.node = selected.node
+        nodeSync = nil; lastNodeSyncFetch = .distantPast
     }
     func chooseFile() -> String? {
         let panel = NSOpenPanel(); panel.canChooseFiles = true; panel.canChooseDirectories = false; panel.allowsMultipleSelection = false

@@ -62,11 +62,21 @@ contains the command with the node's actual RPC port. Replace `NODE_SSH_LOGIN`
 and keep the tunnel running on the Timelord Mac. For direct private-network RPC,
 edit `[node.rpc]` before importing, as described below.
 
-For a custom network, import the entire folder including `network.json`. The app
-adds the imported network to the Network selector and shows its genesis challenge
-and exporting Chia version. It saves the definition with its private configuration;
-the transfer folder is no longer required after import. Switching to a built-in
-network clears the custom selection; import its bundle again to return to it.
+Every import creates and selects a new **connection profile**. On the first import,
+the app also preserves your existing configured connection (for example Mainnet)
+as its own profile. Repeated imports create separate entries with distinct names.
+
+Use **Full node → Connection profile** to switch. Each profile restores its network
+definition, peer host/port, TLS server name, peer identity and optional RPC connection
+together. Changes are applied through **Done** or **Save & Restart**, preserving the
+existing Run/Pause intent. Edits made to one profile are retained when selecting
+another. Selecting a Chia root also creates a profile; its certificate paths remain
+references to that local installation.
+
+For a custom network, import the entire folder including `network.json`. Its genesis
+challenge and exporting Chia version are shown with the selected profile. Remote
+bundle credentials are copied into private app storage, so the transfer folder is
+no longer required. Switching back to Mainnet does not remove the custom profile.
 
 The service uses the exact network ID in its peer handshake and applies exported
 constants represented by the pinned scheduler, with the pinned Chia Mainnet

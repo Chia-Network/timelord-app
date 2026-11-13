@@ -3,9 +3,23 @@ import Foundation
 public struct AppConfiguration: Codable, Sendable, Equatable {
     public var schemaVersion = 1
     public var node = NodeConfiguration()
+    public var connections: ConnectionProfiles?
     public var service = ServiceConfiguration()
     public var hardware = HardwareConfiguration()
     public init() {}
+}
+public struct ConnectionProfiles: Codable, Sendable, Equatable {
+    public var activeId: String?
+    public var profiles: [ConnectionProfile] = []
+    public init() {}
+}
+public struct ConnectionProfile: Codable, Sendable, Equatable, Identifiable {
+    public var id: String
+    public var name: String
+    public var node: NodeConfiguration
+    public init(id: String, name: String, node: NodeConfiguration) {
+        self.id = id; self.name = name; self.node = node
+    }
 }
 public struct NodeConfiguration: Codable, Sendable, Equatable {
     public var host = "localhost"
