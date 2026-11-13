@@ -233,7 +233,7 @@ public enum LivePresentation {
         let productive = live?.boards.contains(where: { $0.hardwareState == "connected" }) == true && live?.productionEnabled == true && live?.timelordState == "running" && live?.latestProofUnix.map { now.timeIntervalSince1970 - $0 < 90 } == true
         let thermal = live?.boards.contains { $0.hardwareState == "thermal_stop" } == true
         let allBoardsFailed = live.map { !$0.boards.isEmpty && $0.boards.allSatisfy { ["fault", "thermal_stop"].contains($0.hardwareState) } } ?? false
-        let admissionBlocked = !productive && live?.boards.contains { $0.hardwareState == "quarantined" } == true
+        let admissionBlocked = !productive && live?.timelordState == "waiting_for_clients" && live?.boards.contains { $0.hardwareState == "quarantined" } == true
         let checkingHardware = live?.timelordState == "waiting_for_clients" && live?.boards.contains { $0.hardwareState == "checking" } == true
         let phase: AppPhase
         if controlOperation == .pause { phase = .pausing }

@@ -664,6 +664,8 @@ extension PresentationTests {
         XCTAssertEqual(checking.explanation, message)
         let unavailable = LivePresentation.snapshot(status: try status("connected", state: "waiting_for_node"), now: now)
         XCTAssertEqual(unavailable.phase, .nodeUnreachable)
+        let nodeFailure = LivePresentation.snapshot(status: try status("quarantined", state: "waiting_for_node"), now: now)
+        XCTAssertEqual(nodeFailure.phase, .nodeUnreachable, "Admission advice must not mask a real node-session failure")
         let paused = LivePresentation.snapshot(status: try status("quarantined"), paused: true, now: now)
         XCTAssertEqual(paused.phase, .paused)
     }
