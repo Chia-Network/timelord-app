@@ -42,12 +42,15 @@ export CHIA_ROOT="/Volumes/LaCie/chia/test-2026-11-13-2-chia"
 /path/to/chia/venv/bin/python tools/export-fullnode-connection
 ```
 
-All three options are optional:
+All options are optional:
 
 - `--chia-root PATH` overrides `$CHIA_ROOT`. One of these must be supplied.
 - `--node-host HOST` overrides the suggested local routing address. The tool prints
   the suggestion; check that the Timelord Mac can reach it, especially with a VPN
   or multiple interfaces. If detection fails, supply this option explicitly.
+- `--rpc-host HOST` overrides the RPC address, which defaults to the same host as
+  the peer connection.
+- `--rpc-port PORT` overrides the full node's configured RPC port.
 - `--output PATH` overrides `./fullnode-NETWORK-connection`. Existing destinations
   are never overwritten.
 
@@ -57,10 +60,11 @@ the node configuration. No CA signing keys are exported. `network.json` preserve
 the selected network's consensus/config overrides, Chia version and export time.
 The root itself is not needed on the receiving Mac.
 
-RPC defaults to an SSH tunnel at `127.0.0.1:18555`; the generated `README.txt`
-contains the command with the node's actual RPC port. Replace `NODE_SSH_LOGIN`
-and keep the tunnel running on the Timelord Mac. For direct private-network RPC,
-edit `[node.rpc]` before importing, as described below.
+RPC defaults to the same node address as the peer connection and the node's
+configured RPC port. The full node must serve authenticated RPC on that reachable
+private-network address. The exporter does not change its listener settings.
+For an explicit SSH tunnel endpoint, use `--rpc-host 127.0.0.1 --rpc-port 18555`
+and establish the tunnel on the Timelord Mac as described below.
 
 Every import creates and selects a new **connection profile**. On the first import,
 the app also preserves your existing configured connection (for example Mainnet)
@@ -186,8 +190,8 @@ generate_ca_signed_cert(ca_crt, (ca / "private_ca.key").read_bytes(),
 PY
 ```
 
-Full-node RPC normally listens on loopback. Keep it there and forward it through
-SSH. Run this on the Timelord Mac, substituting the node's SSH login/address and
+If you choose to keep full-node RPC on loopback, explicitly configure a tunnel
+endpoint with `--rpc-host 127.0.0.1 --rpc-port 18555`. Run this on the Timelord Mac, substituting the node's SSH login/address and
 configured RPC port (8555 for this example):
 
 ```sh
@@ -196,8 +200,9 @@ ssh -N -o ExitOnForwardFailure=yes \
 ```
 
 Keep that session running while using RPC. The app currently does not create or
-supervise SSH tunnels. Before transferring/importing the bundle, append this to
-`connection.toml`:
+supervise SSH tunnels. For a manually assembled bundle, add the following section
+to `connection.toml`; for an exported bundle, the explicit options above set it
+already (edit the existing section if needed):
 
 ```toml
 [node.rpc]
