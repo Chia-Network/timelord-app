@@ -293,7 +293,7 @@ impl Worker {
         // Let the coordinator close native control channels and drain proof
         // work first. The group-wide hard stop remains the bounded fallback.
         self.process.signal_leader(libc::SIGTERM);
-        self.process.wait_for_exit(Duration::from_secs(10)).await?;
+        self.process.wait_for_exit(Duration::from_secs(25)).await?;
         let result = self.process.kill_and_reap(Duration::from_secs(3)).await?;
         for task in &mut self.log_tasks {
             if tokio::time::timeout(Duration::from_secs(1), &mut *task)

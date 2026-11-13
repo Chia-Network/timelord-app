@@ -435,6 +435,20 @@ struct Shared {
     started_unix: u64,
     service_started_unix: u64,
 }
+impl Shared {
+    fn persistent_owners(&self) -> bool {
+        self.runtime.lock().expect("runtime").routing.is_some()
+    }
+    fn assignments(&self) -> Vec<timelord_core::Assignment> {
+        self.runtime
+            .lock()
+            .expect("runtime")
+            .routing
+            .as_ref()
+            .unwrap_or(&self.assignments)
+            .clone()
+    }
+}
 
 impl Shared {
     pub(crate) fn metrics(&self) -> Option<&Arc<observability::Metrics>> {

@@ -51,17 +51,13 @@ locations are discovered afresh; serials preserve settings across port changes.
 `remembered_boards` retains disconnected board settings. The number of detected
 boards determines capacity: one board runs three engines, two boards run two plus
 one, and three boards run one each. Automatic layouts rebalance while the service
-runs, after three agreeing five-second discovery polls. This briefly stops proof
-work and reconnects the node with the new layout; it does not restart the app or
-status endpoint. No boards leaves the service waiting for hardware. USB discovery
-errors do not trigger redistribution. Idle chains with supervised native owners
-remain in the layout even when open FTDI metadata and proof sockets are absent;
-the native owner's sensor/exit watchdog determines when that evidence expires.
-A changed layout uses its separately learned
-engine-count/mask profile, or its configured Automatic starting frequency/voltage
-if no matching profile exists. A high single-engine clock is never reused as a
-three-engine learned setting. Thermal and invalid-proof faults stay latched.
-Changed assignments start fresh chart scopes and run counters, preserving correct
+runs, retaining healthy native owners and the node session while routing affected
+chains to spare engines. No boards leaves the service waiting and retrying for
+hardware. Discovery failures do not remove healthy owners. Known disconnected
+boards retain their settings and recovery supervisors. Each layout selects its
+own learned tuning profile; reserved idle engines are not counted as active work.
+
+Changed assignments start fresh chart scopes, preserving correct
 board attribution; ordinary same-layout client reconnects retain the charts.
 
 ### Chain assignments
@@ -323,8 +319,8 @@ It does not train Automatic tuning or change saved settings.
 
 The status/history HTTP API is read-only and bound to loopback. Same-user,
 mode-0600 Unix IPC handles Pause/Resume tuning. `service.control_socket` optionally
-overrides its derived path. Fault and thermal stops require an explicit restart;
-startup never becomes an automatic restart loop.
+overrides its derived path. Automatic faults retry without a terminal hold;
+only an explicit Pause durably disables requested work.
 
 App administrator overrides: `TIMELORD_CONFIG`, `TIMELORD_SERVICE_BINARY`, and
 `TIMELORD_STATUS_URL`. Run only one owner of a board. The app can observe an external
@@ -355,20 +351,21 @@ emitted by the pinned native event loop after USB, clocks, voltage and PVT setup
 have completed. A socket connection is not used as physical presence evidence;
 a timeout still retires and reaps its owner.
 
-Restart attempts never raise its saved voltage or frequency. An unaccepted Automatic
-trial returns to the last saved point. The retry budget can renew after at least
-ten minutes of operation, three verified outputs for each assigned chain from
-that run, and fresh proof/temperature telemetry.
+Recovery retries indefinitely, including Manual verification failures. Thermal
+faults wait 30 seconds, probe at 200 MHz / 0.7 V and require fresh cool telemetry
+before resuming. Invalid proofs wait 10 seconds and require a private verified
+canonical proof before production routing resumes. Recovery may temporarily use a
+conservative setting below configured optimization minima; saved preferences are
+unchanged. Repeated real thermal/verification faults reduce recovery frequency.
+Unknown shutdown state requires fresh initialization, not a permanent stop gate.
 
-Exhausted retries, failed proof verification, thermal stops and missing temperature
-telemetry require attention; these are not retried indefinitely. Pause/Run starts
-a new supervision session. Pausing or quitting cancels pending restarts.
-
-Other boards keep their processes, settings and chain sessions during a board
-outage. The full-node connection remains open to receive progress from other
-timelords. The service never submits an incomplete combined proof or treats an
-unavailable board as productive. History gaps apply to the affected board; healthy
-boards' verified samples remain available.
+Other native owners and the full-node session survive a board outage. Automatic
+layouts move only affected chains; explicit serial mappings keep their assignments.
+Every submitted proof must still pass the native verifier. Route changes reset
+chart scope to avoid attributing old samples to a different board. Status reports
+`recovery_reason`, `retry_after_unix` and the actual `native_pid`; socket connection
+counts alone are never evidence of verified productivity. Pause cancels retries;
+quitting the GUI preserves the saved Run intent.
 
 See [deployment health and metrics](observability.md) for optional Prometheus,
 liveness/readiness endpoints and deployment examples.

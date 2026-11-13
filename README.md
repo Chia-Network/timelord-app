@@ -43,13 +43,21 @@ installation, SSH control, migration and remaining physical qualification gates.
 USB disconnects and unreadable sensor data stop only the affected client. The
 service retries after 1, 5, then at most every 30 seconds without exhausting a
 retry budget, and finds a returning board by serial even if its USB location
-changes. Other boards keep running. Confirmed overtemperature and invalid proofs
-remain stopped for attention; missing telemetry never permits bypassing the
-native control checks. Automatic layouts rebalance after a stable USB change:
-one board runs three engines, two run two plus one, and three run one each.
-This briefly restarts the proof session and native clients, while the status API
-stays available. Each layout uses its own learned tuning profile. Explicit
-serial-pinned chain assignments retain their mapping instead.
+changes. Other boards and the full-node session keep running. Overtemperature
+retries after a 30-second cooldown using a low-power probe and fresh cool
+telemetry; invalid proofs retry after 10 seconds at a conservative setting and
+must pass a private native verification check before receiving production work.
+Retries have no exhaustion limit, including in Manual mode. A recovery setting
+can be below the configured tuning minimum; saved preferences remain unchanged.
+Missing telemetry never bypasses native control checks. The dashboard reports
+the recovery reason and next retry time.
+
+Automatic layouts route chains among available boards: one board runs three
+engines, two run two plus one, and three run one each. Each native owner keeps
+three identified engine sockets available; unused engines remain idle. Route
+changes cancel only affected chain sessions and retain healthy native owners
+and the full-node connection. Each layout uses its own learned tuning profile.
+Explicit serial-pinned chain assignments retain their mapping instead.
 
 The persistent supervisor prevents idle system sleep while Run is requested,
 including worker recovery, and releases the assertion after Pause cleanup or

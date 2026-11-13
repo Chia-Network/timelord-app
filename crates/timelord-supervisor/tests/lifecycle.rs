@@ -350,18 +350,18 @@ async fn requested_run_survives_shutdown_and_worker_family_is_reaped_before_repl
     ));
     let child = fixture.supervisor(&helper);
     fixture.status(|s| s.worker_pid.is_some()).await;
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while !fixture.0.join("descendant").exists() {
+    let descendant: i32 = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(contents) = fs::read_to_string(fixture.0.join("descendant"))
+                && let Ok(pid) = contents.trim().parse::<i32>()
+            {
+                break pid;
+            }
             sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .unwrap();
-    let descendant: i32 = fs::read_to_string(fixture.0.join("descendant"))
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
     request(&fixture.config(), Control::Reload, None)
         .await
         .unwrap();

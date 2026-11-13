@@ -66,6 +66,15 @@ impl PreparedAttempt {
     }
     pub(super) async fn start(supervisor: &mut BoardSupervisor) -> Result<()> {
         let state = BoardAttempt::claim(supervisor)?;
+        if state.shared.persistent_owners() {
+            let Some(prepared) = Self::reacquire(state, &mut supervisor.shutdown).await? else {
+                return Ok(());
+            };
+            supervisor.board = prepared.state.board.clone();
+            return prepared
+                .run_native(supervisor, supervisor.safety.clone())
+                .await;
+        }
         let plan = state.admission_plan(supervisor.safety.clone())?;
         if state.engines == 0
             && let AdmissionPlan::Managed {

@@ -4,15 +4,24 @@ The build consumes public Chia-Network/chiavdf at the exact commit in
 [upstream.env](upstream.env), without source overlays or copied prover/control
 headers. That revision includes upstream performance, live-control and telemetry
 work plus [opened-handle serial validation](https://github.com/Chia-Network/chiavdf/pull/474).
-The pin is `20e762df612fbb8a0cfb645dc4b0d89e030552b7`, the upstream branch for
+The pin is `906ca599901472599ebbec5fcae8f6ed0275cce5`, the upstream branch for
 [PR 497](https://github.com/Chia-Network/chiavdf/pull/497), based on main
 `47774682a02319c3dfd0f216981ce1eb65623515`. It includes the merged serial and
-initialization changes plus quantized operating-point readback validation.
+initialization changes, quantized operating-point readback validation, checked
+shutdown acknowledgements and opt-in physical engine socket identities.
 Requested operating points retain strict limits; measured values use the existing
 bounded readback tolerance, including the 0.69375 V regulator reading for a
 0.700 V shutdown target. This prevents false shutdown failures and rejected
 initial readback on the next startup. Offline regression coverage does not by
 itself establish hardware/testnet acceptance.
+
+Managed owners send `TLSTOP 1 ID` and retain complete positive `TLSTOPACK` or
+legacy shutdown evidence through soft deadlines and TERM fallback. Process reaping
+is independently required. The supervisor allows 25 seconds for worker cleanup,
+covering the native 5-second soft deadline, 10-second TERM allowance and bounded
+pipe drains. Unknown evidence forces conservative reinitialization, not a
+permanent stop. `--engine-identity` sends `TLENGINE 1 N` on every engine socket
+connection; the adapter consumes it before the usual VDF protocol.
 
 ```sh
 bash scripts/build-native.sh

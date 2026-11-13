@@ -41,6 +41,7 @@ pub struct Snapshot {
 pub struct Store {
     path: PathBuf,
     scope: String,
+    config: Config,
 }
 
 pub fn scope(config: &Config, assignments: &[timelord_core::Assignment]) -> Result<String> {
@@ -74,6 +75,7 @@ impl Store {
         Ok(Self {
             path,
             scope: scope(config, assignments)?,
+            config: config.clone(),
         })
     }
 
@@ -124,7 +126,12 @@ impl Store {
     }
 
     pub fn capture(&self, state: &RuntimeState, started: u64, now: u64) -> Snapshot {
-        Snapshot::capture(self.scope.clone(), state, started, now)
+        let current_scope = state
+            .routing
+            .as_ref()
+            .and_then(|routes| scope(&self.config, routes).ok())
+            .unwrap_or_else(|| self.scope.clone());
+        Snapshot::capture(current_scope, state, started, now)
     }
 
     pub fn checkpoint(

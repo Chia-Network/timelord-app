@@ -522,9 +522,21 @@ extension PresentationTests {
                       "Stale status cannot preserve board presence")
     }
 
-    private func operationalStatus(production: Bool = true, latest: Double = 1_000_000, state: String = "running", message: String = "Producing verified proofs.", chains: [String] = ["challenge","reward","infused_challenge"], faultKind: String? = nil) throws -> ServiceStatus {
+    func testRecoveryRemainsVisibleAndCountsDownWithoutRequiringRun() throws {
+        let status = try operationalStatus(production: false, state: "waiting_for_clients", recoveryReason: "Cooling ASIC", retryAfter: 1_000_010)
+        let snapshot = LivePresentation.snapshot(status: status, detectedDevices: [], now: now)
+        XCTAssertEqual(snapshot.phase, .starting)
+        XCTAssertEqual(snapshot.boards.count, 1)
+        XCTAssertEqual(snapshot.boards.first?.state, .recovering)
+        XCTAssertEqual(snapshot.boards.first?.recoveryText(at: now), "Cooling ASIC · Retrying in 10s")
+        XCTAssertEqual(snapshot.boards.first?.recoveryText(at: now.addingTimeInterval(11)), "Cooling ASIC · Retrying automatically")
+    }
+
+    private func operationalStatus(production: Bool = true, latest: Double = 1_000_000, state: String = "running", message: String = "Producing verified proofs.", chains: [String] = ["challenge","reward","infused_challenge"], faultKind: String? = nil, recoveryReason: String? = nil, retryAfter: Double? = nil) throws -> ServiceStatus {
         var board: [String: Any] = ["id":"a","name":"A","client_port":18110,"assigned_chains":chains,"connected_clients":3,"hardware_state":"connected","temperature_c":42.5,"temperature_limit_c":55,"frequency_mhz":1540,"voltage_v":1,"recoveries":2,"latest_proof_unix":latest,"profile":"Manual"]
         if let faultKind { board["fault_kind"] = faultKind }
+        if let recoveryReason { board["recovery_reason"] = recoveryReason; board["hardware_state"] = "fault" }
+        if let retryAfter { board["retry_after_unix"] = retryAfter }
         let object: [String: Any] = ["api_version":1,"service_pid":42,"service_state":"ready","timelord_state":state,"message":message,"production_enabled":production,"started_unix":999000,"timestamp_unix":1000000,"latest_proof_unix":latest,"proofs_delivered":7,"tuning_paused":false,
             "full_node":["host":"localhost","port":8444,"network":"mainnet","state":"ready"],
             "boards":[board],"connected_client_count":3,"delivered_ips":1000000]

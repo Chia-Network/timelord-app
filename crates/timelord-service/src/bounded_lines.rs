@@ -1,5 +1,5 @@
 //! Cancellation-safe native logs: at most 4096 content bytes plus one provisional CR framing byte.
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt};
 const MAX_LINE: usize = 4096;
 #[derive(Debug, PartialEq, Eq)]
 pub enum Line {
@@ -12,6 +12,7 @@ pub struct Lines<R> {
     reader: R,
     pending: Vec<u8>,
     discarding: bool,
+    last_terminated: bool,
 }
 impl<R: AsyncBufRead + Unpin> Lines<R> {
     pub fn new(reader: R) -> Self {
@@ -19,15 +20,22 @@ impl<R: AsyncBufRead + Unpin> Lines<R> {
             reader,
             pending: Vec::with_capacity(MAX_LINE + 1),
             discarding: false,
+            last_terminated: false,
         }
     }
-    pub fn into_inner(self) -> R {
-        self.reader
+    pub fn terminated(&self) -> bool {
+        self.last_terminated
+    }
+    pub fn into_inner(self) -> impl AsyncRead + Unpin {
+        // next_line may have consumed a partial record before cancellation.
+        // Preserve it when transferring this stream to the retirement reader.
+        std::io::Cursor::new(self.pending).chain(self.reader)
     }
     pub async fn next_line(&mut self) -> std::io::Result<Option<Line>> {
         loop {
             let available = self.reader.fill_buf().await?;
             if available.is_empty() {
+                self.last_terminated = false;
                 if std::mem::take(&mut self.discarding) || self.pending.len() > MAX_LINE {
                     self.pending.clear();
                     return Ok(Some(Line::Oversized));
@@ -52,6 +60,7 @@ impl<R: AsyncBufRead + Unpin> Lines<R> {
             }
             self.reader.consume(count + usize::from(end.is_some()));
             if end.is_some() {
+                self.last_terminated = true;
                 if std::mem::take(&mut self.discarding) {
                     return Ok(Some(Line::Oversized));
                 }

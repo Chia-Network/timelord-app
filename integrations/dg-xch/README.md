@@ -28,7 +28,11 @@ request identity and consensus proof validity before sending a node message.
 Normal resets drain proofs through STOP/ACK and close the old connection; timeout
 or cancellation closes the lease. Cancellation cannot leave a partial native frame
 in a reused socket. Node disconnects cancel workers and drain retained sessions.
-Invalid ASIC results latch a hardware fault and stop owned clients.
+Invalid ASIC results stop the affected owner's work, not other owners or the
+node session. Managed owners recover indefinitely with cooldowns, fresh hardware
+initialization and private verification after invalid proofs. Unknown retirement
+evidence requests conservative recovery rather than a permanent admission gate.
+Every production proof still requires native verification and scheduler checks.
 
 The offline checkpoint fixture is generated and independently verified by canonical
 C++ chiavdf. The adapter has tests for persistent successive requests, partial-frame

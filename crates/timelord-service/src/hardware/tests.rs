@@ -457,7 +457,7 @@ fn live_thermal_rejection_survives_retirement_checkpoint_and_policy_restore() {
     checkpoint_retired(&shared, &board, &store, "fixture").unwrap();
     let record = store.board("fixture").unwrap();
     assert_eq!(record.quarantine, Some(crate::safety::Reason::Thermal));
-    assert!(record.retry_after_unix >= now + 300);
+    assert!(record.retry_after_unix >= now + 30);
     assert!(!record.owner_active);
     let mut restored = crate::board_lifecycle::BoardLifecycle::default();
     restored.restore_policy(store.policy(&board), now + 30);
@@ -465,7 +465,8 @@ fn live_thermal_rejection_survives_retirement_checkpoint_and_policy_restore() {
         restored.status().phase,
         crate::board_lifecycle::Phase::ThermalStop
     );
-    assert!(store.policy(&board).hold_reason(now + 30).is_some());
+    assert!(store.policy(&board).hold_reason(now + 5).is_some());
+    assert!(store.policy(&board).hold_reason(now + 31).is_none());
     std::fs::remove_dir_all(dir).unwrap();
 }
 
