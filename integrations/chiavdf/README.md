@@ -4,24 +4,30 @@ The build consumes public Chia-Network/chiavdf at the exact commit in
 [upstream.env](upstream.env), without source overlays or copied prover/control
 headers. That revision includes upstream performance, live-control and telemetry
 work plus [opened-handle serial validation](https://github.com/Chia-Network/chiavdf/pull/474).
-The pin is `906ca599901472599ebbec5fcae8f6ed0275cce5`, the upstream branch for
-[PR 497](https://github.com/Chia-Network/chiavdf/pull/497), based on main
+The pin is `613da4feb115b4b46d609ac442f4b03a049032f5`, combining
+[PR 497](https://github.com/Chia-Network/chiavdf/pull/497) for bounded readback and
+checked shutdown with [PR 498](https://github.com/Chia-Network/chiavdf/pull/498)
+for physical engine identities, based on main
 `47774682a02319c3dfd0f216981ce1eb65623515`. It includes the merged serial and
-initialization changes, quantized operating-point readback validation, checked
-shutdown acknowledgements and opt-in physical engine socket identities.
-Requested operating points retain strict limits; measured values use the existing
-bounded readback tolerance, including the 0.69375 V regulator reading for a
-0.700 V shutdown target. This prevents false shutdown failures and rejected
-initial readback on the next startup. Offline regression coverage does not by
-itself establish hardware/testnet acceptance.
+initialization changes. Requested operating points retain strict limits; measured
+values use the existing bounded readback tolerance, including a regulator reading
+one 6.25 mV VID step below a 0.700 V target. The request itself is exactly
+representable. `TLACK` measurements must not be reused as commands outside strict
+limits. Offline regression coverage does not establish hardware/testnet acceptance.
 
 Managed owners send `TLSTOP 1 ID` and retain complete positive `TLSTOPACK` or
 legacy shutdown evidence through soft deadlines and TERM fallback. Process reaping
 is independently required. The supervisor allows 25 seconds for worker cleanup,
 covering the native 5-second soft deadline, 10-second TERM allowance and bounded
 pipe drains. Unknown evidence forces conservative reinitialization, not a
-permanent stop. `--engine-identity` sends `TLENGINE 1 N` on every engine socket
-connection; the adapter consumes it before the usual VDF protocol.
+permanent stop. Native exit status is 70 for exceptions or unconfirmed hardware
+shutdown, including TLSTOP and SIGTERM; successful exit alone never replaces the
+positive acknowledgement plus reaping requirement. The version probe does not
+advertise these extensions, so consumers must pin a supporting revision.
+`--engine-identity` sends `TLENGINE 1 N` on every engine socket
+connection; the adapter consumes it before the usual VDF protocol. Incomplete or
+failed identity writes close and retry only that engine connection. Failed
+connects release their socket descriptors.
 
 ```sh
 bash scripts/build-native.sh
