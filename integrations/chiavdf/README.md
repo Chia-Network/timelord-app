@@ -4,11 +4,11 @@ The build consumes public Chia-Network/chiavdf at the exact commit in
 [upstream.env](upstream.env), without source overlays or copied prover/control
 headers. That revision includes upstream performance, live-control and telemetry
 work plus [opened-handle serial validation](https://github.com/Chia-Network/chiavdf/pull/474).
-The pin is `005fe3c357341dfd0c5aa9a8244f8fbc31e957b6`, combining
+The pin is `7c47cf07e575cee38c5ad56c67d391b4f131ad6b`, the merged main commit combining
 [PR 497](https://github.com/Chia-Network/chiavdf/pull/497) for bounded readback and
 checked shutdown with [PR 498](https://github.com/Chia-Network/chiavdf/pull/498)
-for physical engine identities, based on main
-`47774682a02319c3dfd0f216981ce1eb65623515`. It includes the merged serial and
+for physical engine identities. Its source tree is identical to the previously
+validated PR head `005fe3c357341dfd0c5aa9a8244f8fbc31e957b6`. It includes the merged serial and
 initialization changes. Requested operating points retain strict limits; measured
 values use the existing bounded readback tolerance, including a regulator reading
 one 6.25 mV VID step below a 0.700 V target. The request itself is exactly
