@@ -25,7 +25,7 @@ status_listen = "127.0.0.1:9257"
 # allow_remote_observability = true # Explicit opt-in: no built-in authentication/TLS.
 # Persistent supervisor listener; re-register after changing it.
 supervisor_observability_listen = "127.0.0.1:9259"
-# Legacy app-launch preference; durable supervisor Run/Pause is authoritative.
+# Start session supervision when the app opens; saved Run/Pause is authoritative.
 start_automatically = true
 tuning_paused = false
 

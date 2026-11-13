@@ -1,5 +1,18 @@
 # Unattended macOS deployment
 
+Opening an already configured app starts a user-session supervisor if none is
+available and `service.start_automatically` is enabled (the default). Run also
+starts it when needed, without administrator approval. This startup does not send
+Resume: saved Run/Pause intent remains authoritative. An explicit Pause survives
+app relaunch and reboot. With the app open, an unavailable session supervisor is
+retried at most once every 30 seconds. Quitting the interface leaves the supervisor
+and requested proof work running. The full-node RPC sync display is independent
+of supervisor availability and proof readiness.
+
+Session supervision starts when the app opens. Use the system registration below
+for boot operation without a GUI login or app launch; session startup reconnects
+to an existing registered supervisor rather than creating another owner.
+
 Install the signed app at `/Applications/Timelord.app`. Configure the node identity
 and native client using the interface, then choose **Enable background service…**
 in Settings. This is an explicit macOS administrator approval, not an automatic

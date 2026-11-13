@@ -10,6 +10,13 @@ actor SupervisorClient {
         self.config = config
         executor = ConfigurationClient(helper: helper, config: config)
     }
+    func ensureStarted(worker: URL, network: String, monitorListen: String, statusListen: String) async throws -> SupervisorStatus {
+        let data = try await executor.run(["ensure-started", "--config", config.path,
+            "--worker", worker.path, "--network", network, "--monitor-listen", monitorListen,
+            "--status-listen", statusListen])
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode(SupervisorStatus.self, from: data)
+    }
     func send(_ command: Command, expectedRevision: UInt64? = nil) async throws -> SupervisorStatus {
         var arguments = [command.rawValue, "--config", config.path]
         if let expectedRevision {

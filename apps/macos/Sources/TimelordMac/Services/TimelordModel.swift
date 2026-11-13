@@ -36,6 +36,7 @@ final class TimelordModel: ObservableObject {
         controller.supervisor?.mode == .paused && controller.supervisor?.phase == .paused
     }
     private var quitting = false
+    private var lastStartupAttempt = Date.distantPast
     private var monitoring: Task<Void, Never>?
     private let monitoringEnabled: Bool
 
@@ -45,7 +46,10 @@ final class TimelordModel: ObservableObject {
     var logsURL: URL { controller.logsURL }
     var statusURL: URL { liveClient.endpoint }
     var quitLabel: String { "Quit interface" }
-    var canStartService: Bool { !quitting && canControlService && !controller.desiredRunning && presentationOperation != .pause && !isBusy }
+    private var hasRunnableConfiguration: Bool {
+        configurationLoaded && savedConfiguration.node.hasIdentity && !savedConfiguration.hardware.boards.isEmpty && savedConfiguration.hardware.clientBinary != nil
+    }
+    var canStartService: Bool { !quitting && (canControlService || hasRunnableConfiguration) && !controller.desiredRunning && presentationOperation != .pause && !isBusy }
     var canInspectConnections: Bool { !controller.desiredRunning && controller.processID == nil && liveStatus == nil && !isBusy }
 
     init(controller suppliedController: ServiceController? = nil, initialConfiguration: AppConfiguration? = nil, monitoringEnabled: Bool = true) {
@@ -104,6 +108,7 @@ final class TimelordModel: ObservableObject {
             } catch { errorMessage = error.localizedDescription }
         }
         await controller.refresh()
+        if monitoringEnabled { await restoreStartupIntent() }
         await refreshNodeSync()
         let expectedPID = controller.processID
         workerStatus.observe(supervisor: controller.supervisor)
@@ -131,6 +136,21 @@ final class TimelordModel: ObservableObject {
             updateSnapshot()
         }
         if !operationInProgress && !isBusy && Date().timeIntervalSince(lastDiscovery)>15 { await refreshDevices() }
+    }
+
+    /// Starting the control plane never overrides a deliberately saved Pause.
+    func restoreStartupIntent(now: Date = Date()) async {
+        guard configurationLoaded, !quitting, !canControlService, !isBusy,
+              savedConfiguration.service.startAutomatically, hasRunnableConfiguration,
+              now.timeIntervalSince(lastStartupAttempt) >= 30 else { return }
+        lastStartupAttempt = now
+        do { try await ensureSupervisor() }
+        catch { errorMessage = error.localizedDescription }
+    }
+    private func ensureSupervisor() async throws {
+        try await controller.ensureStarted(network: savedConfiguration.node.network,
+            monitorListen: savedConfiguration.service.supervisorObservabilityListen,
+            statusListen: savedConfiguration.service.statusListen)
     }
 
     private func refreshNodeSync() async {
@@ -167,7 +187,7 @@ final class TimelordModel: ObservableObject {
         case .setupRequired:
             if !savedConfiguration.node.hasIdentity { return "Connect node" }
             if savedConfiguration.hardware.boards.isEmpty || savedConfiguration.hardware.clientBinary == nil { return "Set up boards" }
-            return canControlService ? "Start Timelord" : "Enable background service"
+            return "Start Timelord"
         }
     }
     func primaryAction() {
@@ -181,8 +201,7 @@ final class TimelordModel: ObservableObject {
         case .setupRequired:
             if !savedConfiguration.node.hasIdentity { sheet = .node }
             else if savedConfiguration.hardware.boards.isEmpty || savedConfiguration.hardware.clientBinary == nil { sheet = .boards }
-            else if canControlService { startService() }
-            else { sheet = .settings }
+            else { startService() }
         default: sheet = .node
         }
     }
@@ -207,6 +226,7 @@ final class TimelordModel: ObservableObject {
         do {
             switch operation {
             case .start:
+                if !controller.canControlService { try await ensureSupervisor() }
                 if try await controller.start() {
                     // Only a fresh Resume applies the saved configuration.
                     configurationNeedsRestart = false; useSavedStatusEndpoint()

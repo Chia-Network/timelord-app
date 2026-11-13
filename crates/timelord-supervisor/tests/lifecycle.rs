@@ -114,6 +114,95 @@ impl Drop for Fixture {
     }
 }
 
+async fn ensure_session(fixture: &Fixture, helper: &Path) -> Status {
+    let output = Command::new(env!("CARGO_BIN_EXE_timelord-supervisor"))
+        .arg("ensure-started")
+        .arg("--config")
+        .arg(fixture.config())
+        .arg("--worker")
+        .arg(helper)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+async fn stop_session(fixture: &Fixture, status: &Status) {
+    unsafe {
+        libc::kill(status.supervisor_pid as i32, libc::SIGTERM);
+    }
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while request(&fixture.config(), Control::Status, None)
+            .await
+            .is_ok()
+        {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn session_start_survives_cli_exit_reuses_owner_and_preserves_pause() {
+    let fixture = Fixture::new();
+    let helper = fixture.helper("exec /bin/sleep 60");
+    let first = ensure_session(&fixture, &helper).await;
+    assert_eq!(first.mode, Mode::Running);
+    fixture.status(|s| s.worker_pid.is_some()).await;
+    let second = ensure_session(&fixture, &helper).await;
+    assert_eq!(first.supervisor_pid, second.supervisor_pid);
+    let paused = request(&fixture.config(), Control::Pause, None)
+        .await
+        .unwrap();
+    assert_eq!(ensure_session(&fixture, &helper).await.mode, Mode::Paused);
+    stop_session(&fixture, &paused).await;
+    let restarted = ensure_session(&fixture, &helper).await;
+    assert_eq!(restarted.mode, Mode::Paused);
+    assert!(restarted.worker_pid.is_none());
+    stop_session(&fixture, &restarted).await;
+}
+
+#[tokio::test]
+async fn concurrent_session_starters_share_one_supervisor() {
+    let fixture = Fixture::new();
+    let helper = fixture.helper("exec /bin/sleep 60");
+    let (a, b) = tokio::join!(
+        ensure_session(&fixture, &helper),
+        ensure_session(&fixture, &helper)
+    );
+    assert_eq!(a.supervisor_pid, b.supervisor_pid);
+    request(&fixture.config(), Control::Pause, None)
+        .await
+        .unwrap();
+    stop_session(&fixture, &a).await;
+}
+
+#[tokio::test]
+async fn session_start_refuses_an_existing_foreground_worker_listener() {
+    let fixture = Fixture::new();
+    let helper = fixture.helper("exec /bin/sleep 60");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_timelord-supervisor"))
+        .arg("ensure-started")
+        .arg("--config")
+        .arg(fixture.config())
+        .arg("--worker")
+        .arg(&helper)
+        .arg("--status-listen")
+        .arg(listener.local_addr().unwrap().to_string())
+        .output()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("existing worker"));
+    assert!(!fixture.0.join("pids").exists());
+}
+
 #[tokio::test]
 async fn explicit_pause_survives_supervisor_restart_and_resume_uses_one_owner() {
     let fixture = Fixture::new();
