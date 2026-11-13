@@ -4,7 +4,7 @@ The build consumes public Chia-Network/chiavdf at the exact commit in
 [upstream.env](upstream.env), without source overlays or copied prover/control
 headers. That revision includes upstream performance, live-control and telemetry
 work plus [opened-handle serial validation](https://github.com/Chia-Network/chiavdf/pull/474).
-The pin is `85eb50b4cb4a88379e673848b6f74812c1e7cc73`, combining
+The pin is `005fe3c357341dfd0c5aa9a8244f8fbc31e957b6`, combining
 [PR 497](https://github.com/Chia-Network/chiavdf/pull/497) for bounded readback and
 checked shutdown with [PR 498](https://github.com/Chia-Network/chiavdf/pull/498)
 for physical engine identities, based on main
@@ -29,7 +29,8 @@ frames at EOF. These checks do not establish physical shutdown timing. The versi
 advertise these extensions, so consumers must pin a supporting revision.
 `--engine-identity` sends `TLENGINE 1 N` on every engine socket
 connection; the adapter consumes it before the usual VDF protocol. Incomplete or
-failed identity writes close and retry only that engine connection. Failed
+failed identity writes and peer resets close and retry only that engine
+connection; STOP replies are best effort on a broken socket. Failed
 connects release their socket descriptors.
 
 ```sh
