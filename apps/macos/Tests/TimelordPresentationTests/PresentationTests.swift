@@ -639,4 +639,33 @@ extension PresentationTests {
         XCTAssertTrue(reconnecting.boards.allSatisfy { $0.state == .disconnected })
     }
 
+    func testAdmissionFailureShowsActualReasonInsteadOfNodeOrMissingBoardAdvice() throws {
+        let message = "ASIC 1 needs attention: Admission native owner did not confirm hardware quiescence"
+        func status(_ hardware: String, node: String = "disconnected", state: String = "waiting_for_clients") throws -> ServiceStatus {
+            let object: [String: Any] = ["api_version": 1, "service_pid": 42, "timestamp_unix": 1_000_000, "started_unix": 999000,
+                "timelord_state": state, "message": message, "production_enabled": true, "proofs_delivered": 0, "tuning_paused": false,
+                "full_node": ["host": "fixture", "port": 58445, "network": "ephemeral", "state": node],
+                "boards": [["id": "a", "name": "ASIC 1", "assigned_chains": [], "connected_clients": 0, "hardware_state": hardware, "profile": "Automatic"]]]
+            let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+            return try decoder.decode(ServiceStatus.self, from: JSONSerialization.data(withJSONObject: object))
+        }
+        // An active FTDI owner can hide enumeration metadata. Lifecycle rows
+        // describe checking/failure, without claiming detection or productivity.
+        let failed = LivePresentation.snapshot(status: try status("quarantined"), detectedDevices: [], now: now)
+        XCTAssertEqual(failed.phase, .boardMissing)
+        XCTAssertEqual(failed.explanation, message)
+        XCTAssertEqual(failed.boards.count, 1)
+        XCTAssertEqual(failed.boards.first?.state, .needsAttention)
+        XCTAssertEqual(failed.boards.first?.state.title, "Needs attention")
+        XCTAssertEqual(failed.headlineSpeed, "—")
+        let checking = LivePresentation.snapshot(status: try status("checking", node: "waiting_for_hardware"), detectedDevices: [], now: now)
+        XCTAssertEqual(checking.phase, .starting)
+        XCTAssertEqual(checking.boards.first?.state, .checking)
+        XCTAssertEqual(checking.explanation, message)
+        let unavailable = LivePresentation.snapshot(status: try status("connected", state: "waiting_for_node"), now: now)
+        XCTAssertEqual(unavailable.phase, .nodeUnreachable)
+        let paused = LivePresentation.snapshot(status: try status("quarantined"), paused: true, now: now)
+        XCTAssertEqual(paused.phase, .paused)
+    }
+
 }

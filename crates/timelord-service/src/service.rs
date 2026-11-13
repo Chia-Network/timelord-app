@@ -139,7 +139,7 @@ async fn start_run(
     if assignments.is_empty() {
         runtime.transition(
             "waiting_for_clients",
-            "disconnected",
+            "waiting_for_hardware",
             "Connect an ASIC board to resume.",
         );
     }

@@ -66,6 +66,7 @@ pub(super) async fn drain_shutdown(
     let retained = MARKER.len() + 1;
     let mut tail = Vec::with_capacity(buffer.len() + retained);
     let mut confirmed = false;
+    let mut diagnostic_records = 0;
     loop {
         let count = source.read(&mut buffer).await?;
         if count == 0 {
@@ -82,6 +83,22 @@ pub(super) async fn drain_shutdown(
                         [b'\n', ..] | [b'\r', b'\n', ..]
                     )
             });
+        // Shutdown diagnostics were previously discarded, hiding whether the
+        // client rejected readback or simply failed to exit. Keep bounded error
+        // records in the service log without interpreting them as confirmation.
+        for record in tail.split_inclusive(|byte| *byte == b'\n') {
+            if diagnostic_records >= 8 || !record.ends_with(b"\n") {
+                continue;
+            }
+            let text = String::from_utf8_lossy(record);
+            if ["safe_readback", "Hardware shutdown:", "VDF client stopped:"]
+                .iter()
+                .any(|marker| text.contains(marker))
+            {
+                tracing::info!(record = text.trim_end(), "Native shutdown diagnostic");
+                diagnostic_records += 1;
+            }
+        }
         let discard = tail.len().saturating_sub(retained);
         tail.drain(..discard);
     }
@@ -469,12 +486,17 @@ impl NativeControl {
                 tokio::io::copy(&mut output, &mut sink),
                 drain_shutdown(&mut stderr)
             );
-            exit.is_ok() && confirmed.unwrap_or(false)
+            let confirmed = confirmed.unwrap_or(false);
+            if !confirmed {
+                tracing::warn!(?exit, "Native client exited without shutdown confirmation");
+            }
+            exit.is_ok() && confirmed
         })
         .await;
         if let Ok(confirmed) = retired {
             return confirmed;
         }
+        tracing::warn!("Native client did not retire within the shutdown deadline");
         terminate(child).await;
         false
     }

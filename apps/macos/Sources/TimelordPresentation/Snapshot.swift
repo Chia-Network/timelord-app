@@ -36,12 +36,12 @@ public enum AppPhase: String, Sendable {
 }
 
 public enum BoardState: String, Sendable {
-    case uninspected, active, waiting, disconnected, thermalStop, paused
+    case uninspected, checking, needsAttention, active, waiting, disconnected, thermalStop, paused
     public var title: String {
-        switch self { case .uninspected: return "Hardware not inspected"; case .active: return "Producing proofs"; case .waiting: return "Waiting for work"; case .disconnected: return "Disconnected"; case .thermalStop: return "Stopped at temperature limit"; case .paused: return "Paused" }
+        switch self { case .uninspected: return "Hardware not inspected"; case .checking: return "Checking hardware"; case .needsAttention: return "Needs attention"; case .active: return "Producing proofs"; case .waiting: return "Waiting for work"; case .disconnected: return "Disconnected"; case .thermalStop: return "Stopped at temperature limit"; case .paused: return "Paused" }
     }
     public var tone: StatusTone {
-        switch self { case .active: return .positive; case .disconnected: return .attention; case .thermalStop: return .critical; default: return .neutral }
+        switch self { case .active: return .positive; case .disconnected, .needsAttention: return .attention; case .thermalStop: return .critical; default: return .neutral }
     }
 }
 
@@ -233,6 +233,8 @@ public enum LivePresentation {
         let productive = live?.boards.contains(where: { $0.hardwareState == "connected" }) == true && live?.productionEnabled == true && live?.timelordState == "running" && live?.latestProofUnix.map { now.timeIntervalSince1970 - $0 < 90 } == true
         let thermal = live?.boards.contains { $0.hardwareState == "thermal_stop" } == true
         let allBoardsFailed = live.map { !$0.boards.isEmpty && $0.boards.allSatisfy { ["fault", "thermal_stop"].contains($0.hardwareState) } } ?? false
+        let admissionBlocked = !productive && live?.boards.contains { $0.hardwareState == "quarantined" } == true
+        let checkingHardware = live?.timelordState == "waiting_for_clients" && live?.boards.contains { $0.hardwareState == "checking" } == true
         let phase: AppPhase
         if controlOperation == .pause { phase = .pausing }
         else if controlOperation == .start { phase = .starting }
@@ -241,6 +243,9 @@ public enum LivePresentation {
         else if error != nil || live?.timelordState == "fault" || allBoardsFailed { phase = .serviceUnavailable }
         else if paused { phase = .paused }
         else if productive { phase = .running }
+        else if admissionBlocked { phase = .boardMissing }
+        else if checkingHardware { phase = .starting }
+        else if live?.timelordState == "waiting_for_clients" { phase = .boardMissing }
         else if live?.fullNode.state == "disconnected" { phase = .nodeUnreachable }
         else if live?.productionEnabled == true { phase = nodeReady ? .waitingForProofs : .waitingForNode }
         else { phase = .setupRequired }
@@ -251,6 +256,9 @@ public enum LivePresentation {
             boards = live.boards.filter { board in
                 // Fresh supervised owners are stronger presence evidence than
                 // enumeration, which can hide metadata for open USB interfaces.
+                // Checking and quarantined are supervised lifecycle reports,
+                // not claims of detected hardware or productive work.
+                if ["checking", "quarantined"].contains(board.hardwareState) { return true }
                 if board.hardwareState == "connected" || (board.hardwareState == "starting" && board.connectedClients > 0) { return true }
                 guard let detectedDevices else {return true}
                 let configured=configuration?.hardware.boards.first(where:{$0.id==board.id})
@@ -260,7 +268,7 @@ public enum LivePresentation {
             }.map { board in
                 let last = proofCapable ? board.latestProofUnix.map(Date.init(timeIntervalSince1970:)) : nil
                 let freshProof = last.map { now.timeIntervalSince($0) < 90 } ?? false
-                let state: BoardState = board.hardwareState == "thermal_stop" ? .thermalStop : ["fault", "reconnecting"].contains(board.hardwareState) ? .disconnected : productive && freshProof && board.hardwareState == "connected" ? .active : board.hardwareState == "connected" ? .waiting : .uninspected
+                let state: BoardState = board.hardwareState == "quarantined" ? .needsAttention : board.hardwareState == "checking" ? .checking : board.hardwareState == "thermal_stop" ? .thermalStop : ["fault", "reconnecting"].contains(board.hardwareState) ? .disconnected : productive && freshProof && board.hardwareState == "connected" ? .active : board.hardwareState == "connected" ? .waiting : .uninspected
                 let histories = board.assignedChains.compactMap(Chain.init(rawValue:)).map { chain -> ChainHistory in
                     guard let validHistory else { return .empty(chain) }
                     return validHistory.history(boardID: board.id, chain: chain, now: now)
@@ -289,7 +297,7 @@ public enum LivePresentation {
             }
         }
         let faultReason = live.flatMap { status -> String? in
-            guard status.timelordState == "fault" else { return nil }
+            guard status.timelordState == "fault" || admissionBlocked || checkingHardware || status.timelordState == "waiting_for_clients" else { return nil }
             if status.boards.contains(where: { $0.faultKind == "control_closed" }) {
                 return "The ASIC client connection closed unexpectedly. Proof production has stopped. Pause and Run to reconnect. Details: Native control closed before acknowledgement."
             }

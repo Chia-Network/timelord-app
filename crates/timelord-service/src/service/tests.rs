@@ -481,3 +481,33 @@ async fn shutdown_interrupts_accept_backoff_promptly() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test]
+async fn no_admitted_capacity_waits_for_hardware_without_claiming_node_failure() {
+    let directory =
+        std::env::temp_dir().join(format!("tl-waiting-hardware-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let config = Config::default();
+    let prepared = hardware::prepare_for(&config, &HashSet::new())
+        .await
+        .unwrap();
+    let run = start_run(
+        config,
+        prepared,
+        directory.join("history.json"),
+        &HashMap::new(),
+        unix_now(),
+        operational::State::fixture(),
+        None,
+    )
+    .await
+    .unwrap();
+    {
+        let state = run.shared.runtime.lock().unwrap();
+        assert_eq!(state.phase, "waiting_for_clients");
+        assert_eq!(state.node, "waiting_for_hardware");
+        assert_eq!(state.message, "Connect an ASIC board to resume.");
+    }
+    run.stop().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}

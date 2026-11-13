@@ -4,8 +4,15 @@ The build consumes public Chia-Network/chiavdf at the exact commit in
 [upstream.env](upstream.env), without source overlays or copied prover/control
 headers. That revision includes upstream performance, live-control and telemetry
 work plus [opened-handle serial validation](https://github.com/Chia-Network/chiavdf/pull/474).
-The pin is upstream main at `47774682a02319c3dfd0f216981ce1eb65623515`
-(November 12, 2026), including the merged serial and initialization changes.
+The pin is `20e762df612fbb8a0cfb645dc4b0d89e030552b7`, the upstream branch for
+[PR 497](https://github.com/Chia-Network/chiavdf/pull/497), based on main
+`47774682a02319c3dfd0f216981ce1eb65623515`. It includes the merged serial and
+initialization changes plus quantized operating-point readback validation.
+Requested operating points retain strict limits; measured values use the existing
+bounded readback tolerance, including the 0.69375 V regulator reading for a
+0.700 V shutdown target. This prevents false shutdown failures and rejected
+initial readback on the next startup. Offline regression coverage does not by
+itself establish hardware/testnet acceptance.
 
 ```sh
 bash scripts/build-native.sh
