@@ -4,7 +4,7 @@ The build consumes public Chia-Network/chiavdf at the exact commit in
 [upstream.env](upstream.env), without source overlays or copied prover/control
 headers. That revision includes upstream performance, live-control and telemetry
 work plus [opened-handle serial validation](https://github.com/Chia-Network/chiavdf/pull/474).
-The pin is `613da4feb115b4b46d609ac442f4b03a049032f5`, combining
+The pin is `85eb50b4cb4a88379e673848b6f74812c1e7cc73`, combining
 [PR 497](https://github.com/Chia-Network/chiavdf/pull/497) for bounded readback and
 checked shutdown with [PR 498](https://github.com/Chia-Network/chiavdf/pull/498)
 for physical engine identities, based on main
@@ -22,7 +22,10 @@ covering the native 5-second soft deadline, 10-second TERM allowance and bounded
 pipe drains. Unknown evidence forces conservative reinitialization, not a
 permanent stop. Native exit status is 70 for exceptions or unconfirmed hardware
 shutdown, including TLSTOP and SIGTERM; successful exit alone never replaces the
-positive acknowledgement plus reaping requirement. The version probe does not
+positive acknowledgement plus reaping requirement. The native emulator models
+regulator VID writes and can force zero readback; offline main-loop fixtures cover
+confirmed exit 0, unconfirmed exit 70, stale stop IDs and unterminated control
+frames at EOF. These checks do not establish physical shutdown timing. The version probe does not
 advertise these extensions, so consumers must pin a supporting revision.
 `--engine-identity` sends `TLENGINE 1 N` on every engine socket
 connection; the adapter consumes it before the usual VDF protocol. Incomplete or
