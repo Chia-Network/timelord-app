@@ -130,3 +130,13 @@ restarts, with healthy native sessions and the full-node peer connection retaine
 during an isolated hardware outage. Offline socket/process/TLS fixtures exercise
 recovery, exhaustion and safety latches. The live check verifies deployment health
 only; it does not inject a physical board fault or establish an IPS improvement.
+
+`continuous-recovery-deployment.json` records the user-authorized November 13
+custom-testnet deployment. The injected native SIGTERM recovered automatically
+while retaining the supervisor, worker, healthy owner PIDs and the exact node TCP
+connection through the recovery check. Other chains delivered verified proofs
+during recovery. A separate ASIC 2 native timeout also recurred and recovered;
+a process sample locates the stall in FTDI `BulkOutRequest` during engine enable.
+The other two owners delivered 88 additional proofs in a subsequent 50-second
+capture, with zero verification failures. The USB stall remains unresolved; this
+is not an all-board stability result or a PoS transition test.

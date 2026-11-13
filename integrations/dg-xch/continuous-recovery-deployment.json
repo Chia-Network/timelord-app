@@ -1,0 +1,75 @@
+{
+  "date": "2026-11-13",
+  "machine": "m6mini",
+  "purpose": "User-authorized custom-testnet continuous-recovery development deployment",
+  "deployment": {
+    "source_commit": "fddc32b1843de97477f1e34104b7316eb69cccea",
+    "supervisor_pid": 12738,
+    "mode": "running",
+    "prior_mode": "running",
+    "worker_pid": 12739,
+    "configuration_unchanged": false,
+    "testnet_address_updated": true,
+    "testnet_host": "192.168.1.124",
+    "verified_both_app_copies": true
+  },
+  "native_revision": "906ca599901472599ebbec5fcae8f6ed0275cce5",
+  "experiment": {
+    "source_commit": "fddc32b1843de97477f1e34104b7316eb69cccea",
+    "fault_injected": "SIGTERM one native client",
+    "recovered_automatically": true,
+    "elapsed_seconds": 25.23,
+    "worker_pid_retained": 12739,
+    "supervisor_pid_retained": 12738,
+    "healthy_native_pids_retained": {
+      "811F0379-0E67-439C-868A-D83665CE6792": 12754,
+      "92289F26-3466-4292-9A9A-7B9706FDF66E": 12811
+    },
+    "old_target_pid": 12747,
+    "new_target_pid": 12893,
+    "node_connection_retained": true,
+    "proofs_before": 204,
+    "proofs_after": 220,
+    "failed_proofs": 0,
+    "all_three_boards_connected": false
+  },
+  "observed_separate_fault": "ASIC 2 native timeouts occurred before and after deployment and recovered automatically. Its later replacement means the initial experiment is not an all-board stability result.",
+  "validation_boundary": "This tests current custom-testnet proof delivery and owner recovery, not PoS v1/v2 transition acceptance or long-term hardware stability.",
+  "subsequent_observation": {
+    "duration_seconds": 50,
+    "proofs_before": 465,
+    "proofs_after": 553,
+    "failed_proofs": 0,
+    "healthy_native_pids_retained": [
+      12893,
+      12754
+    ],
+    "worker_pid_retained": 12739,
+    "asic_2_fault_retried_without_human_intervention": true,
+    "sampled_stack": "event_loop -> start_hw_vdf -> VdfDriver::EnableEngine -> FtdiDriver::WriteCmd -> FT4222_SPIMaster_MultiReadWrite -> FT_Write -> BulkOutRequest -> pthread_cond_wait",
+    "interpretation": "Native USB write stalled; the underlying cause remains unresolved. This is not an app admission hold."
+  },
+  "latest_snapshot": {
+    "proofs_delivered": 626,
+    "failed_proofs": 0,
+    "node_state": "ready",
+    "timelord_state": "running",
+    "boards": [
+      {
+        "name": "ASIC 3",
+        "hardware_state": "connected",
+        "native_pid": 12893
+      },
+      {
+        "name": "ASIC 1",
+        "hardware_state": "connected",
+        "native_pid": 12754
+      },
+      {
+        "name": "ASIC 2",
+        "hardware_state": "connected",
+        "native_pid": 13122
+      }
+    ]
+  }
+}
