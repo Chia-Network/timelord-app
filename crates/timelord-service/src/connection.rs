@@ -406,6 +406,12 @@ mod tests {
         invalid.network_id = "different".into();
         fs::write(&metadata, serde_json::to_vec(&invalid).unwrap()).unwrap();
         assert!(import(&config_path, &manifest).is_err());
+        let mut invalid = custom.network_definition.clone().unwrap();
+        invalid
+            .constants
+            .insert("NUM_SPS_SUB_SLOT".into(), 0.into());
+        fs::write(&metadata, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(import(&config_path, &manifest).is_err());
         assert_eq!(fs::read(&config_path).unwrap(), saved);
         fs::remove_file(&metadata).unwrap();
         let outside = directory.join("outside.json");

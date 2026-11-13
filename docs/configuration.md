@@ -151,9 +151,17 @@ keep a reference to the transfer folder. Network IDs use 1–64 lowercase letter
 digits or hyphens. Missing or mismatched definitions are rejected before saving.
 Mainnet and Testnet11 continue using their pinned built-in definitions.
 
+Raw exported numeric constants are normalized on import. Saved configuration and
+helper JSON represent integers as `{ integer = "decimal digits" }`, preserving
+the full supported `u128` range through TOML and macOS settings edits. This also
+keeps numeric constants distinct from quoted strings. The resolver checks the
+pinned scheduler's parameter invariants before accepting imports or settings.
+
 Custom chain constants also form part of the saved-history scope and last-good
 fallback identity. Reusing a network name with another genesis or different
 constants cannot silently reuse the earlier chain's history or fallback config.
+Export timestamps, Chia versions and presentation overrides are provenance, not
+chain identity; re-exporting the same chain does not invalidate fallback/history.
 
 ## Automatic tuning
 

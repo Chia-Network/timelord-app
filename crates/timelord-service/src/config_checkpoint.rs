@@ -95,11 +95,20 @@ fn load_saved(
     let config = crate::parse_config(path, &text).with_context(|| {
         format!("Requested configuration and last-good checkpoint are invalid: {requested}")
     })?;
-    ensure!(
-        network.is_none_or(|intent| intent.network == config.node.network
-            && intent.network_definition == config.node.network_definition),
-        "Requested network differs from last-good checkpoint; fallback refused: {requested}"
-    );
+    if let Some(intent) = network {
+        let requested_identity =
+            timelord_core::ChainIdentity::new(&intent.network, intent.network_definition.as_ref())
+                .map_err(anyhow::Error::msg)?;
+        let saved_identity = timelord_core::ChainIdentity::new(
+            &config.node.network,
+            config.node.network_definition.as_ref(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        ensure!(
+            requested_identity == saved_identity,
+            "Requested network differs from last-good checkpoint; fallback refused: {requested}"
+        );
+    }
     tracing::warn!(
         "Requested configuration unavailable; using saved last-good configuration. Run validate to inspect the requested file."
     );
@@ -261,6 +270,15 @@ mod tests {
         };
         crate::save(&saved_path(&path).unwrap(), &config).unwrap();
         config.schema_version = 999;
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        assert!(load_running(&path).unwrap().1);
+        let definition = config.node.network_definition.as_mut().unwrap();
+        definition.exported_at = "re-exported later".into();
+        definition.chia_version = "another version".into();
+        definition.config_overrides.insert(
+            "address_prefix".into(),
+            "different-prefix".to_owned().into(),
+        );
         std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
         assert!(load_running(&path).unwrap().1);
         config

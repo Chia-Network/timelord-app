@@ -51,8 +51,13 @@ pub fn scope(config: &Config, assignments: &[timelord_core::Assignment]) -> Resu
         config.node.port,
         assignments,
     ))?;
-    if let Some(definition) = &config.node.network_definition {
-        bytes.extend(serde_json::to_vec(&definition.constants)?);
+    if config.node.network_definition.is_some() {
+        let identity = timelord_core::ChainIdentity::new(
+            &config.node.network,
+            config.node.network_definition.as_ref(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        bytes.extend(serde_json::to_vec(&identity)?);
     }
     Ok(dg_xch_core::utils::hash_256(bytes)
         .iter()
@@ -504,6 +509,13 @@ mod tests {
             ..Default::default()
         };
         let original = scope(&config, &[]).unwrap();
+        let definition = config.node.network_definition.as_mut().unwrap();
+        definition.exported_at = "another export".into();
+        definition.chia_version = "another version".into();
+        definition
+            .config_overrides
+            .insert("address_prefix".into(), "another-prefix".to_owned().into());
+        assert_eq!(scope(&config, &[]).unwrap(), original);
         config
             .node
             .network_definition

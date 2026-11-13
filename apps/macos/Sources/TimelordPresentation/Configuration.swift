@@ -29,7 +29,8 @@ public struct NetworkDefinition: Codable, Sendable, Equatable {
     public var configOverrides: [String: NetworkValue]
 }
 
-/// Preserve exported numbers and nested overrides through settings edits.
+/// Preserve nested overrides through settings edits. The helper normalizes
+/// integers to {"integer": "decimal digits"} so even u128 stays exact.
 public indirect enum NetworkValue: Codable, Sendable, Equatable {
     case string(String), number(Decimal), bool(Bool), array([NetworkValue]), object([String: NetworkValue]), null
     public init(from decoder: Decoder) throws {

@@ -17,7 +17,7 @@ final class ConfigurationClientTests: XCTestCase {
         let definition = try decoder.decode(NetworkDefinition.self, from: Data("""
         {"schema_version":1,"network_id":"ephemeral-fixture","exported_at":"fixture","chia_version":"fixture",
          "constants":{"GENESIS_CHALLENGE":"abababababababababababababababababababababababababababababababab",
-         "DIFFICULTY_CONSTANT_FACTOR":10052721566054,"SUB_SLOT_ITERS_STARTING":33554432},"config_overrides":{}}
+         "DIFFICULTY_CONSTANT_FACTOR":{"integer":"170141183460469231731687303715884105729"},"SUB_SLOT_ITERS_STARTING":{"integer":"33554432"}},"config_overrides":{}}
         """.utf8))
         var config = AppConfiguration()
         config.node.network = definition.networkId
@@ -32,6 +32,7 @@ final class ConfigurationClientTests: XCTestCase {
         let saved = try await client.load()
         XCTAssertEqual(saved.node.networkDefinition, definition)
         XCTAssertEqual(saved.node.host, "changed.fixture.invalid")
+        XCTAssertEqual(saved.node.networkDefinition?.constants["DIFFICULTY_CONSTANT_FACTOR"], .object(["integer": .string("170141183460469231731687303715884105729")]))
     }
     func testActualHelperConfigurationRoundTripAndInvalidEditPreserveSavedSettings() async throws {
         var root = URL(fileURLWithPath: #filePath)

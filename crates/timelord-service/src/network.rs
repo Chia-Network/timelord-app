@@ -32,7 +32,7 @@ pub fn resolve(node: &NodeConfig) -> Result<ResolvedChain> {
             ($($field:ident),* $(,)?) => {
                 match name.to_ascii_lowercase().as_str() {
                     $(stringify!($field) => {
-                        constants.$field = serde_json::from_value(value.clone())
+                        constants.$field = value.unsigned().map_err(anyhow::Error::msg)
                             .with_context(|| format!("Invalid network constant {name}"))?;
                         continue;
                     })*
@@ -103,12 +103,17 @@ pub fn resolve(node: &NodeConfig) -> Result<ResolvedChain> {
             "GENESIS_PRE_FARM_FARMER_PUZZLE_HASH" => {
                 constants.genesis_pre_farm_farmer_puzzle_hash = hex_constant(name, value)?
             }
-            "MIN_PLOT_SIZE_V1" => constants.min_plot_size = serde_json::from_value(value.clone())?,
-            "MAX_PLOT_SIZE_V1" => constants.max_plot_size = serde_json::from_value(value.clone())?,
-            "NUMBER_ZERO_BITS_PLOT_FILTER_V1" => {
-                constants.number_zero_bits_plot_filter = serde_json::from_value(value.clone())?
+            "MIN_PLOT_SIZE_V1" => {
+                constants.min_plot_size = value.unsigned().map_err(anyhow::Error::msg)?
             }
-            "NETWORK_TYPE" => match value.as_u64() {
+            "MAX_PLOT_SIZE_V1" => {
+                constants.max_plot_size = value.unsigned().map_err(anyhow::Error::msg)?
+            }
+            "NUMBER_ZERO_BITS_PLOT_FILTER_V1" => {
+                constants.number_zero_bits_plot_filter =
+                    value.unsigned().map_err(anyhow::Error::msg)?
+            }
+            "NETWORK_TYPE" => match value.unsigned::<u64>().ok() {
                 Some(0) => constants.is_testnet = false,
                 Some(1) => constants.is_testnet = true,
                 _ => bail!("Invalid NETWORK_TYPE"),
@@ -116,6 +121,10 @@ pub fn resolve(node: &NodeConfig) -> Result<ResolvedChain> {
             _ => {}
         }
     }
+    // Reuse the pinned scheduler's pure constructor to validate all parameters
+    // before an import/configuration can replace usable saved settings.
+    dg_xch_timelord::scheduler::Scheduler::new(constants, false, None)
+        .context("Invalid custom network scheduler parameters")?;
     // Custom Chia networks are not the upstream DGX chain format: their handshake
     // ID is the exact selected_network, with no genesis suffix or derived seed.
     Ok(ResolvedChain {
@@ -128,7 +137,7 @@ pub fn resolve(node: &NodeConfig) -> Result<ResolvedChain> {
 
 fn hex_constant(
     name: &str,
-    value: &serde_json::Value,
+    value: &timelord_core::NetworkValue,
 ) -> Result<dg_xch_core::blockchain::sized_bytes::Bytes32> {
     use std::str::FromStr;
     let text = value.as_str().context("Expected hex network constant")?;
@@ -140,12 +149,13 @@ fn hex_constant(
 
 pub fn yaml_overrides(
     value: &yaml_rust2::Yaml,
-) -> Result<std::collections::BTreeMap<String, serde_json::Value>> {
+) -> Result<std::collections::BTreeMap<String, timelord_core::NetworkValue>> {
     fn json(value: &yaml_rust2::Yaml) -> Result<serde_json::Value> {
         use yaml_rust2::Yaml;
         Ok(match value {
             Yaml::String(v) => v.clone().into(),
             Yaml::Integer(v) => (*v).into(),
+            Yaml::Real(v) => serde_json::from_str(v).context("Invalid numeric network override")?,
             Yaml::Boolean(v) => (*v).into(),
             Yaml::Array(v) => serde_json::Value::Array(v.iter().map(json).collect::<Result<_>>()?),
             Yaml::Hash(v) => serde_json::Value::Object(
@@ -231,10 +241,80 @@ pub(crate) mod tests {
             .as_mut()
             .unwrap()
             .constants
-            .insert("DIFFICULTY_STARTING".into(), "250".into());
+            .insert("DIFFICULTY_STARTING".into(), "250".to_owned().into());
         assert!(resolve(&config.node).is_err());
         config.node.network_definition = None;
         assert!(config.validate().is_err());
         assert!("bad\"network".parse::<Network>().is_err());
+    }
+
+    #[test]
+    fn full_u128_constants_survive_json_toml_and_helper_json() {
+        for expected in [1u128 << 67, (1u128 << 127) + 1, u128::MAX] {
+            let mut json = serde_json::to_value(node()).unwrap();
+            // Simulate raw numeric JSON produced by the exporter, not tagged config.
+            json["network_definition"]["constants"]["DIFFICULTY_CONSTANT_FACTOR"] =
+                serde_json::from_str(&expected.to_string()).unwrap();
+            let config = timelord_core::Config {
+                node: serde_json::from_value(json).unwrap(),
+                ..Default::default()
+            };
+            let restored: timelord_core::Config =
+                toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            let restored: timelord_core::Config =
+                serde_json::from_str(&serde_json::to_string(&restored).unwrap()).unwrap();
+            assert_eq!(
+                resolve(&restored.node)
+                    .unwrap()
+                    .constants
+                    .difficulty_constant_factor,
+                expected
+            );
+        }
+        let yaml = yaml_rust2::YamlLoader::load_from_str(
+            "DIFFICULTY_CONSTANT_FACTOR: 147573952589676412928",
+        )
+        .unwrap();
+        assert_eq!(
+            yaml_overrides(&yaml[0]).unwrap()["DIFFICULTY_CONSTANT_FACTOR"]
+                .unsigned::<u128>()
+                .unwrap(),
+            1u128 << 67
+        );
+    }
+
+    #[test]
+    fn invalid_scheduler_parameters_cannot_replace_a_saved_config() {
+        let directory =
+            std::env::temp_dir().join(format!("tl-invalid-network-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("config.toml");
+        let mut config = timelord_core::Config {
+            node: node(),
+            ..Default::default()
+        };
+        crate::save(&path, &config).unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        for (name, value) in [
+            ("NUM_SPS_SUB_SLOT", 0),
+            ("DIFFICULTY_STARTING", 0),
+            ("SUB_SLOT_ITERS_STARTING", 0),
+            ("DISCRIMINANT_SIZE_BITS", 17),
+        ] {
+            config.node = node();
+            config
+                .node
+                .network_definition
+                .as_mut()
+                .unwrap()
+                .constants
+                .insert(name.into(), value.into());
+            assert!(crate::save(&path, &config).is_err(), "{name}");
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+            let edited = directory.join("invalid.toml");
+            std::fs::write(&edited, toml::to_string(&config).unwrap()).unwrap();
+            assert!(crate::load(&edited).is_err(), "{name}");
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
