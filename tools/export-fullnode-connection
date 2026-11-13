@@ -98,8 +98,8 @@ def export(args, load_yaml, generate_cert):
             f"ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:18555:127.0.0.1:{rpc_port} "
             f"NODE_SSH_LOGIN@{host}\n\n"
             "network.json preserves the selected network overrides and provenance.\n"
-            "The current app accepts only mainnet/testnet11; custom network import\n"
-            "and scheduler transition support must be implemented before use.\n"
+            "Import the entire folder in Timelord Mac, including network.json.\n"
+            "Import and handshake success do not establish consensus acceptance.\n"
         )
         for file in output.iterdir():
             file.chmod(0o600)

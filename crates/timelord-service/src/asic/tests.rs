@@ -89,7 +89,7 @@ async fn setup() -> (
 ) {
     let config: Config =
         toml::from_str("[[hardware.boards]]\nid='a'\nname='A'\nclient_port=18110\n").unwrap();
-    let metrics = crate::observability::Metrics::new(config.node.network).unwrap();
+    let metrics = crate::observability::Metrics::new(config.node.network.clone()).unwrap();
     let process = crate::operational::State::new(metrics.clone());
     let runtime = {
         let mut fixture = crate::runtime::RuntimeState::new(false);
@@ -169,7 +169,7 @@ async fn icc_primer_does_not_supply_unmanaged_readiness_evidence() {
     config.node.certificate = Some("/fixture/no-io.crt".into());
     config.node.private_key = Some("/fixture/no-io.key".into());
     config.node.ca_certificate = Some("/fixture/no-io-ca.crt".into());
-    let metrics = crate::observability::Metrics::new(config.node.network).unwrap();
+    let metrics = crate::observability::Metrics::new(config.node.network.clone()).unwrap();
     let process = crate::operational::State::new(metrics.clone());
     let runtime = Arc::new(SyncMutex::new({
         let mut fixture = crate::runtime::RuntimeState::new(false);

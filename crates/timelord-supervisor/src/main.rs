@@ -45,7 +45,7 @@ enum Action {
         user: String,
         #[arg(long)]
         monitor_listen: Option<std::net::SocketAddr>,
-        #[arg(long, value_enum, default_value_t = Network::Mainnet)]
+        #[arg(long, default_value_t = Network::Mainnet)]
         network: Network,
     },
     /// Refuse migration while an existing coordinator holds its ownership lock.
@@ -60,7 +60,7 @@ enum Action {
         worker: Option<PathBuf>,
         #[arg(long)]
         monitor_listen: Option<std::net::SocketAddr>,
-        #[arg(long, value_enum, default_value_t = Network::Mainnet)]
+        #[arg(long, default_value_t = Network::Mainnet)]
         network: Network,
     },
     Status {

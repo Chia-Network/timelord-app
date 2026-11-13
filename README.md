@@ -160,6 +160,10 @@ need validation. This repository is development source, not a production release
 
 The pinned Rust scheduler needs a narrow decoder for current Chia unfinished-block
 messages. Absent MMR roots are supported; active header MMR roots fail closed.
+Custom Chia network bundles import the selected network ID and constant overrides;
+this configures the existing scheduler and does not add PoS2 transition or MMR
+support. Offline import/handshake fixtures do not establish custom-network consensus
+acceptance.
 Live configuration reload and start-at-login service registration are not implemented. Chart history is checkpointed to disk for up to
 24 hours and restored after service restarts, with downtime shown as gaps. Current
 uptime, proof counts and health still start fresh for each service run.

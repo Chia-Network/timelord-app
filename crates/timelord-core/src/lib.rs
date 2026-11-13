@@ -30,6 +30,7 @@ pub struct NodeConfig {
     pub host: String,
     pub port: u16,
     pub network: Network,
+    pub network_definition: Option<NetworkDefinition>,
     pub server_name: Option<String>,
     pub certificate: Option<PathBuf>,
     pub private_key: Option<PathBuf>,
@@ -55,6 +56,7 @@ impl Default for NodeConfig {
             host: "localhost".into(),
             port: 8444,
             network: Network::Mainnet,
+            network_definition: None,
             server_name: None,
             certificate: None,
             private_key: None,
@@ -64,20 +66,96 @@ impl Default for NodeConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+/// Wire network IDs remain strings in configuration and status JSON.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "String", into = "String")]
 pub enum Network {
     #[default]
     Mainnet,
     Testnet11,
+    Custom(String),
 }
-
 impl Network {
-    pub fn label(self) -> &'static str {
+    pub fn label(&self) -> &str {
         match self {
             Self::Mainnet => "mainnet",
             Self::Testnet11 => "testnet11",
+            Self::Custom(name) => name,
         }
+    }
+}
+impl TryFrom<String> for Network {
+    type Error = String;
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err("Network ID must be 1–64 lowercase letters, digits or hyphens".into());
+        }
+        Ok(match name.as_str() {
+            "mainnet" => Self::Mainnet,
+            "testnet11" => Self::Testnet11,
+            _ => Self::Custom(name),
+        })
+    }
+}
+impl From<Network> for String {
+    fn from(network: Network) -> Self {
+        network.label().to_owned()
+    }
+}
+impl std::str::FromStr for Network {
+    type Err = String;
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        name.to_owned().try_into()
+    }
+}
+impl std::fmt::Display for Network {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Non-secret, portable definition exported from the selected Chia root.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkDefinition {
+    pub schema_version: u32,
+    pub network_id: String,
+    pub exported_at: String,
+    pub chia_version: String,
+    pub constants: std::collections::BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub config_overrides: std::collections::BTreeMap<String, serde_json::Value>,
+}
+impl NetworkDefinition {
+    pub fn validate(&self, network: &Network) -> Result<(), String> {
+        if self.schema_version != 1 || self.network_id != network.label() {
+            return Err("Network definition version or network ID does not match".into());
+        }
+        if self.constants.keys().any(|key| {
+            key.is_empty()
+                || !key
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        }) {
+            return Err(
+                "Network constant names must use uppercase letters, digits or underscores".into(),
+            );
+        }
+        let genesis = self
+            .constants
+            .get("GENESIS_CHALLENGE")
+            .and_then(|v| v.as_str());
+        if !genesis
+            .is_some_and(|value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Err("Custom network requires a 32-byte hex GENESIS_CHALLENGE".into());
+        }
+        Ok(())
     }
 }
 
@@ -298,6 +376,17 @@ impl Config {
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != 1 {
             return Err("Unsupported schema_version; expected 1".into());
+        }
+        if self.node.network.label().parse::<Network>()? != self.node.network {
+            return Err("Invalid network selection".into());
+        }
+        match (&self.node.network, &self.node.network_definition) {
+            (Network::Custom(_), Some(definition)) => definition.validate(&self.node.network)?,
+            (Network::Custom(_), None) => {
+                return Err("Import a definition for this custom network".into());
+            }
+            (_, Some(_)) => return Err("Built-in networks cannot use a custom definition".into()),
+            _ => {}
         }
         if self.node.host.trim().is_empty() || self.node.port == 0 {
             return Err("Node host and nonzero port are required".into());

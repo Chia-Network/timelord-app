@@ -17,6 +17,7 @@ pub fn local(config: &mut Config, root: &Path) -> Result<()> {
     let ssl = root.join("config/ssl");
     let mut node = config.node.clone();
     node.host = "localhost".into();
+    node.network_definition = None;
     node.server_name = Some("chia.net".into());
     node.certificate = Some(
         ssl.join("timelord/public_timelord.crt")
@@ -42,6 +43,39 @@ pub fn local(config: &mut Config, root: &Path) -> Result<()> {
         let documents = yaml_rust2::YamlLoader::load_from_str(&fs::read_to_string(yaml_path)?)?;
         let yaml = documents.first().context("Chia configuration is empty")?;
         let full_node = &yaml["full_node"];
+        if let Some(name) = full_node["selected_network"]
+            .as_str()
+            .or(yaml["selected_network"].as_str())
+        {
+            if yaml["selected_network"]
+                .as_str()
+                .is_some_and(|root| root != name)
+            {
+                bail!("Full node and root selected_network disagree");
+            }
+            node.network = name.parse().map_err(anyhow::Error::msg)?;
+            if matches!(node.network, timelord_core::Network::Custom(_)) {
+                let source = if !full_node["network_overrides"].is_badvalue() {
+                    &full_node["network_overrides"]
+                } else {
+                    &yaml["network_overrides"]
+                };
+                node.network_definition = Some(timelord_core::NetworkDefinition {
+                    schema_version: 1,
+                    network_id: name.into(),
+                    exported_at: "local-root".into(),
+                    chia_version: "unknown (local root)".into(),
+                    constants: crate::network::yaml_overrides(&source["constants"][name])?,
+                    config_overrides: crate::network::yaml_overrides(&source["config"][name])?,
+                });
+            }
+        }
+        if let Some(port) = full_node["port"].as_i64() {
+            node.port = u16::try_from(port)
+                .ok()
+                .filter(|p| *p > 0)
+                .context("Invalid full-node peer port")?;
+        }
         if let Some(port) = full_node["rpc_port"]
             .as_i64()
             .and_then(|p| u16::try_from(p).ok())
@@ -74,8 +108,12 @@ pub fn local(config: &mut Config, root: &Path) -> Result<()> {
             }
         }
     }
-    config.node = node;
-    config.validate().map_err(anyhow::Error::msg)
+    let mut candidate = config.clone();
+    candidate.node = node;
+    candidate.validate().map_err(anyhow::Error::msg)?;
+    crate::network::resolve(&candidate.node)?;
+    *config = candidate;
+    Ok(())
 }
 pub fn validate_identity(node: &NodeConfig) -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -145,6 +183,17 @@ pub fn import(config_path: &Path, manifest: &Path) -> Result<()> {
     let mut config = crate::load(config_path)?;
     let folder = manifest.parent().context("Bundle folder missing")?;
     let mut node = bundle.node;
+    if matches!(node.network, timelord_core::Network::Custom(_)) {
+        let path = bundled_path(folder, Some(&std::path::PathBuf::from("network.json")))?;
+        let definition =
+            serde_json::from_str(&crate::config_checkpoint::bounded_text(&path, false)?)
+                .context("Reading network.json")?;
+        node.network_definition = Some(definition);
+    }
+    let mut candidate = config.clone();
+    candidate.node = node.clone();
+    candidate.validate().map_err(anyhow::Error::msg)?;
+    crate::network::resolve(&node)?;
     node.certificate = Some(bundled_path(folder, node.certificate.as_ref())?);
     node.private_key = Some(bundled_path(folder, node.private_key.as_ref())?);
     node.ca_certificate = Some(bundled_path(folder, node.ca_certificate.as_ref())?);
@@ -293,6 +342,21 @@ mod tests {
         assert_eq!(rpc.port, 8556);
         assert!(rpc.certificate.ends_with("full_node/private_full_node.crt"));
         assert!(rpc.ca_certificate.ends_with("ca/private_ca.crt"));
+        fs::write(chia_root.join("config/config.yaml"), format!(
+            "selected_network: ephemeral-fixture\nfull_node:\n  selected_network: ephemeral-fixture\n  port: 58445\nnetwork_overrides:\n  constants:\n    ephemeral-fixture:\n      GENESIS_CHALLENGE: '{}'\n      DIFFICULTY_STARTING: 250\n",
+            "ab".repeat(32)
+        )).unwrap();
+        let mut custom_local = Config::default();
+        local(&mut custom_local, &chia_root).unwrap();
+        assert_eq!(custom_local.node.network.label(), "ephemeral-fixture");
+        assert_eq!(custom_local.node.port, 58445);
+        assert_eq!(
+            crate::network::resolve(&custom_local.node)
+                .unwrap()
+                .constants
+                .difficulty_starting,
+            250
+        );
         let manifest = source.join("connection.toml");
         let text = "schema_version=1\n[node]\nhost='fixture.invalid'\ncertificate='client.crt'\nprivate_key='client.key'\nca_certificate='ca.crt'\n";
         fs::write(&manifest, text).unwrap();
@@ -327,6 +391,51 @@ mod tests {
         assert_eq!(
             fs::read_dir(directory.join("identities")).unwrap().count(),
             1
+        );
+        // Use only the generated fixture identities for the custom import.
+        let custom = crate::network::tests::node();
+        let custom_text = text.replace(
+            "host='fixture.invalid'",
+            "host='fixture.invalid'\nport=58445\nnetwork='ephemeral-fixture'",
+        );
+        fs::write(&manifest, &custom_text).unwrap();
+        let metadata = source.join("network.json");
+        // A missing/mismatched or escaping definition cannot change saved settings.
+        assert!(import(&config_path, &manifest).is_err());
+        let mut invalid = custom.network_definition.clone().unwrap();
+        invalid.network_id = "different".into();
+        fs::write(&metadata, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(import(&config_path, &manifest).is_err());
+        assert_eq!(fs::read(&config_path).unwrap(), saved);
+        fs::remove_file(&metadata).unwrap();
+        let outside = directory.join("outside.json");
+        fs::write(
+            &outside,
+            serde_json::to_vec(&custom.network_definition).unwrap(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, &metadata).unwrap();
+        assert!(import(&config_path, &manifest).is_err());
+        fs::remove_file(&metadata).unwrap();
+        fs::write(
+            &metadata,
+            serde_json::to_vec(&custom.network_definition).unwrap(),
+        )
+        .unwrap();
+        import(&config_path, &manifest).unwrap();
+        let imported = crate::load(&config_path).unwrap();
+        assert_eq!(imported.node.network, custom.network);
+        assert_eq!(imported.node.port, 58445);
+        assert_eq!(imported.node.network_definition, custom.network_definition);
+        fs::remove_dir_all(&source).unwrap();
+        let imported = crate::load(&config_path).unwrap();
+        assert!(imported.node.certificate.as_ref().unwrap().is_file());
+        assert_eq!(
+            crate::network::resolve(&imported.node)
+                .unwrap()
+                .constants
+                .difficulty_starting,
+            250
         );
         fs::remove_dir_all(directory).unwrap();
     }

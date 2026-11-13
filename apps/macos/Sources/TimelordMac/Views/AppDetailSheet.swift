@@ -58,7 +58,24 @@ struct NodeConnectionSheet: View {
                         .onChange(of: location) { _, value in if value == "local" { model.configuration.node.host = "localhost" } }
                     TextField("Host", text: $model.configuration.node.host)
                     TextField("Port", value: $model.configuration.node.port, format: .number.grouping(.never))
-                    Picker("Network", selection: $model.configuration.node.network) { Text("Mainnet").tag("mainnet"); Text("Testnet11").tag("testnet11") }
+                    Picker("Network", selection: $model.configuration.node.network) {
+                        Text("Mainnet").tag("mainnet")
+                        Text("Testnet11").tag("testnet11")
+                        if let definition = model.configuration.node.networkDefinition {
+                            Text(definition.networkId).tag(definition.networkId)
+                        }
+                    }
+                    .onChange(of: model.configuration.node.network) { _, network in
+                        if let definition = model.configuration.node.networkDefinition, definition.networkId != network {
+                            model.configuration.node.networkDefinition = nil
+                        }
+                    }
+                    if let definition = model.configuration.node.networkDefinition {
+                        if case .string(let genesis) = definition.constants["GENESIS_CHALLENGE"] {
+                            LabeledContent("Genesis", value: genesis).textSelection(.enabled)
+                        }
+                        LabeledContent("Exported from Chia", value: definition.chiaVersion)
+                    }
                 }
                 Section("Connection identity") {
                     Button(location == "local" ? "Choose Chia folder…" : "Import connection bundle…") { Task { await model.importNode(local: location == "local") } }

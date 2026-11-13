@@ -376,6 +376,36 @@ fn launchd_plan_is_boot_scoped_non_root_and_escapes_paths() {
 }
 
 #[test]
+fn launchd_cli_accepts_and_preserves_a_custom_network_id() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_timelord-supervisor"))
+        .args([
+            "launchd-plist",
+            "--app",
+            "/Applications/Timelord.app",
+            "--config",
+            "/tmp/fixture-config.toml",
+            "--user",
+            "operator",
+            "--monitor-listen",
+            "127.0.0.1:9259",
+            "--network",
+            "ephemeral-fixture",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("<string>--network</string><string>ephemeral-fixture</string>")
+    );
+}
+
+#[test]
 fn parent_guard_fixture() {
     let Ok(marker) = std::env::var("TIMELORD_PARENT_FIXTURE_MARKER") else {
         return;

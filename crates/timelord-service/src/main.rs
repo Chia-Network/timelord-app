@@ -11,6 +11,7 @@ mod hardware;
 mod history_buffer;
 mod history_store;
 mod inventory;
+mod network;
 mod node_status;
 mod observability;
 mod operational;
@@ -178,6 +179,7 @@ fn parse_config(path: &Path, text: &str) -> Result<Config> {
         }
     }
     config.validate().map_err(anyhow::Error::msg)?;
+    network::resolve(&config.node)?;
     Ok(config)
 }
 
@@ -195,6 +197,7 @@ fn set_default_automatic_state(config: &mut Config, path: &Path) -> Result<()> {
 
 fn save(path: &Path, config: &Config) -> Result<()> {
     config.validate().map_err(anyhow::Error::msg)?;
+    network::resolve(&config.node)?;
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())

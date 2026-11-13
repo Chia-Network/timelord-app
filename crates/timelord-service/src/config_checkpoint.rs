@@ -55,6 +55,8 @@ struct RequestedNetwork {
 struct NetworkOnly {
     #[serde(default)]
     network: timelord_core::Network,
+    #[serde(default)]
+    network_definition: Option<timelord_core::NetworkDefinition>,
 }
 pub fn load_running(path: &Path) -> Result<(Config, bool)> {
     match bounded_text(path, false) {
@@ -66,7 +68,7 @@ pub fn load_running(path: &Path) -> Result<(Config, bool)> {
                 let intent: RequestedNetwork = toml::from_str(&text).with_context(|| {
                     format!("Cannot establish requested network; fallback refused: {requested}")
                 })?;
-                load_saved(path, Some(intent.node.network), requested)
+                load_saved(path, Some(intent.node), requested)
             }
         },
         // Text that is not UTF-8 was read, so it is malformed, not unreadable.
@@ -82,7 +84,7 @@ pub fn load_running(path: &Path) -> Result<(Config, bool)> {
 }
 fn load_saved(
     path: &Path,
-    network: Option<timelord_core::Network>,
+    network: Option<NetworkOnly>,
     requested: anyhow::Error,
 ) -> Result<(Config, bool)> {
     let saved = saved_path(path)?;
@@ -94,7 +96,8 @@ fn load_saved(
         format!("Requested configuration and last-good checkpoint are invalid: {requested}")
     })?;
     ensure!(
-        network.is_none_or(|network| network == config.node.network),
+        network.is_none_or(|intent| intent.network == config.node.network
+            && intent.network_definition == config.node.network_definition),
         "Requested network differs from last-good checkpoint; fallback refused: {requested}"
     );
     tracing::warn!(
@@ -244,6 +247,31 @@ mod tests {
         assert!(load_running(&path).unwrap().1);
         std::fs::remove_file(&path).unwrap();
         assert!(load_running(&path).unwrap().1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fallback_never_crosses_custom_chain_definitions_with_the_same_name() {
+        let dir = std::env::temp_dir().join(format!("tl-lkg-custom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut config = Config {
+            node: crate::network::tests::node(),
+            ..Default::default()
+        };
+        crate::save(&saved_path(&path).unwrap(), &config).unwrap();
+        config.schema_version = 999;
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        assert!(load_running(&path).unwrap().1);
+        config
+            .node
+            .network_definition
+            .as_mut()
+            .unwrap()
+            .constants
+            .insert("GENESIS_CHALLENGE".into(), "cd".repeat(32).into());
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        assert!(load_running(&path).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]

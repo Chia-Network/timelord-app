@@ -45,12 +45,15 @@ pub struct Store {
 
 pub fn scope(config: &Config, assignments: &[timelord_core::Assignment]) -> Result<String> {
     // Changing a node/assignment must not attribute another session's measurements.
-    let bytes = serde_json::to_vec(&(
-        config.node.network,
+    let mut bytes = serde_json::to_vec(&(
+        &config.node.network,
         &config.node.host,
         config.node.port,
         assignments,
     ))?;
+    if let Some(definition) = &config.node.network_definition {
+        bytes.extend(serde_json::to_vec(&definition.constants)?);
+    }
     Ok(dg_xch_core::utils::hash_256(bytes)
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -492,6 +495,32 @@ mod tests {
             .unwrap();
         assert!(state.archive.is_none());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn custom_genesis_or_constants_changes_start_a_new_history_scope() {
+        let mut config = Config {
+            node: crate::network::tests::node(),
+            ..Default::default()
+        };
+        let original = scope(&config, &[]).unwrap();
+        config
+            .node
+            .network_definition
+            .as_mut()
+            .unwrap()
+            .constants
+            .insert("GENESIS_CHALLENGE".into(), "cd".repeat(32).into());
+        assert_ne!(scope(&config, &[]).unwrap(), original);
+        config.node = crate::network::tests::node();
+        config
+            .node
+            .network_definition
+            .as_mut()
+            .unwrap()
+            .constants
+            .insert("SUB_SLOT_ITERS_STARTING".into(), 67108864.into());
+        assert_ne!(scope(&config, &[]).unwrap(), original);
     }
 
     #[test]

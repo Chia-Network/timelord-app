@@ -5,10 +5,7 @@ use crate::{
     observability::{PeakResult, ProofStage, SubmissionKind},
 };
 use anyhow::{Context, Result, bail};
-use dg_xch_core::{
-    consensus::chain_definition::ChainSelection,
-    protocols::{ChiaMessage, NodeType, ProtocolMessageTypes, shared::Handshake},
-};
+use dg_xch_core::protocols::{ChiaMessage, NodeType, ProtocolMessageTypes, shared::Handshake};
 use dg_xch_serialize::{ChiaProtocolVersion, ChiaSerialize};
 use dg_xch_servers::transport::{
     SERVICE_MESSAGE_LIMIT, TlsIdentity, decode_exact, encode, handshake,
@@ -32,13 +29,6 @@ mod state;
 pub(crate) use state::RuntimeScope;
 pub use state::{Event, HardwareState, Observation, RawSpeed, RawState, RuntimeState};
 
-pub fn chain(config: &Config) -> Result<ChainSelection> {
-    let name = match config.node.network {
-        timelord_core::Network::Mainnet => "mainnet",
-        timelord_core::Network::Testnet11 => "testnet11",
-    };
-    ChainSelection::from_config(name, None).map_err(anyhow::Error::msg)
-}
 pub async fn connect(config: &Config) -> Result<Socket> {
     crate::connection::validate_identity(&config.node)?;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -60,9 +50,7 @@ pub async fn connect(config: &Config) -> Result<Socket> {
             .context("Choose the node CA certificate")?,
     };
     let tls = identity.client().context("Loading node credentials")?;
-    let network = chain(config)?
-        .handshake_network_id()
-        .map_err(anyhow::Error::msg)?;
+    let network = crate::network::handshake_id(&config.node).to_owned();
     let server_name = config
         .node
         .server_name
@@ -323,9 +311,7 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
         "connecting",
         "Connecting to your full node…",
     );
-    let resolved = chain(&shared.config)?
-        .resolve()
-        .map_err(anyhow::Error::msg)?;
+    let resolved = crate::network::resolve(&shared.config.node)?;
     let minimum_deficit = resolved.constants.min_blocks_per_challenge_block;
     let bits = resolved.constants.discriminant_size_bits as usize;
     let mut scheduler = Scheduler::new(resolved.constants, resolved.allows_bootstrap, None)?;
@@ -655,7 +641,11 @@ mod tests {
                 .is_err()
         );
     }
-    async fn fixture(server_name: &str, board_fault: bool) -> Result<()> {
+    #[tokio::test]
+    async fn custom_network_uses_the_exact_exported_id_over_authenticated_tls() {
+        fixture("chia.net", false, true).await.unwrap();
+    }
+    async fn fixture(server_name: &str, board_fault: bool, custom: bool) -> Result<()> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let mut parameters = CertificateParams::new(vec!["fixture-ca".into()])?;
         parameters.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -707,7 +697,17 @@ mod tests {
         config.node.host = "127.0.0.1".into();
         config.node.port = listener.local_addr()?.port();
         config.node.server_name = Some(server_name.into());
-        config.node.network = timelord_core::Network::Testnet11;
+        let network_id = if custom {
+            "ephemeral-fixture"
+        } else {
+            "testnet11"
+        };
+        if custom {
+            config.node.network = crate::network::tests::node().network;
+            config.node.network_definition = crate::network::tests::node().network_definition;
+        } else {
+            config.node.network = timelord_core::Network::Testnet11;
+        }
         config.node.certificate = Some(directory.join("client.crt"));
         config.node.private_key = Some(directory.join("client.key"));
         config.node.ca_certificate = Some(directory.join("ca.crt"));
@@ -724,11 +724,11 @@ mod tests {
             let message: ChiaMessage = decode_exact(&bytes)?;
             let greeting: Handshake = decode_exact(message.data.as_slice())?;
             assert_eq!(greeting.node_type, NodeType::Timelord as u8);
-            assert_eq!(greeting.network_id, "testnet11");
+            assert_eq!(greeting.network_id, network_id);
             socket
                 .send(encode(
                     ProtocolMessageTypes::Handshake,
-                    &handshake("testnet11", NodeType::FullNode, 8444),
+                    &handshake(network_id, NodeType::FullNode, 8444),
                     None,
                 )?)
                 .await?;
@@ -887,14 +887,14 @@ mod tests {
 
     #[tokio::test]
     async fn authenticates_a_mutual_tls_chia_websocket_with_a_fixture_only_identity() {
-        fixture("chia.net", false).await.unwrap();
+        fixture("chia.net", false, false).await.unwrap();
     }
     #[tokio::test]
     async fn rejects_an_incorrect_tls_server_name() {
-        assert!(fixture("wrong.invalid", false).await.is_err());
+        assert!(fixture("wrong.invalid", false, false).await.is_err());
     }
     #[tokio::test]
     async fn full_node_session_keeps_answering_while_a_board_is_latched_off() {
-        fixture("chia.net", true).await.unwrap();
+        fixture("chia.net", true, false).await.unwrap();
     }
 }

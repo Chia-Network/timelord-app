@@ -162,7 +162,7 @@ fn helper_reports_real_socket_state_without_claiming_productivity() {
     let configured: timelord_core::Config =
         toml::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
     let scope = serde_json::to_vec(&(
-        configured.node.network,
+        configured.node.network.clone(),
         &configured.node.host,
         configured.node.port,
         configured.assignments().unwrap(),

@@ -4,6 +4,35 @@ import XCTest
 import TimelordPresentation
 
 final class ConfigurationClientTests: XCTestCase {
+    func testCustomDefinitionPersistsThroughTheActualHelperWithoutStartingService() async throws {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { root.deleteLastPathComponent() }
+        let helper = root.appendingPathComponent("build/rust/debug/timelord-service")
+        guard FileManager.default.isExecutableFile(atPath: helper.path) else { throw XCTSkip("Build the native helper first.") }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("timelord-custom-cli-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let client = ConfigurationClient(helper: helper, config: directory.appendingPathComponent("config.toml"))
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let definition = try decoder.decode(NetworkDefinition.self, from: Data("""
+        {"schema_version":1,"network_id":"ephemeral-fixture","exported_at":"fixture","chia_version":"fixture",
+         "constants":{"GENESIS_CHALLENGE":"abababababababababababababababababababababababababababababababab",
+         "DIFFICULTY_CONSTANT_FACTOR":10052721566054,"SUB_SLOT_ITERS_STARTING":33554432},"config_overrides":{}}
+        """.utf8))
+        var config = AppConfiguration()
+        config.node.network = definition.networkId
+        config.node.networkDefinition = definition
+        config.node.port = 58445
+        try await client.save(config)
+        var restored = try await client.load()
+        XCTAssertEqual(restored.node.networkDefinition, definition)
+        XCTAssertEqual(restored.node.network, definition.networkId)
+        restored.node.host = "changed.fixture.invalid"
+        try await client.save(restored)
+        let saved = try await client.load()
+        XCTAssertEqual(saved.node.networkDefinition, definition)
+        XCTAssertEqual(saved.node.host, "changed.fixture.invalid")
+    }
     func testActualHelperConfigurationRoundTripAndInvalidEditPreserveSavedSettings() async throws {
         var root = URL(fileURLWithPath: #filePath)
         for _ in 0..<5 { root.deleteLastPathComponent() }

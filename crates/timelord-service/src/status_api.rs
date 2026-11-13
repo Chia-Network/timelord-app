@@ -93,7 +93,7 @@ async fn status(State(http): State<observability::HttpState>) -> Json<Status> {
         full_node: NodeStatus {
             host: shared.config.node.host.clone(),
             port: shared.config.node.port,
-            network: shared.config.node.network,
+            network: shared.config.node.network.clone(),
             state: if shared.config.node.certificate.is_none() {
                 "not_connected".into()
             } else {

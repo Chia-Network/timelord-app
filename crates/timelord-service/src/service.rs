@@ -309,7 +309,8 @@ pub(crate) async fn serve(
     tokio::pin!(signal);
     let requested_config = config.clone();
     let service_started_unix = unix_now();
-    let process = operational::State::new(observability::Metrics::new(config.node.network)?);
+    let process =
+        operational::State::new(observability::Metrics::new(config.node.network.clone())?);
     process.progress.configuration(fallback);
     // Start reporting before discovery or native initialization can wait.
     let initial = Arc::new(Shared {

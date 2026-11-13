@@ -199,7 +199,7 @@ cat >/dev/null
             )
             .unwrap(),
         );
-        let metrics = crate::observability::Metrics::new(config.node.network).unwrap();
+        let metrics = crate::observability::Metrics::new(config.node.network.clone()).unwrap();
         let shared = Arc::new(Shared {
             native: if config
                 .hardware

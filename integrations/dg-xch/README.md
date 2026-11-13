@@ -9,6 +9,14 @@ helpers and VDF verifier. Our `runtime.rs` owns the node session and injects our
 `asic.rs` backend directly when executing scheduler plans. Upstream's regular
 service/CLI is not used: it constructs a CpuBackend and recomputes each request.
 
+Custom Chia network imports resolve the exact exported network ID and supported
+constant overrides in our `network.rs` adapter, using pinned Mainnet constants as
+the baseline. They do not use upstream's DGX seed-derived chain format. Newer
+constant fields are retained for provenance without changing upstream consensus
+capabilities. The scheduler, PoS2 verifier and message codecs remain at the pin
+above; offline custom import/handshake tests do not establish transition support
+or live consensus acceptance.
+
 The adapter keeps one logical-chain session per assigned board, retains squaring
 across requests with identical generation/challenge/input, primes the validated infused-chain input as soon as
 peak/slot state arrives (including while signage plans omit ICC), prepares the canonical

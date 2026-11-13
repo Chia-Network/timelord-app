@@ -11,6 +11,7 @@ public struct NodeConfiguration: Codable, Sendable, Equatable {
     public var host = "localhost"
     public var port = 8444
     public var network = "mainnet"
+    public var networkDefinition: NetworkDefinition?
     public var serverName: String? = "chia.net"
     public var certificate: String?
     public var privateKey: String?
@@ -18,6 +19,39 @@ public struct NodeConfiguration: Codable, Sendable, Equatable {
     public var rpc: NodeRPCConfiguration?
     public init() {}
     public var hasIdentity: Bool { certificate != nil && privateKey != nil && caCertificate != nil }
+}
+public struct NetworkDefinition: Codable, Sendable, Equatable {
+    public var schemaVersion: Int
+    public var networkId: String
+    public var exportedAt: String
+    public var chiaVersion: String
+    public var constants: [String: NetworkValue]
+    public var configOverrides: [String: NetworkValue]
+}
+
+/// Preserve exported numbers and nested overrides through settings edits.
+public indirect enum NetworkValue: Codable, Sendable, Equatable {
+    case string(String), number(Decimal), bool(Bool), array([NetworkValue]), object([String: NetworkValue]), null
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() { self = .null }
+        else if let value = try? container.decode(Bool.self) { self = .bool(value) }
+        else if let value = try? container.decode(String.self) { self = .string(value) }
+        else if let value = try? container.decode(Decimal.self) { self = .number(value) }
+        else if let value = try? container.decode([NetworkValue].self) { self = .array(value) }
+        else { self = .object(try container.decode([String: NetworkValue].self)) }
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .string(let value): try container.encode(value)
+        case .number(let value): try container.encode(value)
+        case .bool(let value): try container.encode(value)
+        case .array(let value): try container.encode(value)
+        case .object(let value): try container.encode(value)
+        case .null: try container.encodeNil()
+        }
+    }
 }
 public struct NodeRPCConfiguration: Codable, Sendable, Equatable {
     public var host: String

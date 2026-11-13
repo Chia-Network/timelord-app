@@ -12,7 +12,7 @@ schema_version = 1
 [node]
 host = "localhost"
 port = 8444
-network = "mainnet" # or testnet11
+network = "mainnet" # or testnet11; import a bundle for a custom network
 server_name = "chia.net"
 certificate = "identity/client.crt"
 private_key = "identity/client.key"
@@ -119,7 +119,7 @@ the packaged D2XX library relative to the helper inside the app bundle. Explicit
 ## Node identities
 
 Select a local Chia root in the app, or run `local-node --chia-root FOLDER`. This
-uses its public timelord leaf identity for the full-node peer port and imports the
+reads its selected network and peer port, uses its public timelord leaf identity for the full-node peer port and imports the
 private RPC leaf identity for read-only sync status/height. It neither edits Chia's
 configuration nor imports CA signing keys. Peer connectivity does not establish
 sync status. RPC is polled every 15 seconds; stale observations show no height.
@@ -142,6 +142,18 @@ certificate = "rpc-client.crt"
 private_key = "rpc-client.key"
 ca_certificate = "private-ca.crt"
 ```
+
+Custom bundles additionally include `network.json` (schema 1): the exact
+`network_id`, `GENESIS_CHALLENGE` and selected constant overrides, export time,
+Chia version and selected configuration overrides. The importer validates the
+network ID/genesis and stores this under `[node.network_definition]`; it does not
+keep a reference to the transfer folder. Network IDs use 1–64 lowercase letters,
+digits or hyphens. Missing or mismatched definitions are rejected before saving.
+Mainnet and Testnet11 continue using their pinned built-in definitions.
+
+Custom chain constants also form part of the saved-history scope and last-good
+fallback identity. Reusing a network name with another genesis or different
+constants cannot silently reuse the earlier chain's history or fallback config.
 
 ## Automatic tuning
 
