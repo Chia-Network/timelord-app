@@ -4,7 +4,8 @@ The build consumes public Chia-Network/chiavdf at the exact commit in
 [upstream.env](upstream.env), without source overlays or copied prover/control
 headers. That revision includes upstream performance, live-control and telemetry
 work plus [opened-handle serial validation](https://github.com/Chia-Network/chiavdf/pull/474).
-The serial PR is pending; the pin refers to its immutable public branch commit.
+The pin is upstream main at `47774682a02319c3dfd0f216981ce1eb65623515`
+(November 12, 2026), including the merged serial and initialization changes.
 
 ```sh
 bash scripts/build-native.sh
