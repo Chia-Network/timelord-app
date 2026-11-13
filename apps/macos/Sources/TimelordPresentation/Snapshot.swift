@@ -67,6 +67,7 @@ public struct BoardSnapshot: Identifiable, Sendable {
     public var automatic: AutomaticStatus? = nil
     public var recoveryReason: String? = nil
     public var retryAfterUnix: Double? = nil
+    public var assignedEngines: [Int]? = nil
     public func recoveryText(at now: Date) -> String? {
         guard let recoveryReason else { return nil }
         if let retryAfterUnix, retryAfterUnix > now.timeIntervalSince1970 {
@@ -77,7 +78,13 @@ public struct BoardSnapshot: Identifiable, Sendable {
     public func rawSpeed(for chain: Chain) -> RawSpeed? {
         guard state == .active || state == .waiting,
               let index = histories.firstIndex(where: { $0.chain == chain }) else { return nil }
-        let physicalEngine = histories.count == 1 ? 1 : index
+        let physicalEngine: Int
+        if let assignedEngines {
+            guard assignedEngines.indices.contains(index) else { return nil }
+            physicalEngine = assignedEngines[index]
+        } else {
+            physicalEngine = histories.count == 1 ? 1 : index
+        }
         return rawSpeeds.first { $0.engine == physicalEngine }
     }
     public var isAutomatic: Bool { profile.lowercased() == "automatic" }
@@ -202,6 +209,7 @@ public struct BoardStatus: Decodable, Identifiable, Sendable {
     public let id: String
     public let name: String
     public let assignedChains: [String]
+    public let assignedEngines: [Int]?
     public let connectedClients: Int
     public let hardwareState: String
     public let temperatureC: Double?
@@ -286,7 +294,7 @@ public enum LivePresentation {
                     guard let validHistory else { return .empty(chain) }
                     return validHistory.history(boardID: board.id, chain: chain, now: now)
                 }
-                return BoardSnapshot(id: board.id, name: board.name, state: state, temperatureC: board.temperatureC, temperatureLimitC: board.temperatureLimitC, profile: board.profile, frequencyMHz: board.frequencyMhz, voltageV: board.voltageV, histories: histories, lastProof: last, rawSpeeds: board.rawSpeeds ?? [], automatic: board.automatic, recoveryReason: board.recoveryReason, retryAfterUnix: board.retryAfterUnix)
+                return BoardSnapshot(id: board.id, name: board.name, state: state, temperatureC: board.temperatureC, temperatureLimitC: board.temperatureLimitC, profile: board.profile, frequencyMHz: board.frequencyMhz, voltageV: board.voltageV, histories: histories, lastProof: last, rawSpeeds: board.rawSpeeds ?? [], automatic: board.automatic, recoveryReason: board.recoveryReason, retryAfterUnix: board.retryAfterUnix, assignedEngines: board.assignedEngines)
             }
         } else {
             let connected = (detectedDevices ?? []).compactMap { BoardTopology.matching($0,in:configuration?.hardware.boards ?? []) }

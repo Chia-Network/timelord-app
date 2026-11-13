@@ -103,6 +103,11 @@ final class PresentationTests: XCTestCase {
                 XCTAssertEqual(board.rawSpeed(for: history.chain)?.engine, expected)
                 XCTAssertEqual(board.rawSpeed(for: history.chain)?.ips, Double(1_000_000 + expected))
             }
+            if count == 2 {
+                board.assignedEngines = [1, 0]
+                XCTAssertEqual(board.rawSpeed(for: .challenge)?.engine, 1)
+                XCTAssertEqual(board.rawSpeed(for: .reward)?.engine, 0)
+            }
             board.rawSpeeds = []
             XCTAssertNil(board.rawSpeed(for: histories[0].chain))
         }

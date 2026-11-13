@@ -52,6 +52,7 @@ struct BoardStatus {
     name: String,
     client_port: u16,
     assigned_chains: Vec<Chain>,
+    assigned_engines: Vec<u8>,
     connected_clients: usize,
     hardware_state: String,
     temperature_c: Option<f64>,
@@ -117,6 +118,11 @@ async fn status(State(http): State<observability::HttpState>) -> Json<Status> {
                     .iter()
                     .filter(|a| a.board_id == b.id)
                     .map(|a| a.chain)
+                    .collect(),
+                assigned_engines: assignments
+                    .iter()
+                    .filter(|a| a.board_id == b.id)
+                    .map(|a| a.engine)
                     .collect(),
                 connected_clients: clients.iter().filter(|(id, _)| id == &b.id).count(),
                 hardware_state: runtime
