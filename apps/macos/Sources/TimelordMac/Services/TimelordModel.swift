@@ -37,6 +37,7 @@ final class TimelordModel: ObservableObject {
     }
     private var quitting = false
     private var lastStartupAttempt = Date.distantPast
+    private var startupError: String?
     private var monitoring: Task<Void, Never>?
     private let monitoringEnabled: Bool
 
@@ -108,6 +109,10 @@ final class TimelordModel: ObservableObject {
             } catch { errorMessage = error.localizedDescription }
         }
         await controller.refresh()
+        if canControlService, let startupError {
+            if errorMessage == startupError { errorMessage = nil }
+            self.startupError = nil
+        }
         if monitoringEnabled { await restoreStartupIntent() }
         await refreshNodeSync()
         let expectedPID = controller.processID
@@ -144,8 +149,16 @@ final class TimelordModel: ObservableObject {
               savedConfiguration.service.startAutomatically, hasRunnableConfiguration,
               now.timeIntervalSince(lastStartupAttempt) >= 30 else { return }
         lastStartupAttempt = now
-        do { try await ensureSupervisor() }
-        catch { errorMessage = error.localizedDescription }
+        controlOperation = .start; updateSnapshot()
+        defer { controlOperation = nil; updateSnapshot() }
+        do {
+            try await ensureSupervisor()
+            if errorMessage == startupError { errorMessage = nil }
+            startupError = nil
+        } catch {
+            startupError = error.localizedDescription
+            errorMessage = startupError
+        }
     }
     private func ensureSupervisor() async throws {
         try await controller.ensureStarted(network: savedConfiguration.node.network,
@@ -318,7 +331,11 @@ final class TimelordModel: ObservableObject {
             let runtimeChanged = hasRuntimeSettingsChanges
             let updated = configuration
             try await configurationClient.save(updated)
-            savedConfiguration = updated
+            let persisted = try await configurationClient.load()
+            // Keep edits made while the helper was saving, but adopt its profile
+            // migration whenever the submitted configuration is still current.
+            if configuration == updated { configuration = persisted }
+            savedConfiguration = persisted
             nodeSync = nil; lastNodeSyncFetch = .distantPast
             configurationNeedsRestart = configurationNeedsRestart || ((canControlService || liveStatus != nil) && runtimeChanged)
             errorMessage = nil; configurationLoaded = true

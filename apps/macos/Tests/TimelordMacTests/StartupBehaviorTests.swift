@@ -13,7 +13,12 @@ final class StartupBehaviorTests: XCTestCase {
         let script = """
         #!/bin/sh
         echo "$1" >> '\(commands.path)'
+        if [ "$1" = devices ]; then echo '[]'; exit 0; fi
         if [ "$1" = status ] && [ -f '\(directory.path)/offline' ]; then exit 1; fi
+        if [ "$1" = ensure-started ]; then
+            while [ -f '\(directory.path)/hold-startup' ]; do sleep 0.02; done
+            if [ -f '\(directory.path)/fail-startup' ]; then echo startup-failed >&2; exit 1; fi
+        fi
         mode=paused; phase=paused
         if [ "$1" = resume ]; then mode=running; phase=starting; fi
         printf '{"api_version":1,"supervisor_pid":123,"worker_pid":null,"mode":"%s","revision":1,"worker_generation":0,"restarts":0,"phase":"%s","error":null}' "$mode" "$phase"
@@ -82,4 +87,42 @@ final class StartupBehaviorTests: XCTestCase {
         XCTAssertEqual(calls.filter { $0 == "ensure-started" }.count, 2)
         XCTAssertFalse(calls.contains("resume"))
     }
+    func testAutomaticStartupDisablesRunAndConnectionInspectionUntilComplete() async throws {
+        let (directory, commands, controller, configuration) = try fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let gate = directory.appendingPathComponent("hold-startup")
+        try Data().write(to: gate)
+        let model = TimelordModel(controller: controller, initialConfiguration: configuration, monitoringEnabled: false)
+        let startup = Task { await model.restoreStartupIntent() }
+        for _ in 0..<200 {
+            if FileManager.default.fileExists(atPath: commands.path) { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(model.isBusy)
+        XCTAssertFalse(model.canStartService)
+        XCTAssertFalse(model.canInspectConnections)
+        model.toggleRun()
+        try FileManager.default.removeItem(at: gate)
+        await startup.value
+        XCTAssertFalse(model.isBusy)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(try String(contentsOf: commands), "ensure-started\n")
+    }
+
+    func testRecoveredSupervisorClearsOnlyItsStartupError() async throws {
+        let (directory, _, controller, configuration) = try fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let failure = directory.appendingPathComponent("fail-startup")
+        try Data().write(to: failure)
+        let model = TimelordModel(controller: controller, initialConfiguration: configuration, monitoringEnabled: false)
+        await model.restoreStartupIntent()
+        XCTAssertNotNil(model.errorMessage)
+        try FileManager.default.removeItem(at: failure)
+        await model.refresh()
+        XCTAssertNil(model.errorMessage)
+        model.errorMessage = "Unrelated settings error"
+        await model.refresh()
+        XCTAssertEqual(model.errorMessage, "Unrelated settings error")
+    }
+
 }

@@ -207,6 +207,16 @@ done
     .await
     .expect("initialization blocked on a full stderr pipe")
     .unwrap();
+    // stdout acknowledgement and stderr diagnostics have independent pipes.
+    // Initialization must drain enough to unblock the writer, but the final
+    // buffered diagnostics may still arrive after its acknowledgement.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while shared.runtime.lock().unwrap().boards["storm-init"].recoveries < 5000 {
+            log.read(&shared, &board).await.unwrap();
+        }
+    })
+    .await
+    .expect("initialization lost trailing stderr diagnostics");
     assert_eq!(
         shared.runtime.lock().unwrap().boards["storm-init"].recoveries,
         5000

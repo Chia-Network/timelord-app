@@ -42,4 +42,30 @@ final class ConnectionProfileTests: XCTestCase {
         model.selectConnectionProfile("unknown")
         XCTAssertEqual(model.configuration.node, expected)
     }
+    func testSaveReloadsProfilesCreatedByHelper() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("timelord-save-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let helper = directory.appendingPathComponent("helper")
+        let canonical = directory.appendingPathComponent("canonical.json")
+        let initial = AppConfiguration()
+        var persisted = initial
+        var profiles = ConnectionProfiles(); profiles.activeId = "connection-1"
+        profiles.profiles = [ConnectionProfile(id: "connection-1", name: "Mainnet", node: initial.node)]
+        persisted.connections = profiles
+        let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
+        try encoder.encode(persisted).write(to: canonical)
+        try Data("#!/bin/sh\nif [ \"$1\" = configuration ]; then cat '\(canonical.path)'; fi\n".utf8).write(to: helper)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+        let controller = ServiceController(configURL: directory.appendingPathComponent("config.toml"), helperURL: helper, supervisorURL: helper)
+        let model = TimelordModel(controller: controller, initialConfiguration: initial, monitoringEnabled: false)
+        await model.saveConfiguration()
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.configuration.connections?.activeId, "connection-1")
+        XCTAssertEqual(model.configuration.connections?.profiles.count, 1)
+        XCTAssertFalse(model.hasUnsavedSettings)
+        await model.saveConfiguration()
+        XCTAssertEqual(model.configuration.connections?.profiles.count, 1)
+    }
+
 }

@@ -76,7 +76,7 @@ pub async fn ensure_started(
     let child = command
         .spawn()
         .context("Starting user-session supervisor")?;
-    wait_for_status(&paths.config, Some(child)).await
+    wait_for_status(&paths.config, child, Duration::from_secs(8)).await
 }
 
 async fn status(config: &std::path::Path) -> Result<Status> {
@@ -90,19 +90,63 @@ async fn status(config: &std::path::Path) -> Result<Status> {
 
 async fn wait_for_status(
     config: &std::path::Path,
-    mut child: Option<std::process::Child>,
+    mut child: std::process::Child,
+    timeout: Duration,
 ) -> Result<Status> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if let Ok(current) = status(config).await {
             return Ok(current);
         }
-        let exit = child.as_mut().map(|c| c.try_wait()).transpose()?.flatten();
+        let exit = child.try_wait()?;
         if tokio::time::Instant::now() >= deadline {
-            bail!("User-session supervisor did not become available (exit: {exit:?})");
+            // Only signal the child we spawned, never a concurrent lock winner.
+            // SIGTERM uses normal supervisor cleanup; do not force-kill a worker
+            // that may already own hardware or change the saved Run/Pause intent.
+            if exit.is_none() {
+                unsafe {
+                    libc::kill(child.id() as i32, libc::SIGTERM);
+                }
+                let cleanup = tokio::time::Instant::now() + Duration::from_secs(8);
+                while child.try_wait()?.is_none() {
+                    if tokio::time::Instant::now() >= cleanup {
+                        bail!(
+                            "User-session supervisor startup timed out; shutdown is still pending (pid: {})",
+                            child.id()
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+            bail!(
+                "User-session supervisor did not become available (exit: {exit:?}); startup child has exited"
+            );
         }
         // A concurrent starter may win the lock; wait for that owner rather
         // than confusing the losing child's exit with a failed startup.
         tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn startup_timeout_terminates_and_reaps_only_its_child() {
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let config = std::env::temp_dir().join(format!("tl-startup-timeout-{pid}/config.toml"));
+        let result = wait_for_status(&config, child, Duration::ZERO).await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("startup child has exited")
+        );
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
     }
 }
