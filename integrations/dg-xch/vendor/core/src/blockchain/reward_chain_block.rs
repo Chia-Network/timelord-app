@@ -1,3 +1,4 @@
+use super::proof_encoding::ProofEncoding;
 use crate::blockchain::proof_of_space::ProofOfSpace;
 use crate::blockchain::reward_chain_block_unfinished::RewardChainBlockUnfinished;
 use crate::blockchain::sized_bytes::{Bytes32, Bytes96};
@@ -27,37 +28,41 @@ pub struct RewardChainBlock {
 }
 
 impl RewardChainBlock {
-    pub fn hash(&self) -> Result<Bytes32, Error> {
-        let version = ChiaProtocolVersion::default();
-        let mut bytes = Vec::new();
-        self.weight.append_bytes(&mut bytes, version)?;
-        self.height.append_bytes(&mut bytes, version)?;
-        self.total_iters.append_bytes(&mut bytes, version)?;
-        self.signage_point_index.append_bytes(&mut bytes, version)?;
-        self.pos_ss_cc_challenge_hash
-            .append_bytes(&mut bytes, version)?;
-        bytes.extend(self.proof_of_space.consensus_bytes(version)?);
-        self.challenge_chain_sp_vdf
-            .append_bytes(&mut bytes, version)?;
+    fn append_fields(
+        &self,
+        bytes: &mut Vec<u8>,
+        version: ChiaProtocolVersion,
+        encoding: ProofEncoding,
+    ) -> Result<(), Error> {
+        self.weight.append_bytes(bytes, version)?;
+        self.height.append_bytes(bytes, version)?;
+        self.total_iters.append_bytes(bytes, version)?;
+        self.signage_point_index.append_bytes(bytes, version)?;
+        self.pos_ss_cc_challenge_hash.append_bytes(bytes, version)?;
+        encoding.append(&self.proof_of_space, bytes, version)?;
+        self.challenge_chain_sp_vdf.append_bytes(bytes, version)?;
         self.challenge_chain_sp_signature
-            .append_bytes(&mut bytes, version)?;
-        self.challenge_chain_ip_vdf
-            .append_bytes(&mut bytes, version)?;
-        self.reward_chain_sp_vdf.append_bytes(&mut bytes, version)?;
+            .append_bytes(bytes, version)?;
+        self.challenge_chain_ip_vdf.append_bytes(bytes, version)?;
+        self.reward_chain_sp_vdf.append_bytes(bytes, version)?;
         self.reward_chain_sp_signature
-            .append_bytes(&mut bytes, version)?;
-        self.reward_chain_ip_vdf.append_bytes(&mut bytes, version)?;
-        let flags = u8::from(self.infused_challenge_chain_ip_vdf.is_some())
-            | (u8::from(self.header_mmr_root.is_some()) << 1);
-        flags.append_bytes(&mut bytes, version)?;
-        if let Some(v) = &self.infused_challenge_chain_ip_vdf {
-            v.append_bytes(&mut bytes, version)?;
-        }
-        if let Some(v) = &self.header_mmr_root {
-            v.append_bytes(&mut bytes, version)?;
-        }
-        self.is_transaction_block
-            .append_bytes(&mut bytes, version)?;
+            .append_bytes(bytes, version)?;
+        self.reward_chain_ip_vdf.append_bytes(bytes, version)?;
+        super::packed_optional::append(
+            self.infused_challenge_chain_ip_vdf.as_ref(),
+            self.header_mmr_root.as_ref(),
+            bytes,
+            version,
+        )?;
+        self.is_transaction_block.append_bytes(bytes, version)
+    }
+    pub fn hash(&self) -> Result<Bytes32, Error> {
+        let mut bytes = Vec::new();
+        self.append_fields(
+            &mut bytes,
+            ChiaProtocolVersion::default(),
+            ProofEncoding::Commitment,
+        )?;
         Ok(Bytes32::from(hash_256(bytes)))
     }
 
@@ -83,30 +88,7 @@ impl ChiaSerialize for RewardChainBlock {
         Ok(bytes)
     }
     fn append_bytes(&self, bytes: &mut Vec<u8>, version: ChiaProtocolVersion) -> Result<(), Error> {
-        self.weight.append_bytes(bytes, version)?;
-        self.height.append_bytes(bytes, version)?;
-        self.total_iters.append_bytes(bytes, version)?;
-        self.signage_point_index.append_bytes(bytes, version)?;
-        self.pos_ss_cc_challenge_hash.append_bytes(bytes, version)?;
-        self.proof_of_space.append_bytes(bytes, version)?;
-        self.challenge_chain_sp_vdf.append_bytes(bytes, version)?;
-        self.challenge_chain_sp_signature
-            .append_bytes(bytes, version)?;
-        self.challenge_chain_ip_vdf.append_bytes(bytes, version)?;
-        self.reward_chain_sp_vdf.append_bytes(bytes, version)?;
-        self.reward_chain_sp_signature
-            .append_bytes(bytes, version)?;
-        self.reward_chain_ip_vdf.append_bytes(bytes, version)?;
-        let flags = u8::from(self.infused_challenge_chain_ip_vdf.is_some())
-            | (u8::from(self.header_mmr_root.is_some()) << 1);
-        flags.append_bytes(bytes, version)?;
-        if let Some(v) = &self.infused_challenge_chain_ip_vdf {
-            v.append_bytes(bytes, version)?;
-        }
-        if let Some(v) = &self.header_mmr_root {
-            v.append_bytes(bytes, version)?;
-        }
-        self.is_transaction_block.append_bytes(bytes, version)
+        self.append_fields(bytes, version, ProofEncoding::Wire)
     }
     fn from_bytes(
         bytes: &mut std::io::Cursor<&[u8]>,
@@ -124,23 +106,8 @@ impl ChiaSerialize for RewardChainBlock {
         let reward_chain_sp_vdf: Option<VdfInfo> = ChiaSerialize::from_bytes(bytes, version)?;
         let reward_chain_sp_signature: Bytes96 = ChiaSerialize::from_bytes(bytes, version)?;
         let reward_chain_ip_vdf: VdfInfo = ChiaSerialize::from_bytes(bytes, version)?;
-        let flags = u8::from_bytes(bytes, version)?;
-        if flags > 3 {
-            return Err(Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid reward-chain optional flags",
-            ));
-        }
-        let infused_challenge_chain_ip_vdf = if flags & 1 != 0 {
-            Some(ChiaSerialize::from_bytes(bytes, version)?)
-        } else {
-            None
-        };
-        let header_mmr_root = if flags & 2 != 0 {
-            Some(ChiaSerialize::from_bytes(bytes, version)?)
-        } else {
-            None
-        };
+        let (infused_challenge_chain_ip_vdf, header_mmr_root) =
+            super::packed_optional::parse(bytes, version)?;
         let is_transaction_block = ChiaSerialize::from_bytes(bytes, version)?;
         Ok(Self {
             weight,

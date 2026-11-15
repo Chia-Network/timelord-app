@@ -2,7 +2,7 @@ use crate::blockchain::sized_bytes::Bytes32;
 use crate::utils::hash_256;
 use dg_xch_serialize::{ChiaProtocolVersion, ChiaSerialize};
 use serde::{Deserialize, Serialize};
-use std::io::{Cursor, Error, ErrorKind};
+use std::io::{Cursor, Error};
 
 #[derive(Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub struct SubEpochSummary {
@@ -33,15 +33,12 @@ impl ChiaSerialize for SubEpochSummary {
         self.reward_chain_hash.append_bytes(bytes, version)?;
         self.num_blocks_overflow.append_bytes(bytes, version)?;
         self.new_difficulty.append_bytes(bytes, version)?;
-        let flags = u8::from(self.new_sub_slot_iters.is_some())
-            | (u8::from(self.challenge_merkle_root.is_some()) << 1);
-        flags.append_bytes(bytes, version)?;
-        if let Some(v) = self.new_sub_slot_iters {
-            v.append_bytes(bytes, version)?;
-        }
-        if let Some(v) = self.challenge_merkle_root {
-            v.append_bytes(bytes, version)?;
-        }
+        super::packed_optional::append(
+            self.new_sub_slot_iters.as_ref(),
+            self.challenge_merkle_root.as_ref(),
+            bytes,
+            version,
+        )?;
         Ok(())
     }
     fn from_bytes(bytes: &mut Cursor<&[u8]>, version: ChiaProtocolVersion) -> Result<Self, Error> {
@@ -49,23 +46,8 @@ impl ChiaSerialize for SubEpochSummary {
         let reward_chain_hash = ChiaSerialize::from_bytes(bytes, version)?;
         let num_blocks_overflow = ChiaSerialize::from_bytes(bytes, version)?;
         let new_difficulty = ChiaSerialize::from_bytes(bytes, version)?;
-        let flags = u8::from_bytes(bytes, version)?;
-        if flags > 3 {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "invalid sub-epoch optional flags",
-            ));
-        }
-        let new_sub_slot_iters = if flags & 1 != 0 {
-            Some(ChiaSerialize::from_bytes(bytes, version)?)
-        } else {
-            None
-        };
-        let challenge_merkle_root = if flags & 2 != 0 {
-            Some(ChiaSerialize::from_bytes(bytes, version)?)
-        } else {
-            None
-        };
+        let (new_sub_slot_iters, challenge_merkle_root) =
+            super::packed_optional::parse(bytes, version)?;
         Ok(Self {
             prev_subepoch_summary_hash,
             reward_chain_hash,

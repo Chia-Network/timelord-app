@@ -242,9 +242,45 @@ impl ProofOfSpace {
 }
 
 impl ProofOfSpace {
+    fn append_header(
+        &self,
+        bytes: &mut Vec<u8>,
+        version: ChiaProtocolVersion,
+    ) -> Result<(), Error> {
+        self.challenge.append_bytes(bytes, version)?;
+        self.pool_public_key.append_bytes(bytes, version)?;
+        match self.version {
+            0 => {
+                self.pool_contract_puzzle_hash
+                    .append_bytes(bytes, version)?;
+                self.plot_public_key.append_bytes(bytes, version)?;
+                self.size.append_bytes(bytes, version)?;
+            }
+            1 => {
+                if let Some(contract) = &self.pool_contract_puzzle_hash {
+                    bytes.push(0b11);
+                    contract.append_bytes(bytes, version)?;
+                } else {
+                    bytes.push(0b10);
+                }
+                self.plot_public_key.append_bytes(bytes, version)?;
+                self.plot_index.append_bytes(bytes, version)?;
+                self.meta_group.append_bytes(bytes, version)?;
+                self.strength.append_bytes(bytes, version)?;
+            }
+            other => {
+                return Err(Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unknown proof of space version: {other}"),
+                ));
+            }
+        }
+        Ok(())
+    }
     /// Consensus hashing commits to the v2 quality, not the serialized witness.
     pub fn consensus_bytes(&self, version: ChiaProtocolVersion) -> Result<Vec<u8>, Error> {
-        let mut bytes = self.to_bytes(version)?;
+        let mut bytes = Vec::new();
+        self.append_header(&mut bytes, version)?;
         if self.version == 1 {
             #[cfg(feature = "chia-hf2")]
             {
@@ -279,7 +315,6 @@ impl ProofOfSpace {
                     &q.chain_links,
                     self.strength,
                 ));
-                bytes.truncate(bytes.len() - 4 - self.proof.0.len());
                 bytes.extend(quality);
             }
             #[cfg(not(feature = "chia-hf2"))]
@@ -287,6 +322,9 @@ impl ProofOfSpace {
                 std::io::ErrorKind::Unsupported,
                 "v2 consensus hashing requires chia-hf2",
             ));
+        }
+        if self.version == 0 {
+            self.proof.append_bytes(&mut bytes, version)?;
         }
         Ok(bytes)
     }
@@ -338,34 +376,7 @@ impl ChiaSerialize for ProofOfSpace {
         Ok(bytes)
     }
     fn append_bytes(&self, bytes: &mut Vec<u8>, version: ChiaProtocolVersion) -> Result<(), Error> {
-        self.challenge.append_bytes(bytes, version)?;
-        self.pool_public_key.append_bytes(bytes, version)?;
-        match self.version {
-            0 => {
-                self.pool_contract_puzzle_hash
-                    .append_bytes(bytes, version)?;
-                self.plot_public_key.append_bytes(bytes, version)?;
-                self.size.append_bytes(bytes, version)?;
-            }
-            1 => {
-                if let Some(contract) = &self.pool_contract_puzzle_hash {
-                    bytes.push(0b11);
-                    contract.append_bytes(bytes, version)?;
-                } else {
-                    bytes.push(0b10);
-                }
-                self.plot_public_key.append_bytes(bytes, version)?;
-                self.plot_index.append_bytes(bytes, version)?;
-                self.meta_group.append_bytes(bytes, version)?;
-                self.strength.append_bytes(bytes, version)?;
-            }
-            other => {
-                return Err(Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("unknown proof of space version: {other}"),
-                ));
-            }
-        }
+        self.append_header(bytes, version)?;
         self.proof.append_bytes(bytes, version)
     }
 

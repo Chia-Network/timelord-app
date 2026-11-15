@@ -130,6 +130,7 @@ pub struct Scheduler {
     transaction_height: Option<u32>,
     rewards: VecDeque<(Bytes32, u128)>,
     candidates: BTreeMap<[u8; 32], Candidate>,
+    deferred: BTreeMap<[u8; 32], NewUnfinishedBlockTimelord>,
     signage: HashSet<u8>,
     infused: HashSet<Bytes32>,
     awaiting_peak: Option<Instant>,
@@ -153,6 +154,7 @@ impl Scheduler {
         {
             return Err(invalid("invalid regular timelord parameters"));
         }
+        dg_xch_core::consensus::pot_iterations::validate_timelord_filter_parameters(&constants)?;
         Self::validate_timing(
             &constants,
             constants.difficulty_starting,
@@ -168,6 +170,7 @@ impl Scheduler {
             transaction_height: None,
             rewards: VecDeque::new(),
             candidates: BTreeMap::new(),
+            deferred: BTreeMap::new(),
             signage: HashSet::new(),
             infused: HashSet::new(),
             awaiting_peak: None,
@@ -373,6 +376,12 @@ impl Scheduler {
             anchor: Instant::now(),
         });
         self.prune_candidates();
+        // Every new peak re-evaluates deferred work. Old/reorged candidates are
+        // discarded by the normal state checks, without stopping other work.
+        let deferred = std::mem::take(&mut self.deferred);
+        for (_, candidate) in deferred {
+            let _ = self.admit_unfinished(candidate);
+        }
         Ok(true)
     }
 
@@ -413,12 +422,33 @@ impl Scheduler {
     }
 
     pub fn add_unfinished(&mut self, message: NewUnfinishedBlockTimelord) -> Result<bool, Error> {
+        self.admit_unfinished(message)
+            .map(|identity| identity.is_some())
+    }
+
+    /// Admission owns hashing and candidate-local errors; observers reuse its identity.
+    pub fn admit_unfinished(
+        &mut self,
+        message: NewUnfinishedBlockTimelord,
+    ) -> Result<Option<Bytes32>, Error> {
+        let hash = message.reward_chain_block.hash()?;
+        self.add_unfinished_hashed(message, hash)
+            .map(|accepted| accepted.then_some(hash))
+    }
+
+    fn add_unfinished_hashed(
+        &mut self,
+        message: NewUnfinishedBlockTimelord,
+        hash: Bytes32,
+    ) -> Result<bool, Error> {
         let Some(state) = &self.state else {
             return Ok(false);
         };
         let block = &message.reward_chain_block;
-        let hash = block.hash()?;
-        if self.candidates.contains_key(&hash.const_bytes()) || self.infused.contains(&hash) {
+        if block.total_iters <= state.total_iters
+            || self.candidates.contains_key(&hash.const_bytes())
+            || self.infused.contains(&hash)
+        {
             return Ok(false);
         }
         if self.candidates.len() >= self.reward_limit()
@@ -461,14 +491,23 @@ impl Scheduler {
         ) {
             return Err(invalid("unfinished block signage signature is invalid"));
         }
-        let required = dg_xch_core::consensus::pot_iterations::calculate_timelord_iterations(
-            &self.constants,
-            &block.proof_of_space,
-            quality,
-            message.difficulty,
-            signage_hash,
-            self.transaction_height.unwrap_or(height),
-        )?;
+        let Some(required) =
+            dg_xch_core::consensus::pot_iterations::timelord_iterations_with_context(
+                &self.constants,
+                &block.proof_of_space,
+                quality,
+                message.difficulty,
+                signage_hash,
+                self.transaction_height,
+                height,
+            )?
+        else {
+            if self.deferred.len() < self.reward_limit() {
+                self.deferred.insert(hash.const_bytes(), message);
+            }
+            return Ok(false);
+        };
+        self.deferred.remove(&hash.const_bytes());
         let offset = calculate_ip_iters(
             &self.constants,
             message.sub_slot_iters,
@@ -1242,3 +1281,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "scheduler/context_tests.rs"]
+mod context_tests;

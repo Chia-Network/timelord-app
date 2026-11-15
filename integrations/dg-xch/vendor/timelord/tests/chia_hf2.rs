@@ -34,7 +34,11 @@ fn chia_wire_hash_quality_and_iteration_vectors() {
     c.number_zero_bits_plot_filter_v2 = 7;
     c.max_plot_strength = 9;
     c.difficulty_constant_factor = 10052721566054;
-    c.plot_filter_v2_relative_height = [33000, 30000, 27000, 24000, 21000, 18000, 9216, 6144, 3072];
+    c.plot_filter_v2_relative_height =
+        dg_xch_core::consensus::filter_schedule::FilterSchedule::try_from_slice(&[
+            33000, 30000, 27000, 24000, 21000, 18000, 9216, 6144, 3072,
+        ])
+        .unwrap();
     let first = &data["rows"][0];
     let mut pos: ProofOfSpace =
         serde_json::from_value(first["reward_block"]["proof_of_space"].clone()).unwrap();
@@ -190,7 +194,11 @@ fn captured_peer_sequence_schedules_real_unfinished_blocks() {
     c.number_zero_bits_plot_filter_v2 = 7;
     c.max_plot_strength = 9;
     c.difficulty_constant_factor = 10052721566054;
-    c.plot_filter_v2_relative_height = [33000, 30000, 27000, 24000, 21000, 18000, 9216, 6144, 3072];
+    c.plot_filter_v2_relative_height =
+        dg_xch_core::consensus::filter_schedule::FilterSchedule::try_from_slice(&[
+            33000, 30000, 27000, 24000, 21000, 18000, 9216, 6144, 3072,
+        ])
+        .unwrap();
     let mut scheduler = dg_xch_timelord::scheduler::Scheduler::new(c, false, None).unwrap();
     let mut scheduled = 0;
     for message in data["peer_sequence"].as_array().unwrap() {
@@ -212,4 +220,48 @@ fn captured_peer_sequence_schedules_real_unfinished_blocks() {
         assert_eq!(cursor.position(), raw.len() as u64);
     }
     assert!(scheduled > 0);
+}
+
+#[test]
+fn unknown_transaction_context_requires_an_invariant_target() {
+    use dg_xch_core::consensus::{
+        filter_schedule::FilterSchedule, pot_iterations::timelord_iterations_with_context,
+    };
+    let data = fixture();
+    let first = &data["rows"][0];
+    let mut pos: ProofOfSpace =
+        serde_json::from_value(first["reward_block"]["proof_of_space"].clone()).unwrap();
+    let mut c = MAINNET;
+    c.hard_fork2_height = 9216;
+    c.number_zero_bits_plot_filter_v2 = 7;
+    c.max_effective_plot_filter_bits = 13;
+    c.difficulty_constant_factor = 10052721566054;
+    c.plot_filter_v2_relative_height = FilterSchedule::try_from_slice(&[
+        33000, 30000, 27000, 24000, 21000, 18000, 9216, 6144, 3072,
+    ])
+    .unwrap();
+    pos.strength = 9;
+    let q = hash(&first["quality"]);
+    let sp = hash(&first["signage_hash"]);
+    let before = timelord_iterations_with_context(&c, &pos, q, 536, sp, Some(12287), 12288)
+        .unwrap()
+        .unwrap();
+    let after = timelord_iterations_with_context(&c, &pos, q, 536, sp, Some(12288), 12288)
+        .unwrap()
+        .unwrap();
+    assert_ne!(before, after);
+    assert_eq!(
+        timelord_iterations_with_context(&c, &pos, q, 536, sp, None, 12288).unwrap(),
+        None
+    );
+    assert_eq!(
+        timelord_iterations_with_context(&c, &pos, q, 536, sp, None, 12287).unwrap(),
+        Some(before)
+    );
+    pos.strength = 2;
+    assert!(
+        timelord_iterations_with_context(&c, &pos, q, 536, sp, None, 50000)
+            .unwrap()
+            .is_some()
+    );
 }

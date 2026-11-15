@@ -59,12 +59,9 @@ pub(super) const DGX_V1_BASELINE: ConsensusConstants = ConsensusConstants {
     plot_filter_32_height: 20_643_000,
     number_zero_bits_plot_filter_v2: 5,
     plot_size_v2: 28,
-    plot_filter_v2_relative_height_count: 9,
     filter_window_size: 16,
     max_effective_plot_filter_bits: 13,
-    plot_filter_v2_relative_height: [
-        50494000, 45444000, 40394000, 35343000, 30298000, 25247000, 20197000, 15146000, 10101000,
-    ],
+    plot_filter_v2_relative_height: super::filter_schedule::LEGACY_SCHEDULE,
     min_plot_strength: 2,
     max_plot_strength: 32,
     plot_v1_phase_out_epoch_bits: 8,

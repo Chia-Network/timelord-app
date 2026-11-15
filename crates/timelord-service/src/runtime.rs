@@ -133,6 +133,24 @@ fn decode_unfinished(
     Ok(value)
 }
 
+// Candidate decoding, commitment hashing and admission share a recoverable boundary.
+fn handle_unfinished(scheduler: &mut dg_xch_timelord::scheduler::Scheduler, bytes: &[u8]) {
+    let result = (|| -> Result<_> {
+        let candidate = decode_unfinished(bytes).context("Decoding unfinished block")?;
+        let version = candidate.reward_chain_block.proof_of_space.version;
+        Ok(scheduler
+            .admit_unfinished(candidate)?
+            .map(|identity| (version, identity)))
+    })();
+    match result {
+        Ok(Some((proof_version, unfinished_reward_hash))) => {
+            tracing::info!(proof_version,%unfinished_reward_hash,"Scheduled validated unfinished block")
+        }
+        Ok(None) => {}
+        Err(error) => tracing::warn!(%error,"Rejected unfinished block"),
+    }
+}
+
 async fn send(socket: &mut Socket, message: Message) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(5), socket.send(message))
         .await
@@ -499,14 +517,7 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                             }
                             ProtocolMessageTypes::NewGenesisTimelord => { if scheduler.set_genesis(decode_exact(message.data.as_slice())?)? { prime_infused(&mut primers,backend.clone(),None); } }
                             ProtocolMessageTypes::NewUnfinishedBlockTimelord => {
-                                let unfinished=decode_unfinished(message.data.as_slice()).context("Decoding unfinished block")?;
-                                let proof_version=unfinished.reward_chain_block.proof_of_space.version;
-                                let unfinished_reward_hash=unfinished.reward_chain_block.hash()?;
-                                match scheduler.add_unfinished(unfinished) {
-                                    Ok(true) => tracing::info!(proof_version, %unfinished_reward_hash, "Scheduled validated unfinished block"),
-                                    Ok(false) => {},
-                                    Err(error) => tracing::warn!(%error, "Rejected unfinished block"),
-                                }
+                                handle_unfinished(&mut scheduler,message.data.as_slice());
                             }
                             ProtocolMessageTypes::RequestCompactProofOfTime => {},
                             _ => bail!("Unexpected node protocol message"),
@@ -615,6 +626,53 @@ mod tests {
             malformed.extend(extension);
             assert!(decode_unfinished(&malformed).is_err());
         }
+    }
+    #[test]
+    fn invalid_candidate_does_not_reset_the_scheduler_or_discard_later_work() {
+        use dg_xch_core::protocols::timelord::{NewPeakTimelord, NewUnfinishedBlockTimelord};
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../integrations/dg-xch/vendor/timelord/tests/fixtures/chia_hf2.json"
+        ))
+        .unwrap();
+        let node = crate::network::tests::node();
+        let mut constants = crate::network::resolve(&node).unwrap().constants;
+        constants.hard_fork_height = 0;
+        constants.epoch_blocks = 768;
+        constants.number_zero_bits_plot_filter_v2 = 7;
+        constants.max_plot_strength = 9;
+        let mut scheduler =
+            dg_xch_timelord::scheduler::Scheduler::new(constants, false, None).unwrap();
+        let version = ChiaProtocolVersion::default();
+        let decode_hex = |text: &str| {
+            (0..text.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let sequence = fixture["peer_sequence"].as_array().unwrap();
+        let raw = decode_hex(sequence[0]["bytes"].as_str().unwrap());
+        let peak: NewPeakTimelord = decode_exact(&raw).unwrap();
+        scheduler.set_peak(peak).unwrap();
+        let generation = scheduler.generation();
+        let raw = decode_hex(sequence[1]["bytes"].as_str().unwrap());
+        let mut bad: NewUnfinishedBlockTimelord = decode_exact(&raw).unwrap();
+        bad.reward_chain_block.proof_of_space =
+            serde_json::from_value(fixture["rows"][0]["reward_block"]["proof_of_space"].clone())
+                .unwrap();
+        bad.reward_chain_block.proof_of_space.proof =
+            serde_json::from_value(serde_json::json!("0x00")).unwrap();
+        handle_unfinished(&mut scheduler, &bad.to_bytes(version).unwrap());
+        assert!(scheduler.initialized());
+        assert_eq!(scheduler.generation(), generation);
+        handle_unfinished(&mut scheduler, &raw);
+        assert!(scheduler.initialized());
+        assert_eq!(scheduler.generation(), generation);
+        assert!(
+            !scheduler
+                .add_unfinished(decode_exact(&raw).unwrap())
+                .unwrap(),
+            "later valid candidate was already admitted"
+        );
     }
     impl Drop for Files {
         fn drop(&mut self) {

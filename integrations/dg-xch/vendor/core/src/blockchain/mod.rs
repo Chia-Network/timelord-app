@@ -54,3 +54,6 @@ pub mod weight_proof;
 // The weight-proof VALIDATOR lives in the `dg_xch_weight_proof` crate, not here: wiring the VDF and
 // proof-of-space verifiers from core would be a dependency cycle (vdf/pos both depend on core). The
 // `WeightProof` wire type above stays in core because the full-node protocol needs it.
+
+mod packed_optional;
+mod proof_encoding;

@@ -209,30 +209,12 @@ pub fn calculate_timelord_iterations(
             ));
         }
     };
-    if usize::from(constants.plot_filter_v2_relative_height_count)
-        > constants.plot_filter_v2_relative_height.len()
-        || constants.max_effective_plot_filter_bits > 31
-    {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "invalid Chia filter schedule bounds",
-        ));
-    }
-    let relative = previous_transaction_height.saturating_sub(constants.hard_fork2_height);
-    let mut base = constants.number_zero_bits_plot_filter_v2;
-    for (i, offset) in constants
-        .plot_filter_v2_relative_height
-        .iter()
-        .take(usize::from(constants.plot_filter_v2_relative_height_count))
-        .enumerate()
-    {
-        if relative >= *offset {
-            base = base.saturating_sub(
-                (usize::from(constants.plot_filter_v2_relative_height_count) - i) as u8,
-            );
-            break;
-        }
-    }
+    validate_timelord_filter_parameters(constants)?;
+    let base = constants.plot_filter_v2_relative_height.base_bits(
+        previous_transaction_height,
+        constants.hard_fork2_height,
+        constants.number_zero_bits_plot_filter_v2,
+    );
     let effective = base
         .saturating_add(pos.strength.saturating_sub(constants.min_plot_strength))
         .min(constants.max_effective_plot_filter_bits);
@@ -247,4 +229,45 @@ pub fn calculate_timelord_iterations(
         BigUint::from(difficulty) * BigUint::from(constants.difficulty_constant_factor) * q
             / ((*TWO_POW_256).clone() * BigUint::from(size));
     Ok(result.to_u64().unwrap_or(u64::MAX).max(1))
+}
+
+/// Check scalar invariants at the canonical scheduler/lottery boundary.
+pub fn validate_timelord_filter_parameters(c: &ConsensusConstants) -> Result<(), Error> {
+    if c.max_effective_plot_filter_bits > 31
+        || c.max_effective_plot_filter_bits < c.number_zero_bits_plot_filter_v2
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "invalid effective filter bounds",
+        ));
+    }
+    Ok(())
+}
+/// When transaction context is unknown, trust only a target invariant over all possible schedules.
+pub fn timelord_iterations_with_context(
+    c: &ConsensusConstants,
+    pos: &ProofOfSpace,
+    quality: Bytes32,
+    difficulty: u64,
+    signage: Bytes32,
+    previous: Option<u32>,
+    upper: u32,
+) -> Result<Option<u64>, Error> {
+    if let Some(h) = previous {
+        return calculate_timelord_iterations(c, pos, quality, difficulty, signage, h).map(Some);
+    }
+    let target = calculate_timelord_iterations(c, pos, quality, difficulty, signage, 0)?;
+    if pos.version == 1 {
+        for offset in c.plot_filter_v2_relative_height.entries() {
+            if let Some(h) = c
+                .hard_fork2_height
+                .checked_add(*offset)
+                .filter(|h| *h <= upper)
+                && calculate_timelord_iterations(c, pos, quality, difficulty, signage, h)? != target
+            {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(target))
 }

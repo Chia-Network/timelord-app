@@ -147,12 +147,7 @@ pub struct ConsensusConstants {
         default = "default_plot_filter_v2_relative_height",
         skip_serializing_if = "is_default_plot_filter_v2_relative_height"
     )]
-    pub plot_filter_v2_relative_height: [u32; 9],
-    #[serde(
-        default = "default_plot_filter_v2_relative_height_count",
-        skip_serializing_if = "is_default_plot_filter_v2_relative_height_count"
-    )]
-    pub plot_filter_v2_relative_height_count: u8,
+    pub plot_filter_v2_relative_height: super::filter_schedule::FilterSchedule,
     pub min_plot_strength: u8,
     pub max_plot_strength: u8,
     pub plot_v1_phase_out_epoch_bits: u8,
@@ -257,12 +252,9 @@ pub const MAINNET: ConsensusConstants = ConsensusConstants {
     plot_filter_32_height: 20_643_000,
     number_zero_bits_plot_filter_v2: 5,
     plot_size_v2: 28,
-    plot_filter_v2_relative_height_count: 9,
     filter_window_size: 16,
     max_effective_plot_filter_bits: 13,
-    plot_filter_v2_relative_height: [
-        50494000, 45444000, 40394000, 35343000, 30298000, 25247000, 20197000, 15146000, 10101000,
-    ],
+    plot_filter_v2_relative_height: super::filter_schedule::LEGACY_SCHEDULE,
     min_plot_strength: 2,
     max_plot_strength: 32,
     plot_v1_phase_out_epoch_bits: 8,
@@ -539,29 +531,24 @@ pub const FARMER_REWARD_PREFIXES: [(Bytes32, Bytes32); 10] = [
 ];
 
 fn default_filter_window_size() -> u8 {
-    MAINNET.filter_window_size
+    16
 }
 fn is_default_filter_window_size(value: &u8) -> bool {
     *value == default_filter_window_size()
 }
 
 fn default_max_effective_plot_filter_bits() -> u8 {
-    MAINNET.max_effective_plot_filter_bits
+    13
 }
 fn is_default_max_effective_plot_filter_bits(value: &u8) -> bool {
     *value == default_max_effective_plot_filter_bits()
 }
 
-fn default_plot_filter_v2_relative_height() -> [u32; 9] {
-    MAINNET.plot_filter_v2_relative_height
+fn default_plot_filter_v2_relative_height() -> super::filter_schedule::FilterSchedule {
+    super::filter_schedule::LEGACY_SCHEDULE
 }
-fn is_default_plot_filter_v2_relative_height(value: &[u32; 9]) -> bool {
-    *value == default_plot_filter_v2_relative_height()
-}
-
-fn default_plot_filter_v2_relative_height_count() -> u8 {
-    MAINNET.plot_filter_v2_relative_height_count
-}
-fn is_default_plot_filter_v2_relative_height_count(value: &u8) -> bool {
-    *value == default_plot_filter_v2_relative_height_count()
+fn is_default_plot_filter_v2_relative_height(
+    value: &super::filter_schedule::FilterSchedule,
+) -> bool {
+    *value == super::filter_schedule::LEGACY_SCHEDULE
 }

@@ -272,12 +272,15 @@
     "servers/src/websocket/farmer/mod.rs": "612707ceed35d93d888ec8e5283805b729933c70c7048894a9265a7bc0dbc5e1",
     "servers/src/websocket/farmer/new_proof_or_space.rs": "5443e184173792aa81fc3cc19ae33dff819bfb247febea671f773f76b64738f7",
     "servers/src/websocket/farmer/respond_signatures.rs": "fa059e5ce2df7f60400416b43ea76a47bc1545b79fa1b813731494ce2f3b9d75",
-    "servers/tests/unit/websocket/mod/peer_map_tests.rs": "f2790468ecd34a990edf0f251e9824b4985d2fd4b376de5a5356f7c68997324f"
+    "servers/tests/unit/websocket/mod/peer_map_tests.rs": "f2790468ecd34a990edf0f251e9824b4985d2fd4b376de5a5356f7c68997324f",
+    "tests/support/network.rs": "7d8fb2a6f880359eb1a638385b19b96bd5f49e98bf564f85cd0c24d90b66d059",
+    "config/chains/dgx.json": "3fc85f83f59de336877e4db557cc6a40d47fdba09a204ae6e9610b028eb4795e"
   },
   "import_adjustments": [
     "Explicit package metadata replaces upstream workspace inheritance",
     "Unchanged sibling dependencies use upstream_base Git pin",
     "Local core/server dependencies retain relative paths",
-    "Apache license copied into each crate"
+    "Apache license copied into each crate",
+    "Shared loopback test helper and chain-definition fixture retained under vendor/tests and vendor/config"
   ]
 }

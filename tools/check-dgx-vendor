@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+"""Verify the Cargo graph uses exactly the maintained vendor copies and upstream pin."""
+import json
+from pathlib import Path
+import subprocess
+
+root = Path(__file__).resolve().parent.parent
+origin = json.loads((root / "integrations/dg-xch/vendor-origin.json").read_text())
+metadata = json.loads(subprocess.check_output(
+    ["cargo", "metadata", "--locked", "--format-version", "1"], cwd=root
+))
+vendored = {"dg_xch_core": "core", "dg_xch_timelord": "timelord", "dg_xch_servers": "servers"}
+for name, directory in vendored.items():
+    packages = [p for p in metadata["packages"] if p["name"] == name]
+    assert len(packages) == 1, f"Expected one {name}, found {len(packages)}"
+    package = packages[0]
+    expected = root / "integrations/dg-xch/vendor" / directory / "Cargo.toml"
+    assert Path(package["manifest_path"]).resolve() == expected, name
+    assert package["source"] is None, name
+for package in metadata["packages"]:
+    if package["name"].startswith("dg_") and package["name"] not in vendored:
+        source = package["source"] or ""
+        assert source.startswith("git+https://github.com/GalactechsLLC/dg_xch_utils?"), package["name"]
+        assert source.endswith("#" + origin["upstream_base"]), package["name"]
+print("Verified three vendored crates and unchanged upstream dependency pin")

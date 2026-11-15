@@ -4,11 +4,7 @@ use num_bigint::BigInt;
 use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero, pow};
 use once_cell::sync::Lazy;
 use serde::Deserializer;
-use serde::de::Visitor;
-use std::fmt::Formatter;
 use std::io::{Error, ErrorKind};
-use std::marker::PhantomData;
-use std::str::FromStr;
 
 pub static BIG_ZERO: Lazy<BigInt> = Lazy::new(|| BigInt::from(0));
 pub static BIG_ONE: Lazy<BigInt> = Lazy::new(|| BigInt::from(1));
@@ -240,117 +236,18 @@ pub fn i32_from_slice(buf: &[u8]) -> Option<i32> {
     u32_from_slice_impl(buf, true).map(|v| v as i32)
 }
 
-pub fn parse_u128<'de, D>(d: D) -> Result<u128, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    struct PU128(PhantomData<fn() -> u128>);
-    impl Visitor<'_> for PU128 {
-        type Value = u128;
-
-        fn expecting(&self, formatter: &mut Formatter) -> std::fmt::Result {
-            formatter.write_str("string or number")
-        }
-
-        fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            u128::from_u8(u8::from(v))
-                .ok_or_else(|| serde::de::Error::custom("Invalid Value for bool"))
-        }
-
-        fn visit_i8<E>(self, v: i8) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            u128::from_i8(v).ok_or_else(|| serde::de::Error::custom("Invalid Value for i8"))
-        }
-
-        fn visit_i16<E>(self, v: i16) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            u128::from_i16(v).ok_or_else(|| serde::de::Error::custom("Invalid Value for i16"))
-        }
-
-        fn visit_i32<E>(self, v: i32) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            u128::from_i32(v).ok_or_else(|| serde::de::Error::custom("Invalid Value for i32"))
-        }
-
-        fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            u128::from_i64(v).ok_or_else(|| serde::de::Error::custom("Invalid Value for i64"))
-        }
-
-        fn visit_u8<E>(self, v: u8) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            u128::from_u8(v).ok_or_else(|| serde::de::Error::custom("Invalid Value for u8"))
-        }
-
-        fn visit_u16<E>(self, v: u16) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            u128::from_u16(v).ok_or_else(|| serde::de::Error::custom("Invalid Value for u16"))
-        }
-
-        fn visit_u32<E>(self, v: u32) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            u128::from_u32(v).ok_or_else(|| serde::de::Error::custom("Invalid Value for u32"))
-        }
-
-        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            u128::from_u64(v).ok_or_else(|| serde::de::Error::custom("Invalid Value for u64"))
-        }
-
-        fn visit_f32<E>(self, v: f32) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            u128::from_f32(v).ok_or_else(|| serde::de::Error::custom("Invalid Value for f32"))
-        }
-
-        fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            u128::from_f64(v).ok_or_else(|| serde::de::Error::custom("Invalid Value for f64"))
-        }
-
-        fn visit_char<E>(self, v: char) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            u128::from_str(&v.to_string())
-                .map_err(|_| serde::de::Error::custom("Invalid Value for char"))
-        }
-
-        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            u128::from_str(v).map_err(|_| serde::de::Error::custom("Invalid Value for str"))
-        }
-
-        fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            u128::from_str(&v).map_err(|_| serde::de::Error::custom("Invalid Value for string"))
-        }
+/// RPC space estimates historically accept numbers, decimal strings and booleans.
+/// Deserialize through serde_json's number type so arbitrary-precision numbers
+/// retain their integer precision and floating estimates keep truncation behavior.
+pub fn parse_u128<'de, D: Deserializer<'de>>(d: D) -> Result<u128, D::Error> {
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(d)?;
+    match value {
+        serde_json::Value::Bool(v) => Ok(u128::from(v)),
+        serde_json::Value::String(v) => v.parse().map_err(serde::de::Error::custom),
+        serde_json::Value::Number(v) => v
+            .as_u128()
+            .or_else(|| v.as_f64().and_then(u128::from_f64))
+            .ok_or_else(|| serde::de::Error::custom("invalid unsigned 128-bit number")),
+        _ => Err(serde::de::Error::custom("expected a string or number")),
     }
-    d.deserialize_any(PU128(PhantomData))
 }

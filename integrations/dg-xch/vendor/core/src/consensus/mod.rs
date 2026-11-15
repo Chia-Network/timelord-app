@@ -41,3 +41,5 @@ pub(crate) fn missing(hash: Bytes32) -> Error {
 pub(crate) fn rejected(msg: &'static str) -> Error {
     Error::new(ErrorKind::InvalidData, msg)
 }
+
+pub mod filter_schedule;

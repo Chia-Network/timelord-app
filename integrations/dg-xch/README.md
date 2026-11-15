@@ -1,8 +1,11 @@
 # Rust timelord integration
 
-Pinned dependency: [dg_xch_utils](https://github.com/cameroncooper/dg_xch_utils/tree/3b50863ee641c67e4c46b9a18640001e0c94833f),
-revision `3b50863ee641c67e4c46b9a18640001e0c94833f`, based on upstream `ca437be562cec5f0514f6edd4c794adfe382dd8a`, Apache-2.0.
-See upstream.toml, LICENSE, NOTICE and Cargo.lock. Compatibility changes live in the pinned fork; no local patches are applied.
+The app maintains `core`, `servers` and `timelord` under `vendor/`, imported
+from compatibility snapshot `3b50863ee641c67e4c46b9a18640001e0c94833f` and
+modified in this repository. Unchanged dependencies use original upstream
+revision `ca437be562cec5f0514f6edd4c794adfe382dd8a`, Apache-2.0.
+See [VENDORING.md](VENDORING.md), vendor-origin.json, upstream.toml, LICENSE,
+NOTICE and Cargo.lock for maintenance instructions and exact provenance.
 
 The app links the public regular Scheduler, protocol/consensus types, TLS/framing
 helpers and VDF verifier. Our `runtime.rs` owns the node session and injects our
@@ -12,7 +15,7 @@ service/CLI is not used: it constructs a CpuBackend and recomputes each request.
 Custom Chia network imports resolve the exact exported network ID and supported
 constant overrides in our `network.rs` adapter, using pinned Mainnet constants as
 the baseline. They do not use upstream's DGX seed-derived chain format. Current HF2 filter schedules and strength parameters are applied explicitly.
-The compatibility fork supplies PoS2 witness verification, consensus hashing and
+The maintained vendor copies supply PoS2 witness verification, consensus hashing and
 message codecs. Offline custom import/handshake tests alone do not establish
 transition support or live consensus acceptance.
 
@@ -142,7 +145,7 @@ is not an all-board stability result or a PoS transition test.
 
 ## HF2 development deployment (November 15)
 
-The published compatibility branch `fix/chia-hf2-timelord`, revision
+The original compatibility branch `fix/chia-hf2-timelord`, revision
 `3b50863`, adds current Chia PoS2 verification via `chia-pos2 = 1.0.0`,
 quality-commitment consensus hashing, packed header/sub-epoch MMR roots,
 height/strength-aware iteration calculation and timelord-only HF2 capability.
@@ -152,6 +155,6 @@ absent-root compatibility; custom relative filter schedules retain their length.
 
 `hf2-testnet-deployment.json` records actual m6mini submissions and full-node
 acceptance of PoS2 blocks, beginning at height 10554. It does not establish an
-activation replay or sustained hardware stability. The app now pins this exact revision in the public compatibility fork.
-Standard builds require no local checkout or Cargo override. The upstream PR is
-intentionally deferred until the fork branch has been reviewed.
+activation replay or sustained hardware stability. That historical deployment used the compatibility fork. Current builds use
+maintained vendor copies with the review fixes described in VENDORING.md.
+Standard builds require no local checkout or Cargo override.
