@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/timelord-core", "crates/vdf-client-protocol", "crates/timelord-service", "crates/timelord-supervisor"]
+members = ["crates/timelord-core", "crates/vdf-client-protocol", "crates/timelord-service", "crates/timelord-supervisor", "integrations/dg-xch/vendor/core", "integrations/dg-xch/vendor/timelord", "integrations/dg-xch/vendor/servers"]
 resolver = "3"
 
 [workspace.package]
@@ -20,11 +20,11 @@ tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net", "i
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-dg_xch_core = { git = "https://github.com/cameroncooper/dg_xch_utils", rev = "3b50863ee641c67e4c46b9a18640001e0c94833f", default-features = false, features = ["bls"] }
-dg_xch_timelord = { git = "https://github.com/cameroncooper/dg_xch_utils", rev = "3b50863ee641c67e4c46b9a18640001e0c94833f" }
-dg_xch_servers = { git = "https://github.com/cameroncooper/dg_xch_utils", rev = "3b50863ee641c67e4c46b9a18640001e0c94833f" }
-dg_xch_vdf = { git = "https://github.com/cameroncooper/dg_xch_utils", rev = "3b50863ee641c67e4c46b9a18640001e0c94833f" }
-dg_xch_serialize = { git = "https://github.com/cameroncooper/dg_xch_utils", rev = "3b50863ee641c67e4c46b9a18640001e0c94833f" }
+dg_xch_core = { git = "https://github.com/GalactechsLLC/dg_xch_utils", rev = "ca437be562cec5f0514f6edd4c794adfe382dd8a", default-features = false, features = ["bls"] }
+dg_xch_timelord = { git = "https://github.com/GalactechsLLC/dg_xch_utils", rev = "ca437be562cec5f0514f6edd4c794adfe382dd8a" }
+dg_xch_servers = { git = "https://github.com/GalactechsLLC/dg_xch_utils", rev = "ca437be562cec5f0514f6edd4c794adfe382dd8a" }
+dg_xch_vdf = { git = "https://github.com/GalactechsLLC/dg_xch_utils", rev = "ca437be562cec5f0514f6edd4c794adfe382dd8a" }
+dg_xch_serialize = { git = "https://github.com/GalactechsLLC/dg_xch_utils", rev = "ca437be562cec5f0514f6edd4c794adfe382dd8a" }
 x509-cert = "0.2"
 num-bigint = "0.4"
 futures-util = "0.3"
@@ -35,3 +35,8 @@ tokio-tungstenite = "0.28"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[patch."https://github.com/GalactechsLLC/dg_xch_utils"]
+dg_xch_core = { path = "integrations/dg-xch/vendor/core" }
+dg_xch_timelord = { path = "integrations/dg-xch/vendor/timelord" }
+dg_xch_servers = { path = "integrations/dg-xch/vendor/servers" }

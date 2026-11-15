@@ -1,0 +1,662 @@
+{
+  "base/add": {
+    "value": "23",
+    "cost": 796,
+    "error": null
+  },
+  "base/add_big": {
+    "value": "0x010000000000000000",
+    "cost": 900,
+    "error": null
+  },
+  "base/add_cancel": {
+    "value": "()",
+    "cost": 786,
+    "error": null
+  },
+  "base/add_nil": {
+    "value": "()",
+    "cost": 100,
+    "error": null
+  },
+  "base/all_mixed": {
+    "value": "()",
+    "cost": 841,
+    "error": null
+  },
+  "base/all_true": {
+    "value": "1",
+    "cost": 841,
+    "error": null
+  },
+  "base/any_mixed": {
+    "value": "1",
+    "cost": 841,
+    "error": null
+  },
+  "base/any_none": {
+    "value": "()",
+    "cost": 841,
+    "error": null
+  },
+  "base/apply_env": {
+    "value": "42",
+    "cost": 175,
+    "error": null
+  },
+  "base/ash_left": {
+    "value": "256",
+    "cost": 666,
+    "error": null
+  },
+  "base/ash_neg_sticky": {
+    "value": "-1",
+    "cost": 653,
+    "error": null
+  },
+  "base/ash_over_65535": {
+    "value": null,
+    "cost": null,
+    "error": "Unsupported(\"shift too large: 0x010000\")"
+  },
+  "base/ash_right": {
+    "value": "1",
+    "cost": 656,
+    "error": null
+  },
+  "base/coinid": {
+    "value": "0x00c2e1d66fd22ec36271092c3b77a0066e1a03406a29793052345828826f4b9d",
+    "cost": 861,
+    "error": null
+  },
+  "base/concat": {
+    "value": "\"clvm\"",
+    "cost": 505,
+    "error": null
+  },
+  "base/concat_nil": {
+    "value": "()",
+    "cost": 143,
+    "error": null
+  },
+  "base/cons": {
+    "value": "(q 2 3)",
+    "cost": 91,
+    "error": null
+  },
+  "base/div": {
+    "value": "3",
+    "cost": 1047,
+    "error": null
+  },
+  "base/div_exact": {
+    "value": "3",
+    "cost": 1047,
+    "error": null
+  },
+  "base/div_neg": {
+    "value": "-4",
+    "cost": 1047,
+    "error": null
+  },
+  "base/div_zero": {
+    "value": null,
+    "cost": null,
+    "error": "Unsupported(\"div with 0 : 1\")"
+  },
+  "base/divmod": {
+    "value": "(i . 1)",
+    "cost": 1189,
+    "error": null
+  },
+  "base/divmod_neg": {
+    "value": "(-4 . 2)",
+    "cost": 1189,
+    "error": null
+  },
+  "base/divmod_zero": {
+    "value": null,
+    "cost": null,
+    "error": "Unsupported(\"div with 0 : 1\")"
+  },
+  "base/eq_empty": {
+    "value": "1",
+    "cost": 158,
+    "error": null
+  },
+  "base/eq_false": {
+    "value": "()",
+    "cost": 160,
+    "error": null
+  },
+  "base/eq_true": {
+    "value": "1",
+    "cost": 160,
+    "error": null
+  },
+  "base/first": {
+    "value": "1",
+    "cost": 51,
+    "error": null
+  },
+  "base/first_of_atom": {
+    "value": null,
+    "cost": null,
+    "error": "ExpectedPairGotAtom(\"1\")"
+  },
+  "base/gr_signed": {
+    "value": "()",
+    "cost": 543,
+    "error": null
+  },
+  "base/gr_true": {
+    "value": "1",
+    "cost": 543,
+    "error": null
+  },
+  "base/grs": {
+    "value": "1",
+    "cost": 160,
+    "error": null
+  },
+  "base/grs_prefix": {
+    "value": "1",
+    "cost": 161,
+    "error": null
+  },
+  "base/if_false": {
+    "value": "28271",
+    "cost": 94,
+    "error": null
+  },
+  "base/if_true": {
+    "value": "\"yes\"",
+    "cost": 94,
+    "error": null
+  },
+  "base/listp_atom": {
+    "value": "()",
+    "cost": 40,
+    "error": null
+  },
+  "base/listp_pair": {
+    "value": "1",
+    "cost": 40,
+    "error": null
+  },
+  "base/logand": {
+    "value": "8",
+    "cost": 685,
+    "error": null
+  },
+  "base/logior": {
+    "value": "14",
+    "cost": 685,
+    "error": null
+  },
+  "base/lognot_neg": {
+    "value": "()",
+    "cost": 355,
+    "error": null
+  },
+  "base/lognot_zero": {
+    "value": "-1",
+    "cost": 362,
+    "error": null
+  },
+  "base/logxor": {
+    "value": "6",
+    "cost": 685,
+    "error": null
+  },
+  "base/lsh_left": {
+    "value": "256",
+    "cost": 347,
+    "error": null
+  },
+  "base/lsh_neg_bytes": {
+    "value": "510",
+    "cost": 347,
+    "error": null
+  },
+  "base/mod_op": {
+    "value": "1",
+    "cost": 1047,
+    "error": null
+  },
+  "base/mod_op_neg": {
+    "value": "2",
+    "cost": 1047,
+    "error": null
+  },
+  "base/modpow": {
+    "value": "24",
+    "cost": 17196,
+    "error": null
+  },
+  "base/mul": {
+    "value": "-256",
+    "cost": 1050,
+    "error": null
+  },
+  "base/mul_nil": {
+    "value": "1",
+    "cost": 103,
+    "error": null
+  },
+  "base/not_atom": {
+    "value": "()",
+    "cost": 221,
+    "error": null
+  },
+  "base/not_nil": {
+    "value": "1",
+    "cost": 221,
+    "error": null
+  },
+  "base/raise": {
+    "value": null,
+    "cost": null,
+    "error": "Raise(\"\\\"boom\\\"\")"
+  },
+  "base/rest": {
+    "value": "(a)",
+    "cost": 51,
+    "error": null
+  },
+  "base/rest_of_atom": {
+    "value": null,
+    "cost": null,
+    "error": "ExpectedPairGotAtom(\"1\")"
+  },
+  "base/softfork": {
+    "value": "()",
+    "cost": 142,
+    "error": null
+  },
+  "base/softfork_zero_cost": {
+    "value": null,
+    "cost": null,
+    "error": "Unsupported(\"Cost must be > 0, found 0\")"
+  },
+  "base/strlen": {
+    "value": "4",
+    "cost": 208,
+    "error": null
+  },
+  "base/strlen_nil": {
+    "value": "()",
+    "cost": 194,
+    "error": null
+  },
+  "base/strlen_of_pair": {
+    "value": null,
+    "cost": null,
+    "error": "IoError(Custom { kind: InvalidInput, error: \"strlen on list\" })"
+  },
+  "base/sub": {
+    "value": "-6",
+    "cost": 796,
+    "error": null
+  },
+  "base/sub_nil": {
+    "value": "()",
+    "cost": 100,
+    "error": null
+  },
+  "base/substr": {
+    "value": "27766",
+    "cost": 62,
+    "error": null
+  },
+  "base/substr_all": {
+    "value": "\"clvm\"",
+    "cost": 62,
+    "error": null
+  },
+  "base/substr_backwards": {
+    "value": null,
+    "cost": null,
+    "error": "Unsupported(\"invalid indices for substr: (\\\"clvm\\\" (i (q . ())))\")"
+  },
+  "base/substr_empty": {
+    "value": "()",
+    "cost": 62,
+    "error": null
+  },
+  "base/substr_past_end": {
+    "value": null,
+    "cost": null,
+    "error": "Unsupported(\"invalid indices for substr: (\\\"clvm\\\" (() (f ())))\")"
+  },
+  "mempool/add": {
+    "value": "23",
+    "cost": 796,
+    "error": null
+  },
+  "mempool/add_big": {
+    "value": "0x010000000000000000",
+    "cost": 900,
+    "error": null
+  },
+  "mempool/add_cancel": {
+    "value": "()",
+    "cost": 786,
+    "error": null
+  },
+  "mempool/add_nil": {
+    "value": "()",
+    "cost": 100,
+    "error": null
+  },
+  "mempool/all_mixed": {
+    "value": "()",
+    "cost": 841,
+    "error": null
+  },
+  "mempool/all_true": {
+    "value": "1",
+    "cost": 841,
+    "error": null
+  },
+  "mempool/any_mixed": {
+    "value": "1",
+    "cost": 841,
+    "error": null
+  },
+  "mempool/any_none": {
+    "value": "()",
+    "cost": 841,
+    "error": null
+  },
+  "mempool/apply_env": {
+    "value": "42",
+    "cost": 175,
+    "error": null
+  },
+  "mempool/ash_left": {
+    "value": "256",
+    "cost": 666,
+    "error": null
+  },
+  "mempool/ash_neg_sticky": {
+    "value": "-1",
+    "cost": 653,
+    "error": null
+  },
+  "mempool/ash_over_65535": {
+    "value": null,
+    "cost": null,
+    "error": "Unsupported(\"shift too large: 0x010000\")"
+  },
+  "mempool/ash_right": {
+    "value": "1",
+    "cost": 656,
+    "error": null
+  },
+  "mempool/coinid": {
+    "value": "0x00c2e1d66fd22ec36271092c3b77a0066e1a03406a29793052345828826f4b9d",
+    "cost": 861,
+    "error": null
+  },
+  "mempool/concat": {
+    "value": "\"clvm\"",
+    "cost": 505,
+    "error": null
+  },
+  "mempool/concat_nil": {
+    "value": "()",
+    "cost": 143,
+    "error": null
+  },
+  "mempool/cons": {
+    "value": "(q 2 3)",
+    "cost": 91,
+    "error": null
+  },
+  "mempool/div": {
+    "value": "3",
+    "cost": 1047,
+    "error": null
+  },
+  "mempool/div_exact": {
+    "value": "3",
+    "cost": 1047,
+    "error": null
+  },
+  "mempool/div_neg": {
+    "value": "-4",
+    "cost": 1047,
+    "error": null
+  },
+  "mempool/div_zero": {
+    "value": null,
+    "cost": null,
+    "error": "Unsupported(\"div with 0 : 1\")"
+  },
+  "mempool/divmod": {
+    "value": "(i . 1)",
+    "cost": 1189,
+    "error": null
+  },
+  "mempool/divmod_neg": {
+    "value": "(-4 . 2)",
+    "cost": 1189,
+    "error": null
+  },
+  "mempool/divmod_zero": {
+    "value": null,
+    "cost": null,
+    "error": "Unsupported(\"div with 0 : 1\")"
+  },
+  "mempool/eq_empty": {
+    "value": "1",
+    "cost": 158,
+    "error": null
+  },
+  "mempool/eq_false": {
+    "value": "()",
+    "cost": 160,
+    "error": null
+  },
+  "mempool/eq_true": {
+    "value": "1",
+    "cost": 160,
+    "error": null
+  },
+  "mempool/first": {
+    "value": "1",
+    "cost": 51,
+    "error": null
+  },
+  "mempool/first_of_atom": {
+    "value": null,
+    "cost": null,
+    "error": "ExpectedPairGotAtom(\"1\")"
+  },
+  "mempool/gr_signed": {
+    "value": "()",
+    "cost": 543,
+    "error": null
+  },
+  "mempool/gr_true": {
+    "value": "1",
+    "cost": 543,
+    "error": null
+  },
+  "mempool/grs": {
+    "value": "1",
+    "cost": 160,
+    "error": null
+  },
+  "mempool/grs_prefix": {
+    "value": "1",
+    "cost": 161,
+    "error": null
+  },
+  "mempool/if_false": {
+    "value": "28271",
+    "cost": 94,
+    "error": null
+  },
+  "mempool/if_true": {
+    "value": "\"yes\"",
+    "cost": 94,
+    "error": null
+  },
+  "mempool/listp_atom": {
+    "value": "()",
+    "cost": 40,
+    "error": null
+  },
+  "mempool/listp_pair": {
+    "value": "1",
+    "cost": 40,
+    "error": null
+  },
+  "mempool/logand": {
+    "value": "8",
+    "cost": 685,
+    "error": null
+  },
+  "mempool/logior": {
+    "value": "14",
+    "cost": 685,
+    "error": null
+  },
+  "mempool/lognot_neg": {
+    "value": "()",
+    "cost": 355,
+    "error": null
+  },
+  "mempool/lognot_zero": {
+    "value": "-1",
+    "cost": 362,
+    "error": null
+  },
+  "mempool/logxor": {
+    "value": "6",
+    "cost": 685,
+    "error": null
+  },
+  "mempool/lsh_left": {
+    "value": "256",
+    "cost": 347,
+    "error": null
+  },
+  "mempool/lsh_neg_bytes": {
+    "value": "510",
+    "cost": 347,
+    "error": null
+  },
+  "mempool/mod_op": {
+    "value": "1",
+    "cost": 1047,
+    "error": null
+  },
+  "mempool/mod_op_neg": {
+    "value": "2",
+    "cost": 1047,
+    "error": null
+  },
+  "mempool/modpow": {
+    "value": "24",
+    "cost": 17196,
+    "error": null
+  },
+  "mempool/mul": {
+    "value": "-256",
+    "cost": 1050,
+    "error": null
+  },
+  "mempool/mul_nil": {
+    "value": "1",
+    "cost": 103,
+    "error": null
+  },
+  "mempool/not_atom": {
+    "value": "()",
+    "cost": 221,
+    "error": null
+  },
+  "mempool/not_nil": {
+    "value": "1",
+    "cost": 221,
+    "error": null
+  },
+  "mempool/raise": {
+    "value": null,
+    "cost": null,
+    "error": "Raise(\"\\\"boom\\\"\")"
+  },
+  "mempool/rest": {
+    "value": "(a)",
+    "cost": 51,
+    "error": null
+  },
+  "mempool/rest_of_atom": {
+    "value": null,
+    "cost": null,
+    "error": "ExpectedPairGotAtom(\"1\")"
+  },
+  "mempool/softfork": {
+    "value": "()",
+    "cost": 142,
+    "error": null
+  },
+  "mempool/softfork_zero_cost": {
+    "value": null,
+    "cost": null,
+    "error": "Unsupported(\"Cost must be > 0, found 0\")"
+  },
+  "mempool/strlen": {
+    "value": "4",
+    "cost": 208,
+    "error": null
+  },
+  "mempool/strlen_nil": {
+    "value": "()",
+    "cost": 194,
+    "error": null
+  },
+  "mempool/strlen_of_pair": {
+    "value": null,
+    "cost": null,
+    "error": "IoError(Custom { kind: InvalidInput, error: \"strlen on list\" })"
+  },
+  "mempool/sub": {
+    "value": "-6",
+    "cost": 796,
+    "error": null
+  },
+  "mempool/sub_nil": {
+    "value": "()",
+    "cost": 100,
+    "error": null
+  },
+  "mempool/substr": {
+    "value": "27766",
+    "cost": 62,
+    "error": null
+  },
+  "mempool/substr_all": {
+    "value": "\"clvm\"",
+    "cost": 62,
+    "error": null
+  },
+  "mempool/substr_backwards": {
+    "value": null,
+    "cost": null,
+    "error": "Unsupported(\"invalid indices for substr: (\\\"clvm\\\" (i (q . ())))\")"
+  },
+  "mempool/substr_empty": {
+    "value": "()",
+    "cost": 62,
+    "error": null
+  },
+  "mempool/substr_past_end": {
+    "value": null,
+    "cost": null,
+    "error": "Unsupported(\"invalid indices for substr: (\\\"clvm\\\" (() (f ())))\")"
+  }
+}
