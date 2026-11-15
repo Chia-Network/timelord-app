@@ -158,3 +158,12 @@ acceptance of PoS2 blocks, beginning at height 10554. It does not establish an
 activation replay or sustained hardware stability. That historical deployment used the compatibility fork. Current builds use
 maintained vendor copies with the review fixes described in VENDORING.md.
 Standard builds require no local checkout or Cargo override.
+
+## Maintained vendor deployment (November 15)
+
+`vendor-hf2-deployment.json` records the signed vendor build and full-node
+acceptance of its PoS2 infusion at height 11052, including the source peer,
+submission time and accepted header hash. All three boards delivered verified
+proofs; configuration and Running intent were preserved. The 885 workspace tests,
+feature matrix, Swift build and fresh-archive checks passed. This short trial
+does not establish sustained hardware stability or activation replay coverage.

@@ -1,0 +1,160 @@
+{
+  "date": "2026-11-15",
+  "machine": "m6mini",
+  "network": "test-2026-11-13-2-chia",
+  "deployment": {
+    "source_commit": "859903389c6b2ecde97c3a5d41f415da77d443d9",
+    "supervisor_pid": 55280,
+    "mode": "running",
+    "prior_mode": "running",
+    "worker_pid": 55281,
+    "native_revision": "7c47cf07e575cee38c5ad56c67d391b4f131ad6b",
+    "configuration_unchanged": true,
+    "verified_both_app_copies": true
+  },
+  "vendor_tree_sha256": "780665602ccc1c87c60db09af8f9befaf4d387192796498a8afd5f0ea5137029",
+  "native_revision": "7c47cf07e575cee38c5ad56c67d391b4f131ad6b",
+  "validation": {
+    "workspace_tests_passed": 885,
+    "format": "passed",
+    "workspace_clippy_all_targets_deny_warnings": "passed",
+    "core_feature_matrix": [
+      "no-default-features",
+      "bls only",
+      "chia-hf2 only"
+    ],
+    "swift_build": "passed",
+    "fresh_git_archive_cargo_check_locked": "passed",
+    "fresh_archive_dependency_graph_check": "passed"
+  },
+  "acceptance": {
+    "primary_pos2_block": {
+      "height": 11052,
+      "header_hash": "944ffef6b0138cbcca5708546ee151c8b105cff373dabe2340f82ca321d99680",
+      "unfinished_reward_hash": "bfa28b0186c1c48a7d06cbba6053ae164e6dbe864cdcb651cf9d8f85d6dc6558",
+      "proof_version": 1,
+      "submission": "2026-11-15T18:54:13.218011Z  INFO timelord_service::runtime: Submitting verified infusion point unfinished_reward_hash=0xbfa28b0186c1c48a7d06cbba6053ae164e6dbe864cdcb651cf9d8f85d6dc6558"
+    },
+    "node_peer_id": "e0a703da82bf07ba3eff71715fda1ba5fc167d2647359feca5645ec7fc1f55db",
+    "node_received_infusion_utc": "2026-11-15T18:54:13.225Z",
+    "node_validated_peak_utc": "2026-11-15T18:54:13.276Z",
+    "matched_pos2_blocks": [
+      {
+        "height": 11034,
+        "header_hash": "34070c016643656bcdd2f4efbdb713cd206c8bee6d717682a917f57562980ba1",
+        "unfinished_reward_hash": "348883979885c296da6a5881a56573792b1dc541b8294a470cebb6025aa5e672",
+        "proof_version": 1,
+        "submission": "2026-11-15T18:53:24.049766Z  INFO timelord_service::runtime: Submitting verified infusion point unfinished_reward_hash=0x348883979885c296da6a5881a56573792b1dc541b8294a470cebb6025aa5e672"
+      },
+      {
+        "height": 11036,
+        "header_hash": "05db773584ad6e0c70d86a158200a7584fb56e6f6d75c8c5fd6b17d2e9f98af3",
+        "unfinished_reward_hash": "5765db888b73396c4c4bbea995435b4d5cb7ac683ac91ae67bf75e82949128a2",
+        "proof_version": 1,
+        "submission": "2026-11-15T18:53:25.297524Z  INFO timelord_service::runtime: Submitting verified infusion point unfinished_reward_hash=0x5765db888b73396c4c4bbea995435b4d5cb7ac683ac91ae67bf75e82949128a2"
+      },
+      {
+        "height": 11037,
+        "header_hash": "4247ce4b69273491d9aaaf433feecb38c2fe6111763ebafc3e3346e4218c51c4",
+        "unfinished_reward_hash": "1f2a15c2c16e8c0df30a883d27aa356578acf937609553f14d89afaf713f3aa9",
+        "proof_version": 1,
+        "submission": "2026-11-15T18:53:30.459323Z  INFO timelord_service::runtime: Submitting verified infusion point unfinished_reward_hash=0x1f2a15c2c16e8c0df30a883d27aa356578acf937609553f14d89afaf713f3aa9"
+      },
+      {
+        "height": 11040,
+        "header_hash": "167f127a7a3ea2b9315d6b9bec9e7f1671a4e594d62d7190da5e831ee260d3fd",
+        "unfinished_reward_hash": "ffb03efc5bcb4eb4f8a5680d2e438076933ff2c278757fa7f830002318001dc0",
+        "proof_version": 1,
+        "submission": "2026-11-15T18:53:38.019082Z  INFO timelord_service::runtime: Submitting verified infusion point unfinished_reward_hash=0xffb03efc5bcb4eb4f8a5680d2e438076933ff2c278757fa7f830002318001dc0"
+      },
+      {
+        "height": 11041,
+        "header_hash": "78cf35752c8ed58f3e22052574368d5a88a8fd3af974fe18cca35287eee541ff",
+        "unfinished_reward_hash": "ea3376b6135729c9607dd1e96a49a4eaf91b63ee738154207a26c7d46205274f",
+        "proof_version": 1,
+        "submission": "2026-11-15T18:53:38.377799Z  INFO timelord_service::runtime: Submitting verified infusion point unfinished_reward_hash=0xea3376b6135729c9607dd1e96a49a4eaf91b63ee738154207a26c7d46205274f"
+      },
+      {
+        "height": 11042,
+        "header_hash": "743978702ddc96f07b2992ecf385cc1099b9984815e92a8cab7d3687d0322840",
+        "unfinished_reward_hash": "66a54c5849f1e09be6a336afd2560c46a98f45615536db43fdd7b3a29c6a6205",
+        "proof_version": 1,
+        "submission": "2026-11-15T18:53:38.704481Z  INFO timelord_service::runtime: Submitting verified infusion point unfinished_reward_hash=0x66a54c5849f1e09be6a336afd2560c46a98f45615536db43fdd7b3a29c6a6205"
+      },
+      {
+        "height": 11043,
+        "header_hash": "2fd3e563340ce0663f853bc21a66d17f3ba5753bcc5bd4c48ad84501fc9d3fc2",
+        "unfinished_reward_hash": "06614aa45cd7eff85a0fc8c144e5b354ec4c0458fb54b75ae3045ea4f452c342",
+        "proof_version": 1,
+        "submission": "2026-11-15T18:53:39.107119Z  INFO timelord_service::runtime: Submitting verified infusion point unfinished_reward_hash=0x06614aa45cd7eff85a0fc8c144e5b354ec4c0458fb54b75ae3045ea4f452c342"
+      },
+      {
+        "height": 11044,
+        "header_hash": "e0867eeadacc307e69a2b96f18145a1c3cdb75abc2e31a467b659b9ff3eba977",
+        "unfinished_reward_hash": "7791c43424eab333e8e1f47e09ac47a0d627c7e037fa43996850254de779ac0a",
+        "proof_version": 1,
+        "submission": "2026-11-15T18:53:39.489751Z  INFO timelord_service::runtime: Submitting verified infusion point unfinished_reward_hash=0x7791c43424eab333e8e1f47e09ac47a0d627c7e037fa43996850254de779ac0a"
+      },
+      {
+        "height": 11052,
+        "header_hash": "944ffef6b0138cbcca5708546ee151c8b105cff373dabe2340f82ca321d99680",
+        "unfinished_reward_hash": "bfa28b0186c1c48a7d06cbba6053ae164e6dbe864cdcb651cf9d8f85d6dc6558",
+        "proof_version": 1,
+        "submission": "2026-11-15T18:54:13.218011Z  INFO timelord_service::runtime: Submitting verified infusion point unfinished_reward_hash=0xbfa28b0186c1c48a7d06cbba6053ae164e6dbe864cdcb651cf9d8f85d6dc6558"
+      },
+      {
+        "height": 11053,
+        "header_hash": "2828a2b80722cea7ffc4ca0f6cbccdaad13a5dd78e17f4c8229892b35f17834d",
+        "unfinished_reward_hash": "58450e547b40c03bb3c475b21c41e9b416edcd4a5b49d701453300bd0fdf56ee",
+        "proof_version": 1,
+        "submission": "2026-11-15T18:54:14.087020Z  INFO timelord_service::runtime: Submitting verified infusion point unfinished_reward_hash=0x58450e547b40c03bb3c475b21c41e9b416edcd4a5b49d701453300bd0fdf56ee"
+      },
+      {
+        "height": 11054,
+        "header_hash": "30525579ff1a4f759c4624a21a04a638d4707827f29037f29e82d48cc82e6c73",
+        "unfinished_reward_hash": "4ebea25fe7775253e0ca8d5ac828f04cf69cf43e3863ef2c8f0ce4f6a7f563e8",
+        "proof_version": 1,
+        "submission": "2026-11-15T18:54:14.310268Z  INFO timelord_service::runtime: Submitting verified infusion point unfinished_reward_hash=0x4ebea25fe7775253e0ca8d5ac828f04cf69cf43e3863ef2c8f0ce4f6a7f563e8"
+      },
+      {
+        "height": 11055,
+        "header_hash": "9b0c7257551b1d1ea31b88da7332c50bdd599dd2d0fd8c333e86cde550f36702",
+        "unfinished_reward_hash": "6be82c1239683dbe31db5c67650ffdb7eec84a5a1c3de03ef624a90403e3b68a",
+        "proof_version": 1,
+        "submission": "2026-11-15T18:54:14.521240Z  INFO timelord_service::runtime: Submitting verified infusion point unfinished_reward_hash=0x6be82c1239683dbe31db5c67650ffdb7eec84a5a1c3de03ef624a90403e3b68a"
+      }
+    ],
+    "proofs_delivered": 182,
+    "failed_proofs": 0,
+    "timelord_state": "running",
+    "node_state": "ready",
+    "boards": [
+      {
+        "name": "ASIC 3",
+        "state": "connected",
+        "recoveries": 13,
+        "latest_proof_unix": 1794768883
+      },
+      {
+        "name": "ASIC 1",
+        "state": "connected",
+        "recoveries": 0,
+        "latest_proof_unix": 1794768883
+      },
+      {
+        "name": "ASIC 2",
+        "state": "connected",
+        "recoveries": 0,
+        "latest_proof_unix": 1794768883
+      }
+    ]
+  },
+  "configuration_unchanged": true,
+  "run_intent_preserved": true,
+  "node_log_level_restored": "INFO",
+  "limits": [
+    "Post-fork mixed-proof testnet acceptance, not a controlled activation replay or sustained stability qualification.",
+    "ASIC 3 had transient native recoveries during the trial; it resumed and all three boards delivered verified proofs.",
+    "Candidate-isolation and missing-height cases were exercised offline, not injected into the live node."
+  ]
+}
