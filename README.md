@@ -166,12 +166,15 @@ chains. Sustained consensus acceptance, physical clock/voltage transitions,
 USB unplug/replug, clean-machine installation and notarized distribution still
 need validation. This repository is development source, not a production release.
 
-The pinned Rust scheduler needs a narrow decoder for current Chia unfinished-block
-messages. Absent MMR roots are supported; active header MMR roots fail closed.
-Custom Chia network bundles import the selected network ID and constant overrides;
-this configures the existing scheduler and does not add PoS2 transition or MMR
-support. Offline import/handshake fixtures do not establish custom-network consensus
-acceptance.
+The November 15 HF2 development build supports current Chia PoS2 proofs and active
+header/sub-epoch MMR roots. Its m6mini testnet deployment produced infusion proofs
+that the full node accepted into PoS2 blocks. See
+[integration evidence](integrations/dg-xch/hf2-testnet-deployment.json).
+The app pins the compatibility branch in
+[cameroncooper/dg_xch_utils](https://github.com/cameroncooper/dg_xch_utils/tree/3b50863ee641c67e4c46b9a18640001e0c94833f).
+Normal Cargo checks and builds use that exact revision without local overrides. Offline
+fixtures and this post-fork trial do not establish activation replay, sustained
+hardware stability or production compatibility.
 Live configuration reload and start-at-login service registration are not implemented. Chart history is checkpointed to disk for up to
 24 hours and restored after service restarts, with downtime shown as gaps. Current
 uptime, proof counts and health still start fresh for each service run.

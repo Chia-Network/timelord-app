@@ -85,6 +85,8 @@ pub fn resolve(node: &NodeConfig) -> Result<ResolvedChain> {
             plot_filter_32_height,
             number_zero_bits_plot_filter_v2,
             plot_size_v2,
+            filter_window_size,
+            max_effective_plot_filter_bits,
             min_plot_strength,
             max_plot_strength,
             plot_v1_phase_out_epoch_bits,
@@ -92,6 +94,22 @@ pub fn resolve(node: &NodeConfig) -> Result<ResolvedChain> {
             plot_filter_v2_second_adjustment_height,
             plot_filter_v2_third_adjustment_height,
         );
+        if name == "PLOT_FILTER_V2_RELATIVE_HEIGHT" {
+            let timelord_core::NetworkValue::Array(values) = value else {
+                bail!("Invalid PLOT_FILTER_V2_RELATIVE_HEIGHT");
+            };
+            let entries: Vec<u32> = values
+                .iter()
+                .map(|v| v.unsigned().map_err(anyhow::Error::msg))
+                .collect::<Result<_>>()?;
+            if entries.len() > 9 {
+                bail!("At most nine relative plot-filter heights are supported");
+            }
+            constants.plot_filter_v2_relative_height = [u32::MAX; 9];
+            constants.plot_filter_v2_relative_height[..entries.len()].copy_from_slice(&entries);
+            constants.plot_filter_v2_relative_height_count = entries.len() as u8;
+            continue;
+        }
         match name.as_str() {
             "GENESIS_CHALLENGE" => constants.genesis_challenge = hex_constant(name, value)?,
             "AGG_SIG_ME_ADDITIONAL_DATA" => {
@@ -120,6 +138,16 @@ pub fn resolve(node: &NodeConfig) -> Result<ResolvedChain> {
             },
             _ => {}
         }
+    }
+    let schedule = &constants.plot_filter_v2_relative_height
+        [..usize::from(constants.plot_filter_v2_relative_height_count)];
+    if schedule.contains(&0) || schedule.windows(2).any(|pair| pair[0] <= pair[1]) {
+        bail!("Relative plot-filter heights must be positive and strictly descending");
+    }
+    if constants.max_effective_plot_filter_bits > 31
+        || constants.max_effective_plot_filter_bits < constants.number_zero_bits_plot_filter_v2
+    {
+        bail!("Invalid effective plot-filter bit bounds");
     }
     // Reuse the pinned scheduler's pure constructor to validate all parameters
     // before an import/configuration can replace usable saved settings.
@@ -224,6 +252,11 @@ pub(crate) mod tests {
         );
         assert_eq!(resolved.constants.sub_slot_iters_starting, 33554432);
         assert_eq!(resolved.constants.hard_fork2_height, 9216);
+        assert_eq!(resolved.constants.plot_filter_v2_relative_height_count, 7);
+        assert_eq!(
+            &resolved.constants.plot_filter_v2_relative_height[..7],
+            &[33000, 30000, 27000, 24000, 21000, 18000, 9216]
+        );
         assert!(!resolved.allows_bootstrap);
     }
     #[test]

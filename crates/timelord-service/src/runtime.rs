@@ -112,27 +112,27 @@ pub fn validate_handshake(
     }
     Ok(())
 }
-// Current Chia appends an optional header MMR root to the legacy unfinished
-// block envelope. The pinned scheduler supports pre-MMR consensus only. Accept
-// the absent root, require exact framing, and fail closed on an active MMR root.
+// Current envelopes carry the MMR root. Retain exact legacy framing only when
+// appending the absent-root byte produces a complete, valid message.
 fn decode_unfinished(
     bytes: &[u8],
 ) -> Result<dg_xch_core::protocols::timelord::NewUnfinishedBlockTimelord> {
-    use dg_xch_core::protocols::timelord::NewUnfinishedBlockTimelord;
     if bytes.len() > SERVICE_MESSAGE_LIMIT {
         bail!("Unfinished block exceeds message limit");
     }
-    let mut cursor = std::io::Cursor::new(bytes);
-    let value =
-        NewUnfinishedBlockTimelord::from_bytes(&mut cursor, ChiaProtocolVersion::default())?;
-    match &bytes[cursor.position() as usize..] {
-        [] | [0] => Ok(value),
-        [1, root @ ..] if root.len() == 32 => {
-            bail!("The pinned scheduler does not support header MMR roots yet")
-        }
-        _ => bail!("Malformed unfinished-block extension"),
+    if let Ok(value) = decode_exact(bytes) {
+        return Ok(value);
     }
+    let mut legacy = bytes.to_vec();
+    legacy.push(0);
+    let value: dg_xch_core::protocols::timelord::NewUnfinishedBlockTimelord =
+        decode_exact(&legacy).context("Malformed unfinished-block envelope")?;
+    if value.header_mmr_root.is_some() {
+        bail!("Truncated unfinished-block MMR root");
+    }
+    Ok(value)
 }
+
 async fn send(socket: &mut Socket, message: Message) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(5), socket.send(message))
         .await
@@ -476,7 +476,7 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                         let message: ChiaMessage = decode_exact(&bytes)?;
                         match message.msg_type {
                             ProtocolMessageTypes::NewPeakTimelord => {
-                                let peak: dg_xch_core::protocols::timelord::NewPeakTimelord=decode_exact(message.data.as_slice())?;
+                                let peak: dg_xch_core::protocols::timelord::NewPeakTimelord=decode_exact(message.data.as_slice()).context("Decoding timelord peak")?;
                                 metrics.peak_received();
                                 let result = scheduler.set_peak(peak.clone());
                                 metrics.peak_updated(match &result {
@@ -498,7 +498,16 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                                 }
                             }
                             ProtocolMessageTypes::NewGenesisTimelord => { if scheduler.set_genesis(decode_exact(message.data.as_slice())?)? { prime_infused(&mut primers,backend.clone(),None); } }
-                            ProtocolMessageTypes::NewUnfinishedBlockTimelord => { if let Err(error) = scheduler.add_unfinished(decode_unfinished(message.data.as_slice()).context("Decoding unfinished block")?) { tracing::warn!(%error, "Rejected unfinished block"); } }
+                            ProtocolMessageTypes::NewUnfinishedBlockTimelord => {
+                                let unfinished=decode_unfinished(message.data.as_slice()).context("Decoding unfinished block")?;
+                                let proof_version=unfinished.reward_chain_block.proof_of_space.version;
+                                let unfinished_reward_hash=unfinished.reward_chain_block.hash()?;
+                                match scheduler.add_unfinished(unfinished) {
+                                    Ok(true) => tracing::info!(proof_version, %unfinished_reward_hash, "Scheduled validated unfinished block"),
+                                    Ok(false) => {},
+                                    Err(error) => tracing::warn!(%error, "Rejected unfinished block"),
+                                }
+                            }
                             ProtocolMessageTypes::RequestCompactProofOfTime => {},
                             _ => bail!("Unexpected node protocol message"),
                         }
@@ -595,13 +604,13 @@ mod tests {
         let mut mmr = legacy.to_vec();
         mmr.push(1);
         mmr.extend([42; 32]);
-        assert!(
-            decode_unfinished(&mmr)
-                .unwrap_err()
-                .to_string()
-                .contains("MMR")
+        assert_eq!(
+            decode_unfinished(&mmr).unwrap().header_mmr_root,
+            Some(dg_xch_core::blockchain::sized_bytes::Bytes32::const_new(
+                [42; 32]
+            ))
         );
-        for extension in [vec![2], vec![0, 0], vec![1], vec![1; 34]] {
+        for extension in [vec![2], vec![0, 0], vec![1], vec![1; 32], vec![1; 34]] {
             let mut malformed = legacy.to_vec();
             malformed.extend(extension);
             assert!(decode_unfinished(&malformed).is_err());
