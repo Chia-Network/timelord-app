@@ -5,6 +5,22 @@ import TimelordPresentation
 
 @MainActor
 final class TerminationTests: XCTestCase {
+    func testClosingLastWindowKeepsInterfaceAndSupervisorAvailable() async throws {
+        let fixture = try SupervisedFixture()
+        defer { fixture.close() }
+        try await fixture.launch()
+        let pid = try XCTUnwrap(fixture.controller.processID)
+        let model = TimelordModel(controller: fixture.controller, initialConfiguration: AppConfiguration(), monitoringEnabled: false)
+        var replies = [Bool]()
+        let delegate = ApplicationDelegate(model: model, reply: { replies.append($0) })
+        XCTAssertFalse(delegate.applicationShouldTerminateAfterLastWindowClosed(NSApplication.shared))
+        await Task.yield()
+        XCTAssertTrue(replies.isEmpty)
+        await fixture.controller.refresh()
+        XCTAssertEqual(fixture.controller.processID, pid)
+        XCTAssertEqual(kill(pid, 0), 0)
+    }
+
     func testSystemQuitRepliesOnceAndLeavesIndependentWorkerRunning() async throws {
         let fixture = try SupervisedFixture()
         defer { fixture.close() }
