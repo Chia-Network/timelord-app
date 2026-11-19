@@ -308,7 +308,20 @@ timelord-service node-state --config FILE
 timelord-service serve --config FILE
 timelord-service status --config FILE
 timelord-service tuning --config FILE --paused true
+timelord-service board --config FILE --serial SERIAL --action retry
+timelord-service board --config FILE --serial SERIAL --action disable [--minutes 60]
+timelord-service board --config FILE --serial SERIAL --action enable
+timelord-service select-node --config FILE --profile ID
+timelord-service reload-node --config FILE
 ```
+
+`board` acts on one board in the running service: `retry` ends its probation,
+clears its failure streak and retries a waiting owner now, `disable` keeps it out of rotation (for the
+given minutes, or until `enable`), and `enable` returns it. The other boards and
+the node session keep running. `reload-node` applies a saved full-node profile
+change (for example after `select-node`) without restarting ASIC boards; it is
+refused, with the reason, when board or service settings also changed, which
+still need a supervised restart.
 
 `configuration` prints JSON; `configure --input JSON_FILE` validates before
 replacement. `check-hardware --config FILE` explicitly starts the configured
@@ -336,28 +349,57 @@ Native readback retries are separate from client recovery: three reads per stage
 20 ms apart, with engines paused and no repeated voltage/PLL writes. Persistent
 unexpected state still stops that native client.
 
-The service supervises each physical board independently. After a transient
-client/control/socket failure it restarts only that board, with delays of 1, 5,
-and 30 seconds. Initialization must reapply and verify the saved operating point;
-verified proofs are required before the board appears productive again.
+Each physical board has one persistent supervisor and native owner. Failures
+are handled by the smallest part first:
 
-Capabilities, binary identity and host provenance are prepared once per configuration
-generation, outside the async executor. Automatic owner setup has a 45-second
+- A dropped proof session is retried on the same owner. A second lane error
+  within 120 seconds, or a routed engine whose socket never arrives, retires
+  that board's owner.
+- A native client that stops reporting telemetry for 15 seconds is treated as
+  stuck (typically a blocked USB write) and retired with bounded waits.
+- Only overheating and invalid proofs are safety restrictions. Overheating waits
+  30 seconds, probes at 200 MHz / 0.7 V and needs fresh cool telemetry; an invalid
+  proof waits 10 seconds and needs a private verified proof. The first fault at a
+  point lowers the recovery clock limit 50 MHz below it; six hours of fault-free
+  serving raise it 50 MHz again until it reaches the normal 1450 MHz cap.
+- An unconfirmed shutdown (crash, kill, unplug) is not a restriction. The next
+  owner starts cautiously at the recovery point and returns to the board's
+  best-known setting (learned for Automatic, configured for Manual) after its
+  first verified work. A cautious start never overwrites a learned profile.
+- An unplugged or busy board is looked for again every 5 seconds and does not
+  count as a failure. When a running owner dies, the service checks USB before
+  counting it: a board that is no longer attached was unplugged, not broken.
+
+Availability comes first: every serving board carries work, and nothing but
+hardware evidence or an operator disable takes a working board out. Reliability
+is saved per serial, survives worker restarts and node-profile switches, and
+only decides which chain a board carries. Restart delays follow the failure
+streak: 1, 5, then 30 seconds. After a failure a board is on probation (1 min,
+5 min, then 30 min, and 2 h after six consecutive failures). On probation it
+prefers the infused-challenge chain while more reliable boards carry the
+challenge and reward chains; with no more reliable board it carries whatever is
+needed. Thirty minutes of stable serving after probation clears the streak, and
+so does an operator retry. Retries never exhaust. A serving board with no chains
+(for example a spare) runs a private canary proof every minute, as does a board
+finishing a cautious start whose chain has no work yet.
+
+Routing keeps every chain on its current board while that board stays eligible,
+uses a fixed board order (serial, then identifier), and moves chains back to a
+returning board only at the next peak, so improvements never cancel in-flight
+work. Any board starting, stopping or being rerouted holds Automatic tuning on
+every board for 20 seconds, and live operating-point changes are serialized
+across boards. When a route changes a board's active engine count, the board
+applies the setting learned for that count; without one it never keeps a clock
+above the configured start for more active engines. A new native build starts
+50 MHz below the previous build's stable point when that is above the start.
+
+Capabilities, binary identity and host provenance are prepared once per service
+process, outside the async executor. Automatic owner setup has a 45-second
 limit, including the control exchange's own 30-second acknowledgement limit.
 After setup succeeds, the native network-ready message has a separate 30-second
 allowance. The USB initialization mutex is released earlier: on acknowledged
-Automatic control, or on the first valid Manual temperature sample. Both are
-emitted by the pinned native event loop after USB, clocks, voltage and PVT setup
-have completed. A socket connection is not used as physical presence evidence;
-a timeout still retires and reaps its owner.
-
-Recovery retries indefinitely, including Manual verification failures. Thermal
-faults wait 30 seconds, probe at 200 MHz / 0.7 V and require fresh cool telemetry
-before resuming. Invalid proofs wait 10 seconds and require a private verified
-canonical proof before production routing resumes. Recovery may temporarily use a
-conservative setting below configured optimization minima; saved preferences are
-unchanged. Repeated real thermal/verification faults reduce recovery frequency.
-Unknown shutdown state requires fresh initialization, not a permanent stop gate.
+Automatic control, or on the first valid Manual temperature sample. A board
+serves only once all engine sockets connected and fresh telemetry is cool.
 
 Other native owners and the full-node session survive a board outage. Automatic
 layouts move only affected chains; explicit serial mappings keep their assignments.

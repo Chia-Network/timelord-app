@@ -73,7 +73,9 @@ impl Fixture {
             .unwrap()
     }
     async fn status(&self, predicate: impl Fn(&Status) -> bool) -> Status {
-        tokio::time::timeout(Duration::from_secs(8), async {
+        // Pause and Reload return before retirement completes; allow for a
+        // loaded CI host while a worker family retires in the background.
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if let Ok(status) = request(&self.config(), Control::Status, None).await
                     && predicate(&status)
@@ -224,6 +226,8 @@ async fn explicit_pause_survives_supervisor_restart_and_resume_uses_one_owner() 
         .await
         .unwrap();
     assert_eq!(paused.mode, Mode::Paused);
+    // Pause is acknowledged once durable; follow status until cleanup completes.
+    let paused = fixture.status(|s| s.phase == SupervisorPhase::Paused).await;
     assert!(paused.worker_pid.is_none());
     let old = running.worker_pid.unwrap();
     assert_eq!(unsafe { libc::kill(old as i32, 0) }, -1);
@@ -831,7 +835,7 @@ async fn installer_pid_extraction_matches_live_status_cli() {
 }
 
 #[tokio::test]
-async fn fresh_status_readers_observe_durable_pause_before_cleanup_acknowledges() {
+async fn pause_acknowledges_durable_intent_while_graceful_cleanup_continues() {
     let fixture = Fixture::new();
     let ready = fixture.0.join("ready");
     let helper = fixture.helper(&format!(
@@ -880,8 +884,17 @@ async fn fresh_status_readers_observe_durable_pause_before_cleanup_acknowledges(
             .await
             .starts_with("HTTP/1.1 200")
     );
-    let config = fixture.config();
-    let pause = tokio::spawn(async move { request(&config, Control::Pause, None).await });
+    // The worker takes 2s to honour SIGTERM; Pause must not wait for it.
+    let acknowledged = tokio::time::timeout(
+        Duration::from_secs(1),
+        request(&fixture.config(), Control::Pause, None),
+    )
+    .await
+    .expect("Pause acknowledgment waited for worker cleanup")
+    .unwrap();
+    assert_eq!(acknowledged.mode, Mode::Paused);
+    assert_eq!(acknowledged.phase, SupervisorPhase::Stopping);
+    assert_eq!(acknowledged.worker_pid, running.worker_pid);
     let stopping = tokio::time::timeout(
         Duration::from_secs(1),
         fixture.status(|s| s.phase == SupervisorPhase::Stopping),
@@ -910,13 +923,148 @@ async fn fresh_status_readers_observe_durable_pause_before_cleanup_acknowledges(
             .mode,
         Mode::Paused
     );
-    assert!(
-        !pause.is_finished(),
-        "Pause acknowledged before graceful cleanup"
-    );
-    let paused = pause.await.unwrap().unwrap();
-    assert_eq!(paused.phase, SupervisorPhase::Paused);
+    let paused = fixture.status(|s| s.phase == SupervisorPhase::Paused).await;
     assert!(paused.worker_pid.is_none());
+    assert_eq!(paused.worker_generation, running.worker_generation);
+    assert_eq!(
+        unsafe { libc::kill(running.worker_pid.unwrap() as i32, 0) },
+        -1
+    );
+    fixture.terminate(supervisor).await;
+}
+
+/// Each started family records `alive.<pid>` until it exits after a slow
+/// SIGTERM drain, and flags `overlap` if it starts while another is alive.
+fn slow_exit_body(fixture: &Fixture, drain_seconds: u32) -> String {
+    let d = fixture.0.display();
+    format!(
+        "for f in '{d}'/alive.*; do [ -e \"$f\" ] && touch '{d}/overlap'; done\n\
+         touch '{d}/alive.'$$\n\
+         trap \"sleep {drain_seconds}; rm -f '{d}/alive.'$$; exit 0\" TERM\n\
+         while :; do sleep 0.05; done"
+    )
+}
+
+#[tokio::test]
+async fn reload_returns_before_a_slow_worker_retires_and_families_never_overlap() {
+    let fixture = Fixture::new();
+    let helper = fixture.helper(&slow_exit_body(&fixture, 4));
+    let supervisor = fixture.supervisor(&helper);
+    let running = fixture
+        .status(|s| s.phase == SupervisorPhase::WorkerStarted)
+        .await;
+    let started = std::time::Instant::now();
+    let reloading = request(&fixture.config(), Control::Reload, Some(running.revision))
+        .await
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "Reload waited for worker retirement: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(reloading.phase, SupervisorPhase::Stopping);
+    assert_eq!(reloading.worker_pid, running.worker_pid);
+    assert_eq!(reloading.worker_generation, running.worker_generation);
+    // Repeated reloads coalesce into the retirement in flight, and the
+    // control loop answers mutations while the old family drains.
+    let started = std::time::Instant::now();
+    let again = request(&fixture.config(), Control::Reload, None)
+        .await
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(again.worker_pid, running.worker_pid);
+    let replaced = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let status = request(&fixture.config(), Control::Status, None)
+                .await
+                .unwrap();
+            if status.worker_generation == running.worker_generation {
+                // Either the old family is still owned, or it was reaped and
+                // the replacement has not been spawned yet.
+                match status.phase {
+                    SupervisorPhase::Stopping => {
+                        assert_eq!(status.worker_pid, running.worker_pid)
+                    }
+                    SupervisorPhase::Starting => assert_eq!(status.worker_pid, None),
+                    phase => panic!("unexpected phase while reloading: {phase:?}"),
+                }
+            } else if status.phase == SupervisorPhase::WorkerStarted {
+                break status;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("replacement did not start after retirement");
+    assert_eq!(replaced.worker_generation, running.worker_generation + 1);
+    assert_ne!(replaced.worker_pid, running.worker_pid);
+    assert_eq!(
+        unsafe { libc::kill(running.worker_pid.unwrap() as i32, 0) },
+        -1
+    );
+    sleep(Duration::from_millis(300)).await;
+    let settled = request(&fixture.config(), Control::Status, None)
+        .await
+        .unwrap();
+    assert_eq!(settled.worker_generation, replaced.worker_generation);
+    assert_eq!(
+        fs::read_to_string(fixture.0.join("pids"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    assert!(!fixture.0.join("overlap").exists());
+    request(&fixture.config(), Control::Pause, None)
+        .await
+        .unwrap();
+    fixture.status(|s| s.phase == SupervisorPhase::Paused).await;
+    fixture.terminate(supervisor).await;
+}
+
+#[tokio::test]
+async fn pause_during_reload_retirement_ends_paused_without_a_new_worker() {
+    let fixture = Fixture::new();
+    let helper = fixture.helper(&slow_exit_body(&fixture, 2));
+    let supervisor = fixture.supervisor(&helper);
+    let running = fixture
+        .status(|s| s.phase == SupervisorPhase::WorkerStarted)
+        .await;
+    let reloading = request(&fixture.config(), Control::Reload, None)
+        .await
+        .unwrap();
+    assert_eq!(reloading.phase, SupervisorPhase::Stopping);
+    let started = std::time::Instant::now();
+    let paused = request(&fixture.config(), Control::Pause, Some(reloading.revision))
+        .await
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(paused.mode, Mode::Paused);
+    assert_eq!(paused.phase, SupervisorPhase::Stopping);
+    assert_eq!(
+        Paths::for_config(&fixture.config())
+            .unwrap()
+            .load_intent()
+            .unwrap()
+            .mode,
+        Mode::Paused
+    );
+    let settled = fixture.status(|s| s.phase == SupervisorPhase::Paused).await;
+    assert!(settled.worker_pid.is_none());
+    sleep(Duration::from_millis(500)).await;
+    let later = request(&fixture.config(), Control::Status, None)
+        .await
+        .unwrap();
+    assert_eq!(later.phase, SupervisorPhase::Paused);
+    assert_eq!(later.worker_generation, running.worker_generation);
+    assert_eq!(
+        fs::read_to_string(fixture.0.join("pids"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(!fixture.0.join("overlap").exists());
     fixture.terminate(supervisor).await;
 }
 

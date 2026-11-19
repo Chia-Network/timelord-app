@@ -38,6 +38,8 @@ struct BoardCard: View {
                     }
                     if let recovery = board.recoveryText(at: snapshot.now) {
                         Text(recovery).font(.caption).foregroundStyle(.secondary).lineLimit(3)
+                    } else if let rotation = board.rotationText(at: snapshot.now) {
+                        Text(rotation).font(.caption).foregroundStyle(.secondary).lineLimit(3)
                     }
                     if board.histories.isEmpty { Text("No chains assigned").font(.callout).foregroundStyle(.secondary).frame(maxHeight: .infinity) }
                     HStack { Text("1 hour ago"); Spacer(); Text("Now") }.font(.caption2).foregroundStyle(.secondary)

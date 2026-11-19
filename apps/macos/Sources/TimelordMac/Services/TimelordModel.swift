@@ -16,6 +16,9 @@ final class TimelordModel: ObservableObject {
     @Published var configuration = AppConfiguration()
     @Published private(set) var configurationLoaded = false
     @Published private(set) var configurationNeedsRestart = false
+    /// The pending change touches only the full-node profile, which the running
+    /// service applies without restarting ASIC boards.
+    private var pendingChangeIsNodeOnly = true
     @Published private(set) var operationInProgress = false
     @Published var connectionResult: String?
     @Published private(set) var discoveredDevices: [DiscoveredDevice] = []
@@ -226,6 +229,17 @@ final class TimelordModel: ObservableObject {
             configuration.hardware.driverLibrary = Bundle.main.bundleURL.appendingPathComponent("Contents/Frameworks/libftd2xx.dylib").path
         }
     }
+    /// Operator board controls. They act on one board; the others keep running.
+    func boardAction(_ id: String, _ action: BoardAction, minutes: Int? = nil) async {
+        guard canControlService, !operationInProgress,
+              let serial = snapshot.boards.first(where: { $0.id == id })?.serial else { return }
+        operationInProgress = true; defer { operationInProgress = false }
+        do {
+            try await configurationClient.board(serial: serial, action: action, minutes: minutes)
+            errorMessage = nil
+            await refresh()
+        } catch { errorMessage = error.localizedDescription }
+    }
     func toggleTuning() async {
         guard canControlService, !operationInProgress, let pid = controller.processID else { return }
         operationInProgress = true; defer { operationInProgress = false }
@@ -285,6 +299,14 @@ final class TimelordModel: ObservableObject {
         catch { errorMessage = error.localizedDescription }
     }
     var hasUnsavedSettings: Bool { configuration != savedConfiguration }
+    /// Only the node profile differs between two configurations.
+    private static func onlyNodeDiffers(_ old: AppConfiguration, _ new: AppConfiguration) -> Bool {
+        var adjusted = old
+        adjusted.node = new.node
+        adjusted.connections = new.connections
+        adjusted.service.startAutomatically = new.service.startAutomatically
+        return adjusted == new
+    }
     private var hasRuntimeSettingsChanges: Bool {
         var runtimeConfiguration = configuration
         runtimeConfiguration.service.startAutomatically = savedConfiguration.service.startAutomatically
@@ -305,8 +327,10 @@ final class TimelordModel: ObservableObject {
                 : "Your settings are saved. Timelord is paused."
         }
         if canControlService {
-            return hasRuntimeSettingsChanges || configurationNeedsRestart
-                ? "Save & Restart applies your changes and briefly restarts Timelord."
+            let pending = hasRuntimeSettingsChanges || configurationNeedsRestart
+            let nodeOnly = pendingChangeIsNodeOnly && Self.onlyNodeDiffers(savedConfiguration, configuration)
+            return pending
+                ? (nodeOnly ? "Save & Restart switches the full-node connection. ASIC boards keep running." : "Save & Restart applies your changes and briefly restarts Timelord.")
                 : "Your settings are saved. Timelord keeps running."
         }
         if liveStatus != nil { return "Done saves your changes. Restart the externally managed service to apply them." }
@@ -320,8 +344,25 @@ final class TimelordModel: ObservableObject {
             guard errorMessage == nil else { return false }
         }
         if configurationNeedsRestart && canControlService {
+            if pendingChangeIsNodeOnly && controller.desiredRunning && liveStatus != nil {
+                // Switch networks without touching USB: boards keep their owners,
+                // tuning and reliability history. Fall back to a restart if the
+                // service refuses (for example, a board setting also changed).
+                operationInProgress = true
+                do {
+                    try await configurationClient.reloadNode()
+                    configurationNeedsRestart = false; pendingChangeIsNodeOnly = true
+                    useSavedStatusEndpoint(); errorMessage = nil
+                    connectionResult = "Switched the full-node connection. ASIC boards kept running."
+                } catch {
+                    connectionResult = nil
+                }
+                operationInProgress = false
+                if !configurationNeedsRestart { updateSnapshot(); return true }
+            }
             await restartService()
             guard !configurationNeedsRestart else { return false }
+            pendingChangeIsNodeOnly = true
         }
         return true
     }
@@ -329,6 +370,7 @@ final class TimelordModel: ObservableObject {
         guard !operationInProgress else { return }; operationInProgress = true; defer { operationInProgress = false }
         do {
             let runtimeChanged = hasRuntimeSettingsChanges
+            let nodeOnly = Self.onlyNodeDiffers(savedConfiguration, configuration)
             let updated = configuration
             try await configurationClient.save(updated)
             let persisted = try await configurationClient.load()
@@ -337,7 +379,9 @@ final class TimelordModel: ObservableObject {
             if configuration == updated { configuration = persisted }
             savedConfiguration = persisted
             nodeSync = nil; lastNodeSyncFetch = .distantPast
-            configurationNeedsRestart = configurationNeedsRestart || ((canControlService || liveStatus != nil) && runtimeChanged)
+            let needsRestart = (canControlService || liveStatus != nil) && runtimeChanged
+            if needsRestart { pendingChangeIsNodeOnly = (configurationNeedsRestart ? pendingChangeIsNodeOnly : true) && nodeOnly }
+            configurationNeedsRestart = configurationNeedsRestart || needsRestart
             errorMessage = nil; configurationLoaded = true
             connectionResult = configurationNeedsRestart ? "Saved. Restart Timelord to apply these settings." : "Settings saved."
             if !configurationNeedsRestart { useSavedStatusEndpoint() }

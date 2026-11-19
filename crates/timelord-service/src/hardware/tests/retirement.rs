@@ -71,79 +71,21 @@ async fn shutdown_confirmation_requires_exact_fields_and_complete_lf_or_crlf_fra
     }
 }
 
-#[tokio::test]
-async fn failed_spawn_closes_only_the_unopened_journal_owner() {
-    let dir = std::env::temp_dir().join(format!("tl-failed-spawn-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let binary = dir.join("removed-client");
-    std::fs::write(&binary, "fixture identity").unwrap();
-    let board: BoardConfig = toml::from_str("id='spawn'\nname='Spawn'\nserial='fixture'\nclient_port=18110\ndevice_location=1\nprofile='manual'").unwrap();
-    let mut config = Config::default();
-    config.hardware.client_binary = Some(binary.clone());
-    config.hardware.boards = vec![board.clone()];
-    let path = dir.join("config.toml");
-    let store = Arc::new(crate::safety::Store::open(&path).unwrap());
-    let shared = Shared {
-        native: if config
-            .hardware
-            .boards
-            .iter()
-            .any(|b| b.profile == ProfileMode::Automatic)
-        {
-            Some(Facts::load(&config).await.unwrap())
-        } else {
-            None
-        },
-        assignments: config.assignments().unwrap(),
-        config,
-        clients: Default::default(),
-        process: crate::operational::State::fixture(),
-        scope: crate::runtime::RuntimeScope::Production,
-        runtime: Arc::new(std::sync::Mutex::new({
-            let mut state = crate::runtime::RuntimeState::new(false);
-            state.safety = Some(store.clone());
-            state
-        })),
-        started_unix: crate::unix_now(),
-        service_started_unix: crate::unix_now(),
-    };
-    let q = admission::qualification(&shared, &board, 3).unwrap();
-    store.qualify("fixture", q.clone()).unwrap();
-    std::fs::remove_file(binary).unwrap();
-    for _ in 0..2 {
-        store.begin_owner("fixture", q.point).unwrap();
-        shared
-            .runtime
-            .lock()
-            .unwrap()
-            .boards
-            .entry(board.id.clone())
-            .or_default()
-            .lifecycle
-            .start_native();
-        let startup = startup(&shared, &board).await.unwrap();
-        assert!(launch_prepared(&shared, &board, &startup).await.is_err());
-        let record = store.board("fixture").unwrap();
-        assert!(!record.owner_active);
-        assert_eq!(record.qualification, Some(q.clone()));
-        assert!(record.quarantine.is_none());
-        assert!(!store.needs_self_test("fixture", &q));
-        assert!(
-            shared.runtime.lock().unwrap().boards[&board.id]
-                .lifecycle
-                .status()
-                .quiesced
-        );
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_spawn_closes_the_unopened_journal_owner_without_a_cautious_start() {
+    let mut rig = crate::hardware::testing::Rig::new("spawn", 1, "manual", true).await;
+    std::fs::remove_file(rig.shared.config.hardware.client_binary.clone().unwrap()).unwrap();
+    rig.start(crate::hardware::testing::Rig::fast());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while rig.store.health(&rig.serial(1)).consecutive_failures < 2 {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    // The rollback is persisted, so restarting the service cannot mistake the
-    // unsuccessful spawn for an owner that opened USB and failed to retire.
-    drop(shared);
-    drop(store);
-    let reopened = crate::safety::Store::open(&path).unwrap();
-    assert!(!reopened.needs_self_test("fixture", &q));
-    assert!(reopened.board("fixture").unwrap().quarantine.is_none());
-    drop(reopened);
-    std::fs::remove_dir_all(dir).unwrap();
+    let record = rig.store.board(&rig.serial(1)).unwrap();
+    assert!(!record.owner_active);
+    assert!(!record.cautious, "no child existed, so its state is known");
+    assert!(record.restriction.is_none());
+    rig.shutdown().await;
 }
 
 #[tokio::test]
@@ -201,33 +143,33 @@ cat >/dev/null
             .unwrap(),
         );
         let metrics = crate::observability::Metrics::new(config.node.network.clone()).unwrap();
-        let shared = Arc::new(Shared {
-            native: if config
-                .hardware
-                .boards
-                .iter()
-                .any(|b| b.profile == ProfileMode::Automatic)
-            {
-                Some(Facts::load(&config).await.unwrap())
-            } else {
-                None
-            },
-            assignments: config.assignments().unwrap(),
-            config,
-            clients: Default::default(),
-            process: crate::operational::State::new(metrics.clone()),
-            scope: crate::runtime::RuntimeScope::Production,
-            runtime: Arc::new(std::sync::Mutex::new({
-                let mut state = crate::runtime::RuntimeState::new(false);
-                state.safety = Some(store.clone());
-                state
-            })),
-            started_unix: crate::unix_now(),
-            service_started_unix: crate::unix_now(),
-        });
-        let q = admission::qualification(&shared, &board, 3).unwrap();
-        store.qualify("fixture", q.clone()).unwrap();
-        store.begin_owner("fixture", q.point).unwrap();
+        let shared = Arc::new(
+            crate::Shared::new(
+                if config
+                    .hardware
+                    .boards
+                    .iter()
+                    .any(|b| b.profile == ProfileMode::Automatic)
+                {
+                    Some(Facts::load(&config).await.unwrap())
+                } else {
+                    None
+                },
+                config,
+                Arc::new(std::sync::Mutex::new({
+                    let mut state = crate::runtime::RuntimeState::new(false);
+                    state.safety = Some(store.clone());
+                    state
+                })),
+                crate::operational::State::new(metrics.clone()),
+                crate::unix_now(),
+                crate::unix_now(),
+            )
+            .routed_by_config(),
+        );
+        let startup = startup(&shared, &board).await.unwrap();
+        let point = startup.point;
+        store.begin_owner("fixture", point).unwrap();
         shared
             .runtime
             .lock()
@@ -236,16 +178,15 @@ cat >/dev/null
             .entry(board.id.clone())
             .or_default()
             .lifecycle
-            .start_native();
-        let startup = startup(&shared, &board).await.unwrap();
+            .testing()
+            .begin_attempt(crate::unix_now());
         let child = launch(&shared, &board, &startup).await.unwrap();
-        let (ready, _ready) = oneshot::channel();
         let (stop, rx) = watch::channel(false);
         let supervising = supervise(
             shared.clone(),
+            crate::hardware::fixture_backend(&shared),
             board.clone(),
             child,
-            ready,
             rx,
             INITIALIZATION.lock().await,
             None,
@@ -306,27 +247,20 @@ cat >/dev/null
         let checkpoint_started = crate::unix_now();
         checkpoint_retired(&shared, &board, &store, "fixture").unwrap();
         let record = store.board("fixture").unwrap();
+        // Only overheating is a restriction; an unconfirmed stop is only a
+        // cautious start, and a rejected handshake is neither.
         assert_eq!(
-            record.qualification,
-            (confirmed && !rejected && !prior_fault).then_some(q.clone())
+            record.restriction,
+            thermal.then_some(crate::safety::Reason::Thermal)
         );
-        assert_eq!(
-            record.quarantine,
-            if thermal {
-                Some(crate::safety::Reason::Thermal)
-            } else {
-                (!confirmed || rejected || prior_fault)
-                    .then_some(crate::safety::Reason::UncleanOwner)
-            }
-        );
-        assert_eq!(record.owner_active, !confirmed);
+        assert_eq!(record.cautious, thermal || !confirmed);
+        assert!(!record.owner_active);
         if thermal {
             assert_eq!(
-                record.admission_frequency_mhz,
-                Some((q.point.frequency_mhz - 50.).max(200.))
+                record.recovery_ceiling_mhz,
+                Some((point.frequency_mhz - 50.).max(200.))
             );
             assert!(record.retry_after_unix >= checkpoint_started + 30);
-            assert!(store.needs_self_test("fixture", &q));
         }
     }
     std::fs::remove_dir_all(dir).unwrap();

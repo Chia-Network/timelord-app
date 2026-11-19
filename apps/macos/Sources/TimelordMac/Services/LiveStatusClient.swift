@@ -14,7 +14,7 @@ actor LiveStatusClient {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         let status = try decoder.decode(ServiceStatus.self, from: data)
-        guard status.apiVersion == 1 else { throw StatusError.unsupportedVersion }
+        guard [1, 2].contains(status.apiVersion) else { throw StatusError.unsupportedVersion }
         if let expectedPID, status.servicePid != Int(expectedPID) { throw StatusError.differentOwner }
         let age = Date().timeIntervalSince1970 - status.timestampUnix
         guard age >= -5 && age < 10 else { throw StatusError.stale }

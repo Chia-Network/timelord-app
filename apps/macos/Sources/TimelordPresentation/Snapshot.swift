@@ -37,11 +37,57 @@ public enum AppPhase: String, Sendable {
 
 public enum BoardState: String, Sendable {
     case uninspected, checking, recovering, needsAttention, active, waiting, disconnected, thermalStop, paused
+    /// Recently failed: still working, preferring the infused-challenge chain.
+    case probation
+    /// Reported by older services only; current ones never idle a working board.
+    case benched
+    /// Kept out of rotation by the operator.
+    case disabled
     public var title: String {
-        switch self { case .uninspected: return "Hardware not inspected"; case .checking: return "Checking hardware"; case .recovering: return "Recovering"; case .needsAttention: return "Needs attention"; case .active: return "Producing proofs"; case .waiting: return "Waiting for work"; case .disconnected: return "Disconnected"; case .thermalStop: return "Stopped at temperature limit"; case .paused: return "Paused" }
+        switch self {
+        case .uninspected: return "Hardware not inspected"
+        case .checking: return "Checking hardware"
+        case .recovering: return "Recovering"
+        case .needsAttention: return "Needs attention"
+        case .active: return "Producing proofs"
+        case .waiting: return "Waiting for work"
+        case .disconnected: return "Disconnected"
+        case .thermalStop: return "Stopped at temperature limit"
+        case .paused: return "Paused"
+        case .probation: return "On probation"
+        case .benched: return "Out of rotation"
+        case .disabled: return "Disabled"
+        }
     }
     public var tone: StatusTone {
-        switch self { case .active: return .positive; case .disconnected, .needsAttention, .recovering: return .attention; case .thermalStop: return .critical; default: return .neutral }
+        switch self {
+        case .active: return .positive
+        case .disconnected, .needsAttention, .recovering, .benched: return .attention
+        case .thermalStop: return .critical
+        default: return .neutral
+        }
+    }
+    /// Map service status to an honest state. "Needs attention" is reserved for
+    /// what a person must look at: invalid proofs, repeated overheating, or a
+    /// board out of rotation for a long time. Automatic recovery is not that.
+    public static func from(_ board: BoardStatus, productive: Bool, freshProof: Bool) -> BoardState {
+        let failures = board.consecutiveFailures ?? 0
+        switch (board.routingState, board.hardwareState) {
+        case ("disabled", _): return .disabled
+        case (_, "thermal_stop"): return failures >= 3 ? .needsAttention : .thermalStop
+        case (_, "invalid_proof"): return .needsAttention
+        case ("benched", _): return .benched
+        default: break
+        }
+        if board.recoveryReason != nil { return .recovering }
+        switch board.hardwareState {
+        case "checking", "starting": return .checking
+        case "reconnecting", "stopped": return .disconnected
+        case "connected":
+            if board.routingState == "probation" { return failures >= 6 ? .needsAttention : .probation }
+            return productive && freshProof ? .active : .waiting
+        default: return .uninspected
+        }
     }
 }
 
@@ -68,6 +114,31 @@ public struct BoardSnapshot: Identifiable, Sendable {
     public var recoveryReason: String? = nil
     public var retryAfterUnix: Double? = nil
     public var assignedEngines: [Int]? = nil
+    public var serial: String? = nil
+    public var consecutiveFailures: Int = 0
+    public var failuresLastHour: Int = 0
+    public var probationUntilUnix: Double? = nil
+    public var disabledUntilUnix: Double? = nil
+    public var lastFailure: String? = nil
+    public var cautious: Bool = false
+    public var events: [BoardEvent] = []
+    /// Why routing currently treats this board the way it does.
+    public func rotationText(at now: Date) -> String? {
+        let remaining = { (until: Double?) in until.map { max(0, Int(ceil(($0 - now.timeIntervalSince1970) / 60))) } }
+        switch state {
+        case .probation:
+            return "Working after \(consecutiveFailures) recent failure\(consecutiveFailures == 1 ? "" : "s"); prefers the infused-challenge chain" + (remaining(probationUntilUnix).map { " for about \($0) more min" } ?? "") + (lastFailure.map { ". Last: \($0)" } ?? "")
+        case .benched:
+            let wait = remaining(probationUntilUnix).map { "; next return in about \($0) min" } ?? ""
+            return "\(consecutiveFailures) failures in a row (\(failuresLastHour) in the last hour)\(wait)" + (lastFailure.map { ". Last: \($0)" } ?? "")
+        case .needsAttention where consecutiveFailures >= 6:
+            return "Still working, but \(consecutiveFailures) failures in a row (\(failuresLastHour) in the last hour)" + (lastFailure.map { ". Last: \($0)" } ?? "") + ". Check its cable, hub and power."
+        case .disabled:
+            return disabledUntilUnix.map { _ in "Kept out of rotation for about \(remaining(disabledUntilUnix) ?? 0) more min" } ?? "Disabled until you enable it"
+        default:
+            return cautious ? "Started cautiously after an unconfirmed stop; returns to its saved setting after verified work" : nil
+        }
+    }
     public func recoveryText(at now: Date) -> String? {
         guard let recoveryReason else { return nil }
         if let retryAfterUnix, retryAfterUnix > now.timeIntervalSince1970 {
@@ -226,6 +297,34 @@ public struct BoardStatus: Decodable, Identifiable, Sendable {
     public let recoveryReason: String?
     public let retryAfterUnix: Double?
     public let nativePid: Int?
+    public var routingState: String? = nil
+    public var consecutiveFailures: Int? = nil
+    public var failuresLastHour: Int? = nil
+    public var probationUntilUnix: Double? = nil
+    public var disabledUntilUnix: Double? = nil
+    public var lastFailure: String? = nil
+    public var cautious: Bool? = nil
+    public var history: [BoardEvent]? = nil
+}
+
+/// One saved board event from the service (failures, probation, cautious starts).
+public struct BoardEvent: Decodable, Sendable, Identifiable {
+    public let timestampUnix: Double
+    public let kind: String
+    public let detail: String?
+    public let consecutiveFailures: Int?
+    public let probationUntilUnix: Double?
+    public var id: String { "\(timestampUnix)-\(kind)" }
+    public var title: String {
+        switch kind {
+        case "failure": return "Failed" + (detail.map { ": \($0)" } ?? "")
+        case "stable": return "Served stably; failure streak cleared"
+        case "cautious_complete": return "Returned to its saved setting after verified work"
+        case "ceiling_raised": return "Recovery clock limit raised after fault-free running"
+        case "failure_forgiven": return "Was unplugged; the last stop is no longer counted as a failure"
+        default: return kind.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+    }
 }
 
 public struct AutomaticStatus: Decodable, Sendable {
@@ -252,8 +351,8 @@ public enum LivePresentation {
         let nodeReady = ["authenticated", "ready"].contains(live?.fullNode.state ?? "")
         let productive = live?.boards.contains(where: { $0.hardwareState == "connected" }) == true && live?.productionEnabled == true && live?.timelordState == "running" && live?.latestProofUnix.map { now.timeIntervalSince1970 - $0 < 90 } == true
         let thermal = live?.boards.contains { $0.hardwareState == "thermal_stop" } == true
-        let allBoardsFailed = live.map { !$0.boards.isEmpty && $0.boards.allSatisfy { ["fault", "thermal_stop"].contains($0.hardwareState) && $0.recoveryReason == nil } } ?? false
-        let admissionBlocked = !productive && live?.timelordState == "waiting_for_clients" && live?.boards.contains { $0.hardwareState == "quarantined" } == true
+        let allBoardsFailed = live.map { !$0.boards.isEmpty && $0.boards.allSatisfy { ["invalid_proof", "thermal_stop"].contains($0.hardwareState) && $0.recoveryReason == nil } } ?? false
+        let admissionBlocked = !productive && live?.timelordState == "waiting_for_clients" && live?.boards.isEmpty == false && live?.boards.allSatisfy { $0.routingState == "disabled" } == true
         let checkingHardware = live?.timelordState == "waiting_for_clients" && live?.boards.contains { $0.hardwareState == "checking" } == true
         let phase: AppPhase
         if controlOperation == .pause { phase = .pausing }
@@ -279,7 +378,7 @@ public enum LivePresentation {
                 // enumeration, which can hide metadata for open USB interfaces.
                 // Checking and quarantined are supervised lifecycle reports,
                 // not claims of detected hardware or productive work.
-                if ["checking", "quarantined"].contains(board.hardwareState) || board.recoveryReason != nil { return true }
+                if ["checking", "invalid_proof", "thermal_stop"].contains(board.hardwareState) || ["benched", "disabled", "probation"].contains(board.routingState ?? "") || board.recoveryReason != nil { return true }
                 if board.hardwareState == "connected" || (board.hardwareState == "starting" && board.connectedClients > 0) { return true }
                 guard let detectedDevices else {return true}
                 let configured=configuration?.hardware.boards.first(where:{$0.id==board.id})
@@ -289,12 +388,12 @@ public enum LivePresentation {
             }.map { board in
                 let last = proofCapable ? board.latestProofUnix.map(Date.init(timeIntervalSince1970:)) : nil
                 let freshProof = last.map { now.timeIntervalSince($0) < 90 } ?? false
-                let state: BoardState = board.recoveryReason != nil && board.hardwareState != "thermal_stop" ? .recovering : board.hardwareState == "quarantined" ? .needsAttention : board.hardwareState == "checking" ? .checking : board.hardwareState == "thermal_stop" ? .thermalStop : ["fault", "reconnecting"].contains(board.hardwareState) ? .disconnected : productive && freshProof && board.hardwareState == "connected" ? .active : board.hardwareState == "connected" ? .waiting : .uninspected
+                let state = BoardState.from(board, productive: productive, freshProof: freshProof)
                 let histories = board.assignedChains.compactMap(Chain.init(rawValue:)).map { chain -> ChainHistory in
                     guard let validHistory else { return .empty(chain) }
                     return validHistory.history(boardID: board.id, chain: chain, now: now)
                 }
-                return BoardSnapshot(id: board.id, name: board.name, state: state, temperatureC: board.temperatureC, temperatureLimitC: board.temperatureLimitC, profile: board.profile, frequencyMHz: board.frequencyMhz, voltageV: board.voltageV, histories: histories, lastProof: last, rawSpeeds: board.rawSpeeds ?? [], automatic: board.automatic, recoveryReason: board.recoveryReason, retryAfterUnix: board.retryAfterUnix, assignedEngines: board.assignedEngines)
+                return BoardSnapshot(id: board.id, name: board.name, state: state, temperatureC: board.temperatureC, temperatureLimitC: board.temperatureLimitC, profile: board.profile, frequencyMHz: board.frequencyMhz, voltageV: board.voltageV, histories: histories, lastProof: last, rawSpeeds: board.rawSpeeds ?? [], automatic: board.automatic, recoveryReason: board.recoveryReason, retryAfterUnix: board.retryAfterUnix, assignedEngines: board.assignedEngines, serial: board.serial, consecutiveFailures: board.consecutiveFailures ?? 0, failuresLastHour: board.failuresLastHour ?? 0, probationUntilUnix: board.probationUntilUnix, disabledUntilUnix: board.disabledUntilUnix, lastFailure: board.lastFailure, cautious: board.cautious ?? false, events: board.history ?? [])
             }
         } else {
             let connected = (detectedDevices ?? []).compactMap { BoardTopology.matching($0,in:configuration?.hardware.boards ?? []) }

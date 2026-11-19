@@ -31,17 +31,17 @@ done
     assert!(args.windows(2).any(|a| a == ["--voltage", "1"]));
     assert!(args.contains(&"--live-control".into()));
     let native = Some(crate::hardware::Facts::load(&config).await.unwrap());
-    let shared = Shared {
+    let shared = crate::Shared::new(
         native,
-        assignments: config.assignments().unwrap(),
         config,
-        clients: Default::default(),
-        process: crate::operational::State::fixture(),
-        scope: crate::runtime::RuntimeScope::Production,
-        runtime: Default::default(),
-        started_unix: crate::unix_now(),
-        service_started_unix: crate::unix_now(),
-    };
+        std::sync::Arc::new(std::sync::Mutex::new(crate::runtime::RuntimeState::new(
+            false,
+        ))),
+        crate::operational::State::fixture(),
+        crate::unix_now(),
+        crate::unix_now(),
+    )
+    .routed_by_config();
     let mut child = Command::new(binary)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -59,10 +59,9 @@ done
         .recoveries = 20;
     let mut owner = NativeOwner::attach(&board, &mut child).unwrap();
     let startup = startup(&shared, &board).await.unwrap();
-    let (ready, _rx) = oneshot::channel();
-    let mut log = ClientLog::new(child.stderr.take().unwrap(), ready);
+    let mut log = ClientLog::new(child.stderr.take().unwrap());
     owner
-        .initialize(&shared, &board, &mut log, startup)
+        .initialize(&shared, &board, &mut log, &startup)
         .await
         .unwrap();
     let (_stop, mut shutdown) = tokio::sync::watch::channel(false);
@@ -96,6 +95,7 @@ done
                     temperature_limit: board.temperature_limit_c,
                     paused: false,
                     exploration_allowed: false,
+                    disturbed: false,
                 }
             )
             .is_none(),

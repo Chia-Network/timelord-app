@@ -384,17 +384,19 @@ mod tests {
         config.node.ca_certificate = Some(dir.join("fixture-ca.crt"));
         config.hardware.boards =
             vec![toml::from_str("id='a'\nname='A'\nclient_port=18110").unwrap()];
-        let shared = Arc::new(Shared {
-            native: None,
-            assignments: config.assignments().unwrap(),
-            config: config.clone(),
-            clients: Default::default(),
-            process: crate::operational::State::fixture(),
-            scope: crate::runtime::RuntimeScope::Production,
-            runtime: Default::default(),
-            started_unix: crate::unix_now(),
-            service_started_unix: crate::unix_now(),
-        });
+        let shared = Arc::new(
+            crate::Shared::new(
+                None,
+                config.clone(),
+                std::sync::Arc::new(std::sync::Mutex::new(crate::runtime::RuntimeState::new(
+                    false,
+                ))),
+                crate::operational::State::fixture(),
+                crate::unix_now(),
+                crate::unix_now(),
+            )
+            .routed_by_config(),
+        );
         let process = shared.process.clone();
         process.fail(); // A failed scrape listener leaves proof production running.
         let (current_tx, current) = watch::channel(shared.clone());
@@ -415,11 +417,10 @@ mod tests {
                             crate::board_lifecycle::Phase::Connected,
                             true,
                             None,
-                            None,
                             1,
                         );
-                        owner.verified(1, 0);
-                        owner.verified(1, 1);
+                        owner.verified(1, 0, 1);
+                        owner.verified(1, 1, 1);
                         owner
                     },
                     ..Default::default()
@@ -462,17 +463,18 @@ mod tests {
                 waiting_state.proofs_delivered = proven.proofs_delivered;
                 waiting_state.boards = proven.boards.clone();
             }
-            let waiting = Arc::new(Shared {
-                native: None,
-                config: shared.config.clone(),
-                assignments: shared.assignments.clone(),
-                clients: shared.clients.clone(),
-                process: waiting_process.clone(),
-                scope: crate::runtime::RuntimeScope::Production,
-                runtime: Arc::new(std::sync::Mutex::new(waiting_state)),
-                started_unix: shared.started_unix,
-                service_started_unix: shared.service_started_unix,
-            });
+            let waiting = Arc::new(
+                crate::Shared::new(
+                    None,
+                    shared.config.clone(),
+                    Arc::new(std::sync::Mutex::new(waiting_state)),
+                    waiting_process.clone(),
+                    shared.started_unix,
+                    shared.service_started_unix,
+                )
+                .with_clients(shared.clients.clone())
+                .routed(shared.assignments()),
+            );
             current_tx.send_replace(waiting.clone());
             assert!(eligible(&waiting));
             let capacity = waiting_process

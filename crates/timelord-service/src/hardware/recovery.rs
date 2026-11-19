@@ -24,12 +24,14 @@ pub(super) async fn establish(
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if *shutdown.borrow() { return Ok(false); }
+            // Serve only once every engine socket has connected and fresh
+            // telemetry is cool; routes must never point at a half-ready owner.
             let cool = {
                 let state = shared.runtime.lock().expect("runtime");
                 state.boards.get(&board.id).is_some_and(|h| h.temperature_c.is_some_and(|t| t > 0. && t < limit)
                     && crate::unix_now().saturating_sub(h.temperature_unix) <= 10)
             };
-            if cool { break; }
+            if cool && log.connected { break; }
             tokio::select! { _ = shutdown.changed() => return Ok(false), result = log.read(shared, board) => { result?; } }
         }
         if let Some(point) = resume {
@@ -58,12 +60,12 @@ pub(super) async fn establish(
         }
         let mut state = shared.runtime.lock().expect("runtime");
         let hardware = state.boards.entry(board.id.clone()).or_default();
-        hardware.lifecycle.recovered();
+        hardware.lifecycle.recovered(crate::unix_now());
         hardware.fault_kind = None;
         hardware.recovery_reason = None;
         hardware.retry_after_unix = None;
         Ok(true)
-    }).await.context("Waiting for fresh cool ASIC telemetry")?
+    }).await.context("ASIC initialization timed out waiting for connected engines and fresh cool telemetry")?
 }
 
 #[cfg(test)]
@@ -80,36 +82,26 @@ mod tests {
         let store = Arc::new(crate::safety::Store::open(&directory.join("config.toml")).unwrap());
         let board: BoardConfig = toml::from_str("id='probe'\nname='Probe'\nserial='probe'\nprofile='automatic'\nclient_port=18110\n[automatic]\nmin_frequency_mhz=1600.0\nmin_voltage_v=0.9").unwrap();
         store
-            .quarantine("probe", crate::safety::Reason::Thermal)
+            .restrict("probe", crate::safety::Reason::Thermal)
             .unwrap();
         let mut runtime = crate::runtime::RuntimeState::new(false);
-        runtime.routing = Some(vec![]);
         runtime.safety = Some(store);
-        let shared = Shared {
-            config: Config::default(),
-            assignments: vec![],
-            clients: Default::default(),
-            native: Some(Arc::new(Facts {
+        let shared = crate::Shared::new(
+            Some(Arc::new(Facts {
                 hash: "a".repeat(64),
                 host: "fixture".into(),
                 frequencies: vec![200., 1450., 1600.],
             })),
-            runtime: Arc::new(std::sync::Mutex::new(runtime)),
-            process: crate::operational::State::fixture(),
-            scope: crate::runtime::RuntimeScope::Production,
-            started_unix: 0,
-            service_started_unix: 0,
-        };
+            Config::default(),
+            Arc::new(std::sync::Mutex::new(runtime)),
+            crate::operational::State::fixture(),
+            0,
+            0,
+        );
         let startup = startup(&shared, &board).await.unwrap();
         assert_eq!(startup.point.frequency_mhz, 200.);
         assert_eq!(startup.point.voltage_v, 0.7);
-        assert!(
-            admission::qualification(&shared, &board, 1)
-                .unwrap()
-                .point
-                .frequency_mhz
-                <= 1450.
-        );
+        assert!(recovery_point(&shared, &board).frequency_mhz <= 1450.);
         std::fs::remove_dir_all(directory).unwrap();
     }
     async fn fixture(thermal: bool, temperature: u32) {
@@ -142,36 +134,33 @@ done
         config.hardware.client_binary = Some(helper.clone());
         let board = config.hardware.boards[0].clone();
         let store = Arc::new(crate::safety::Store::open(&directory.join("config.toml")).unwrap());
-        store
-            .quarantine(
-                "warm-fixture",
-                if thermal {
-                    crate::safety::Reason::Thermal
-                } else {
-                    crate::safety::Reason::UncleanOwner
-                },
-            )
-            .unwrap();
+        if thermal {
+            store
+                .restrict("warm-fixture", crate::safety::Reason::Thermal)
+                .unwrap();
+        } else {
+            // An unconfirmed previous owner: a cautious start, not a restriction.
+            store.mark_cautious("warm-fixture").unwrap();
+        }
         let mut runtime = crate::runtime::RuntimeState::new(false);
-        runtime.routing = Some(config.assignments().unwrap());
         runtime.safety = Some(store.clone());
         runtime
             .boards
             .entry(board.id.clone())
             .or_default()
             .lifecycle
-            .restore_policy(store.policy(&board), crate::unix_now());
-        let shared = Arc::new(Shared {
-            assignments: config.assignments().unwrap(),
-            config,
-            native: None,
-            clients: Default::default(),
-            runtime: Arc::new(std::sync::Mutex::new(runtime)),
-            process: crate::operational::State::fixture(),
-            scope: crate::runtime::RuntimeScope::Production,
-            started_unix: crate::unix_now(),
-            service_started_unix: crate::unix_now(),
-        });
+            .restore_policy(store.policy(&board));
+        let shared = Arc::new(
+            crate::Shared::new(
+                None,
+                config,
+                Arc::new(std::sync::Mutex::new(runtime)),
+                crate::operational::State::fixture(),
+                crate::unix_now(),
+                crate::unix_now(),
+            )
+            .routed_by_config(),
+        );
         let startup = startup(&shared, &board).await.unwrap();
         store.begin_owner("warm-fixture", startup.point).unwrap();
         let child = Command::new(&helper)
@@ -182,15 +171,14 @@ done
             .spawn()
             .unwrap();
         let pid = child.id().unwrap();
-        let (ready, _) = oneshot::channel();
         let (stop, rx) = watch::channel(false);
         let initialization: &'static tokio::sync::Mutex<()> =
             Box::leak(Box::new(tokio::sync::Mutex::new(())));
         let task = tokio::spawn(supervise(
             shared.clone(),
+            crate::hardware::fixture_backend(&shared),
             board.clone(),
             child,
-            ready,
             rx,
             initialization.lock().await,
             None,
@@ -203,7 +191,7 @@ done
                 .unwrap();
             assert!(result.is_err());
             assert_eq!(
-                store.board("warm-fixture").unwrap().quarantine,
+                store.board("warm-fixture").unwrap().restriction,
                 Some(crate::safety::Reason::Thermal)
             );
         } else {
@@ -211,8 +199,7 @@ done
                 loop {
                     if shared.runtime.lock().unwrap().boards[&board.id]
                         .lifecycle
-                        .capacity(crate::unix_now(), true)
-                        .accepts_work
+                        .accepts_work()
                     {
                         break;
                     }
@@ -223,8 +210,8 @@ done
             .unwrap();
             let record = store.board("warm-fixture").unwrap();
             assert!(record.owner_active);
-            assert!(record.quarantine.is_none());
-            assert!(record.qualification.is_none());
+            assert!(record.restriction.is_none());
+            assert!(record.cautious, "cautious until verified work");
             assert_eq!(
                 shared.runtime.lock().unwrap().boards[&board.id].native_pid,
                 Some(pid)

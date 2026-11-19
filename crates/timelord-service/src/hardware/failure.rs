@@ -7,6 +7,10 @@ pub enum NativeFailureKind {
     ControlClosed,
     Readback,
     Protocol,
+    /// The native event loop stopped reporting (for example a blocked USB write).
+    Stalled,
+    /// The native client process exited on its own.
+    Exited,
 }
 #[derive(Debug)]
 pub struct NativeFailure {
@@ -91,16 +95,22 @@ mod tests {
         .context("Board A");
         let thermal = anyhow::Error::new(NativeFailure::rejection(1, "temperature_limit"));
         for (error, fault, reason) in [
-            (invalid, Fault::InvalidProof, Reason::InvalidProof),
-            (thermal, Fault::Thermal, Reason::Thermal),
+            (invalid, Fault::InvalidProof, Some(Reason::InvalidProof)),
+            (thermal, Fault::Thermal, Some(Reason::Thermal)),
+            // Display text alone never becomes a safety restriction.
             (
-                anyhow::anyhow!("ASIC admission rejected: temperature_limit"),
+                anyhow::anyhow!("rejected: temperature_limit"),
                 Fault::Transport,
-                Reason::UncleanOwner,
+                None,
             ),
         ] {
             assert_eq!(classify(&error), fault);
-            assert_eq!(Reason::from(classify(&error)), reason);
+            let restriction = match classify(&error) {
+                Fault::Thermal => Some(Reason::Thermal),
+                Fault::InvalidProof => Some(Reason::InvalidProof),
+                Fault::Transport => None,
+            };
+            assert_eq!(restriction, reason);
         }
     }
     #[test]

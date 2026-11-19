@@ -2,6 +2,7 @@ mod asic;
 mod assignment;
 mod automatic;
 use hardware::lifecycle as board_lifecycle;
+mod board_history;
 mod bounded_lines;
 mod config_checkpoint;
 mod connection;
@@ -20,7 +21,6 @@ mod private_control;
 mod runtime;
 mod safety;
 mod service;
-mod stable_change;
 mod status_api;
 
 use anyhow::{Context, Result, bail};
@@ -32,7 +32,9 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use timelord_core::{Assignment, Config};
+#[cfg(test)]
+use timelord_core::Assignment;
+use timelord_core::Config;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -133,6 +135,23 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Retry, disable or enable one board by serial without restarting others.
+    Board {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        serial: String,
+        #[arg(long, value_enum)]
+        action: private_control::BoardAction,
+        /// With `disable`, keep the board out of rotation for this many minutes.
+        #[arg(long)]
+        minutes: Option<u64>,
+    },
+    /// Apply a saved full-node profile change without restarting ASIC boards.
+    ReloadNode {
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Hold or resume Automatic tuning without pausing proof production.
     Tuning {
         #[arg(long)]
@@ -147,7 +166,7 @@ enum Command {
     },
 }
 
-fn load(path: &Path) -> Result<Config> {
+pub(crate) fn load(path: &Path) -> Result<Config> {
     let text = config_checkpoint::bounded_text(path, false)
         .with_context(|| format!("Reading {}", path.display()))?;
     parse_config(path, &text)
@@ -210,7 +229,7 @@ fn parse_config(path: &Path, text: &str) -> Result<Config> {
     Ok(config)
 }
 
-fn set_default_automatic_state(config: &mut Config, path: &Path) -> Result<()> {
+pub(crate) fn set_default_automatic_state(config: &mut Config, path: &Path) -> Result<()> {
     if config.hardware.automatic_state.is_none() {
         let parent = path
             .parent()
@@ -222,7 +241,7 @@ fn set_default_automatic_state(config: &mut Config, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn save(path: &Path, config: &Config) -> Result<()> {
+pub(crate) fn save(path: &Path, config: &Config) -> Result<()> {
     let mut config = config.clone();
     config.remember_connection().map_err(anyhow::Error::msg)?;
     config.validate().map_err(anyhow::Error::msg)?;
@@ -341,7 +360,7 @@ async fn main() -> Result<()> {
         Command::CheckHardware { config } => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&diagnostics::check(load(&config)?).await?)?
+                serde_json::to_string_pretty(&diagnostics::check(load(&config)?, &config).await?)?
             );
         }
         Command::Validate { config, supervised } => {
@@ -358,7 +377,7 @@ async fn main() -> Result<()> {
             set_default_automatic_state(&mut value, &config)?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&assignment::resolve(&value)?)?
+                serde_json::to_string_pretty(&value.assignments().map_err(anyhow::Error::msg)?)?
             );
         }
         Command::Serve { config, supervised } => {
@@ -382,6 +401,33 @@ async fn main() -> Result<()> {
                 shutdown_signal_from(termination),
             )
             .await?;
+        }
+        Command::Board {
+            config,
+            serial,
+            action,
+            minutes,
+        } => {
+            let value = config_checkpoint::load_running(&config)?.0;
+            let result = private_control::command(
+                &automatic::socket_path(&config, &value),
+                private_control::Command::Board {
+                    serial,
+                    action,
+                    seconds: minutes.map(|m| m.saturating_mul(60)),
+                },
+            )
+            .await?;
+            println!("{}", serde_json::to_string(&result)?);
+        }
+        Command::ReloadNode { config } => {
+            let value = config_checkpoint::load_running(&config)?.0;
+            let result = private_control::command(
+                &automatic::socket_path(&config, &value),
+                private_control::Command::ReloadNode,
+            )
+            .await?;
+            println!("{}", serde_json::to_string(&result)?);
         }
         Command::Tuning { config, paused } => {
             let value = config_checkpoint::load_running(&config)?.0;
@@ -426,7 +472,6 @@ async fn main() -> Result<()> {
 struct Shared {
     native: Option<Arc<hardware::Facts>>,
     config: Config,
-    assignments: Vec<Assignment>,
     // These are socket slots, not authenticated board/engine identities.
     clients: Arc<Mutex<BTreeSet<(String, u8)>>>,
     process: Arc<operational::State>,
@@ -436,17 +481,62 @@ struct Shared {
     service_started_unix: u64,
 }
 impl Shared {
-    fn persistent_owners(&self) -> bool {
-        self.runtime.lock().expect("runtime").routing.is_some()
+    /// One production runtime; the caller supplies its own lifecycle state.
+    fn new(
+        native: Option<Arc<hardware::Facts>>,
+        config: Config,
+        runtime: Arc<Mutex<runtime::RuntimeState>>,
+        process: Arc<operational::State>,
+        started_unix: u64,
+        service_started_unix: u64,
+    ) -> Self {
+        Self {
+            native,
+            config,
+            clients: Default::default(),
+            process,
+            scope: runtime::RuntimeScope::Production,
+            runtime,
+            started_unix,
+            service_started_unix,
+        }
     }
-    fn assignments(&self) -> Vec<timelord_core::Assignment> {
+    /// The current live chain routes. There is no separate static plan.
+    #[cfg(test)]
+    fn assignments(&self) -> Vec<Assignment> {
+        self.runtime.lock().expect("runtime").routing.clone()
+    }
+    #[cfg(test)]
+    fn with_clients(mut self, clients: Arc<Mutex<BTreeSet<(String, u8)>>>) -> Self {
+        self.clients = clients;
+        self
+    }
+    #[cfg(test)]
+    fn connected(self, board: &str, slots: &[u8]) -> Self {
+        self.clients
+            .lock()
+            .expect("clients")
+            .extend(slots.iter().map(|&s| (board.to_owned(), s)));
+        self
+    }
+    #[cfg(test)]
+    fn routed_by_config(self) -> Self {
+        let routes = self.config.assignments().expect("fixture routes");
+        self.routed(routes)
+    }
+    #[cfg(test)]
+    fn routed(self, routes: Vec<Assignment>) -> Self {
+        self.runtime.lock().expect("runtime").routing = routes;
+        self
+    }
+    fn engines(&self, board: &str) -> usize {
         self.runtime
             .lock()
             .expect("runtime")
             .routing
-            .as_ref()
-            .unwrap_or(&self.assignments)
-            .clone()
+            .iter()
+            .filter(|a| a.board_id == board)
+            .count()
     }
 }
 

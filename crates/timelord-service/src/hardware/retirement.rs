@@ -84,7 +84,16 @@ pub(super) async fn retire(
     if !reaped {
         forced = true;
         let _ = child.start_kill();
-        reaped = child.wait().await.is_ok();
+        // A process stuck in an uninterruptible USB call may not die promptly.
+        // Never wait forever: report it unreaped (the next start is cautious)
+        // and let the runtime's orphan reaper collect it later.
+        reaped = matches!(
+            tokio::time::timeout(Duration::from_secs(10), child.wait()).await,
+            Ok(Ok(_))
+        );
+        if !reaped {
+            tracing::error!("Native process did not exit after SIGKILL; continuing without it");
+        }
     }
     // A descendant retaining a pipe cannot erase already observed evidence or
     // leave a background drain task alive after the owner has been reaped.

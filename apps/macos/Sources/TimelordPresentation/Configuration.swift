@@ -233,6 +233,8 @@ public struct RecordedProof: Decodable, Sendable {
     public let chain: Chain
     public let timestampUnix: Double
     public let ips: Double
+    /// The board that produced the proof; absent in older checkpoints.
+    public var boardId: String? = nil
 }
 public struct RecordedEvent: Decodable, Sendable {
     public let id: Int

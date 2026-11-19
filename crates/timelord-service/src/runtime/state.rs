@@ -11,6 +11,12 @@ pub struct Observation {
     pub timestamp_unix: u64,
     pub work_started_unix: u64,
     pub ips: f64,
+    /// The board and physical engine that produced the proof. Older
+    /// checkpoints lack these; routing changes never relabel a sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<u8>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Event {
@@ -53,6 +59,15 @@ pub struct HardwareState {
     pub recovery_reason: Option<String>,
     pub retry_after_unix: Option<u64>,
     pub native_pid: Option<u32>,
+    /// Lane errors for one native generation; repeated errors retire the owner.
+    #[serde(skip)]
+    pub lane_errors: (u64, std::collections::VecDeque<u64>),
+    /// The current owner reached its best-known point after a cautious start.
+    #[serde(skip)]
+    pub cautious: bool,
+    /// An operator asked to retry now; the supervisor's wait ends early.
+    #[serde(skip)]
+    pub retry_requested: bool,
 }
 impl HardwareState {
     pub fn fault(&mut self, error: &anyhow::Error) {
@@ -107,7 +122,16 @@ impl RuntimeScope {
 pub struct RuntimeState {
     pub experiments: Arc<crate::experiments::Gate>,
     pub safety: Option<Arc<crate::safety::Store>>,
-    pub routing: Option<Vec<timelord_core::Assignment>>,
+    /// Live chain routes. Every native owner keeps three engine sockets; only
+    /// these assignments receive work.
+    pub routing: Vec<timelord_core::Assignment>,
+    /// Incremented when the node accepts a new peak. Optional rebalancing waits
+    /// for this boundary so it never cancels in-flight work for an improvement.
+    pub peak_epoch: u64,
+    /// Any board starting, retiring or being rerouted holds Automatic tuning on
+    /// every board until this time. Shared USB disturbances are not evidence
+    /// about a healthy board's operating point.
+    pub disturbed_until_unix: u64,
     pub prover: std::sync::Weak<crate::asic::AsicBackend>,
     scope: RuntimeScope,
     pub metric_epoch: u64,
@@ -135,7 +159,9 @@ impl RuntimeState {
             scope: RuntimeScope::Production,
             experiments: Default::default(),
             safety: None,
-            routing: None,
+            routing: Vec::new(),
+            peak_epoch: 0,
+            disturbed_until_unix: 0,
             prover: Default::default(),
             metric_epoch: 0,
             pending: [0; 3],
@@ -173,6 +199,32 @@ impl RuntimeState {
     pub(crate) fn scope(&self) -> RuntimeScope {
         self.scope
     }
+    /// Hold Automatic tuning on every board until `now + seconds`.
+    pub fn disturb(&mut self, now: u64, seconds: u64) {
+        self.disturbed_until_unix = self.disturbed_until_unix.max(now.saturating_add(seconds));
+    }
+    pub fn disturbed(&self, now: u64) -> bool {
+        now < self.disturbed_until_unix
+    }
+    /// A different node profile starts a new chain context. Board state,
+    /// routes and per-board history are retained.
+    pub fn reset_node_context(&mut self) {
+        self.scheduler_initialized = false;
+        self.scheduler_height = None;
+        self.scheduler_deficit = None;
+        self.pending = [0; 3];
+        self.archive = None;
+        // Session proof counters belong to the node they were sent to: the
+        // configuration checkpoint must not treat proofs sent to the previous
+        // node as evidence that the new profile works.
+        self.proofs_delivered = 0;
+        self.failed_proofs = 0;
+        self.transition(
+            "waiting_for_node",
+            "connecting",
+            "Switching full-node profile; ASIC boards keep running.",
+        );
+    }
     pub fn transition(&mut self, phase: &str, node: &str, message: &str) {
         self.phase = phase.into();
         self.node = node.into();
@@ -197,7 +249,14 @@ impl RuntimeState {
             }
         }
     }
-    pub fn estimated(&mut self, chain: Chain, ips: f64, work_started_unix: u64) {
+    pub fn estimated(
+        &mut self,
+        chain: Chain,
+        ips: f64,
+        work_started_unix: u64,
+        board_id: &str,
+        engine: u8,
+    ) {
         self.observations_created += 1;
         self.estimated_observations.push(Observation {
             id: self.observations_created,
@@ -205,6 +264,8 @@ impl RuntimeState {
             ips,
             timestamp_unix: unix_now(),
             work_started_unix,
+            board_id: Some(board_id.to_owned()),
+            engine: Some(engine),
         });
         self.estimated_observations
             .expire_front(|o| o.timestamp_unix < unix_now().saturating_sub(86400));
@@ -219,6 +280,8 @@ impl RuntimeState {
                 ips,
                 timestamp_unix: unix_now(),
                 work_started_unix: timing.started_unix(),
+                board_id: Some(timing.board.clone()),
+                engine: Some(timing.engine),
             });
             self.proofs_delivered += 1;
         }

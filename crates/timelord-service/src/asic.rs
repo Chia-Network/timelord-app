@@ -19,7 +19,7 @@ use std::{
     sync::{Arc, Mutex as SyncMutex, RwLock, atomic::AtomicBool},
     time::{Duration, Instant},
 };
-use timelord_core::{Assignment, Chain, Config};
+use timelord_core::{Assignment, Chain};
 use timelord_supervisor::progress::Stage;
 use tokio::{
     io::AsyncWriteExt,
@@ -66,9 +66,11 @@ impl Drop for Lease {
             .remove(&(self.board.clone(), self.slot));
     }
 }
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ProofTiming {
     iterations: u64,
+    pub board: String,
+    pub engine: u8,
     started: Instant,
     pub ready_at: Instant,
     pub ready_unix_ms: u128,
@@ -92,8 +94,6 @@ struct Active {
     estimated_started: Instant,
 }
 struct Lane {
-    board: String,
-    engine: u8,
     active: Mutex<Option<Active>>,
     started_once: std::sync::atomic::AtomicBool,
 }
@@ -109,6 +109,19 @@ impl std::fmt::Display for AsicFailure {
     }
 }
 impl std::error::Error for AsicFailure {}
+/// The routed engine's native socket did not arrive. A healthy native client
+/// reconnects within milliseconds; this means its event loop is stuck.
+#[derive(Debug)]
+pub struct ClientWaitTimeout;
+impl std::fmt::Display for ClientWaitTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Waiting for ASIC client timed out")
+    }
+}
+impl std::error::Error for ClientWaitTimeout {}
+/// Lane errors on one native generation that escalate to an owner restart.
+const LANE_ERROR_LIMIT: usize = 2;
+const LANE_ERROR_WINDOW_SECONDS: u64 = 120;
 pub struct AsicBackend {
     lanes: Vec<(Chain, Lane)>,
     pools: RwLock<HashMap<String, Arc<Mutex<Pool>>>>,
@@ -117,56 +130,32 @@ pub struct AsicBackend {
     runtime: Arc<SyncMutex<crate::runtime::RuntimeState>>,
 }
 impl AsicBackend {
+    /// One lane per chain. Boards register their engine pools as their
+    /// persistent owners start; routes decide which engine serves each chain.
     pub fn new(
-        config: &Config,
-        assignments: &[Assignment],
         runtime: Arc<SyncMutex<crate::runtime::RuntimeState>>,
         process: Arc<crate::operational::State>,
-    ) -> Result<(Self, HashMap<String, mpsc::Sender<Lease>>)> {
+    ) -> Self {
         let scope = runtime.lock().expect("runtime").scope();
-        let mut pools = HashMap::new();
-        let mut offers = HashMap::new();
-        for board in &config.hardware.boards {
-            let (tx, rx) = mpsc::channel(3);
-            offers.insert(board.id.clone(), tx);
-            pools.insert(board.id.clone(), Arc::new(Mutex::new(Pool::new(rx))));
-        }
-        let mut planned = assignments.to_vec();
-        if runtime.lock().expect("runtime").routing.is_some() {
-            for chain in [Chain::Challenge, Chain::Reward, Chain::InfusedChallenge] {
-                if !planned.iter().any(|a| a.chain == chain) {
-                    planned.push(Assignment {
-                        chain,
-                        board_id: String::new(),
-                        engine: 1,
-                    });
-                }
-            }
-        }
-        let lanes = planned
+        let lanes = [Chain::Challenge, Chain::Reward, Chain::InfusedChallenge]
             .into_iter()
-            .map(|a| {
+            .map(|chain| {
                 (
-                    a.chain,
+                    chain,
                     Lane {
-                        board: a.board_id,
-                        engine: a.engine,
                         active: Mutex::new(None),
                         started_once: std::sync::atomic::AtomicBool::new(false),
                     },
                 )
             })
             .collect();
-        Ok((
-            Self {
-                lanes,
-                pools: RwLock::new(pools),
-                process,
-                scope,
-                runtime,
-            },
-            offers,
-        ))
+        Self {
+            lanes,
+            pools: RwLock::new(HashMap::new()),
+            process,
+            scope,
+            runtime,
+        }
     }
     pub fn add_board(&self, id: &str) -> mpsc::Sender<Lease> {
         let (sender, receiver) = mpsc::channel(3);
@@ -187,17 +176,7 @@ impl AsicBackend {
     }
     fn route(&self, chain: Chain) -> Option<Assignment> {
         let state = self.runtime.lock().expect("runtime");
-        if let Some(routes) = &state.routing {
-            return routes.iter().find(|a| a.chain == chain).cloned();
-        }
-        self.lanes
-            .iter()
-            .find(|(c, _)| *c == chain)
-            .map(|(_, lane)| Assignment {
-                chain,
-                board_id: lane.board.clone(),
-                engine: lane.engine,
-            })
+        state.routing.iter().find(|a| a.chain == chain).cloned()
     }
     fn metrics(&self) -> Option<&Arc<crate::observability::Metrics>> {
         (self.scope == RuntimeScope::Production).then_some(&self.process.metrics)
@@ -205,6 +184,10 @@ impl AsicBackend {
     /// Verify a suspect board without moving live routes or replacing its USB
     /// owner. Admission traffic has no production metrics or node submissions.
     pub async fn check_board(&self, board: &str) -> Result<()> {
+        self.check_engine(board, 1).await
+    }
+    /// A private canonical proof on one physical engine of the live owner.
+    pub async fn check_engine(&self, board: &str, engine: u8) -> Result<()> {
         let pool = self
             .pools
             .read()
@@ -222,18 +205,16 @@ impl AsicBackend {
             .context("Missing recovery owner")?;
         let route = Assignment {
             board_id: board.into(),
-            engine: 1,
+            engine,
             chain: Chain::Challenge,
         };
         let mut state = crate::runtime::RuntimeState::admission();
-        state.routing = Some(vec![route.clone()]);
+        state.routing = vec![route.clone()];
         state.boards.insert(board.into(), hardware);
         let probe = Self {
             lanes: vec![(
                 Chain::Challenge,
                 Lane {
-                    board: board.into(),
-                    engine: 1,
                     active: Mutex::new(None),
                     started_once: AtomicBool::new(false),
                 },
@@ -254,6 +235,11 @@ impl AsicBackend {
         probe.stop_chain(Chain::Challenge).await;
         result.map(|_| ())
     }
+    pub fn bundle_delayed(&self, chain: Chain) {
+        if let Some(metrics) = self.metrics() {
+            metrics.bundle_delayed(chain);
+        }
+    }
     pub fn observe_duration(&self, chain: Chain, stage: ProofStage, duration: Duration) {
         if let Some(metrics) = self.metrics() {
             metrics.duration(chain, stage, duration);
@@ -269,14 +255,9 @@ impl AsicBackend {
                 error
             } else {
                 AsicFailure {
-                    board_id: self
-                        .lanes
-                        .iter()
-                        .find(|(c, _)| *c == chain)
-                        .map(|(_, lane)| lane.board.clone())
-                        .unwrap_or_default(),
+                    board_id: self.route(chain).map(|r| r.board_id).unwrap_or_default(),
                     verification: false,
-                    message: error.to_string(),
+                    message: format!("{error:#}"),
                 }
                 .into()
             }
@@ -312,15 +293,8 @@ impl AsicBackend {
                 state
                     .boards
                     .get(board)
-                    .map(|b| {
-                        (
-                            b.lifecycle.status().generation,
-                            !b.lifecycle
-                                .capacity(crate::unix_now(), state.safety.is_some())
-                                .accepts_work,
-                        )
-                    })
-                    .unwrap_or((0, state.safety.is_some()))
+                    .map(|b| (b.lifecycle.status().generation, !b.lifecycle.accepts_work()))
+                    .unwrap_or((0, true))
             };
             if unavailable {
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -334,7 +308,7 @@ impl AsicBackend {
                         if self.route(chain).as_ref() != Some(&route) { break; }
                         let state = self.runtime.lock().expect("runtime");
                         if state.boards.get(board).is_some_and(|b| b.lifecycle.status().generation != generation
-                            || !b.lifecycle.capacity(crate::unix_now(), state.safety.is_some()).accepts_work) { break; }
+                            || !b.lifecycle.accepts_work()) { break; }
                     }
                 } => continue,
             };
@@ -359,50 +333,68 @@ impl AsicBackend {
                     return Ok(proof);
                 }
                 Err(error) => {
-                    let mut state = self.runtime.lock().expect("runtime");
-                    let hardware = state.boards.entry(board.clone()).or_default();
-                    let verification = error
-                        .downcast_ref::<AsicFailure>()
-                        .is_some_and(|e| e.verification);
-                    if !hardware.lifecycle.report_fault(
-                        generation,
-                        if verification {
-                            crate::board_lifecycle::Fault::InvalidProof
-                        } else {
-                            crate::board_lifecycle::Fault::Transport
-                        },
-                        error.to_string(),
-                        crate::unix_now(),
-                    ) {
-                        continue;
+                    let retry = self.lane_failed(board, generation, &error);
+                    if retry {
+                        tracing::warn!(board=%board, error=%format!("{error:#}"), "ASIC lane session failed; retrying on the same owner");
+                        tokio::time::sleep(Duration::from_millis(250)).await;
                     }
-                    hardware.fault(&error);
-                    hardware.raw_speeds.clear();
-                    let needs_attention = hardware.lifecycle.status().latched_fault;
-                    if verification {
-                        state.failed_proofs += 1;
-                    }
-                    if !state.events.iter().any(|e| {
-                        e.board_id.as_ref() == Some(board)
-                            && e.kind == "board_fault"
-                            && e.end_unix.is_none()
-                    }) {
-                        state.event(Some(board.clone()), "board_fault");
-                    }
-                    state.phase = "waiting_for_clients".into();
-                    state.message = if needs_attention {
-                        format!("An ASIC needs attention: {error}")
-                    } else {
-                        "Waiting for ASIC recovery.".into()
-                    };
-                    // The owner supervisor quiesces before checkpointing this
-                    // restriction. Its durable active-owner marker covers a crash
-                    // or failed fault write; proof verification never waits on disk.
-                    drop(state);
-                    tracing::warn!(board=%board, %error, verification, "ASIC proof lane unavailable");
                 }
             }
         }
+    }
+    /// Fix the smallest part first: a dropped session socket is retried on the
+    /// same owner; a stuck client, an invalid proof or repeated lane errors
+    /// retire the native owner. Returns true to retry on the same owner.
+    fn lane_failed(&self, board: &str, generation: u64, error: &anyhow::Error) -> bool {
+        let mut state = self.runtime.lock().expect("runtime");
+        let now = crate::unix_now();
+        let hardware = state.boards.entry(board.to_owned()).or_default();
+        let verification = error
+            .downcast_ref::<AsicFailure>()
+            .is_some_and(|e| e.verification);
+        let stuck = error.is::<ClientWaitTimeout>();
+        if !verification && !stuck {
+            if hardware.lane_errors.0 != generation {
+                hardware.lane_errors = (generation, Default::default());
+            }
+            let errors = &mut hardware.lane_errors.1;
+            errors.retain(|&t: &u64| now.saturating_sub(t) < LANE_ERROR_WINDOW_SECONDS);
+            errors.push_back(now);
+            if errors.len() < LANE_ERROR_LIMIT {
+                return true;
+            }
+        }
+        if !hardware.lifecycle.report_fault(
+            generation,
+            if verification {
+                crate::board_lifecycle::Fault::InvalidProof
+            } else {
+                crate::board_lifecycle::Fault::Transport
+            },
+            format!("{error:#}"),
+            now,
+        ) {
+            return false;
+        }
+        hardware.fault(error);
+        hardware.raw_speeds.clear();
+        let needs_attention = hardware.lifecycle.status().latched_fault;
+        if verification {
+            state.failed_proofs += 1;
+        }
+        if !state.events.iter().any(|e| {
+            e.board_id.as_deref() == Some(board) && e.kind == "board_fault" && e.end_unix.is_none()
+        }) {
+            state.event(Some(board.to_owned()), "board_fault");
+        }
+        state.message = if needs_attention {
+            format!("An ASIC needs attention: {error:#}")
+        } else {
+            "Moving work off a failing ASIC.".into()
+        };
+        drop(state);
+        tracing::warn!(board=%board, error=%format!("{error:#}"), verification, "ASIC proof lane unavailable; retiring its native owner");
+        false
     }
     pub async fn prime(&self, work: ProofRequest) -> Result<()> {
         // A one-iteration primer keeps ICC ready; it is not a scheduled VDF output.
@@ -428,13 +420,7 @@ impl AsicBackend {
             .1;
         let route = self.route(chain).context("No available ASIC for chain")?;
         let board = &route.board_id;
-        let physical = self
-            .runtime
-            .lock()
-            .expect("runtime")
-            .routing
-            .is_some()
-            .then_some(route.engine);
+        let physical = Some(route.engine);
         let metrics = self.metrics().cloned();
         let epoch = self.runtime.lock().expect("runtime").metric_epoch;
         let process_progress = self.process.progress.clone();
@@ -521,7 +507,7 @@ impl AsicBackend {
                     pool.receive(physical, generation),
                 )
                 .await
-                .context("Waiting for ASIC client timed out")?
+                .map_err(|_| anyhow::Error::new(ClientWaitTimeout))?
                 .context("ASIC listener stopped")?;
 
                 if let Some(metrics) = &metrics {
@@ -608,6 +594,8 @@ impl AsicBackend {
         })?;
         let timing = ProofTiming {
             iterations: work.iterations,
+            board: board.clone(),
+            engine: active.lease.slot,
             started: active.started,
             ready_at: Instant::now(),
             ready_unix_ms: std::time::SystemTime::now()
@@ -636,9 +624,11 @@ impl AsicBackend {
             {
                 let mut state = self.runtime.lock().expect("runtime");
                 let hardware = state.boards.entry(board.clone()).or_default();
-                hardware
-                    .lifecycle
-                    .verified(active.lease.generation, active.lease.slot);
+                hardware.lifecycle.verified(
+                    active.lease.generation,
+                    active.lease.slot,
+                    crate::unix_now(),
+                );
             }
             if let Some(metrics) = &metrics {
                 metrics.verified(epoch, chain, ips);
@@ -647,6 +637,8 @@ impl AsicBackend {
                 chain,
                 ips,
                 crate::unix_now().saturating_sub(active.estimated_started.elapsed().as_secs()),
+                board,
+                active.lease.slot,
             );
         }
         *owner = Some(active);

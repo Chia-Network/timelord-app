@@ -4,12 +4,14 @@ import TimelordPresentation
 struct BoardDetailSheet: View {
     let board: BoardSnapshot
     let snapshot: AppSnapshot
+    var act: ((BoardAction, Int?) -> Void)? = nil
     @State private var range: HistoryRange = .hour
     @State private var chain: Chain
 
-    init(board: BoardSnapshot, snapshot: AppSnapshot) {
+    init(board: BoardSnapshot, snapshot: AppSnapshot, act: ((BoardAction, Int?) -> Void)? = nil) {
         self.board = board
         self.snapshot = snapshot
+        self.act = act
         _chain = State(initialValue: board.histories.first?.chain ?? .challenge)
     }
 
@@ -29,6 +31,8 @@ struct BoardDetailSheet: View {
                 VStack(alignment: .leading, spacing: 24) {
                     StatusBadge(title: board.state.title, tone: board.state.tone)
                     if let recovery = board.recoveryText(at: snapshot.now) { Text(recovery).font(.callout).foregroundStyle(.secondary) }
+                    if let rotation = board.rotationText(at: snapshot.now) { Text(rotation).font(.callout).foregroundStyle(.secondary) }
+                    if let act, board.serial != nil { controls(act) }
                     VStack(alignment: .leading, spacing: 18) {
                         HStack {
                             Text("IPS").font(.headline)
@@ -59,6 +63,19 @@ struct BoardDetailSheet: View {
                             Text("Configured operating point")
                                 .font(.caption).foregroundStyle(.secondary)
                         }.frame(maxWidth: .infinity, alignment: .leading).timelordCard()
+                    }
+                    if !board.events.isEmpty {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("Board history").font(.headline)
+                            ForEach(board.events.reversed()) { event in
+                                HStack(alignment: .top, spacing: 12) {
+                                    Image(systemName: event.kind == "failure" ? "exclamationmark.triangle" : "checkmark.circle").foregroundStyle(.secondary)
+                                    Text(event.title).font(.callout).lineLimit(3)
+                                    Spacer()
+                                    Text(Date(timeIntervalSince1970: event.timestampUnix), style: .relative).font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                        }.timelordCard()
                     }
                     VStack(alignment: .leading, spacing: 14) {
                         Text("Activity in this range").font(.headline)
@@ -93,6 +110,24 @@ struct BoardDetailSheet: View {
                         }.padding(.top, 12)
                     }.timelordCard()
                 }.padding(24)
+    }
+
+    /// One-board controls; the other boards and the node session keep running.
+    private func controls(_ act: @escaping (BoardAction, Int?) -> Void) -> some View {
+        HStack(spacing: 10) {
+            if board.state == .disabled {
+                Button("Enable") { act(.enable, nil) }
+            } else {
+                Button("Retry now") { act(.retry, nil) }
+                    .disabled(![.benched, .probation, .recovering, .disconnected, .needsAttention].contains(board.state))
+                    .help("End this board's probation and retry it immediately")
+                Menu("Keep out of rotation") {
+                    Button("For 1 hour") { act(.disable, 60) }
+                    Button("For 1 day") { act(.disable, 1440) }
+                    Button("Until I enable it") { act(.disable, nil) }
+                }.fixedSize()
+            }
+        }.controlSize(.small)
     }
 
     private var statistics: some View {

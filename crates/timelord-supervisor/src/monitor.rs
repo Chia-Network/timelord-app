@@ -196,6 +196,8 @@ mod tests {
             )
             .await
             .unwrap();
+        // Pause acknowledges once durable; retirement completes in the background.
+        state.poll_retirement(&snapshots, true).await;
         assert!(state.snapshot().worker_pid.is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }

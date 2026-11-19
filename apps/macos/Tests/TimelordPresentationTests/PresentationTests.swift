@@ -520,7 +520,7 @@ extension PresentationTests {
                        "An idle ICC owner's USB metadata can also be hidden")
         let starting=try status(states:["starting","starting","starting"],clients:[1,0,0])
         XCTAssertEqual(LivePresentation.snapshot(status:starting,detectedDevices:[],now:now).boards.map(\.id),["board-0"])
-        let absent=try status(states:["fault","reconnecting","starting"],clients:[0,0,0])
+        let absent=try status(states:["reconnecting","reconnecting","starting"],clients:[0,0,0])
         XCTAssertTrue(LivePresentation.snapshot(status:absent,detectedDevices:[],now:now).boards.isEmpty,
                       "Configured or unavailable clients alone are not presence evidence")
         XCTAssertTrue(LivePresentation.snapshot(status:healthy,detectedDevices:[],now:now.addingTimeInterval(15)).boards.isEmpty,
@@ -540,7 +540,7 @@ extension PresentationTests {
     private func operationalStatus(production: Bool = true, latest: Double = 1_000_000, state: String = "running", message: String = "Producing verified proofs.", chains: [String] = ["challenge","reward","infused_challenge"], faultKind: String? = nil, recoveryReason: String? = nil, retryAfter: Double? = nil) throws -> ServiceStatus {
         var board: [String: Any] = ["id":"a","name":"A","client_port":18110,"assigned_chains":chains,"connected_clients":3,"hardware_state":"connected","temperature_c":42.5,"temperature_limit_c":55,"frequency_mhz":1540,"voltage_v":1,"recoveries":2,"latest_proof_unix":latest,"profile":"Manual"]
         if let faultKind { board["fault_kind"] = faultKind }
-        if let recoveryReason { board["recovery_reason"] = recoveryReason; board["hardware_state"] = "fault" }
+        if let recoveryReason { board["recovery_reason"] = recoveryReason; board["hardware_state"] = "reconnecting" }
         if let retryAfter { board["retry_after_unix"] = retryAfter }
         let object: [String: Any] = ["api_version":1,"service_pid":42,"service_state":"ready","timelord_state":state,"message":message,"production_enabled":production,"started_unix":999000,"timestamp_unix":1000000,"latest_proof_unix":latest,"proofs_delivered":7,"tuning_paused":false,
             "full_node":["host":"localhost","port":8444,"network":"mainnet","state":"ready"],
@@ -644,46 +644,56 @@ extension PresentationTests {
             let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
             return try decoder.decode(ServiceStatus.self, from: JSONSerialization.data(withJSONObject: object))
         }
-        for failed in ["fault", "thermal_stop", "starting", "reconnecting"] {
+        for failed in ["invalid_proof", "thermal_stop", "starting", "reconnecting"] {
             let view = LivePresentation.snapshot(status: try status(["connected", failed]), now: now)
             XCTAssertEqual(view.phase, .running)
             XCTAssertEqual(view.boards[0].state, .active)
             XCTAssertNotEqual(view.boards[1].state, .active)
         }
-        XCTAssertEqual(LivePresentation.snapshot(status: try status(["fault", "fault"]), now: now).phase, .serviceUnavailable)
+        XCTAssertEqual(LivePresentation.snapshot(status: try status(["invalid_proof", "invalid_proof"]), now: now).phase, .serviceUnavailable)
         let reconnecting = LivePresentation.snapshot(status: try status(["reconnecting", "reconnecting"]), now: now)
         XCTAssertEqual(reconnecting.phase, .waitingForProofs)
         XCTAssertTrue(reconnecting.boards.allSatisfy { $0.state == .disconnected })
     }
 
-    func testAdmissionFailureShowsActualReasonInsteadOfNodeOrMissingBoardAdvice() throws {
-        let message = "ASIC 1 needs attention: Admission native owner did not confirm hardware quiescence"
-        func status(_ hardware: String, node: String = "disconnected", state: String = "waiting_for_clients") throws -> ServiceStatus {
-            let object: [String: Any] = ["api_version": 1, "service_pid": 42, "timestamp_unix": 1_000_000, "started_unix": 999000,
+    func testRotationStatesExplainThemselvesAndReserveNeedsAttentionForPeople() throws {
+        let message = "Moving work off a failing ASIC."
+        func status(_ hardware: String, routing: String, failures: Int = 0, node: String = "disconnected", state: String = "waiting_for_clients", probationUntil: Double? = nil) throws -> ServiceStatus {
+            var board: [String: Any] = ["id": "a", "name": "ASIC 1", "assigned_chains": [], "connected_clients": 0, "hardware_state": hardware, "profile": "Automatic",
+                "routing_state": routing, "consecutive_failures": failures, "failures_last_hour": failures, "serial": "S1",
+                "last_failure": "Waiting for ASIC client timed out"]
+            if let probationUntil { board["probation_until_unix"] = probationUntil }
+            let object: [String: Any] = ["api_version": 2, "service_pid": 42, "timestamp_unix": 1_000_000, "started_unix": 999000,
                 "timelord_state": state, "message": message, "production_enabled": true, "proofs_delivered": 0, "tuning_paused": false,
                 "full_node": ["host": "fixture", "port": 58445, "network": "ephemeral", "state": node],
-                "boards": [["id": "a", "name": "ASIC 1", "assigned_chains": [], "connected_clients": 0, "hardware_state": hardware, "profile": "Automatic"]]]
+                "boards": [board]]
             let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
             return try decoder.decode(ServiceStatus.self, from: JSONSerialization.data(withJSONObject: object))
         }
-        // An active FTDI owner can hide enumeration metadata. Lifecycle rows
-        // describe checking/failure, without claiming detection or productivity.
-        let failed = LivePresentation.snapshot(status: try status("quarantined"), detectedDevices: [], now: now)
-        XCTAssertEqual(failed.phase, .boardMissing)
-        XCTAssertEqual(failed.explanation, message)
-        XCTAssertEqual(failed.boards.count, 1)
-        XCTAssertEqual(failed.boards.first?.state, .needsAttention)
-        XCTAssertEqual(failed.boards.first?.state.title, "Needs attention")
-        XCTAssertEqual(failed.headlineSpeed, "—")
-        let checking = LivePresentation.snapshot(status: try status("checking", node: "waiting_for_hardware"), detectedDevices: [], now: now)
+        // A board that failed recently keeps working; that is not a call for
+        // help until it has failed many times in a row.
+        let recent = LivePresentation.snapshot(status: try status("connected", routing: "probation", failures: 3, probationUntil: 1_001_800), detectedDevices: [], now: now)
+        XCTAssertEqual(recent.boards.first?.state, .probation)
+        XCTAssertEqual(recent.boards.first?.state.title, "On probation")
+        XCTAssertEqual(recent.boards.first?.rotationText(at: now), "Working after 3 recent failures; prefers the infused-challenge chain for about 30 more min. Last: Waiting for ASIC client timed out")
+        let chronic = LivePresentation.snapshot(status: try status("connected", routing: "probation", failures: 6), detectedDevices: [], now: now)
+        XCTAssertEqual(chronic.boards.first?.state, .needsAttention)
+        XCTAssertTrue(chronic.boards.first?.rotationText(at: now)?.contains("cable") == true)
+        let invalid = LivePresentation.snapshot(status: try status("invalid_proof", routing: "unavailable"), detectedDevices: [], now: now)
+        XCTAssertEqual(invalid.boards.first?.state, .needsAttention)
+        let probation = LivePresentation.snapshot(status: try status("connected", routing: "probation", failures: 1, probationUntil: 1_000_060), detectedDevices: [], now: now)
+        XCTAssertEqual(probation.boards.first?.state, .probation)
+        XCTAssertEqual(probation.boards.first?.state.tone, .neutral)
+        let disabled = LivePresentation.snapshot(status: try status("stopped", routing: "disabled"), detectedDevices: [], now: now)
+        XCTAssertEqual(disabled.phase, .boardMissing)
+        XCTAssertEqual(disabled.boards.first?.state, .disabled)
+        XCTAssertEqual(disabled.boards.first?.rotationText(at: now), "Disabled until you enable it")
+        let checking = LivePresentation.snapshot(status: try status("checking", routing: "unavailable", node: "waiting_for_hardware"), detectedDevices: [], now: now)
         XCTAssertEqual(checking.phase, .starting)
         XCTAssertEqual(checking.boards.first?.state, .checking)
-        XCTAssertEqual(checking.explanation, message)
-        let unavailable = LivePresentation.snapshot(status: try status("connected", state: "waiting_for_node"), now: now)
-        XCTAssertEqual(unavailable.phase, .nodeUnreachable)
-        let nodeFailure = LivePresentation.snapshot(status: try status("quarantined", state: "waiting_for_node"), now: now)
-        XCTAssertEqual(nodeFailure.phase, .nodeUnreachable, "Admission advice must not mask a real node-session failure")
-        let paused = LivePresentation.snapshot(status: try status("quarantined"), paused: true, now: now)
+        let nodeFailure = LivePresentation.snapshot(status: try status("stopped", routing: "disabled", state: "waiting_for_node"), now: now)
+        XCTAssertEqual(nodeFailure.phase, .nodeUnreachable, "Rotation advice must not mask a real node-session failure")
+        let paused = LivePresentation.snapshot(status: try status("stopped", routing: "disabled"), paused: true, now: now)
         XCTAssertEqual(paused.phase, .paused)
     }
 

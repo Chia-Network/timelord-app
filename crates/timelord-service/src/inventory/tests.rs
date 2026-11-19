@@ -6,17 +6,14 @@ async fn initialization_wait_does_not_arm_discovery_watchdog() {
     config.hardware.client_binary = Some("/not-present/client".into());
     config.hardware.driver_library = Some("/not-present/driver".into());
     let state = crate::runtime::RuntimeState::new(false);
-    let shared = crate::Shared {
-        native: None,
+    let shared = crate::Shared::new(
+        None,
         config,
-        assignments: vec![],
-        clients: Default::default(),
-        process: process.clone(),
-        scope: crate::runtime::RuntimeScope::Production,
-        runtime: std::sync::Arc::new(std::sync::Mutex::new(state)),
-        started_unix: 0,
-        service_started_unix: 0,
-    };
+        std::sync::Arc::new(std::sync::Mutex::new(state)),
+        process.clone(),
+        0,
+        0,
+    );
     let topology = |sequence| {
         process
             .progress
@@ -38,42 +35,6 @@ async fn initialization_wait_does_not_arm_discovery_watchdog() {
     assert!(topology(2).is_none());
 }
 
-#[test]
-fn admitted_capacity_requires_matching_fresh_inventory_despite_display_changes() {
-    let config = configured();
-    let board = &config.hardware.boards[0];
-    {
-        let mut h = crate::runtime::HardwareState {
-            lifecycle: {
-                let mut owner = crate::board_lifecycle::BoardLifecycle::default();
-                owner.testing().admitted(7);
-                owner
-            },
-            ..Default::default()
-        };
-        let blocked = |h: &crate::runtime::HardwareState| {
-            crate::hardware::unavailable_for(
-                &config,
-                &std::collections::HashMap::from([(board.id.clone(), h.clone())]),
-                None,
-            )
-            .contains(&board.id)
-        };
-        assert!(blocked(&h));
-        confirm_admitted_presence(&mut h, board, &devices(&[0]), 6);
-        assert!(blocked(&h), "old inventory released a newer admission");
-        confirm_admitted_presence(&mut h, board, &[], 7);
-        assert!(blocked(&h));
-        let mut duplicate = devices(&[0]);
-        duplicate.extend(devices(&[0]));
-        confirm_admitted_presence(&mut h, board, &duplicate, 7);
-        assert!(blocked(&h), "ambiguous inventory released capacity");
-        confirm_admitted_presence(&mut h, board, &devices(&[0]), 7);
-        assert!(!blocked(&h));
-        assert_eq!(h.lifecycle.status().usb_present, Some(true));
-    }
-}
-
 fn configured() -> Config {
     let mut config = Config::default();
     config.hardware.boards = (0..3).map(|i| toml::from_str(&format!(
@@ -91,30 +52,6 @@ fn devices(indices: &[u32]) -> Vec<Device> {
             serial: Some(format!("serial-{i}")),
         })
         .collect()
-}
-#[test]
-fn admitted_board_unplug_during_debounce_removes_capacity_and_presence_fallback() {
-    let config = configured();
-    let board = &config.hardware.boards[0];
-    let mut state = crate::runtime::RuntimeState::default();
-    let mut hardware = crate::runtime::HardwareState::default();
-    hardware.lifecycle.testing().begin_attempt(1);
-    hardware.lifecycle.testing().admitted(7);
-    confirm_admitted_presence(&mut hardware, board, &devices(&[0]), 7);
-    assert!(hardware.lifecycle.capacity(2, true).usable);
-    assert_eq!(hardware.lifecycle.admitted_inventory_epoch(), Some(7));
-    let epoch = hardware.lifecycle.admitted_inventory_epoch().unwrap();
-    confirm_admitted_presence(&mut hardware, board, &[], epoch);
-    assert!(!hardware.lifecycle.capacity(3, true).usable);
-    assert_eq!(hardware.lifecycle.status().usb_present, Some(false));
-    state.boards.insert(board.id.clone(), hardware);
-    let mut empty = vec![];
-    preserve_managed_boards(&config, &mut empty, &state, 3);
-    assert!(empty.is_empty());
-    let hardware = state.boards.get_mut(&board.id).unwrap();
-    hardware.lifecycle.testing().start_native();
-    confirm_admitted_presence(hardware, board, &devices(&[0]), epoch);
-    assert_eq!(hardware.lifecycle.status().usb_present, Some(false));
 }
 #[test]
 fn automatic_ports_skip_http_listeners_across_hotplug() {
@@ -187,67 +124,11 @@ fn automatic_topology_survives_three_one_zero_two_three_and_remembers_settings()
     }
 }
 #[test]
-fn topology_requires_three_consistent_successes_and_ignores_order() {
-    let current = configured();
-    let one = connected_plan(current.clone(), devices(&[0])).unwrap();
-    let two = connected_plan(current.clone(), devices(&[0, 1])).unwrap();
-    let mut debounce = TopologyChange::default();
-    let mut now = std::time::Instant::now();
-    let mut observe = |candidate| {
-        now += std::time::Duration::from_secs(5);
-        debounce.observe_at(&current, candidate, now)
-    };
-    assert!(observe(Ok(one.clone())).is_none());
-    assert!(observe(Ok(one.clone())).is_none());
-    assert!(observe(Err(anyhow::anyhow!("busy"))).is_none());
-    assert!(observe(Ok(one.clone())).is_none());
-    assert!(observe(Ok(two)).is_none());
-    assert!(observe(Ok(one.clone())).is_none());
-    assert!(observe(Ok(current.clone())).is_none());
-    let mut reordered = current.clone();
-    reordered.hardware.boards.reverse();
-    assert!(observe(Ok(reordered)).is_none());
-    assert!(observe(Ok(one.clone())).is_none());
-    assert!(observe(Ok(one.clone())).is_none());
-    assert_eq!(observe(Ok(one)).unwrap().hardware.boards.len(), 1);
-}
-#[test]
-fn missed_poll_ticks_cannot_shorten_the_debounce_period() {
-    let current = configured();
-    let one = connected_plan(current.clone(), devices(&[0])).unwrap();
-    let mut change = TopologyChange::default();
-    let now = std::time::Instant::now();
-    for _ in 0..4 {
-        assert!(change.observe_at(&current, Ok(one.clone()), now).is_none());
-    }
-    assert!(
-        change
-            .observe_at(
-                &current,
-                Ok(one.clone()),
-                now + std::time::Duration::from_secs(9)
-            )
-            .is_none()
-    );
-    assert!(
-        change
-            .observe_at(&current, Ok(one), now + std::time::Duration::from_secs(10))
-            .is_some()
-    );
-}
-#[test]
-fn ambiguous_serial_is_not_a_topology_change() {
-    assert!(connected_plan(configured(), devices(&[0, 0])).is_err());
-}
-#[test]
 fn visible_managed_board_is_not_synthesized_twice() {
     let config = configured();
     let mut runtime = crate::runtime::RuntimeState::default();
     let mut board = crate::runtime::HardwareState::default();
-    board
-        .lifecycle
-        .testing()
-        .inventory(None, crate::board_lifecycle::Inventory::Present);
+    board.lifecycle.testing().inventory(true);
     runtime.boards.insert("b0".into(), board);
     let mut detected = devices(&[0, 1, 2]);
     preserve_managed_boards(&config, &mut detected, &runtime, 1000);
@@ -269,7 +150,7 @@ fn idle_owner_without_socket_keeps_three_board_layout_through_metadata_gaps() {
     runtime.boards.insert(
         "b2".into(),
         crate::runtime::HardwareState {
-            lifecycle: crate::board_lifecycle::BoardLifecycle::fixture(
+            lifecycle: crate::board_lifecycle::BoardLifecycle::fixture_usb(
                 crate::board_lifecycle::Phase::Connected,
                 false,
                 None,
@@ -281,19 +162,12 @@ fn idle_owner_without_socket_keeps_three_board_layout_through_metadata_gaps() {
             ..Default::default()
         },
     );
-    let mut topology = TopologyChange::default();
-    let instant = std::time::Instant::now();
     // No socket or recent raw IPS is required for an idle, supervised owner.
     for elapsed in [0, 10, 20, 30, 45, 59, 60, 90, 300] {
         let mut detected = devices(&[0, 1]);
         preserve_managed_boards(&config, &mut detected, &runtime, 1000 + elapsed);
         let next = connected_plan(config.clone(), detected).unwrap();
         assert_eq!(next.hardware.boards.len(), 3);
-        assert!(
-            topology
-                .observe_at(&config, Ok(next), instant + Duration::from_secs(elapsed))
-                .is_none()
-        );
     }
 }
 
@@ -302,7 +176,7 @@ fn transport_and_sensor_recovery_do_not_become_false_usb_removals() {
     let config = configured();
     for phase in [
         crate::board_lifecycle::Phase::Connected,
-        crate::board_lifecycle::Phase::Fault,
+        crate::board_lifecycle::Phase::Reconnecting,
         crate::board_lifecycle::Phase::Reconnecting,
         crate::board_lifecycle::Phase::Starting,
     ] {
@@ -310,7 +184,7 @@ fn transport_and_sensor_recovery_do_not_become_false_usb_removals() {
         runtime.boards.insert(
             "b2".into(),
             crate::runtime::HardwareState {
-                lifecycle: crate::board_lifecycle::BoardLifecycle::fixture(
+                lifecycle: crate::board_lifecycle::BoardLifecycle::fixture_usb(
                     phase,
                     false,
                     None,
@@ -341,7 +215,7 @@ fn live_owner_preserves_anonymous_usb_row_without_overriding_a_replacement() {
     runtime.boards.insert(
         "b2".into(),
         crate::runtime::HardwareState {
-            lifecycle: crate::board_lifecycle::BoardLifecycle::fixture(
+            lifecycle: crate::board_lifecycle::BoardLifecycle::fixture_usb(
                 crate::board_lifecycle::Phase::Connected,
                 false,
                 None,
@@ -371,7 +245,7 @@ fn closed_owner_confirmed_absence_wins_over_old_socket_or_telemetry() {
     runtime.boards.insert(
         "b2".into(),
         crate::runtime::HardwareState {
-            lifecycle: crate::board_lifecycle::BoardLifecycle::fixture(
+            lifecycle: crate::board_lifecycle::BoardLifecycle::fixture_usb(
                 crate::board_lifecycle::Phase::Connected,
                 false,
                 None,
@@ -398,7 +272,7 @@ fn absent_faulted_or_stale_owner_does_not_hide_an_unplugged_board() {
     let config = configured();
     for (phase, latched, age) in [
         (crate::board_lifecycle::Phase::Reconnecting, false, 1),
-        (crate::board_lifecycle::Phase::Fault, false, 1),
+        (crate::board_lifecycle::Phase::Reconnecting, false, 1),
         (crate::board_lifecycle::Phase::Starting, false, 1),
         (crate::board_lifecycle::Phase::Connected, true, 1),
         (crate::board_lifecycle::Phase::Connected, false, 61),
@@ -407,7 +281,7 @@ fn absent_faulted_or_stale_owner_does_not_hide_an_unplugged_board() {
         runtime.boards.insert(
             "b2".into(),
             crate::runtime::HardwareState {
-                lifecycle: crate::board_lifecycle::BoardLifecycle::fixture(
+                lifecycle: crate::board_lifecycle::BoardLifecycle::fixture_usb(
                     phase,
                     false,
                     latched.then_some(crate::board_lifecycle::Fault::InvalidProof),

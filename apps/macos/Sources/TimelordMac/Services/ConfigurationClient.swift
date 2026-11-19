@@ -25,6 +25,14 @@ actor ConfigurationClient {
     func nodeState() async throws -> NodeSyncStatus { try decode(await run(["node-state", "--config", config.path])) }
     func tuning(paused: Bool) async throws -> TuningResponse { try decode(await run(["tuning","--config",config.path,"--paused",String(paused)])) }
     func devices() async throws -> [DiscoveredDevice] { try decode(await run(["devices", "--config", config.path])) }
+    /// Retry, disable (optionally for a time) or enable one board in the running service.
+    func board(serial: String, action: BoardAction, minutes: Int? = nil) async throws {
+        var arguments = ["board", "--config", config.path, "--serial", serial, "--action", action.rawValue]
+        if let minutes { arguments += ["--minutes", String(minutes)] }
+        _ = try await run(arguments)
+    }
+    /// Apply a saved node-profile change without restarting ASIC boards.
+    func reloadNode() async throws { _ = try await run(["reload-node", "--config", config.path]) }
     private func decode<T: Decodable>(_ data: Data) throws -> T {
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
         return try decoder.decode(T.self, from: data)
@@ -56,3 +64,4 @@ enum ConfigurationError: LocalizedError {
 }
 
 struct TuningResponse: Decodable { let paused: Bool; let servicePid: Int }
+enum BoardAction: String { case retry, disable, enable }
