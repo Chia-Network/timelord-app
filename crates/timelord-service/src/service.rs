@@ -466,6 +466,9 @@ async fn node_reload(
     saved.service.control_socket = Some(crate::automatic::socket_path(config_path, &saved));
     crate::set_default_automatic_state(&mut saved, config_path)?;
     saved.service.tuning_paused = run.shared.config.service.tuning_paused;
+    // A legacy app-launch preference with no runtime effect (README); the app
+    // also treats it as node-only, so it must not force a board restart.
+    saved.service.start_automatically = run.shared.config.service.start_automatically;
     let candidate = hardware::continuous::known_configuration(saved);
     let running = &run.shared.config;
     // USB locations are resolved at runtime and remembered boards are a

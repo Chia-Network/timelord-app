@@ -145,6 +145,31 @@ impl ClientLog {
             shutdown_confirmed: false,
         }
     }
+    /// Read what a stopped client still had to say (bounded), so its last
+    /// records decide the outcome rather than which pipe closed first.
+    pub(super) async fn drain(&mut self, board: &BoardConfig, limit: Duration) {
+        let deadline = tokio::time::Instant::now() + limit;
+        while let Ok(Ok(Some(line))) =
+            tokio::time::timeout_at(deadline, self.lines.next_line()).await
+        {
+            let crate::bounded_lines::Line::Text(line) = line else {
+                continue;
+            };
+            if let Some((_, reason)) = line.split_once("VDF client stopped: ") {
+                self.stop_reason = Some(reason.trim().chars().take(120).collect());
+            }
+            if line.contains("Failed to open device") {
+                self.open_failed = true;
+            }
+            if !routine(&line) {
+                tracing::info!(board=%board.id, "{line}");
+                self.recent.push_back(line.chars().take(512).collect());
+                if self.recent.len() > 8 {
+                    self.recent.pop_front();
+                }
+            }
+        }
+    }
     pub(super) async fn read(
         &mut self,
         shared: &Shared,
@@ -800,7 +825,11 @@ pub(super) async fn supervise_with(
     } else {
         initialized
     };
-    // A device that could not be opened is busy or absent, not failing.
+    // A device that could not be opened is busy or absent, not failing. The
+    // control pipe can close before stderr is read, so read its last words.
+    if initialized.is_err() && !log.open_failed {
+        log.drain(&board, Duration::from_millis(500)).await;
+    }
     let initialized = match initialized {
         Err(error) if log.open_failed => Err(anyhow::Error::new(super::board::BoardAbsent(
             board.name.clone(),

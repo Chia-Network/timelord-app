@@ -23,6 +23,9 @@ done
 echo $$ >> "$root/launches-$loc"
 if [ -f "$root/exit-$loc" ]; then exit 1; fi
 if [ -f "$root/busy-$loc" ]; then
+ # The control pipe closes before the log explains why (the CI race).
+ exec 1>&-
+ sleep 0.2
  echo "FT_OpenEx(spi_loc_id, FT_OPEN_BY_LOCATION, &spi_ft_handle) failed (error 3)" >&2
  echo "Failed to open device" >&2
  exit 1

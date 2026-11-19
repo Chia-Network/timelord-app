@@ -171,6 +171,10 @@ pub struct Store {
     state: Mutex<Saved>,
     update_order: Mutex<()>,
     progress: Option<std::sync::Arc<timelord_supervisor::progress::Progress>>,
+    /// A hardware check shares the physical facts (owner epochs, cautious
+    /// starts, restrictions) but never changes reliability health: its forced
+    /// settings and synthetic work say nothing about how a board serves.
+    keep_health: bool,
 }
 fn serial_valid(serial: &str) -> bool {
     !serial.is_empty() && serial.len() <= 15 && serial.bytes().all(|b| (33..=126).contains(&b))
@@ -341,6 +345,7 @@ impl Store {
             state: Mutex::new(state),
             update_order: Mutex::new(()),
             progress: None,
+            keep_health: false,
         })
     }
     #[cfg(test)]
@@ -354,6 +359,11 @@ impl Store {
         let _guard = self.update_order.lock().expect("fixture safety");
         let _ = entered.send(());
         let _ = release.recv_timeout(std::time::Duration::from_secs(2));
+    }
+    /// For the explicit hardware check: see `keep_health`.
+    pub fn diagnostic(mut self) -> Self {
+        self.keep_health = true;
+        self
     }
     pub fn monitored(
         mut self,
@@ -581,6 +591,9 @@ impl Store {
     }
     /// Reliability updates. A failure is restrictive and published before I/O.
     pub fn record_failure(&self, serial: &str, reason: &str) -> Result<Health> {
+        if self.keep_health {
+            return Ok(self.health(serial));
+        }
         let mut health = Health::default();
         self.update(serial, false, |b| {
             b.health.record_failure(crate::unix_now(), reason);
@@ -594,6 +607,9 @@ impl Store {
         relaxing: bool,
         change: impl FnOnce(&mut Health),
     ) -> Result<Health> {
+        if self.keep_health {
+            return Ok(self.health(serial));
+        }
         let mut health = Health::default();
         self.update(serial, relaxing, |b| {
             change(&mut b.health);
@@ -758,6 +774,32 @@ mod tests {
             .unwrap();
         assert_eq!(store.relax_ceiling("A", token).unwrap(), Some(None));
         assert_eq!(store.board("A").unwrap().recovery_ceiling_mhz, None);
+    }
+    #[test]
+    fn a_hardware_check_keeps_safety_facts_but_not_reliability_health() {
+        let f = Fixture::new();
+        Store::open(&f.config())
+            .unwrap()
+            .record_failure("A", "before")
+            .unwrap();
+        let check = Store::open(&f.config()).unwrap().diagnostic();
+        assert_eq!(
+            check
+                .record_failure("A", "check")
+                .unwrap()
+                .consecutive_failures,
+            1
+        );
+        check
+            .update_health("A", true, |health| health.consecutive_failures = 0)
+            .unwrap();
+        check.restrict("A", Reason::Thermal).unwrap();
+        let production = Store::open(&f.config()).unwrap();
+        assert_eq!(production.health("A").consecutive_failures, 1);
+        assert_eq!(
+            production.board("A").unwrap().restriction,
+            Some(Reason::Thermal)
+        );
     }
     #[test]
     fn health_survives_reopen_and_failures_publish_before_io() {

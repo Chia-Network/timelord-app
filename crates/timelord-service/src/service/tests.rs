@@ -403,9 +403,11 @@ async fn reload_node_accepts_only_saved_node_changes_from_the_real_config_file()
             .unwrap()
             .is_none()
     );
-    // A node-only edit switches the session in place.
+    // A node-only edit switches the session in place, even when the app-only
+    // launch preference changed with it.
     let mut edited = crate::load(&path).unwrap();
     edited.node.port = 58444;
+    edited.service.start_automatically = !edited.service.start_automatically;
     crate::save(&path, &edited).unwrap();
     assert!(
         node_reload(&mut run, &path, &current)
