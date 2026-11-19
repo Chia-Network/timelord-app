@@ -67,6 +67,13 @@ public enum BoardState: String, Sendable {
         default: return .neutral
         }
     }
+    /// How long after its last verified proof a board still counts as
+    /// producing. Challenge and reward chains prove every signage point; the
+    /// infused-challenge chain proves only at infusions: on mainnet one gap in
+    /// twelve exceeded 90 s and the longest seen in a day was 321 s.
+    public static func proofWindow(chains: [String]) -> TimeInterval {
+        !chains.isEmpty && chains.allSatisfy { $0 == Chain.infusedChallenge.rawValue } ? 360 : 90
+    }
     /// Map service status to an honest state. "Needs attention" is reserved for
     /// what a person must look at: invalid proofs, repeated overheating, or a
     /// board out of rotation for a long time. Automatic recovery is not that.
@@ -122,6 +129,10 @@ public struct BoardSnapshot: Identifiable, Sendable {
     public var lastFailure: String? = nil
     public var cautious: Bool = false
     public var events: [BoardEvent] = []
+    /// Connected, routed and with a verified proof inside its chain's window.
+    /// True on probation too: probation limits trust, not work.
+    public var deliveringProofs: Bool = false
+    public var onProbation: Bool = false
     /// Why routing currently treats this board the way it does.
     public func rotationText(at now: Date) -> String? {
         let remaining = { (until: Double?) in until.map { max(0, Int(ceil(($0 - now.timeIntervalSince1970) / 60))) } }
@@ -178,6 +189,12 @@ public struct AppSnapshot: Sendable {
     public let serviceAvailable: Bool
     public var tuningPaused: Bool = false
     public var automaticActive: Bool { boards.contains { $0.isAutomatic } }
+    /// The ASICs tile caption. Probation is shown beside the count, never
+    /// subtracted from it: a board on probation can still deliver proofs.
+    public var boardSummary: String {
+        let probation = boards.filter(\.onProbation).count
+        return "\(boards.filter(\.deliveringProofs).count) producing proofs" + (probation == 0 ? "" : " · \(probation) on probation")
+    }
     public var readyToRun = false
     public var sessionUptimeSeconds: TimeInterval? = nil
     public var runningTitle: String { phase == .serviceUnavailable && serviceAvailable ? "Proof service stopped" : readyToRun ? "Ready to run" : phase == .running && !tuningPaused && boards.contains(where: { ["learning","testing"].contains($0.automatic?.state ?? "") }) ? "Running · Optimizing" : phase.title }
@@ -387,13 +404,14 @@ public enum LivePresentation {
                 return detectedDevices.contains { device in if let serial {return device.serial==serial};return device.location==location }
             }.map { board in
                 let last = proofCapable ? board.latestProofUnix.map(Date.init(timeIntervalSince1970:)) : nil
-                let freshProof = last.map { now.timeIntervalSince($0) < 90 } ?? false
+                let freshProof = last.map { now.timeIntervalSince($0) < BoardState.proofWindow(chains: board.assignedChains) } ?? false
                 let state = BoardState.from(board, productive: productive, freshProof: freshProof)
+                let routed = board.hardwareState == "connected" && board.recoveryReason == nil && !["benched", "disabled"].contains(board.routingState ?? "")
                 let histories = board.assignedChains.compactMap(Chain.init(rawValue:)).map { chain -> ChainHistory in
                     guard let validHistory else { return .empty(chain) }
                     return validHistory.history(boardID: board.id, chain: chain, now: now)
                 }
-                return BoardSnapshot(id: board.id, name: board.name, state: state, temperatureC: board.temperatureC, temperatureLimitC: board.temperatureLimitC, profile: board.profile, frequencyMHz: board.frequencyMhz, voltageV: board.voltageV, histories: histories, lastProof: last, rawSpeeds: board.rawSpeeds ?? [], automatic: board.automatic, recoveryReason: board.recoveryReason, retryAfterUnix: board.retryAfterUnix, assignedEngines: board.assignedEngines, serial: board.serial, consecutiveFailures: board.consecutiveFailures ?? 0, failuresLastHour: board.failuresLastHour ?? 0, probationUntilUnix: board.probationUntilUnix, disabledUntilUnix: board.disabledUntilUnix, lastFailure: board.lastFailure, cautious: board.cautious ?? false, events: board.history ?? [])
+                return BoardSnapshot(id: board.id, name: board.name, state: state, temperatureC: board.temperatureC, temperatureLimitC: board.temperatureLimitC, profile: board.profile, frequencyMHz: board.frequencyMhz, voltageV: board.voltageV, histories: histories, lastProof: last, rawSpeeds: board.rawSpeeds ?? [], automatic: board.automatic, recoveryReason: board.recoveryReason, retryAfterUnix: board.retryAfterUnix, assignedEngines: board.assignedEngines, serial: board.serial, consecutiveFailures: board.consecutiveFailures ?? 0, failuresLastHour: board.failuresLastHour ?? 0, probationUntilUnix: board.probationUntilUnix, disabledUntilUnix: board.disabledUntilUnix, lastFailure: board.lastFailure, cautious: board.cautious ?? false, events: board.history ?? [], deliveringProofs: routed && productive && freshProof, onProbation: board.routingState == "probation")
             }
         } else {
             let connected = (detectedDevices ?? []).compactMap { BoardTopology.matching($0,in:configuration?.hardware.boards ?? []) }

@@ -656,6 +656,28 @@ extension PresentationTests {
         XCTAssertTrue(reconnecting.boards.allSatisfy { $0.state == .disconnected })
     }
 
+    func testBoardsOnProbationStillCountWhileTheyDeliverProofs() throws {
+        func board(_ id: String, _ chain: String, routing: String, proofAge: Double, failures: Int = 0) -> [String: Any] {
+            ["id": id, "name": id, "assigned_chains": [chain], "connected_clients": 1, "hardware_state": "connected",
+             "routing_state": routing, "consecutive_failures": failures, "latest_proof_unix": 1_000_000 - proofAge, "profile": "Automatic"]
+        }
+        let boards = [board("cc", "challenge", routing: "serving", proofAge: 5),
+                      board("icc", "infused_challenge", routing: "probation", proofAge: 200, failures: 46),
+                      board("rc", "reward", routing: "serving", proofAge: 120),
+                      board("benched", "challenge", routing: "benched", proofAge: 5, failures: 9)]
+        let object: [String: Any] = ["api_version": 1, "service_pid": 42, "timestamp_unix": 1_000_000, "started_unix": 999000,
+            "timelord_state": "running", "message": "Producing proofs", "production_enabled": true, "proofs_delivered": 7, "tuning_paused": false,
+            "latest_proof_unix": 1_000_000, "full_node": ["host": "localhost", "port": 8444, "network": "mainnet", "state": "ready"], "boards": boards]
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let view = LivePresentation.snapshot(status: try decoder.decode(ServiceStatus.self, from: JSONSerialization.data(withJSONObject: object)), now: now)
+        // The infused-challenge chain proves only at infusions, so 200 s is
+        // still current there; the reward chain at 120 s is not.
+        XCTAssertEqual(view.boards.map(\.deliveringProofs), [true, true, false, false])
+        XCTAssertEqual(view.boards[1].state, .needsAttention, "probation limits trust, it does not hide the board's state")
+        XCTAssertEqual(view.boardSummary, "2 producing proofs · 1 on probation")
+        XCTAssertEqual(BoardState.proofWindow(chains: ["infused_challenge", "challenge"]), 90)
+    }
+
     func testRotationStatesExplainThemselvesAndReserveNeedsAttentionForPeople() throws {
         let message = "Moving work off a failing ASIC."
         func status(_ hardware: String, routing: String, failures: Int = 0, node: String = "disconnected", state: String = "waiting_for_clients", probationUntil: Double? = nil) throws -> ServiceStatus {
