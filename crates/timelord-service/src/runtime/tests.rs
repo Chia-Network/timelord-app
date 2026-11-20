@@ -22,7 +22,7 @@ fn timelord_handshake_capability_is_advertised_once() {
 }
 
 use crate::unix_now;
-use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
 use std::{fs, path::PathBuf};
 use tokio::net::TcpListener;
 struct Files(PathBuf);
@@ -188,15 +188,13 @@ async fn fixture(server_name: &str, board_fault: bool, custom: bool) -> Result<(
     parameters.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let ca_key = KeyPair::generate()?;
     let ca = parameters.self_signed(&ca_key)?;
+    let issuer = Issuer::from_params(&parameters, &ca_key);
     let server_key = KeyPair::generate()?;
     let server =
-        CertificateParams::new(vec!["chia.net".into()])?.signed_by(&server_key, &ca, &ca_key)?;
+        CertificateParams::new(vec!["chia.net".into()])?.signed_by(&server_key, &issuer)?;
     let client_key = KeyPair::generate()?;
-    let client = CertificateParams::new(vec!["timelord-fixture".into()])?.signed_by(
-        &client_key,
-        &ca,
-        &ca_key,
-    )?;
+    let client =
+        CertificateParams::new(vec!["timelord-fixture".into()])?.signed_by(&client_key, &issuer)?;
     let directory = std::env::temp_dir().join(format!(
         "timelord-tls-fixture-{}-{}-{}",
         std::process::id(),

@@ -30,7 +30,7 @@ num-bigint = "0.5"
 futures-util = "0.3"
 rustls = "0.23"
 tokio-rustls = "0.26"
-tokio-tungstenite = "0.30"
+tokio-tungstenite = "0.28"
 
 [profile.release]
 lto = "thin"
