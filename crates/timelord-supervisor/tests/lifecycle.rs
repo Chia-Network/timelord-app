@@ -99,6 +99,23 @@ impl Fixture {
         assert!(exit.success());
     }
 }
+/// Wait until the worker shell recorded `count` starts. The supervisor
+/// publishes WorkerStarted when it spawns the process, before the shell runs,
+/// so a status check alone can precede the pid line it is about to write.
+async fn worker_starts(fixture: &Fixture, count: usize) -> String {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(pids) = fs::read_to_string(fixture.0.join("pids"))
+                && pids.lines().filter(|line| !line.trim().is_empty()).count() >= count
+            {
+                return pids;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("worker starts were not recorded")
+}
 impl Drop for Fixture {
     fn drop(&mut self) {
         if let Ok(pids) = fs::read_to_string(self.0.join("pids")) {
@@ -953,6 +970,7 @@ async fn reload_returns_before_a_slow_worker_retires_and_families_never_overlap(
     let running = fixture
         .status(|s| s.phase == SupervisorPhase::WorkerStarted)
         .await;
+    worker_starts(&fixture, 1).await;
     let started = std::time::Instant::now();
     let reloading = request(&fixture.config(), Control::Reload, Some(running.revision))
         .await
@@ -1007,13 +1025,7 @@ async fn reload_returns_before_a_slow_worker_retires_and_families_never_overlap(
         .await
         .unwrap();
     assert_eq!(settled.worker_generation, replaced.worker_generation);
-    assert_eq!(
-        fs::read_to_string(fixture.0.join("pids"))
-            .unwrap()
-            .lines()
-            .count(),
-        2
-    );
+    assert_eq!(worker_starts(&fixture, 2).await.lines().count(), 2);
     assert!(!fixture.0.join("overlap").exists());
     request(&fixture.config(), Control::Pause, None)
         .await
@@ -1030,6 +1042,7 @@ async fn pause_during_reload_retirement_ends_paused_without_a_new_worker() {
     let running = fixture
         .status(|s| s.phase == SupervisorPhase::WorkerStarted)
         .await;
+    worker_starts(&fixture, 1).await;
     let reloading = request(&fixture.config(), Control::Reload, None)
         .await
         .unwrap();
@@ -1057,13 +1070,7 @@ async fn pause_during_reload_retirement_ends_paused_without_a_new_worker() {
         .unwrap();
     assert_eq!(later.phase, SupervisorPhase::Paused);
     assert_eq!(later.worker_generation, running.worker_generation);
-    assert_eq!(
-        fs::read_to_string(fixture.0.join("pids"))
-            .unwrap()
-            .lines()
-            .count(),
-        1
-    );
+    assert_eq!(worker_starts(&fixture, 1).await.lines().count(), 1);
     assert!(!fixture.0.join("overlap").exists());
     fixture.terminate(supervisor).await;
 }
