@@ -41,3 +41,28 @@ fn recovery_records_match_a_captured_hardware_client_log() {
         .collect();
     assert_eq!(engines, [0, 0, 0, 2, 0, 0, 1, 0, 0]);
 }
+
+#[tokio::test]
+async fn drain_keeps_clean_shutdown_evidence_it_consumes() {
+    let board: BoardConfig =
+        toml::from_str("id='probe'\nname='Probe'\nprofile='manual'\nclient_port=18110").unwrap();
+    let mut child = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "printf 'Failed to open device\\nHardware shutdown: engines_paused=1 safe_point_restored=1\\n' >&2; exit 1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let mut log = ClientLog::new(stderr);
+    log.drain(&board, Duration::from_millis(500)).await;
+    assert!(log.open_failed, "fixture must print an open failure");
+    assert!(
+        log.shutdown_confirmed,
+        "a clean shutdown consumed by the drain must still count as confirmation"
+    );
+}

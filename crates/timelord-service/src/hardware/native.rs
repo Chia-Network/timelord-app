@@ -81,6 +81,9 @@ pub(super) struct ClientLog {
     pub(super) recent: std::collections::VecDeque<String>,
     shutdown_confirmed: bool,
 }
+/// The one native record that proves the client paused its engines and restored
+/// its safe point. Any reader that consumes it must keep the evidence.
+const SHUTDOWN_CONFIRMED: &str = "Hardware shutdown: engines_paused=1 safe_point_restored=1";
 /// Routine per-second native output. Kept at debug so the worker log retains
 /// days of decisions instead of minutes of throughput chatter.
 fn routine(line: &str) -> bool {
@@ -155,6 +158,11 @@ impl ClientLog {
             let crate::bounded_lines::Line::Text(line) = line else {
                 continue;
             };
+            // These bytes never reach the retirement reader, so a clean
+            // shutdown recorded here must count as confirmation now.
+            if self.lines.terminated() && line.ends_with(SHUTDOWN_CONFIRMED) {
+                self.shutdown_confirmed = true;
+            }
             if let Some((_, reason)) = line.split_once("VDF client stopped: ") {
                 self.stop_reason = Some(reason.trim().chars().take(120).collect());
             }
@@ -192,9 +200,7 @@ impl ClientLog {
                 return Ok(None);
             }
         };
-        if self.lines.terminated()
-            && line.ends_with("Hardware shutdown: engines_paused=1 safe_point_restored=1")
-        {
+        if self.lines.terminated() && line.ends_with(SHUTDOWN_CONFIRMED) {
             self.shutdown_confirmed = true;
         }
         if let Some((_, reason)) = line.split_once("VDF client stopped: ") {
