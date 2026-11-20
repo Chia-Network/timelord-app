@@ -116,6 +116,52 @@ impl PeakResult {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnfinishedOutcome {
+    Admitted,
+    Deferred,
+    DeferredQueueFull,
+    Duplicate,
+    Stale,
+    Ignored,
+    Rejected,
+}
+impl UnfinishedOutcome {
+    pub(super) const ALL: [Self; 7] = [
+        Self::Admitted,
+        Self::Deferred,
+        Self::DeferredQueueFull,
+        Self::Duplicate,
+        Self::Stale,
+        Self::Ignored,
+        Self::Rejected,
+    ];
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::Deferred => "deferred",
+            Self::DeferredQueueFull => "deferred_queue_full",
+            Self::Duplicate => "duplicate",
+            Self::Stale => "stale",
+            Self::Ignored => "ignored",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnfinishedSource {
+    Node,
+    Retry,
+}
+impl UnfinishedSource {
+    pub(super) const ALL: [Self; 2] = [Self::Node, Self::Retry];
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Retry => "retry",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionReason {
     Initial,
     InputChange,

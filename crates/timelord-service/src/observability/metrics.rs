@@ -1,7 +1,7 @@
 //! Process-owned metric handles and Prometheus encoding.
 use super::{
     OperatingPointReason, PeakResult, ProofStage, RestartReason, SessionReason, SubmissionKind,
-    board, chain, index, snapshot,
+    UnfinishedOutcome, UnfinishedSource, board, chain, index, snapshot,
 };
 use crate::Shared;
 use anyhow::Result;
@@ -30,6 +30,7 @@ pub struct Metrics {
     proofs_verified_total: IntCounterVec,
     proof_verification_failures_total: IntCounterVec,
     submissions_total: IntCounterVec,
+    unfinished_candidates_total: IntCounterVec,
     topology_changes_total: IntCounterVec,
     asic_recoveries_total: IntCounterVec,
     client_restarts_total: IntCounterVec,
@@ -74,6 +75,14 @@ impl Metrics {
             &["kind"],
         )?;
         registry.register(Box::new(submissions_total.clone()))?;
+        let unfinished_candidates_total = IntCounterVec::new(
+            Opts::new(
+                "unfinished_candidates_total",
+                "unfinished candidate admission outcomes total",
+            ),
+            &["outcome", "source"],
+        )?;
+        registry.register(Box::new(unfinished_candidates_total.clone()))?;
         let topology_changes_total = IntCounterVec::new(
             Opts::new("topology_changes_total", "topology changes total"),
             &[],
@@ -202,6 +211,7 @@ impl Metrics {
             proofs_verified_total,
             proof_verification_failures_total,
             submissions_total,
+            unfinished_candidates_total,
             topology_changes_total,
             asic_recoveries_total,
             client_restarts_total,
@@ -241,6 +251,13 @@ impl Metrics {
         for kind in SubmissionKind::ALL {
             metrics.submissions_total.with_label_values(&[kind.label()]);
         }
+        for outcome in UnfinishedOutcome::ALL {
+            for source in UnfinishedSource::ALL {
+                metrics
+                    .unfinished_candidates_total
+                    .with_label_values(&[outcome.label(), source.label()]);
+            }
+        }
         Ok(metrics)
     }
     #[cfg(test)]
@@ -252,6 +269,10 @@ impl Metrics {
                 .with_label_values(labels)
                 .get(),
             "submissions_total" => self.submissions_total.with_label_values(labels).get(),
+            "unfinished_candidates_total" => self
+                .unfinished_candidates_total
+                .with_label_values(labels)
+                .get(),
             "topology_changes_total" => self.topology_changes_total.with_label_values(labels).get(),
             "asic_recoveries_total" => self.asic_recoveries_total.with_label_values(labels).get(),
             "client_restarts_total" => self.client_restarts_total.with_label_values(labels).get(),
@@ -357,6 +378,11 @@ impl Metrics {
         self.proof_duration
             .with_label_values(&[chain(c), stage.label()])
             .observe(elapsed.as_secs_f64());
+    }
+    pub fn unfinished_candidate(&self, outcome: UnfinishedOutcome, source: UnfinishedSource) {
+        self.unfinished_candidates_total
+            .with_label_values(&[outcome.label(), source.label()])
+            .inc();
     }
     pub fn submitted(&self, kind: SubmissionKind, elapsed: Duration) {
         self.submissions_total

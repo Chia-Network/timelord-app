@@ -10,7 +10,7 @@ pub use activity::Activity;
 use domain::index;
 pub use domain::{
     OperatingPointReason, PeakResult, ProofStage, RestartReason, SessionReason, SubmissionKind,
-    board, chain, proof_lane, restart_reason,
+    UnfinishedOutcome, UnfinishedSource, board, chain, proof_lane, restart_reason,
 };
 pub use http::{HttpState, routes};
 pub use metrics::Metrics;
