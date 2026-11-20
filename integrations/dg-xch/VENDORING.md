@@ -31,6 +31,12 @@ source documentation; use the app README for supported builds and operation.
   Signage work continues while candidate context is missing.
 - The RPC space-estimate parser uses serde_json's number representation so the
   app's arbitrary-precision feature does not break upstream floating-point inputs.
+- Core's optional `sqlx` dependency, its `mysql`, `postgres` and `sqlite`
+  features, and the sized-bytes database codecs are removed. The timelord stores
+  nothing in SQL. Cargo locks sqlx's optional backends even when they are
+  disabled, which kept RUSTSEC-2026-0459 (`libsqlite3-sys` 0.30.1) in the
+  lockfile, and the fixed sqlx 0.9 line needs Rust 1.94. Do not restore these
+  features when syncing upstream unless this app needs a database.
 
 This is timelord compatibility. It does not qualify other dg_xch node roles for
 current Chia consensus. Native ASIC proving and verification remain separate.
