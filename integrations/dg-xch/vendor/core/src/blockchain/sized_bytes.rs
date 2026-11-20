@@ -381,72 +381,6 @@ impl<const SIZE: usize> std::fmt::Debug for SizedBytesImpl<SIZE> {
         write!(f, "0x{}", encode(self.bytes))
     }
 }
-#[cfg(feature = "postgres")]
-impl<'r, const SIZE: usize> sqlx::Decode<'r, sqlx::Postgres> for SizedBytesImpl<SIZE> {
-    fn decode(value: sqlx::postgres::PgValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
-        let bytes = <&[u8] as sqlx::Decode<'_, sqlx::Postgres>>::decode(value)?;
-        Ok(Self::parse(bytes)
-            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e.to_string()))?)
-    }
-}
-#[cfg(feature = "postgres")]
-impl<'r, const SIZE: usize> sqlx::Encode<'r, sqlx::Postgres> for SizedBytesImpl<SIZE> {
-    fn encode(
-        self,
-        buf: &mut <sqlx::Postgres as sqlx::Database>::ArgumentBuffer<'r>,
-    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError>
-    where
-        Self: Sized,
-    {
-        buf.extend_from_slice(&self);
-        Ok(sqlx::encode::IsNull::No)
-    }
-    fn encode_by_ref(
-        &self,
-        buf: &mut <sqlx::Postgres as sqlx::Database>::ArgumentBuffer<'r>,
-    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
-        buf.extend_from_slice(self);
-        Ok(sqlx::encode::IsNull::No)
-    }
-    fn size_hint(&self) -> usize {
-        SIZE
-    }
-}
-#[cfg(feature = "sqlite")]
-impl<'r, const SIZE: usize> sqlx::Decode<'r, sqlx::Sqlite> for SizedBytesImpl<SIZE> {
-    fn decode(value: sqlx::sqlite::SqliteValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
-        let bytes = <&[u8] as sqlx::Decode<'_, sqlx::Sqlite>>::decode(value)?;
-        Ok(Self::parse(bytes)
-            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e.to_string()))?)
-    }
-}
-#[cfg(feature = "sqlite")]
-impl<'q, const SIZE: usize> sqlx::Encode<'q, sqlx::Sqlite> for SizedBytesImpl<SIZE> {
-    fn encode(
-        self,
-        buf: &mut <sqlx::Sqlite as sqlx::Database>::ArgumentBuffer<'q>,
-    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError>
-    where
-        Self: Sized,
-    {
-        buf.push(sqlx::sqlite::SqliteArgumentValue::Blob(
-            std::borrow::Cow::Owned(self.bytes.to_vec()),
-        ));
-        Ok(sqlx::encode::IsNull::No)
-    }
-    fn encode_by_ref(
-        &self,
-        buf: &mut <sqlx::Sqlite as sqlx::Database>::ArgumentBuffer<'q>,
-    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
-        buf.push(sqlx::sqlite::SqliteArgumentValue::Blob(
-            std::borrow::Cow::Owned(self.bytes.to_vec()),
-        ));
-        Ok(sqlx::encode::IsNull::No)
-    }
-    fn size_hint(&self) -> usize {
-        SIZE
-    }
-}
 struct SizedBytesImplVisitor<const SIZE: usize>;
 impl<const SIZE: usize> Visitor<'_> for SizedBytesImplVisitor<SIZE> {
     type Value = SizedBytesImpl<SIZE>;
@@ -553,24 +487,6 @@ macro_rules! impl_sized_bytes {
                 fn try_from(value: &SExp) -> Result<Self, Self::Error> {
                     let vec = value.as_vec().ok_or_else(|| ClvmError::InvalidInput(format!("SExp is not a valid {}",  stringify!($name))))?;
                     Self::parse(&vec)
-                }
-            }
-            #[cfg(feature = "postgres")]
-            impl sqlx::Type<sqlx::Postgres> for $name {
-                fn type_info() -> sqlx::postgres::PgTypeInfo {
-                    <Vec<u8> as sqlx::Type<sqlx::Postgres>>::type_info()
-                }
-                fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
-                    <Vec<u8> as sqlx::Type<sqlx::Postgres>>::compatible(ty)
-                }
-            }
-            #[cfg(feature = "sqlite")]
-            impl sqlx::Type<sqlx::Sqlite> for $name {
-                fn type_info() -> sqlx::sqlite::SqliteTypeInfo {
-                    <Vec<u8> as sqlx::Type<sqlx::Sqlite>>::type_info()
-                }
-                fn compatible(ty: &sqlx::sqlite::SqliteTypeInfo) -> bool {
-                    <Vec<u8> as sqlx::Type<sqlx::Sqlite>>::compatible(ty)
                 }
             }
             impl ChiaSerialize for $name {
@@ -687,32 +603,5 @@ mod bls_conversions {
         fn from(val: Signature) -> Bytes96 {
             Bytes96::new(val.to_bytes())
         }
-    }
-}
-
-#[cfg(all(test, feature = "postgres", feature = "sqlite"))]
-mod codec_tests {
-    use super::Bytes32;
-    use crate::traits::SizedBytes;
-
-    #[test]
-    fn bytes32_round_trips_through_pg_and_sqlite_codecs() {
-        let original = Bytes32::from(std::array::from_fn::<u8, 32, _>(|i| i as u8));
-
-        let mut pg_buf = sqlx::postgres::PgArgumentBuffer::default();
-        let _ = <Bytes32 as sqlx::Encode<sqlx::Postgres>>::encode_by_ref(&original, &mut pg_buf)
-            .unwrap();
-        let pg_bytes: &[u8] = &pg_buf;
-        assert_eq!(Bytes32::parse(pg_bytes).unwrap(), original);
-
-        let mut sq_buf: Vec<sqlx::sqlite::SqliteArgumentValue> = Vec::new();
-        let _ =
-            <Bytes32 as sqlx::Encode<sqlx::Sqlite>>::encode_by_ref(&original, &mut sq_buf).unwrap();
-        let sqlx::sqlite::SqliteArgumentValue::Blob(sq_bytes) = &sq_buf[0] else {
-            panic!("sqlite encode did not produce a Blob");
-        };
-        assert_eq!(Bytes32::parse(sq_bytes).unwrap(), original);
-
-        assert_eq!(pg_bytes, sq_bytes.as_ref());
     }
 }

@@ -42,7 +42,6 @@ rsa = { version = "0.9.10", features = ["std", "pem", "sha2"] }
 secrecy = "0.10.3"
 serde = { version = "1.0.228", features = ["derive"] }
 sha2 = { version = "0.10.9", features = ["oid"] }
-sqlx = {version= "=0.8.6", features=["macros", "json", "time", "runtime-tokio", "tls-rustls-aws-lc-rs"], optional = true}
 time = { version = "0.3.47", features = ["serde"]}
 tokio = {version = "1.50.0", features=["rt-multi-thread", "sync", "signal", "macros", "process", "time", "fs", "net", "io-util"]}
 tokio-tungstenite = {version = "0.28.0", features = ["rustls", "rustls-tls-webpki-roots"] }
@@ -84,8 +83,5 @@ chia-hf2 = ["dep:chia-pos2"]
 # compiled out — a `bls`-less build is NOT consensus-capable.
 bls = ["dep:blst"]
 bounded-bls = ["bls", "blst/no-threads"]
-mysql = ["sqlx/mysql"]
-postgres = ["sqlx/postgres"]
-sqlite = ["sqlx/sqlite"]
 metrics = ["dep:prometheus"]
-default = ["sqlx", "postgres", "bls"]
+default = ["bls"]
