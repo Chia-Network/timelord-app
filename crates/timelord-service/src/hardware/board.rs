@@ -139,10 +139,16 @@ struct BoardSupervisor {
     safety: Arc<crate::safety::Store>,
     previous_failure: crate::observability::RestartReason,
     timing: Timing,
-    /// Health from before the last counted transport failure. If the board is
-    /// then found unplugged within `FORGIVE_WINDOW`, that failure was the
-    /// unplug (USB enumeration can outlive the I/O error) and is taken back.
-    forgivable: Option<(crate::hardware::health::Health, tokio::time::Instant)>,
+    /// Health from before the last counted transport failure, the live health
+    /// right after it, and when it happened. If the board is then found
+    /// unplugged within `FORGIVE_WINDOW` and nobody else changed that health,
+    /// the failure was the unplug (USB enumeration can outlive the I/O error)
+    /// and is taken back.
+    forgivable: Option<(
+        crate::hardware::health::Health,
+        crate::hardware::health::Health,
+        tokio::time::Instant,
+    )>,
 }
 /// How long after a counted failure a board found missing proves the failure
 /// was an unplug.
@@ -447,10 +453,12 @@ impl BoardSupervisor {
                 .map(|serial| self.safety.record_failure(serial, &reason))
             {
                 Some(Ok(health)) => {
-                    self.forgivable = (fault == crate::board_lifecycle::Fault::Transport)
-                        .then_some(before)
-                        .flatten()
-                        .map(|health| (health, tokio::time::Instant::now()));
+                    self.forgivable = if fault == crate::board_lifecycle::Fault::Transport {
+                        before
+                            .map(|previous| (previous, health.clone(), tokio::time::Instant::now()))
+                    } else {
+                        None
+                    };
                     if let Some(metrics) = shared.metrics() {
                         metrics
                             .board_failed(&crate::observability::board(&shared.config, &board.id));
@@ -513,13 +521,18 @@ impl BoardSupervisor {
     /// The board was found unplugged soon after a counted transport failure:
     /// that failure was the unplug, so restore the health from before it.
     fn forgive(&mut self) {
-        let Some((previous, at)) = self.forgivable.take() else {
+        let Some((previous, post_failure, at)) = self.forgivable.take() else {
             return;
         };
         let Some(serial) = self.board.serial.as_deref() else {
             return;
         };
         if at.elapsed() > FORGIVE_WINDOW {
+            return;
+        }
+        if self.safety.health(serial) != post_failure {
+            // An operator retry/disable/enable (or any other update) acted
+            // after the failure; never overwrite that decision.
             return;
         }
         match self

@@ -499,7 +499,7 @@ impl NativeOwner {
                 experiment: None,
                 policy,
                 serial,
-                engines: shared.engines(&board.id),
+                engines: shared.engines(&board.id).max(1),
                 hash: facts.hash.clone(),
                 host: facts.host.clone(),
                 raw_window: Default::default(),

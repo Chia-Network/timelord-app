@@ -324,3 +324,64 @@ async fn a_late_detected_unplug_is_forgiven() {
     assert_eq!(rig.store.health(&rig.serial(2)).consecutive_failures, 0);
     rig.shutdown().await;
 }
+
+/// A late-detected unplug may forgive the failure it caused, but it must never
+/// overwrite an operator disable that landed after the failure was counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operator_disable_is_not_undone_by_a_late_unplug_forgive() {
+    let mut rig = Rig::new("forgiveop", 2, "manual", true).await;
+    rig.start(super::board::Timing {
+        restart: [std::time::Duration::from_secs(2); 3],
+        ..Rig::fast()
+    });
+    rig.until(20, "both boards serving", |s| {
+        serving(s, "b1") && serving(s, "b2")
+    })
+    .await;
+    let binary = rig.shared.config.hardware.client_binary.clone().unwrap();
+    let only = |count: u32| -> Vec<crate::inventory::Device> {
+        (1..=count)
+            .map(|i| crate::inventory::Device {
+                name: format!("ASIC {i}"),
+                location: i,
+                serial: Some(rig.serial(i)),
+            })
+            .collect()
+    };
+    // Still enumerated when its client dies: counted as a late transport stop.
+    rig.touch("die-2");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    while rig.store.health(&rig.serial(2)).consecutive_failures != 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the late transport stop was never counted"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    // Hold the setup gate so the next attempt passes its operator-hold check
+    // and then waits here. The disable therefore lands mid-attempt, exactly
+    // where a late unplug can still be forgiven.
+    let initialization = crate::hardware::INITIALIZATION.lock().await;
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    rig.store
+        .update_health(&rig.serial(2), false, |h| h.disable(None))
+        .unwrap();
+    crate::inventory::fixture::set(binary, only(1));
+    drop(initialization);
+    rig.until(10, "the operator disable surviving the forgive", |s| {
+        !serving(s, "b2")
+            && s.boards["b2"]
+                .recovery_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("Disabled"))
+    })
+    .await;
+    let health = rig.store.health(&rig.serial(2));
+    assert_eq!(health.disabled_until_unix, Some(u64::MAX));
+    assert_eq!(health.tier(crate::unix_now()), Tier::Disabled);
+    assert_eq!(
+        health.consecutive_failures, 1,
+        "forgive must not restore the pre-failure snapshot over the operator"
+    );
+    rig.shutdown().await;
+}
