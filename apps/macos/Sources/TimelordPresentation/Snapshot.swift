@@ -382,7 +382,7 @@ public enum LivePresentation {
         else if live?.boards.contains(where: { $0.recoveryReason != nil }) == true { phase = .starting }
         else if admissionBlocked { phase = .boardMissing }
         else if checkingHardware { phase = .starting }
-        else if live?.timelordState == "waiting_for_clients" { phase = .boardMissing }
+        else if live?.timelordState == "waiting_for_clients" && live?.boards.contains(where: { $0.hardwareState == "connected" || ($0.hardwareState == "starting" && $0.connectedClients > 0) }) != true { phase = .boardMissing }
         else if live?.fullNode.state == "disconnected" { phase = .nodeUnreachable }
         else if live?.productionEnabled == true { phase = nodeReady ? .waitingForProofs : .waitingForNode }
         else { phase = .setupRequired }

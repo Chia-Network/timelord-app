@@ -719,4 +719,31 @@ extension PresentationTests {
         XCTAssertEqual(paused.phase, .paused)
     }
 
+    func testHealthyWaitingForClientsDoesNotReportMissingBoards() throws {
+        func status(boards: [[String: Any]]) throws -> ServiceStatus {
+            let object: [String: Any] = ["api_version": 2, "service_pid": 42, "timestamp_unix": 1_000_000, "started_unix": 999000,
+                "timelord_state": "waiting_for_clients", "message": "Waiting for ASIC clients", "production_enabled": true,
+                "proofs_delivered": 0, "tuning_paused": false, "latest_proof_unix": 999000,
+                "full_node": ["host": "fixture", "port": 58445, "network": "ephemeral", "state": "ready"],
+                "boards": boards]
+            let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+            return try decoder.decode(ServiceStatus.self, from: JSONSerialization.data(withJSONObject: object))
+        }
+        let healthy: [String: Any] = ["id": "a", "name": "ASIC 1", "assigned_chains": ["challenge"], "connected_clients": 1,
+            "hardware_state": "connected", "routing_state": "serving", "profile": "Automatic", "latest_proof_unix": 999000]
+        // Waiting for the first verified proof (or the first after a reload)
+        // is a healthy wait when boards are present and the node is ready.
+        let waiting = LivePresentation.snapshot(status: try status(boards: [healthy]), detectedDevices: [], now: now)
+        XCTAssertEqual(waiting.phase, .waitingForProofs)
+        XCTAssertNotEqual(waiting.phase, .boardMissing)
+        // An empty board list is still a genuinely missing board.
+        XCTAssertEqual(LivePresentation.snapshot(status: try status(boards: []), detectedDevices: [], now: now).phase, .boardMissing)
+        // A board the service still lists but cannot reach is missing too, even
+        // though it is neither disabled nor in the checking/recovery phases.
+        let unplugged: [String: Any] = ["id": "a", "name": "ASIC 1", "assigned_chains": ["challenge"], "connected_clients": 0,
+            "hardware_state": "reconnecting", "routing_state": "serving", "profile": "Automatic"]
+        let missing = LivePresentation.snapshot(status: try status(boards: [unplugged]), detectedDevices: [], now: now)
+        XCTAssertEqual(missing.phase, .boardMissing)
+    }
+
 }
