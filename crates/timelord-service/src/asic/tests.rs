@@ -89,7 +89,7 @@ async fn setup() -> (
 ) {
     let config: Config =
         toml::from_str("[[hardware.boards]]\nid='a'\nname='A'\nclient_port=18110\n").unwrap();
-    let metrics = crate::observability::Metrics::new(config.node.network).unwrap();
+    let metrics = crate::observability::Metrics::new(config.node.network.clone()).unwrap();
     let process = crate::operational::State::new(metrics.clone());
     let runtime = {
         let mut fixture = crate::runtime::RuntimeState::new(false);
@@ -169,7 +169,7 @@ async fn icc_primer_does_not_supply_unmanaged_readiness_evidence() {
     config.node.certificate = Some("/fixture/no-io.crt".into());
     config.node.private_key = Some("/fixture/no-io.key".into());
     config.node.ca_certificate = Some("/fixture/no-io-ca.crt".into());
-    let metrics = crate::observability::Metrics::new(config.node.network).unwrap();
+    let metrics = crate::observability::Metrics::new(config.node.network.clone()).unwrap();
     let process = crate::operational::State::new(metrics.clone());
     let runtime = Arc::new(SyncMutex::new({
         let mut fixture = crate::runtime::RuntimeState::new(false);
@@ -501,7 +501,7 @@ fn discriminant_starts_before_a_client_is_available_and_cancellation_releases_la
                 .is_cancelled()
         );
         assert!(backend.lanes[0].1.active.try_lock().unwrap().is_none());
-        assert!(backend.pools["a"].try_lock().is_ok());
+        assert!(backend.pools.read().unwrap()["a"].try_lock().is_ok());
         assert!(
             backend
                 .runtime
@@ -674,4 +674,239 @@ async fn cancelled_proof_closes_its_partial_frame_and_releases_the_slot() {
         .unwrap();
     assert!(clients.lock().unwrap().is_empty());
     backend.stop_all().await;
+}
+
+#[tokio::test]
+async fn live_route_failover_preserves_the_healthy_engine_session() {
+    let mut config = Config::default();
+    config.hardware.boards = (0..2)
+        .map(|i| {
+            toml::from_str(&format!(
+                "id='b{i}'\nname='B{i}'\nprofile='manual'\nclient_port={}",
+                18110 + i
+            ))
+            .unwrap()
+        })
+        .collect();
+    let plan = vec![
+        Assignment {
+            board_id: "b0".into(),
+            engine: 1,
+            chain: Chain::Challenge,
+        },
+        Assignment {
+            board_id: "b1".into(),
+            engine: 1,
+            chain: Chain::Reward,
+        },
+    ];
+    let mut runtime = crate::runtime::RuntimeState::new(false);
+    runtime.routing = Some(plan.clone());
+    for id in ["b0", "b1"] {
+        runtime.boards.entry(id.into()).or_default().lifecycle =
+            crate::board_lifecycle::BoardLifecycle::fixture(
+                crate::board_lifecycle::Phase::Connected,
+                true,
+                None,
+                Some(true),
+                0,
+            );
+    }
+    let runtime = Arc::new(SyncMutex::new(runtime));
+    let (backend, offers) = AsicBackend::new(
+        &config,
+        &plan,
+        runtime.clone(),
+        crate::operational::State::fixture(),
+    )
+    .unwrap();
+    let backend = Arc::new(backend);
+    let clients = Arc::new(SyncMutex::new(BTreeSet::new()));
+    let mut sockets = Vec::new();
+    // The spare arrives first. Physical routing must park it, not consume it
+    // as the healthy board's preferred engine or drop it during cancellation.
+    for (id, slot) in [("b0", 1), ("b1", 0), ("b1", 1)] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        clients.lock().unwrap().insert((id.into(), slot));
+        offers[id]
+            .send(Lease {
+                socket,
+                board: id.into(),
+                slot,
+                generation: 0,
+                clients: clients.clone(),
+            })
+            .await
+            .ok()
+            .unwrap();
+        sockets.push(peer);
+    }
+    let mut failed = sockets.remove(0);
+    let mut spare = sockets.remove(0);
+    let mut healthy = sockets.remove(0);
+    let first = tokio::spawn(async move {
+        handshake(&mut failed).await;
+        assert_eq!(requested(&mut failed).await, 1);
+        send_fixture_proof(&mut failed, &work(1, 64)).await;
+        let mut buf = [0; 1];
+        let _ = failed.read(&mut buf).await;
+    });
+    let second = tokio::spawn(async move {
+        handshake(&mut healthy).await;
+        for n in [1, 20] {
+            assert_eq!(requested(&mut healthy).await, n);
+            send_fixture_proof(&mut healthy, &work(n, 64)).await;
+        }
+        assert_eq!(requested(&mut healthy).await, 0);
+        healthy.write_all(b"STOP").await.unwrap();
+        let mut ack = [0; 3];
+        healthy.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"ACK");
+    });
+    let fallback = tokio::spawn(async move {
+        handshake(&mut spare).await;
+        assert_eq!(requested(&mut spare).await, 20);
+        send_fixture_proof(&mut spare, &work(20, 64)).await;
+        assert_eq!(requested(&mut spare).await, 0);
+        spare.write_all(b"STOP").await.unwrap();
+        let mut ack = [0; 3];
+        spare.read_exact(&mut ack).await.unwrap();
+    });
+    backend
+        .prove_when_available(Chain::Challenge, work(1, 64), true)
+        .await
+        .unwrap();
+    backend
+        .prove_when_available(Chain::Reward, work(1, 64), true)
+        .await
+        .unwrap();
+    runtime.lock().unwrap().routing.as_mut().unwrap()[0] = Assignment {
+        board_id: "b1".into(),
+        engine: 0,
+        chain: Chain::Challenge,
+    };
+    backend
+        .prove_when_available(Chain::Challenge, work(20, 64), true)
+        .await
+        .unwrap();
+    backend
+        .prove_when_available(Chain::Reward, work(20, 64), true)
+        .await
+        .unwrap();
+    backend.stop_all().await;
+    first.await.unwrap();
+    second.await.unwrap();
+    fallback.await.unwrap();
+    assert_eq!(
+        runtime.lock().unwrap().boards["b1"]
+            .lifecycle
+            .status()
+            .generation,
+        0
+    );
+    assert_eq!(
+        backend
+            .process
+            .metrics
+            .counter("proofs_verified_total", &["reward"]),
+        2
+    );
+}
+
+#[tokio::test]
+async fn recovery_proofs_use_the_live_owner_pool_without_publishing_or_trusting_bad_proofs() {
+    let mut config = Config::default();
+    config
+        .hardware
+        .boards
+        .push(toml::from_str("id='a'\nname='A'\nprofile='manual'\nclient_port=18110").unwrap());
+    let plan = config.assignments().unwrap();
+    let mut state = crate::runtime::RuntimeState::new(false);
+    state.routing = Some(plan.clone());
+    state.boards.entry("a".into()).or_default().lifecycle =
+        crate::board_lifecycle::BoardLifecycle::fixture(
+            crate::board_lifecycle::Phase::Checking,
+            true,
+            Some(crate::board_lifecycle::Fault::InvalidProof),
+            None,
+            0,
+        );
+    let runtime = Arc::new(SyncMutex::new(state));
+    let (backend, offers) = AsicBackend::new(
+        &config,
+        &plan,
+        runtime.clone(),
+        crate::operational::State::fixture(),
+    )
+    .unwrap();
+    for invalid in [false, true] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        offers["a"]
+            .send(Lease {
+                socket,
+                board: "a".into(),
+                slot: 1,
+                generation: 0,
+                clients: Default::default(),
+            })
+            .await
+            .ok()
+            .unwrap();
+        let fixture = tokio::spawn(async move {
+            handshake(&mut peer).await;
+            assert_eq!(requested(&mut peer).await, 360);
+            let blob = include_bytes!("../../tests/fixtures/checkpointed-proof.bin");
+            let mut raw = 360_u64.to_be_bytes().to_vec();
+            raw.extend(100_u64.to_be_bytes());
+            raw.extend_from_slice(&blob[..100]);
+            raw.push(((blob.len() - 200) / 141) as u8);
+            raw.extend_from_slice(&blob[100..]);
+            if invalid {
+                raw[16] ^= 1;
+            }
+            let frame: Vec<_> = raw
+                .iter()
+                .flat_map(|v| format!("{v:02x}").into_bytes())
+                .collect();
+            peer.write_all(&(frame.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
+            peer.write_all(&frame).await.unwrap();
+            if !invalid {
+                assert_eq!(requested(&mut peer).await, 0);
+                peer.write_all(b"STOP").await.unwrap();
+                let mut ack = [0; 3];
+                peer.read_exact(&mut ack).await.unwrap();
+            }
+        });
+        let checked = backend.check_board("a").await;
+        assert_eq!(checked.is_err(), invalid);
+        if let Err(error) = checked {
+            assert!(error.downcast_ref::<AsicFailure>().unwrap().verification);
+        }
+        fixture.await.unwrap();
+    }
+    let state = runtime.lock().unwrap();
+    assert_eq!(state.proofs_delivered, 0);
+    assert!(state.observations.is_empty());
+    assert!(state.estimated_observations.is_empty());
+    assert_eq!(
+        state.boards["a"].lifecycle.status().fault,
+        Some(crate::board_lifecycle::Fault::InvalidProof)
+    );
+    assert_eq!(
+        backend
+            .process
+            .metrics
+            .counter("proofs_verified_total", &["challenge"]),
+        0
+    );
 }

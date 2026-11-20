@@ -26,9 +26,15 @@ pub(super) fn qualification(
         .unwrap_or(1450.);
     let point = Point {
         frequency_mhz: if board.profile == ProfileMode::Automatic {
-            frequency_mhz
-                .min(admission_frequency)
-                .max(board.automatic.min_frequency_mhz)
+            // Optimization preferences cannot prevent a conservative recovery.
+            let minimum = if shared.persistent_owners() && force_safe(shared, board) {
+                200.
+            } else {
+                board.automatic.min_frequency_mhz
+            };
+            frequency_mhz.min(admission_frequency).max(minimum)
+        } else if shared.persistent_owners() && force_safe(shared, board) {
+            frequency_mhz.min(admission_frequency).clamp(200., 1450.)
         } else {
             frequency_mhz
         },

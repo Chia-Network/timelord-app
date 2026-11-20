@@ -247,7 +247,14 @@ impl BoardSupervisor {
             .or_default()
             .lifecycle
             .restore_policy(policy, crate::unix_now());
-        policy.hold_reason(crate::unix_now()).is_some()
+        let reason = policy.hold_reason(crate::unix_now());
+        if let Some(reason) = &reason {
+            let mut state = self.shared.runtime.lock().expect("runtime");
+            let hardware = state.boards.entry(self.board.id.clone()).or_default();
+            hardware.recovery_reason = Some(reason.clone());
+            hardware.retry_after_unix = Some(policy.retry_after_unix);
+        }
+        reason.is_some()
     }
     async fn attempt(&mut self) -> Result<()> {
         PreparedAttempt::start(self).await
@@ -283,6 +290,8 @@ impl BoardSupervisor {
             hardware.temperature_c = None;
             hardware.temperature_unix = 0;
             hardware.fault(&error);
+            hardware.recovery_reason = Some(error.to_string());
+            hardware.retry_after_unix = Some(crate::unix_now().saturating_add(delay.as_secs()));
             let stop = hardware.lifecycle.status().latched_fault;
             if !state.boards.iter().any(|(id, b)| {
                 id != &board.id

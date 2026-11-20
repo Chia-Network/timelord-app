@@ -1,10 +1,15 @@
-Timelord Mac links dg_xch_utils crates from GalactechsLLC, revision
-ca437be562cec5f0514f6edd4c794adfe382dd8a, under the Apache License 2.0.
-https://github.com/GalactechsLLC/dg_xch_utils
+Timelord Mac links dg_xch_utils crates from GalactechsLLC, compatibility fork revision
+3b50863ee641c67e4c46b9a18640001e0c94833f, under the Apache License 2.0.
+https://github.com/cameroncooper/dg_xch_utils
 
 The regular scheduler, protocol/consensus types, authenticated transport helpers
 and VDF verification are used as dependencies. The native-client adapter and
-application lifecycle are maintained in this repository. No upstream source files
-are vendored or modified. See LICENSE and Cargo.lock for provenance.
+application lifecycle are maintained in this repository. The fork modifies
+upstream protocol codecs, consensus hashing and the timelord scheduler. No upstream
+source files are vendored in the app repository. See LICENSE and Cargo.lock for
+provenance.
 
 ICC seed translation follows Scheduler.set_peak/finish at the pinned revision.
+
+PoS2 witness verification uses Chia Network chia-pos2 1.0.0 (Apache-2.0),
+https://github.com/Chia-Network/pos2.

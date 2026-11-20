@@ -1,6 +1,6 @@
 import Foundation
 
-/// Controls an independently installed supervisor. The interface never owns or
+/// Controls an independent supervisor. The interface never owns or
 /// terminates the worker, and disappearing from the desktop changes no intent.
 @MainActor
 final class ServiceController {
@@ -47,6 +47,17 @@ final class ServiceController {
             guard epoch == controlEpoch, !changingIntent else { return }
             supervisor = nil; errorMessage = "Background supervision unavailable: \(error.localizedDescription)"
         }
+    }
+
+    func ensureStarted(network: String, monitorListen: String, statusListen: String) async throws {
+        guard !changingIntent else { throw ConfigurationError.message("A background service change is already in progress.") }
+        controlEpoch &+= 1
+        changingIntent = true
+        defer { changingIntent = false; onChange?() }
+        do {
+            observe(try await client.ensureStarted(worker: helperURL, network: network, monitorListen: monitorListen, statusListen: statusListen))
+            errorMessage = supervisor?.error
+        } catch { errorMessage = error.localizedDescription; throw error }
     }
 
     /// Fresh revision protects a remote administrator's concurrent Pause/Run.

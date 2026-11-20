@@ -5,7 +5,7 @@ import TimelordPresentation
 
 @MainActor
 final class SupervisorPresentationTests: XCTestCase {
-    func testMissingSupervisorOffersSetupButLossAfterContactRemainsFailure() async throws {
+    func testMissingSupervisorAllowsRunButLossAfterContactRemainsFailure() async throws {
         let fixture = try StatusFixture()
         defer { fixture.close() }
         var configuration = AppConfiguration()
@@ -17,11 +17,10 @@ final class SupervisorPresentationTests: XCTestCase {
         let model = fixture.model(configuration)
         await model.refresh()
         XCTAssertEqual(model.snapshot.phase, .setupRequired)
-        XCTAssertEqual(model.primaryActionTitle, "Enable background service")
+        XCTAssertEqual(model.primaryActionTitle, "Start Timelord")
+        XCTAssertTrue(model.canStartService)
         XCTAssertFalse(model.canControlService)
         XCTAssertNotNil(fixture.controller.errorMessage, "Keep transport diagnostics without blocking setup")
-        model.primaryAction()
-        XCTAssertEqual(model.sheet?.id, "settings")
 
         try fixture.publish(mode: "paused", phase: "paused")
         await model.refresh()

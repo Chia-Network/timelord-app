@@ -44,7 +44,7 @@ def export(args, load_yaml, generate_cert):
     if config.get("selected_network", network) != network:
         raise ValueError("Full node and root selected_network disagree")
     peer_port = port(node.get("port"), "Full node port")
-    rpc_port = port(node.get("rpc_port"), "RPC port")
+    rpc_port = port(args.rpc_port if args.rpc_port is not None else node.get("rpc_port"), "RPC port")
     try:
         host = args.node_host or detect_host()
     except OSError as error:
@@ -53,6 +53,9 @@ def export(args, load_yaml, generate_cert):
         raise ValueError("--node-host must be a reachable hostname or address")
     if not args.node_host:
         print(f"Suggested node address: {host}; use --node-host to override", file=sys.stderr)
+    rpc_host = host if args.rpc_host is None else args.rpc_host
+    if not rpc_host.strip() or rpc_host in ("0.0.0.0", "::"):
+        raise ValueError("--rpc-host must be a reachable hostname or address")
     slug = re.sub(r"[^A-Za-z0-9._-]", "-", network).strip(".-") or "network"
     output = Path(args.output or f"fullnode-{slug}-connection").expanduser()
 
@@ -64,13 +67,12 @@ def export(args, load_yaml, generate_cert):
     rpc_crt = (root / private_ca.get("crt", "config/ssl/ca/private_ca.crt")).read_bytes()
     rpc_key = (root / private_ca.get("key", "config/ssl/ca/private_ca.key")).read_bytes()
     q = lambda value: json.dumps(value, ensure_ascii=True)
-    # RPC stays on loopback by default; the consumer must establish the tunnel.
     manifest = (
         'schema_version = 1\n\n[node]\n'
         f'host = {q(host)}\nport = {peer_port}\nnetwork = {q(network)}\n'
         'server_name = "chia.net"\ncertificate = "client.crt"\n'
         'private_key = "client.key"\nca_certificate = "ca.crt"\n\n'
-        '[node.rpc]\nhost = "127.0.0.1"\nport = 18555\n'
+        f'[node.rpc]\nhost = {q(rpc_host)}\nport = {rpc_port}\n'
         'server_name = "chia.net"\ncertificate = "rpc-client.crt"\n'
         'private_key = "rpc-client.key"\nca_certificate = "private-ca.crt"\n'
     )
@@ -93,13 +95,13 @@ def export(args, load_yaml, generate_cert):
         (output / "connection.toml").write_text(manifest)
         (output / "network.json").write_text(json.dumps(provenance, indent=2) + "\n")
         (output / "README.txt").write_text(
-            f"Network: {network}\nPeer: {host}:{peer_port}\n\n"
-            "For RPC sync status, establish an SSH tunnel on the Timelord Mac:\n"
-            f"ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:18555:127.0.0.1:{rpc_port} "
-            f"NODE_SSH_LOGIN@{host}\n\n"
+            f"Network: {network}\nPeer: {host}:{peer_port}\nRPC: {rpc_host}:{rpc_port}\n\n"
+            "Both endpoints are reached from the Timelord Mac. For direct RPC,\n"
+            "the full node must listen on its reachable private-network address.\n"
+            "This bundle does not change listeners or establish an SSH tunnel.\n\n"
             "network.json preserves the selected network overrides and provenance.\n"
-            "The current app accepts only mainnet/testnet11; custom network import\n"
-            "and scheduler transition support must be implemented before use.\n"
+            "Import the entire folder in Timelord Mac, including network.json.\n"
+            "Import and handshake success do not establish consensus acceptance.\n"
         )
         for file in output.iterdir():
             file.chmod(0o600)
@@ -113,6 +115,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--chia-root", help="Chia root (default: $CHIA_ROOT)")
     parser.add_argument("--node-host", help="Address reachable from Timelord (default: suggested local route address)")
+    parser.add_argument("--rpc-host", help="RPC address reachable from Timelord (default: same as --node-host)")
+    parser.add_argument("--rpc-port", type=int, help="RPC port (default: full_node.rpc_port from Chia configuration)")
     parser.add_argument("--output", help="New output folder (default: ./fullnode-NETWORK-connection)")
     args = parser.parse_args()
     os.umask(0o077)

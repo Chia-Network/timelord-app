@@ -11,6 +11,7 @@ mod hardware;
 mod history_buffer;
 mod history_store;
 mod inventory;
+mod network;
 mod node_status;
 mod observability;
 mod operational;
@@ -49,6 +50,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Select a saved full-node connection profile without starting hardware.
+    SelectNode {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        profile: String,
+    },
     /// Create an incomplete-setup configuration; never overwrite an existing file.
     Init {
         #[arg(long)]
@@ -151,33 +159,54 @@ fn parse_config(path: &Path, text: &str) -> Result<Config> {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
         .canonicalize()?;
-    for credential in [
-        &mut config.node.certificate,
-        &mut config.node.private_key,
-        &mut config.node.ca_certificate,
-        &mut config.hardware.client_binary,
-        &mut config.hardware.driver_library,
-        &mut config.hardware.automatic_state,
-        &mut config.service.control_socket,
-    ] {
-        if let Some(relative) = credential
-            && relative.is_relative()
-        {
-            *relative = parent.join(&relative);
-        }
-    }
-    if let Some(rpc) = &mut config.node.rpc {
+    for node in std::iter::once(&mut config.node)
+        .chain(config.connections.profiles.iter_mut().map(|p| &mut p.node))
+    {
         for path in [
-            &mut rpc.certificate,
-            &mut rpc.private_key,
-            &mut rpc.ca_certificate,
-        ] {
+            &mut node.certificate,
+            &mut node.private_key,
+            &mut node.ca_certificate,
+        ]
+        .into_iter()
+        .flatten()
+        {
             if path.is_relative() {
                 *path = parent.join(&*path);
             }
         }
+        if let Some(rpc) = &mut node.rpc {
+            for path in [
+                &mut rpc.certificate,
+                &mut rpc.private_key,
+                &mut rpc.ca_certificate,
+            ] {
+                if path.is_relative() {
+                    *path = parent.join(&*path);
+                }
+            }
+        }
+    }
+    for path in [
+        &mut config.hardware.client_binary,
+        &mut config.hardware.driver_library,
+        &mut config.hardware.automatic_state,
+        &mut config.service.control_socket,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if path.is_relative() {
+            *path = parent.join(&*path);
+        }
+    }
+    if config.connections.active_id.is_none() && config.connections.profiles.is_empty() {
+        config.remember_connection().map_err(anyhow::Error::msg)?;
     }
     config.validate().map_err(anyhow::Error::msg)?;
+    network::resolve(&config.node)?;
+    for profile in &config.connections.profiles {
+        network::resolve(&profile.node)?;
+    }
     Ok(config)
 }
 
@@ -194,13 +223,19 @@ fn set_default_automatic_state(config: &mut Config, path: &Path) -> Result<()> {
 }
 
 fn save(path: &Path, config: &Config) -> Result<()> {
+    let mut config = config.clone();
+    config.remember_connection().map_err(anyhow::Error::msg)?;
     config.validate().map_err(anyhow::Error::msg)?;
+    network::resolve(&config.node)?;
+    for profile in &config.connections.profiles {
+        network::resolve(&profile.node)?;
+    }
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
-    timelord_supervisor::atomic::write(path, toml::to_string_pretty(config)?.as_bytes())
+    timelord_supervisor::atomic::write(path, toml::to_string_pretty(&config)?.as_bytes())
 }
 
 #[tokio::main]
@@ -215,6 +250,17 @@ async fn main() -> Result<()> {
         .with_writer(move || tracing_log.clone())
         .init();
     match Cli::parse().command {
+        Command::SelectNode { config, profile } => {
+            let mut updated = load(&config)?;
+            updated
+                .select_connection(&profile)
+                .map_err(anyhow::Error::msg)?;
+            save(&config, &updated)?;
+            println!(
+                "{}",
+                serde_json::json!({"saved":true,"restart_required":true})
+            );
+        }
         Command::Init { config } => {
             if let Some(parent) = config.parent().filter(|p| !p.as_os_str().is_empty()) {
                 std::fs::create_dir_all(parent)?;
@@ -388,6 +434,20 @@ struct Shared {
     runtime: Arc<Mutex<runtime::RuntimeState>>,
     started_unix: u64,
     service_started_unix: u64,
+}
+impl Shared {
+    fn persistent_owners(&self) -> bool {
+        self.runtime.lock().expect("runtime").routing.is_some()
+    }
+    fn assignments(&self) -> Vec<timelord_core::Assignment> {
+        self.runtime
+            .lock()
+            .expect("runtime")
+            .routing
+            .as_ref()
+            .unwrap_or(&self.assignments)
+            .clone()
+    }
 }
 
 impl Shared {

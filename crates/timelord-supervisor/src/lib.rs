@@ -306,20 +306,7 @@ pub fn watch_parent() -> Result<()> {
     Ok(())
 }
 
-/// Network label for supervisor monitoring.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub enum Network {
-    Mainnet,
-    Testnet11,
-}
-impl Network {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Mainnet => "mainnet",
-            Self::Testnet11 => "testnet11",
-        }
-    }
-}
+pub use timelord_core::Network;
 
 /// Generate a system-domain job without installing or loading it. The installer
 /// validates the selected account's numeric UID before performing privileged work.

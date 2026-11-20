@@ -13,6 +13,7 @@ use std::{
 };
 use timelord_core::Config;
 use timelord_supervisor::AcceptBackoff;
+use tokio::io::AsyncReadExt;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::watch,
@@ -26,6 +27,7 @@ struct Run {
     tasks: JoinSet<Result<()>>,
     store: Arc<history_store::Store>,
     history_enabled: bool,
+    owner_updates: Option<watch::Sender<Arc<Shared>>>,
 }
 
 impl Run {
@@ -92,10 +94,14 @@ async fn start_run(
     process: Arc<operational::State>,
     safety: Option<Arc<safety::Store>>,
 ) -> Result<Run> {
+    let persistent = safety.is_some();
     let hardware::Prepared {
-        assignments,
+        mut assignments,
         native,
     } = prepared;
+    if persistent {
+        assignments = crate::assignment::resolve(&config)?;
+    }
     tracing::info!(plan=?assignments, "Resolved chain assignments for this run");
     let control = config
         .service
@@ -105,6 +111,9 @@ async fn start_run(
         .transpose()?;
     let mut listeners = vec![];
     for b in &config.hardware.boards {
+        if persistent {
+            continue;
+        }
         let capacity = assignments.iter().filter(|a| a.board_id == b.id).count() as u8;
         if capacity == 0 {
             continue;
@@ -114,7 +123,7 @@ async fn start_run(
             .with_context(|| format!("Binding client listener for {}", b.id))?;
         listeners.push((b.id.clone(), capacity, listener));
     }
-    let active = config.node.certificate.is_some() && !assignments.is_empty();
+    let active = config.node.certificate.is_some() && (persistent || !assignments.is_empty());
     let tuning_paused = config.service.tuning_paused;
     let started_unix = unix_now();
     let store = Arc::new(history_store::Store::new(
@@ -132,6 +141,9 @@ async fn start_run(
             false
         }
     };
+    if persistent {
+        runtime.routing = Some(assignments.clone());
+    }
     runtime.boards = board_states.clone();
     hardware::restore_lifecycles(&config, &mut runtime.boards, safety.as_deref());
     runtime.safety = safety;
@@ -139,8 +151,12 @@ async fn start_run(
     if assignments.is_empty() {
         runtime.transition(
             "waiting_for_clients",
-            "disconnected",
-            "Connect an ASIC board to resume.",
+            "waiting_for_hardware",
+            if config.hardware.boards.is_empty() {
+                "Connect an ASIC board to resume."
+            } else {
+                "Checking ASIC board admission before connecting to the full node."
+            },
         );
     }
     let runtime = Arc::new(Mutex::new(runtime));
@@ -158,6 +174,9 @@ async fn start_run(
         started_unix,
         service_started_unix,
     });
+    if persistent {
+        shared.runtime.lock().expect("runtime").prover = Arc::downgrade(&backend);
+    }
     let (shutdown, receiver) = watch::channel(false);
     let mut tasks = JoinSet::new();
     if history_enabled {
@@ -190,16 +209,33 @@ async fn start_run(
             Ok(())
         });
     }
-    if shared.config.hardware.client_binary.is_some() {
-        let backend = backend.clone();
-        let shared = shared.clone();
-        let shutdown = receiver.clone();
-        tasks.spawn(async move {
-            hardware::run(shared, backend, shutdown)
-                .await
-                .context("ASIC supervision stopped")
-        });
-    }
+    let owner_updates = if persistent {
+        let (updates, receiver_updates) = watch::channel(shared.clone());
+        let source = shared.clone();
+        let prover = backend.clone();
+        let stopped = receiver.clone();
+        tasks.spawn(hardware::continuous::run(
+            source,
+            prover,
+            offers,
+            receiver_updates,
+            stopped,
+        ));
+        Some(updates)
+    } else {
+        if shared.config.hardware.client_binary.is_some() {
+            let backend = backend.clone();
+            let shared = shared.clone();
+            let shutdown = receiver.clone();
+            tasks.spawn(async move {
+                hardware::run(shared, backend, shutdown)
+                    .await
+                    .context("ASIC supervision stopped")
+            });
+        }
+        None
+    };
+
     if let Some(control) = control {
         let shared = shared.clone();
         let shutdown = receiver.clone();
@@ -211,6 +247,7 @@ async fn start_run(
         tasks,
         store,
         history_enabled,
+        owner_updates,
     })
 }
 
@@ -309,7 +346,8 @@ pub(crate) async fn serve(
     tokio::pin!(signal);
     let requested_config = config.clone();
     let service_started_unix = unix_now();
-    let process = operational::State::new(observability::Metrics::new(config.node.network)?);
+    let process =
+        operational::State::new(observability::Metrics::new(config.node.network.clone())?);
     process.progress.configuration(fallback);
     // Start reporting before discovery or native initialization can wait.
     let initial = Arc::new(Shared {
@@ -361,7 +399,11 @@ pub(crate) async fn serve(
                 0,
                 timelord_supervisor::progress::Stage::Discovery,
             );
-            let config = inventory::connected_configuration(config).await?;
+            let config = if safety.is_some() {
+                hardware::continuous::known_configuration(config)
+            } else {
+                inventory::connected_configuration(config).await?
+            };
             let unavailable = hardware::unavailable_for(&config, &board_states, safety.as_deref());
             let prepared = hardware::prepare_for(&config, &unavailable).await?;
             (config, prepared)
@@ -435,6 +477,31 @@ pub(crate) async fn serve(
                 continue;
             }
         };
+        if let Some(updates) = &run.owner_updates {
+            if let Ok(candidate) = candidate {
+                let config = hardware::continuous::known_configuration(candidate);
+                if serde_json::to_value(&config.hardware.boards)?
+                    != serde_json::to_value(&run.shared.config.hardware.boards)?
+                {
+                    let previous = &run.shared;
+                    let updated = Arc::new(Shared {
+                        config,
+                        native: previous.native.clone(),
+                        assignments: previous.assignments.clone(),
+                        clients: previous.clients.clone(),
+                        runtime: previous.runtime.clone(),
+                        process: previous.process.clone(),
+                        scope: previous.scope,
+                        started_unix: previous.started_unix,
+                        service_started_unix: previous.service_started_unix,
+                    });
+                    updates.send_replace(updated.clone());
+                    run.shared = updated.clone();
+                    current.send_replace(updated);
+                }
+            }
+            continue;
+        }
         let next = topology.observe(&run.shared.config, candidate);
         let unavailable = hardware::unavailable(&run.shared);
         let capacity_changed =
@@ -451,6 +518,9 @@ pub(crate) async fn serve(
     }
     run.stop().await?;
     if let Some(inventory) = inventory_task {
+        // Cancelling the isolated probe drops its kill-on-drop child. Do not
+        // wait for a blocked driver enumeration when stopping the service.
+        inventory.abort();
         let _ = inventory.await;
     }
     let _ = http_stop.send(true);
@@ -509,8 +579,14 @@ async fn client_listener_with(
             accepted=backoff.accept(listener.accept(), |error, failures, delay| {
                 tracing::warn!(%error,failures=failures,?delay,"VDF accept failed; retrying");
             })=>{
-                let Some((socket,_))=accepted else { continue; };
-                let slot={let mut connected=shared.clients.lock().expect("client state lock");let slot=(0..capacity).find(|slot|!connected.contains(&(id.clone(),*slot)));if let Some(slot)=slot {connected.insert((id.clone(),slot));}slot};
+                let Some((mut socket,_))=accepted else { continue; };
+                let physical = if shared.persistent_owners() {
+                    let mut identity = [0u8;13];
+                    if !matches!(tokio::time::timeout(Duration::from_secs(2), socket.read_exact(&mut identity)).await, Ok(Ok(_)))
+                        || &identity[..11] != b"TLENGINE 1 " || identity[12] != b'\n' || !(b'0'..=b'2').contains(&identity[11]) { continue; }
+                    Some(identity[11] - b'0')
+                } else { None };
+                let slot={let mut connected=shared.clients.lock().expect("client state lock");let slot=(0..capacity).find(|slot|physical.is_none_or(|p|p==*slot) && !connected.contains(&(id.clone(),*slot)));if let Some(slot)=slot {connected.insert((id.clone(),slot));}slot};
                 if let Some(slot)=slot {
                     if let Some(offers) = &offers {
                         let generation = {

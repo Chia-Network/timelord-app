@@ -1,0 +1,161 @@
+{
+  "date": "2026-11-15",
+  "machine": "m6mini",
+  "network": "test-2026-11-13-2-chia",
+  "hard_fork2_height": 9216,
+  "dg_xch_base": "ca437be562cec5f0514f6edd4c794adfe382dd8a",
+  "dg_xch_development_revision": "3b50863ee641c67e4c46b9a18640001e0c94833f",
+  "dg_xch_publication": "https://github.com/cameroncooper/dg_xch_utils/tree/3b50863ee641c67e4c46b9a18640001e0c94833f",
+  "patch_sha256": "e9903d1fa05509521350f0bbebd19ff515bba261e6a7dba64c087658908a9513",
+  "native_revision": "7c47cf07e575cee38c5ad56c67d391b4f131ad6b",
+  "reference_chia_revision": "9b2bc639afd56c7797cec5d5bccf5ab1bf49d178",
+  "acceptance": {
+    "first_pos2_block": 10554,
+    "unfinished_reward_hash": "db950466d49a65ec66b21eda147a5e7289760df20ead3c106dc65e9738559ba9",
+    "m6mini_submission_utc": "2026-11-15T16:32:47.106702Z",
+    "node_received_utc": "2026-11-15T16:32:47.225Z",
+    "node_peak_accepted_utc": "2026-11-15T16:32:47.412Z",
+    "source_peer_id": "e0a703da82bf07ba3eff71715fda1ba5fc167d2647359feca5645ec7fc1f55db",
+    "blocks": [
+      {
+        "height": 10554,
+        "header_hash": "57625fb441f045c67ff538452c38b3630788c24b20a947c9edf8c6d60cbfbf09",
+        "proof_version": 1
+      },
+      {
+        "height": 10556,
+        "header_hash": "4ed987b26a2ba465627f8c5a57b55b87b6e6e9350d7f2bbf5994f2062e588df3",
+        "proof_version": 1
+      },
+      {
+        "height": 10557,
+        "header_hash": "068292ea476f436ca3a9b9f9c618a55dafac01cbba2457b6b486e60d35a28f92",
+        "proof_version": 1
+      },
+      {
+        "height": 10558,
+        "header_hash": "693efdce147d2df871fcfd2117794edb64d718efe5c9865ea99efa48a13cc095",
+        "proof_version": 1
+      },
+      {
+        "height": 10565,
+        "header_hash": "3a2f07389f58f7f63f75a3457c9100148ee5260c3daa42d6d2ff9728e10e5d32",
+        "proof_version": 1
+      },
+      {
+        "height": 10567,
+        "header_hash": "9fc676c2208ec3b94df70590be48eda61392176eafec4b255848ce4fd7a30ee4",
+        "proof_version": 1
+      }
+    ]
+  },
+  "configuration_changed": false,
+  "run_intent_preserved": true,
+  "node_log_level_restored": "INFO",
+  "scope": "Post-fork mixed legacy/v2 testnet acceptance; not a controlled activation replay or sustained stability/production qualification",
+  "final_deployment": {
+    "source_commit": "905599c555ad7a07d0ecd28e17fd022d3b1e2974",
+    "supervisor_pid": 54598,
+    "mode": "running",
+    "prior_mode": "running",
+    "worker_pid": 54599,
+    "native_revision": "7c47cf07e575cee38c5ad56c67d391b4f131ad6b",
+    "configuration_unchanged": true,
+    "verified_both_app_copies": true
+  },
+  "final_acceptance": {
+    "proofs_delivered": 128,
+    "failed_proofs": 0,
+    "node_state": "ready",
+    "timelord_state": "running",
+    "worker_pid": 54599,
+    "boards": [
+      {
+        "name": "ASIC 3",
+        "hardware_state": "connected",
+        "latest_proof_unix": 1794760703,
+        "recoveries": 0
+      },
+      {
+        "name": "ASIC 1",
+        "hardware_state": "connected",
+        "latest_proof_unix": 1794760703,
+        "recoveries": 0
+      },
+      {
+        "name": "ASIC 2",
+        "hardware_state": "connected",
+        "latest_proof_unix": 1794760650,
+        "recoveries": 0
+      }
+    ],
+    "matched_pos2_blocks": [
+      {
+        "height": 10579,
+        "header_hash": "8febd1889591603dab1002857c196720f444fd80ec23abebd5671a8973766675",
+        "proof_version": 1,
+        "unfinished_reward_hash": "ea5e426ac930525bb7559aeefbb2c41ef71db7dbfde3055b1d389c78f894c096"
+      },
+      {
+        "height": 10580,
+        "header_hash": "6bb84ae4bbef7ee5054f9b6ecf8e4105585a538ffb5b2ca06d8035db3cb48596",
+        "proof_version": 1,
+        "unfinished_reward_hash": "0e024786e6441ee4beeca8b0046da385d259f3864def4f6937b6dfe5215808ab"
+      },
+      {
+        "height": 10581,
+        "header_hash": "ccb7efe6bd9b04f315432289596e3ff7380db0eb131c9338228e7a96c7d03b44",
+        "proof_version": 1,
+        "unfinished_reward_hash": "e6575e1d6a8ae9c60a30a627616428f22250438eda4be7b08379dc9edd07562a"
+      },
+      {
+        "height": 10582,
+        "header_hash": "557e18aba6fc9c28ad8a0ac0042e5f1ddd39c2c4abed31db6028d444138786ca",
+        "proof_version": 1,
+        "unfinished_reward_hash": "74bddca31b2419e8a15afa5065dcad186ca26ac5462c7ef18212cfd9b1483643"
+      },
+      {
+        "height": 10583,
+        "header_hash": "4ed69bea3c03685cdc634a0d5e0024f0aa2dbe9f41e33630a36b97675170994c",
+        "proof_version": 1,
+        "unfinished_reward_hash": "3eaa5a8206a6205815803683df3acf8085277ea7cee178dda4b38b466e148cfa"
+      },
+      {
+        "height": 10584,
+        "header_hash": "705c29612fffbf92fbaeeb76b0c0f1fb9f3a05ee8468056daa940912cdf64047",
+        "proof_version": 1,
+        "unfinished_reward_hash": "a3e6a85a1aa59082edff3415d1fbe461212f65adcf7945a97389c0d468f8e62b"
+      },
+      {
+        "height": 10585,
+        "header_hash": "6e466c9f0f69c2e7c5318c4ef9391e719a0241c76016fa209fc6cb6c0c1c5939",
+        "proof_version": 1,
+        "unfinished_reward_hash": "a504676d3e672fcba9cc0807dab4f59ae7932c06a64bf0f3e69712a2bdd56bc0"
+      },
+      {
+        "height": 10589,
+        "header_hash": "ba98286268fcae88db204c743c38703e6cf6af7aca6041bb43981730c6c6ca9a",
+        "proof_version": 1,
+        "unfinished_reward_hash": "7ed87f471cb7d26f34c56403ab8fdb49a8a2b6662622df2234556297ba3495bd"
+      }
+    ]
+  },
+  "checks": {
+    "app": "cargo fmt --check; cargo clippy --workspace --all-targets -- -D warnings; cargo test --workspace (explicit development dependency override)",
+    "swift": "swift build --package-path apps/macos",
+    "upstream": "cargo test -p dg_xch_core --features chia-hf2; cargo test -p dg_xch_timelord; cargo clippy -p dg_xch_timelord --all-targets -- -D warnings",
+    "result": "passed"
+  },
+  "observations": [
+    "One peer connection reset during verification recovered automatically within the normal five-second retry; no manual resume was required.",
+    "ASIC 2 had an FTDI shutdown stall during an intermediate install and was recovered by existing owner supervision; all three boards later delivered verified proofs."
+  ],
+  "public_dependency_pin": "3b50863ee641c67e4c46b9a18640001e0c94833f",
+  "upstream_pr": "deferred pending fork branch review",
+  "public_pin_validation": {
+    "cargo_fmt": "passed",
+    "cargo_clippy_workspace_all_targets_deny_warnings": "passed",
+    "cargo_test_workspace": "passed",
+    "dependency_source": "public Git fork; no local overrides"
+  }
+}

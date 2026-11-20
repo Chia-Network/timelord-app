@@ -6,8 +6,11 @@ pub(crate) mod lifecycle;
 use failure::classify;
 pub use failure::{NativeFailure, NativeFailureKind};
 pub use prepared::{Facts, Prepared, prepare_for};
+pub(crate) mod continuous;
 mod native;
 mod prepared;
+mod recovery;
+mod retirement;
 mod tuning;
 use crate::{
     Shared,
@@ -21,7 +24,7 @@ use native::*;
 use std::{process::Stdio, sync::Arc, time::Duration};
 use timelord_core::{BoardConfig, Config, ProfileMode};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncWriteExt, BufReader},
     process::{Child, Command},
     sync::{oneshot, watch},
     task::JoinSet,

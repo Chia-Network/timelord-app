@@ -1,6 +1,6 @@
 Timelord uses chiavdf from Chia-Network under the Apache License 2.0.
 https://github.com/Chia-Network/chiavdf
-The small native control integration is applied only to build staging.
+The pinned upstream native client is built without source modifications.
 
 The developer app bundles FT4222/D2XX libraries from Future Technology Devices
 International Ltd. (FTDI). These vendor libraries retain their own license terms.

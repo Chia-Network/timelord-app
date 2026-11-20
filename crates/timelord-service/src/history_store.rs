@@ -41,16 +41,25 @@ pub struct Snapshot {
 pub struct Store {
     path: PathBuf,
     scope: String,
+    config: Config,
 }
 
 pub fn scope(config: &Config, assignments: &[timelord_core::Assignment]) -> Result<String> {
     // Changing a node/assignment must not attribute another session's measurements.
-    let bytes = serde_json::to_vec(&(
-        config.node.network,
+    let mut bytes = serde_json::to_vec(&(
+        &config.node.network,
         &config.node.host,
         config.node.port,
         assignments,
     ))?;
+    if config.node.network_definition.is_some() {
+        let identity = timelord_core::ChainIdentity::new(
+            &config.node.network,
+            config.node.network_definition.as_ref(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        bytes.extend(serde_json::to_vec(&identity)?);
+    }
     Ok(dg_xch_core::utils::hash_256(bytes)
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -66,6 +75,7 @@ impl Store {
         Ok(Self {
             path,
             scope: scope(config, assignments)?,
+            config: config.clone(),
         })
     }
 
@@ -116,7 +126,12 @@ impl Store {
     }
 
     pub fn capture(&self, state: &RuntimeState, started: u64, now: u64) -> Snapshot {
-        Snapshot::capture(self.scope.clone(), state, started, now)
+        let current_scope = state
+            .routing
+            .as_ref()
+            .and_then(|routes| scope(&self.config, routes).ok())
+            .unwrap_or_else(|| self.scope.clone());
+        Snapshot::capture(current_scope, state, started, now)
     }
 
     pub fn checkpoint(
@@ -492,6 +507,39 @@ mod tests {
             .unwrap();
         assert!(state.archive.is_none());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn custom_genesis_or_constants_changes_start_a_new_history_scope() {
+        let mut config = Config {
+            node: crate::network::tests::node(),
+            ..Default::default()
+        };
+        let original = scope(&config, &[]).unwrap();
+        let definition = config.node.network_definition.as_mut().unwrap();
+        definition.exported_at = "another export".into();
+        definition.chia_version = "another version".into();
+        definition
+            .config_overrides
+            .insert("address_prefix".into(), "another-prefix".to_owned().into());
+        assert_eq!(scope(&config, &[]).unwrap(), original);
+        config
+            .node
+            .network_definition
+            .as_mut()
+            .unwrap()
+            .constants
+            .insert("GENESIS_CHALLENGE".into(), "cd".repeat(32).into());
+        assert_ne!(scope(&config, &[]).unwrap(), original);
+        config.node = crate::network::tests::node();
+        config
+            .node
+            .network_definition
+            .as_mut()
+            .unwrap()
+            .constants
+            .insert("SUB_SLOT_ITERS_STARTING".into(), 67108864.into());
+        assert_ne!(scope(&config, &[]).unwrap(), original);
     }
 
     #[test]

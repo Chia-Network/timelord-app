@@ -329,6 +329,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "chia-pos2"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d1c74b1f37e9188c5f2e2b8bd0d389708fe4027b284a6b2bbb3809c727d8a19"
+dependencies = [
+ "cc",
+ "serde",
+ "serde-big-array",
+]
+
+[[package]]
 name = "cipher"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -534,7 +545,7 @@ dependencies = [
 [[package]]
 name = "dg_parser_macro"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/cameroncooper/dg_xch_utils?rev=3b50863ee641c67e4c46b9a18640001e0c94833f#3b50863ee641c67e4c46b9a18640001e0c94833f"
 dependencies = [
  "bytes",
  "dg_xch_serialize",
@@ -548,7 +559,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_clients"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/cameroncooper/dg_xch_utils?rev=3b50863ee641c67e4c46b9a18640001e0c94833f#3b50863ee641c67e4c46b9a18640001e0c94833f"
 dependencies = [
  "async-trait",
  "blst",
@@ -573,11 +584,12 @@ dependencies = [
 [[package]]
 name = "dg_xch_core"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/cameroncooper/dg_xch_utils?rev=3b50863ee641c67e4c46b9a18640001e0c94833f#3b50863ee641c67e4c46b9a18640001e0c94833f"
 dependencies = [
  "async-trait",
  "blst",
  "bytes",
+ "chia-pos2",
  "const-hex",
  "der",
  "dg_parser_macro",
@@ -616,7 +628,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_keys"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/cameroncooper/dg_xch_utils?rev=3b50863ee641c67e4c46b9a18640001e0c94833f#3b50863ee641c67e4c46b9a18640001e0c94833f"
 dependencies = [
  "bech32",
  "bip39",
@@ -632,7 +644,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_macros"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/cameroncooper/dg_xch_utils?rev=3b50863ee641c67e4c46b9a18640001e0c94833f#3b50863ee641c67e4c46b9a18640001e0c94833f"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -643,7 +655,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_pos"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/cameroncooper/dg_xch_utils?rev=3b50863ee641c67e4c46b9a18640001e0c94833f#3b50863ee641c67e4c46b9a18640001e0c94833f"
 dependencies = [
  "dg_xch_core",
  "dg_xch_pos1",
@@ -655,7 +667,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_pos1"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/cameroncooper/dg_xch_utils?rev=3b50863ee641c67e4c46b9a18640001e0c94833f#3b50863ee641c67e4c46b9a18640001e0c94833f"
 dependencies = [
  "async-trait",
  "blake3",
@@ -680,7 +692,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_pos2"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/cameroncooper/dg_xch_utils?rev=3b50863ee641c67e4c46b9a18640001e0c94833f#3b50863ee641c67e4c46b9a18640001e0c94833f"
 dependencies = [
  "aes",
  "blake3",
@@ -691,12 +703,12 @@ dependencies = [
 [[package]]
 name = "dg_xch_pos_common"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/cameroncooper/dg_xch_utils?rev=3b50863ee641c67e4c46b9a18640001e0c94833f#3b50863ee641c67e4c46b9a18640001e0c94833f"
 
 [[package]]
 name = "dg_xch_puzzles"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/cameroncooper/dg_xch_utils?rev=3b50863ee641c67e4c46b9a18640001e0c94833f#3b50863ee641c67e4c46b9a18640001e0c94833f"
 dependencies = [
  "blst",
  "dg_parser_macro",
@@ -714,7 +726,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_serialize"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/cameroncooper/dg_xch_utils?rev=3b50863ee641c67e4c46b9a18640001e0c94833f#3b50863ee641c67e4c46b9a18640001e0c94833f"
 dependencies = [
  "log",
  "serde",
@@ -724,7 +736,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_servers"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/cameroncooper/dg_xch_utils?rev=3b50863ee641c67e4c46b9a18640001e0c94833f#3b50863ee641c67e4c46b9a18640001e0c94833f"
 dependencies = [
  "async-trait",
  "blst",
@@ -753,7 +765,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_timelord"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/cameroncooper/dg_xch_utils?rev=3b50863ee641c67e4c46b9a18640001e0c94833f#3b50863ee641c67e4c46b9a18640001e0c94833f"
 dependencies = [
  "dg_xch_core",
  "dg_xch_pos",
@@ -771,7 +783,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_vdf"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/cameroncooper/dg_xch_utils?rev=3b50863ee641c67e4c46b9a18640001e0c94833f#3b50863ee641c67e4c46b9a18640001e0c94833f"
 dependencies = [
  "dg_xch_core",
  "gmp-mpfr-sys",
@@ -2205,6 +2217,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde-big-array"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11fc7cc2c76d73e0f27ee52abbd64eec84d46f370c88371120433196934e4b7f"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "serde_core"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2567,6 +2588,7 @@ name = "timelord-core"
 version = "1.0.0"
 dependencies = [
  "serde",
+ "serde_json",
  "toml",
 ]
 
@@ -2617,6 +2639,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "timelord-core",
  "tokio",
 ]
 

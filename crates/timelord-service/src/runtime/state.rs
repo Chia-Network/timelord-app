@@ -50,6 +50,9 @@ pub struct HardwareState {
     #[serde(skip)]
     pub temperature_samples: u64,
     pub automatic: Option<crate::automatic::Status>,
+    pub recovery_reason: Option<String>,
+    pub retry_after_unix: Option<u64>,
+    pub native_pid: Option<u32>,
 }
 impl HardwareState {
     pub fn fault(&mut self, error: &anyhow::Error) {
@@ -104,6 +107,8 @@ impl RuntimeScope {
 pub struct RuntimeState {
     pub experiments: Arc<crate::experiments::Gate>,
     pub safety: Option<Arc<crate::safety::Store>>,
+    pub routing: Option<Vec<timelord_core::Assignment>>,
+    pub prover: std::sync::Weak<crate::asic::AsicBackend>,
     scope: RuntimeScope,
     pub metric_epoch: u64,
     pub pending: [u32; 3],
@@ -130,6 +135,8 @@ impl RuntimeState {
             scope: RuntimeScope::Production,
             experiments: Default::default(),
             safety: None,
+            routing: None,
+            prover: Default::default(),
             metric_epoch: 0,
             pending: [0; 3],
             scheduler_initialized: false,
