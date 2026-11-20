@@ -82,7 +82,7 @@ pub async fn connect(config: &Config) -> Result<Socket> {
         &mut socket,
         encode(
             ProtocolMessageTypes::Handshake,
-            &handshake(&network, NodeType::Timelord, 0),
+            &timelord_handshake(&network),
             None,
         )?,
     )
@@ -98,6 +98,17 @@ pub async fn connect(config: &Config) -> Result<Socket> {
     let greeting: Handshake = decode_exact(message.data.as_slice())?;
     validate_handshake(message.msg_type, &greeting, &network)?;
     Ok(socket)
+}
+fn timelord_handshake(network: &str) -> Handshake {
+    let mut greeting = handshake(network, NodeType::Timelord, 0);
+    if !greeting
+        .capabilities
+        .iter()
+        .any(|capability| capability.0 == 6)
+    {
+        greeting.capabilities.push((6, "1".to_owned()));
+    }
+    greeting
 }
 pub fn validate_handshake(
     kind: ProtocolMessageTypes,
@@ -554,6 +565,10 @@ pub async fn run(
     }
     backend.stop_all().await;
 }
+
+#[cfg(test)]
+#[path = "runtime/tests.rs"]
+mod capability_tests;
 
 #[cfg(test)]
 mod tests {

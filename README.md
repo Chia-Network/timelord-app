@@ -170,8 +170,9 @@ The November 15 HF2 development build supports current Chia PoS2 proofs and acti
 header/sub-epoch MMR roots. Its m6mini testnet deployment produced infusion proofs
 that the full node accepted into PoS2 blocks. See
 [integration evidence](integrations/dg-xch/hf2-testnet-deployment.json).
-The app maintains three [vendored dg_xch crates](integrations/dg-xch/VENDORING.md).
-Other dg_xch dependencies remain pinned to the original upstream revision.
+The app maintains two [vendored dg_xch crates](integrations/dg-xch/VENDORING.md).
+Other dg_xch dependencies, including `dg_xch_servers`, remain pinned to the
+original upstream revision.
 Normal Cargo checks and builds require no fork or local overrides. Offline
 fixtures and this post-fork trial do not establish activation replay, sustained
 hardware stability or production compatibility.

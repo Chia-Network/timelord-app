@@ -1,17 +1,17 @@
 # Maintaining the dg_xch vendor copies
 
-The app owns three crates under `vendor/`: core, servers and timelord. They are
-normal Cargo workspace members, tested by the app CI. Root `[patch]` entries
-replace the original Git packages throughout the dependency graph. Unchanged
-crates remain on upstream revision `ca437be562cec5f0514f6edd4c794adfe382dd8a`.
-No custom build-time patching, sibling checkout or fork download is required.
+The app owns two crates under `vendor/`: core and timelord. They are normal Cargo
+workspace members, tested by the app CI. Root `[patch]` entries replace those
+original Git packages throughout the dependency graph. `servers` is no longer
+vendored; `dg_xch_servers` comes from the unchanged upstream revision
+`ca437be562cec5f0514f6edd4c794adfe382dd8a`. No custom build-time patching,
+sibling checkout or fork download is required.
 
 `vendor-origin.json` records the imported HF2 snapshot, original upstream base,
 source-file checksums and mechanical import adjustments. The initial import is
 commit `69eeaa4`; later commits contain the maintained modifications. Licenses are
-retained in each crate. The shared loopback test helper and chain-definition
-fixture are copied under `vendor/tests` and `vendor/config`; these are test data,
-not additional vendored crates. Upstream crate READMEs are retained as historical
+retained in each crate. The chain-definition fixture is copied under
+`vendor/config`; this is test data, not an additional vendored crate. Upstream crate READMEs are retained as historical
 source documentation; use the app README for supported builds and operation.
 
 ## Local compatibility changes
@@ -45,11 +45,11 @@ current Chia consensus. Native ASIC proving and verification remain separate.
 
 1. Fetch a proposed upstream revision into an explicit temporary checkout. Never
    edit Cargo's source cache or infer a nearby checkout.
-2. Compare its three crate directories against the recorded source revision and
+2. Compare its core and timelord crate directories against the recorded source revision and
    the maintained vendor diff. Port relevant changes as reviewable commits; do
    not overwrite local fixes or replace all dependencies with a moving branch.
 3. Preserve package names, versions, licenses and authorship. Keep explicit
-   package metadata, local core/server paths and exact Git pins for other crates.
+   package metadata, the local core path and exact Git pins for other crates.
    Include any required test fixtures/helpers, and record their source hashes.
 4. Update provenance deliberately when adopting a new baseline. Keep the prior
    origin record in Git history. Update the unchanged dependency pin only after

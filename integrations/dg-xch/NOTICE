@@ -1,5 +1,6 @@
-Timelord Mac maintains vendored copies of dg_xch_core, dg_xch_servers and
-dg_xch_timelord from GalactechsLLC dg_xch_utils (Apache License 2.0).
+Timelord Mac maintains vendored copies of dg_xch_core and dg_xch_timelord from
+GalactechsLLC dg_xch_utils (Apache License 2.0). dg_xch_servers comes from the
+unchanged upstream Git pin below.
 Imported compatibility snapshot: 3b50863ee641c67e4c46b9a18640001e0c94833f
 https://github.com/cameroncooper/dg_xch_utils
 Original upstream and unchanged dependency pin:

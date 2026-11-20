@@ -158,7 +158,15 @@ fn chia_wire_hash_quality_and_iteration_vectors() {
 }
 #[test]
 fn capability_is_scoped_to_timelord_role() {
-    let enabled = dg_xch_servers::transport::handshake("mainnet", NodeType::Timelord, 0);
+    let enabled = dg_xch_timelord::service::timelord_handshake("mainnet");
+    assert_eq!(
+        enabled
+            .capabilities
+            .iter()
+            .filter(|capability| capability.0 == 6)
+            .count(),
+        1
+    );
     assert!(enabled.capabilities.contains(&(6, "1".to_owned())));
     let other = dg_xch_servers::transport::handshake("mainnet", NodeType::FullNode, 0);
     assert!(!other.capabilities.iter().any(|c| c.0 == 6));

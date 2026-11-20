@@ -9,7 +9,7 @@ origin = json.loads((root / "integrations/dg-xch/vendor-origin.json").read_text(
 metadata = json.loads(subprocess.check_output(
     ["cargo", "metadata", "--locked", "--format-version", "1"], cwd=root
 ))
-vendored = {"dg_xch_core": "core", "dg_xch_timelord": "timelord", "dg_xch_servers": "servers"}
+vendored = {"dg_xch_core": "core", "dg_xch_timelord": "timelord"}
 for name, directory in vendored.items():
     packages = [p for p in metadata["packages"] if p["name"] == name]
     assert len(packages) == 1, f"Expected one {name}, found {len(packages)}"
@@ -17,9 +17,14 @@ for name, directory in vendored.items():
     expected = root / "integrations/dg-xch/vendor" / directory / "Cargo.toml"
     assert Path(package["manifest_path"]).resolve() == expected, name
     assert package["source"] is None, name
+servers = [p for p in metadata["packages"] if p["name"] == "dg_xch_servers"]
+assert len(servers) == 1, f"Expected one dg_xch_servers, found {len(servers)}"
+servers_source = servers[0]["source"] or ""
+assert servers_source.startswith("git+https://github.com/GalactechsLLC/dg_xch_utils?"), "dg_xch_servers"
+assert servers_source.endswith("#" + origin["upstream_base"]), "dg_xch_servers"
 for package in metadata["packages"]:
     if package["name"].startswith("dg_") and package["name"] not in vendored:
         source = package["source"] or ""
         assert source.startswith("git+https://github.com/GalactechsLLC/dg_xch_utils?"), package["name"]
         assert source.endswith("#" + origin["upstream_base"]), package["name"]
-print("Verified three vendored crates and unchanged upstream dependency pin")
+print("Verified two vendored crates and unchanged upstream dependency pin")

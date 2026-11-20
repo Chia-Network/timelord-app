@@ -1,9 +1,10 @@
 # Rust timelord integration
 
-The app maintains `core`, `servers` and `timelord` under `vendor/`, imported
-from compatibility snapshot `3b50863ee641c67e4c46b9a18640001e0c94833f` and
-modified in this repository. Unchanged dependencies use original upstream
-revision `ca437be562cec5f0514f6edd4c794adfe382dd8a`, Apache-2.0.
+The app maintains `core` and `timelord` under `vendor/`, imported from
+compatibility snapshot `3b50863ee641c67e4c46b9a18640001e0c94833f` and modified in
+this repository. `servers` is not vendored; it and other unchanged dependencies
+use original upstream revision `ca437be562cec5f0514f6edd4c794adfe382dd8a`,
+Apache-2.0.
 See [VENDORING.md](VENDORING.md), vendor-origin.json, upstream.toml, LICENSE,
 NOTICE and Cargo.lock for maintenance instructions and exact provenance.
 
