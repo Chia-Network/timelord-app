@@ -28,7 +28,13 @@ source documentation; use the app README for supported builds and operation.
 - Unknown transaction context is retained. An invariant iteration target can be
   used immediately; ambiguous candidates enter a bounded queue and are retried on
   each new peak. Stale/reorged candidates are discarded through ordinary checks.
-  Signage work continues while candidate context is missing.
+  Signage work continues while candidate context is missing. For an unknown
+  previous transaction height, the scheduler computes the target at a sound lower
+  bound and only defers if a filter-schedule boundary in `(lower, upper]` changes
+  it; `upper` is the peak height, so a boundary at the candidate height does not
+  defer. The lower bound is the last accepted transaction block's height and is
+  kept across contiguous peaks or a non-contiguous peak whose reward history
+  contains that block's hash; otherwise it resets to zero (unknown).
 - The RPC space-estimate parser uses serde_json's number representation so the
   app's arbitrary-precision feature does not break upstream floating-point inputs.
 - Core's optional `sqlx` dependency, its `mysql`, `postgres` and `sqlite`

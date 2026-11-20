@@ -243,6 +243,17 @@ pub fn validate_timelord_filter_parameters(c: &ConsensusConstants) -> Result<(),
     }
     Ok(())
 }
+/// The previous transaction block's height, exactly when known, otherwise its sound range.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct TxContext {
+    /// The exact previous transaction height, when the chain state provides it.
+    pub known: Option<u32>,
+    /// Lower bound for the previous transaction height when `known` is `None`.
+    pub lower: u32,
+    /// Upper bound for the previous transaction height (the peak height).
+    pub upper: u32,
+}
+
 /// When transaction context is unknown, trust only a target invariant over all possible schedules.
 pub fn timelord_iterations_with_context(
     c: &ConsensusConstants,
@@ -250,19 +261,19 @@ pub fn timelord_iterations_with_context(
     quality: Bytes32,
     difficulty: u64,
     signage: Bytes32,
-    previous: Option<u32>,
-    upper: u32,
+    context: TxContext,
 ) -> Result<Option<u64>, Error> {
-    if let Some(h) = previous {
+    if let Some(h) = context.known {
         return calculate_timelord_iterations(c, pos, quality, difficulty, signage, h).map(Some);
     }
-    let target = calculate_timelord_iterations(c, pos, quality, difficulty, signage, 0)?;
+    let target =
+        calculate_timelord_iterations(c, pos, quality, difficulty, signage, context.lower)?;
     if pos.version == 1 {
         for offset in c.plot_filter_v2_relative_height.entries() {
             if let Some(h) = c
                 .hard_fork2_height
                 .checked_add(*offset)
-                .filter(|h| *h <= upper)
+                .filter(|h| context.lower < *h && *h <= context.upper)
                 && calculate_timelord_iterations(c, pos, quality, difficulty, signage, h)? != target
             {
                 return Ok(None);

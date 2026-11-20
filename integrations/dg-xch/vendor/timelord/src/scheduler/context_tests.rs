@@ -65,9 +65,60 @@ fn a_new_peak_retries_deferred_candidates_without_stopping_other_work() {
     let mut later = peak;
     later.reward_chain_block.height += 2;
     later.reward_chain_block.is_transaction_block = false;
+    scheduler
+        .retry_outcomes
+        .push((Bytes32::default(), Ok(Admission::Stale)));
     assert!(scheduler.set_peak(later).unwrap());
     assert_eq!(scheduler.transaction_height, None);
+    assert!(
+        scheduler.retry_outcomes.is_empty(),
+        "a peak replaces the previous peak's retry outcomes"
+    );
     assert!(scheduler.next_plan().unwrap().is_some());
+}
+
+#[test]
+fn a_noncontiguous_peak_only_keeps_an_ancestor_transaction_lower_bound() {
+    let data: serde_json::Value =
+        serde_json::from_str(include_str!("../../tests/fixtures/chia_hf2.json")).unwrap();
+    let sequence = data["peer_sequence"].as_array().unwrap();
+    let raw = bytes(sequence[0]["bytes"].as_str().unwrap());
+    let peak = NewPeakTimelord::from_bytes(
+        &mut Cursor::new(raw.as_slice()),
+        ChiaProtocolVersion::default(),
+    )
+    .unwrap();
+    let mut c = dg_xch_core::consensus::constants::MAINNET;
+    c.min_plot_size = 18;
+    c.hard_fork_height = 0;
+    c.epoch_blocks = 768;
+    c.hard_fork2_height = 9216;
+    c.number_zero_bits_plot_filter_v2 = 7;
+    c.max_plot_strength = 9;
+    c.difficulty_constant_factor = 10052721566054;
+    let mut scheduler = Scheduler::new(c, false, None).unwrap();
+    assert!(scheduler.set_peak(peak.clone()).unwrap());
+
+    let ancestor = peak.previous_reward_challenges[0].0;
+    scheduler.last_transaction = Some((10_000, ancestor));
+    scheduler.transaction_height = None;
+    let mut contiguous_history = peak.clone();
+    contiguous_history.reward_chain_block.height += 2;
+    contiguous_history.reward_chain_block.is_transaction_block = false;
+    assert!(scheduler.set_peak(contiguous_history).unwrap());
+    assert_eq!(scheduler.last_transaction, Some((10_000, ancestor)));
+
+    let unrelated = Bytes32::from([0xAB; 32]);
+    scheduler.last_transaction = Some((10_001, unrelated));
+    scheduler.transaction_height = None;
+    let mut unrelated_history = peak;
+    unrelated_history.reward_chain_block.height += 4;
+    unrelated_history.reward_chain_block.is_transaction_block = false;
+    assert!(scheduler.set_peak(unrelated_history).unwrap());
+    assert_eq!(
+        scheduler.last_transaction, None,
+        "a non-ancestor transaction block cannot bound the next candidate"
+    );
 }
 
 #[test]
@@ -109,7 +160,7 @@ fn full_deferral_queue_reports_the_shed_candidate() {
         state.total_iters = 0;
         state.difficulty = candidate.difficulty;
         state.sub_slot_iters = candidate.sub_slot_iters;
-        state.height = Some(12287);
+        state.height = Some(12288);
     }
     scheduler.transaction_height = None;
     assert_eq!(

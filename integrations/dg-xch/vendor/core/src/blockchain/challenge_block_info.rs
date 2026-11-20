@@ -3,11 +3,12 @@ use crate::blockchain::proof_of_space::ProofOfSpace;
 use crate::blockchain::sized_bytes::{Bytes32, Bytes96};
 use crate::blockchain::vdf_info::VdfInfo;
 use crate::utils::hash_256;
+use dg_xch_macros::ChiaSerial;
 use dg_xch_serialize::{ChiaProtocolVersion, ChiaSerialize};
 use serde::{Deserialize, Serialize};
 use std::io::Error;
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
+#[derive(ChiaSerial, Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub struct ChallengeBlockInfo {
     pub proof_of_space: ProofOfSpace,
     pub challenge_chain_sp_vdf: Option<VdfInfo>,
@@ -40,40 +41,38 @@ impl ChallengeBlockInfo {
     }
 }
 
-impl ChiaSerialize for ChallengeBlockInfo {
-    fn to_bytes(&self, version: ChiaProtocolVersion) -> Result<Vec<u8>, Error> {
-        let mut bytes = Vec::new();
-        self.append_bytes(&mut bytes, version)?;
-        Ok(bytes)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blockchain::class_group_element::ClassgroupElement;
+    use crate::blockchain::proof_of_space::ProofBytes;
+    use crate::blockchain::sized_bytes::Bytes48;
+
+    fn sample() -> ChallengeBlockInfo {
+        let output = ClassgroupElement::get_default_element();
+        ChallengeBlockInfo {
+            proof_of_space: ProofOfSpace::v1(
+                Bytes32::default(),
+                Some(Bytes48::default()),
+                None,
+                Bytes48::default(),
+                32,
+                ProofBytes::from(vec![0x80]),
+            ),
+            challenge_chain_sp_vdf: Some(VdfInfo::new(Bytes32::default(), 7, output)),
+            challenge_chain_sp_signature: Bytes96::default(),
+            challenge_chain_ip_vdf: VdfInfo::new(Bytes32::default(), 11, output),
+        }
     }
-    fn append_bytes(&self, bytes: &mut Vec<u8>, version: ChiaProtocolVersion) -> Result<(), Error> {
-        self.append_fields(bytes, version, ProofEncoding::Wire)
-    }
-    fn from_bytes(
-        bytes: &mut std::io::Cursor<&[u8]>,
-        version: ChiaProtocolVersion,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            proof_of_space: ChiaSerialize::from_bytes(bytes, version)?,
-            challenge_chain_sp_vdf: ChiaSerialize::from_bytes(bytes, version)?,
-            challenge_chain_sp_signature: ChiaSerialize::from_bytes(bytes, version)?,
-            challenge_chain_ip_vdf: ChiaSerialize::from_bytes(bytes, version)?,
-        })
-    }
-}
-impl From<&ChallengeBlockInfo> for crate::clvm::sexp::SExp<'static> {
-    fn from(v: &ChallengeBlockInfo) -> Self {
-        (&[
-            crate::clvm::sexp::SExp::from(&v.proof_of_space),
-            crate::clvm::sexp::SExp::from(&v.challenge_chain_sp_vdf),
-            crate::clvm::sexp::SExp::from(&v.challenge_chain_sp_signature),
-            crate::clvm::sexp::SExp::from(&v.challenge_chain_ip_vdf),
-        ])
-            .into()
-    }
-}
-impl From<ChallengeBlockInfo> for crate::clvm::sexp::SExp<'static> {
-    fn from(v: ChallengeBlockInfo) -> Self {
-        Self::from(&v)
+
+    #[test]
+    fn wire_fields_match_derived_to_bytes() {
+        let value = sample();
+        let version = ChiaProtocolVersion::default();
+        let mut fields = Vec::new();
+        value
+            .append_fields(&mut fields, version, ProofEncoding::Wire)
+            .unwrap();
+        assert_eq!(fields, value.to_bytes(version).unwrap());
     }
 }

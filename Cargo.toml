@@ -36,6 +36,8 @@ tokio-tungstenite = "0.28"
 lto = "thin"
 codegen-units = 1
 
+# Redirect the upstream Git packages to the maintained vendor copies throughout the graph.
+# Only core and timelord are vendored; see integrations/dg-xch/VENDORING.md.
 [patch."https://github.com/GalactechsLLC/dg_xch_utils"]
 dg_xch_core = { path = "integrations/dg-xch/vendor/core" }
 dg_xch_timelord = { path = "integrations/dg-xch/vendor/timelord" }

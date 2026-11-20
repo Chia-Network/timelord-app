@@ -128,6 +128,7 @@ pub struct Scheduler {
     generation: u64,
     last_peak: Option<Bytes32>,
     transaction_height: Option<u32>,
+    last_transaction: Option<(u32, Bytes32)>,
     rewards: VecDeque<(Bytes32, u128)>,
     candidates: BTreeMap<[u8; 32], Candidate>,
     deferred: BTreeMap<[u8; 32], NewUnfinishedBlockTimelord>,
@@ -169,6 +170,7 @@ impl Scheduler {
             generation: 0,
             last_peak: None,
             transaction_height: None,
+            last_transaction: None,
             rewards: VecDeque::new(),
             candidates: BTreeMap::new(),
             deferred: BTreeMap::new(),
@@ -231,6 +233,7 @@ impl Scheduler {
         }
         self.reset_generation()?;
         self.transaction_height = Some(0);
+        self.last_transaction = Some((0, message.genesis_challenge));
         self.rewards.push_back((message.genesis_challenge, 0));
         self.state = Some(State {
             total_iters: 0,
@@ -343,11 +346,13 @@ impl Scheduler {
             .state
             .as_ref()
             .is_some_and(|state| state.new_epoch && state.slot_start == slot_start);
-        if block.is_transaction_block {
-            self.transaction_height = Some(block.height);
-        } else if !contiguous {
-            self.transaction_height = None;
-        }
+        self.update_transaction_context(
+            block.is_transaction_block,
+            block.height,
+            hash,
+            &rewards,
+            contiguous,
+        );
         self.reset_generation()?;
         self.last_peak = Some(hash);
         self.rewards = rewards;
@@ -381,6 +386,7 @@ impl Scheduler {
         // Every new peak re-evaluates deferred work. Old/reorged candidates are
         // discarded by the normal state checks, without stopping other work.
         let deferred = std::mem::take(&mut self.deferred);
+        self.retry_outcomes.clear();
         for (key, candidate) in deferred {
             let result = self
                 .admit_unfinished(candidate)

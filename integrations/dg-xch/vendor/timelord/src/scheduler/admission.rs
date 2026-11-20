@@ -32,8 +32,37 @@ impl Scheduler {
         self.add_unfinished_hashed(message, hash)
     }
 
+    /// Retry outcomes from the most recent peak only; they are cleared on every new peak.
     pub fn take_retry_outcomes(&mut self) -> Vec<(Bytes32, Result<Admission, String>)> {
         std::mem::take(&mut self.retry_outcomes)
+    }
+
+    fn transaction_lower(&self) -> u32 {
+        self.last_transaction.map_or(0, |(height, _)| height)
+    }
+
+    pub(super) fn update_transaction_context(
+        &mut self,
+        is_transaction_block: bool,
+        height: u32,
+        hash: Bytes32,
+        rewards: &VecDeque<(Bytes32, u128)>,
+        contiguous: bool,
+    ) {
+        if is_transaction_block {
+            self.transaction_height = Some(height);
+            self.last_transaction = Some((height, hash));
+            return;
+        }
+        if !contiguous {
+            self.transaction_height = None;
+        }
+        let ancestor = self
+            .last_transaction
+            .is_some_and(|(_, last)| rewards.iter().any(|(reward, _)| *reward == last));
+        if !contiguous && !ancestor {
+            self.last_transaction = None;
+        }
     }
 
     fn add_unfinished_hashed(
@@ -98,8 +127,11 @@ impl Scheduler {
                 quality,
                 message.difficulty,
                 signage_hash,
-                self.transaction_height,
-                height,
+                dg_xch_core::consensus::pot_iterations::TxContext {
+                    known: self.transaction_height,
+                    lower: self.transaction_lower(),
+                    upper: height.saturating_sub(1),
+                },
             )?
         else {
             if self.deferred.len() < self.reward_limit() {
