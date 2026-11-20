@@ -1,3 +1,4 @@
+// Modified by Chia Network for timelord-app; see integrations/dg-xch/VENDORING.md
 pub mod block_filter;
 // Block validation and production verify BLS signatures on their main paths; they are only
 // available with the `bls` feature (default-on). A `bls`-less build keeps the pure data/wire

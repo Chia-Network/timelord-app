@@ -12,5 +12,9 @@ consensus encodings, candidate failure isolation and validated filter schedules.
 See vendor-origin.json, VENDORING.md, crate licenses and Git history for provenance.
 The app maintains the native-client adapter and application lifecycle separately.
 
+Vendored files changed from the imported source carry a "Modified by Chia Network"
+header, and files added locally carry an "Added by Chia Network" header. Any
+future edit to an unmodified vendored file must add the header.
+
 PoS2 witness verification uses Chia Network chia-pos2 1.0.0 (Apache-2.0),
 https://github.com/Chia-Network/pos2.

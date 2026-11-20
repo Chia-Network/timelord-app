@@ -1,3 +1,4 @@
+# Modified by Chia Network for timelord-app; see integrations/dg-xch/VENDORING.md
 [package]
 name = "dg_xch_core"
 description = "Core library containing type/error definitions, CLVM tools, Consensus and Pool definitions"

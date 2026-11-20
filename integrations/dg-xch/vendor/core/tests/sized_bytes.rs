@@ -1,3 +1,4 @@
+// Modified by Chia Network for timelord-app; see integrations/dg-xch/VENDORING.md
 macro_rules! test_bytes {
     ($($name:ident, $size:expr, $bad:ident, $large:ident),* $(,)?) => {
         $(

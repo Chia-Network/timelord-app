@@ -1,3 +1,4 @@
+// Added by Chia Network for timelord-app; see integrations/dg-xch/VENDORING.md
 use super::*;
 
 /// Result of offering an unfinished block to the scheduler.

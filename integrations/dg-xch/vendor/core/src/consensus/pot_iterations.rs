@@ -1,3 +1,4 @@
+// Modified by Chia Network for timelord-app; see integrations/dg-xch/VENDORING.md
 use crate::blockchain::proof_of_space::ProofOfSpace;
 use crate::blockchain::sized_bytes::Bytes32;
 use crate::consensus::constants::ConsensusConstants;

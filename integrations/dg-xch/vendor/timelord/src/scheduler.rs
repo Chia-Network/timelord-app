@@ -1,3 +1,4 @@
+// Modified by Chia Network for timelord-app; see integrations/dg-xch/VENDORING.md
 use crate::worker::{ProofRequest, ProofResult};
 use dg_xch_core::blockchain::challenge_block_info::ChallengeBlockInfo;
 use dg_xch_core::blockchain::challenge_chain_subslot::ChallengeChainSubSlot;

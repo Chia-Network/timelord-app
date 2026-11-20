@@ -1,3 +1,4 @@
+// Added by Chia Network for timelord-app; see integrations/dg-xch/VENDORING.md
 //! Chia packs presence of two optional trailing fields into bits 0 and 1.
 use dg_xch_serialize::{ChiaProtocolVersion, ChiaSerialize};
 use std::io::{Cursor, Error, ErrorKind};

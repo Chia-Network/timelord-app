@@ -1,3 +1,4 @@
+// Modified by Chia Network for timelord-app; see integrations/dg-xch/VENDORING.md
 pub mod announcement;
 pub mod block_record;
 pub mod blockchain_state;

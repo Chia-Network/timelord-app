@@ -1,3 +1,4 @@
+// Added by Chia Network for timelord-app; see integrations/dg-xch/VENDORING.md
 //! Validated bounded schedule. Ordering and length are owned by consensus.
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::io::{Error, ErrorKind};

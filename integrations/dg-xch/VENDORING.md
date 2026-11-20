@@ -14,6 +14,10 @@ retained in each crate. The chain-definition fixture is copied under
 `vendor/config`; this is test data, not an additional vendored crate. Upstream crate READMEs are retained as historical
 source documentation; use the app README for supported builds and operation.
 
+Vendored files changed from the imported source carry a "Modified by Chia Network"
+header, and files added locally carry an "Added by Chia Network" header. Any
+future edit to an unmodified vendored file must add the header.
+
 ## Local compatibility changes
 
 - PoS2 witness checks use the official `chia-pos2` crate. Consensus field writers

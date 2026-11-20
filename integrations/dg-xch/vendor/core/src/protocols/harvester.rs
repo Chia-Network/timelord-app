@@ -1,3 +1,4 @@
+// Modified by Chia Network for timelord-app; see integrations/dg-xch/VENDORING.md
 use crate::blockchain::proof_of_space::ProofOfSpace;
 use crate::blockchain::reward_chain_block_unfinished::RewardChainBlockUnfinished;
 use crate::blockchain::sized_bytes::{Bytes32, Bytes48, Bytes96};

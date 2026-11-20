@@ -1,3 +1,4 @@
+// Modified by Chia Network for timelord-app; see integrations/dg-xch/VENDORING.md
 use crate::blockchain::sized_bytes::Bytes32;
 use std::fmt::Display;
 use std::str::FromStr;

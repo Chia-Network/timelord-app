@@ -1,3 +1,4 @@
+# Modified by Chia Network for timelord-app; see integrations/dg-xch/VENDORING.md
 [package]
 name = "dg_xch_timelord"
 description = "Native CPU VDF workers and authenticated regular and compact timelord services"

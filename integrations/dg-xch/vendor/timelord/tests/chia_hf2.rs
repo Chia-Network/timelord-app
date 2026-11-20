@@ -1,3 +1,4 @@
+// Modified by Chia Network for timelord-app; see integrations/dg-xch/VENDORING.md
 use dg_xch_core::{
     blockchain::{
         challenge_block_info::ChallengeBlockInfo, proof_of_space::ProofOfSpace,

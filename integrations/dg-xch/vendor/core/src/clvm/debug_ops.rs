@@ -1,3 +1,4 @@
+// Modified by Chia Network for timelord-app; see integrations/dg-xch/VENDORING.md
 use crate::clvm::arena::{Arena, NodePtr};
 use crate::clvm::dialect::Dialect;
 use crate::clvm::more_ops::BOOL_BASE_COST;

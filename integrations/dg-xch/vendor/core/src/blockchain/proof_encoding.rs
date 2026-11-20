@@ -1,3 +1,4 @@
+// Added by Chia Network for timelord-app; see integrations/dg-xch/VENDORING.md
 use super::proof_of_space::ProofOfSpace;
 use dg_xch_serialize::{ChiaProtocolVersion, ChiaSerialize};
 use std::io::Error;

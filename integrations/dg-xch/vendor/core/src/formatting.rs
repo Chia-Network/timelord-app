@@ -1,3 +1,4 @@
+// Modified by Chia Network for timelord-app; see integrations/dg-xch/VENDORING.md
 use crate::errors::ClvmError;
 use hex::{FromHexError, decode};
 use num_bigint::BigInt;

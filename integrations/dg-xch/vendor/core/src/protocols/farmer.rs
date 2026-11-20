@@ -1,3 +1,4 @@
+// Modified by Chia Network for timelord-app; see integrations/dg-xch/VENDORING.md
 use crate::blockchain::challenge_chain_subslot::ChallengeChainSubSlot;
 use crate::blockchain::class_group_element::ClassgroupElement;
 use crate::blockchain::foliage_block_data::FoliageBlockData;

@@ -1,3 +1,4 @@
+// Modified by Chia Network for timelord-app; see integrations/dg-xch/VENDORING.md
 use crate::worker::{MAX_ITERATIONS, ProofRequest, ProofResult, run_isolated};
 use dg_xch_core::blockchain::class_group_element::ClassgroupElement;
 use dg_xch_core::consensus::chain_definition::ChainSelection;

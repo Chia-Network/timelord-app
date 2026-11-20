@@ -1,3 +1,4 @@
+// Added by Chia Network for timelord-app; see integrations/dg-xch/VENDORING.md
 use super::*;
 use dg_xch_serialize::{ChiaProtocolVersion, ChiaSerialize};
 use std::io::Cursor;
