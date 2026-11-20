@@ -7,13 +7,13 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
-prometheus = { version = "0.13.4", default-features = false }
+prometheus = { version = "0.14.0", default-features = false }
 timelord-supervisor = { path = "../timelord-supervisor" }
 timelord-core = { path = "../timelord-core" }
 vdf-client-protocol = { path = "../vdf-client-protocol" }
 anyhow.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-yaml-rust2 = "0.11"
+yaml-rust2 = "0.13"
 libc.workspace = true
 axum.workspace = true
 clap.workspace = true
@@ -43,4 +43,4 @@ sha2 = { version = "0.10.9", features = ["asm"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
-rcgen = "0.13"
+rcgen = "0.14"
