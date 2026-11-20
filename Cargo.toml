@@ -17,7 +17,7 @@ clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "sync", "time", "process"] }
-toml = "0.9"
+toml = "1.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dg_xch_core = { git = "https://github.com/cameroncooper/dg_xch_utils", rev = "3b50863ee641c67e4c46b9a18640001e0c94833f", default-features = false, features = ["bls"] }
@@ -25,12 +25,12 @@ dg_xch_timelord = { git = "https://github.com/cameroncooper/dg_xch_utils", rev =
 dg_xch_servers = { git = "https://github.com/cameroncooper/dg_xch_utils", rev = "3b50863ee641c67e4c46b9a18640001e0c94833f" }
 dg_xch_vdf = { git = "https://github.com/cameroncooper/dg_xch_utils", rev = "3b50863ee641c67e4c46b9a18640001e0c94833f" }
 dg_xch_serialize = { git = "https://github.com/cameroncooper/dg_xch_utils", rev = "3b50863ee641c67e4c46b9a18640001e0c94833f" }
-x509-cert = "0.2"
-num-bigint = "0.4"
+x509-cert = "0.3"
+num-bigint = "0.5"
 futures-util = "0.3"
 rustls = "0.23"
 tokio-rustls = "0.26"
-tokio-tungstenite = "0.28"
+tokio-tungstenite = "0.30"
 
 [profile.release]
 lto = "thin"
