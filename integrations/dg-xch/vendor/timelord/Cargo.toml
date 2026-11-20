@@ -1,3 +1,4 @@
+# Modified by Chia Network for timelord-app; see integrations/dg-xch/VENDORING.md
 [package]
 name = "dg_xch_timelord"
 description = "Native CPU VDF workers and authenticated regular and compact timelord services"
@@ -10,7 +11,7 @@ repository = "https://github.com/GalactechsLLC/dg_xch_utils"
 
 [dependencies]
 dg_xch_core = { path = "../core", version = "3.0.0", default-features = false, features = ["bls", "chia-hf2"] }
-dg_xch_servers = { path = "../servers" }
+dg_xch_servers = { git = "https://github.com/GalactechsLLC/dg_xch_utils", rev = "ca437be562cec5f0514f6edd4c794adfe382dd8a" }
 dg_xch_vdf = { git = "https://github.com/GalactechsLLC/dg_xch_utils", rev = "ca437be562cec5f0514f6edd4c794adfe382dd8a" }
 dg_xch_pos = { git = "https://github.com/GalactechsLLC/dg_xch_utils", rev = "ca437be562cec5f0514f6edd4c794adfe382dd8a" }
 futures-util = "0.3.32"

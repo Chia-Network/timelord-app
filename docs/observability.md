@@ -96,6 +96,7 @@ All names below have the prefix `chia_timelord_`:
 | `node_connected`, `node_reconnects_total` | gauge / counter | Authenticated link and reconnections after the first authenticated connection |
 | `last_node_message_timestamp_seconds`, `last_peak_received_timestamp_seconds` | gauge | Last observed node frame / decoded peak |
 | `peak_updates_total` | counter; `result` | Scheduler accepted, ignored or rejected peak updates |
+| `unfinished_candidates_total` | counter; `outcome,source` | Unfinished-block admission outcomes from node frames or peak retries |
 | `scheduler_peak_height`, `deficit` | gauge | Accepted peak values, absent before a peak or after session replacement |
 | `work_pending` | gauge; `chain` | Adapter has an unfinished scheduled request, 0 or 1 |
 | `work_cancelled_total` | counter; `chain` | Adapter requests dropped without completion |
@@ -109,7 +110,9 @@ All names below have the prefix `chia_timelord_`:
 | `submission_duration_seconds` | histogram; `kind` | Successful bundle write duration |
 
 Chains are `challenge`, `reward`, `infused_challenge`. Bundle kinds are `signage`,
-`infusion`, `end_of_sub_slot`. All reason/state labels use fixed enumerations;
+`infusion`, `end_of_sub_slot`. Unfinished candidate outcomes are `admitted`,
+`deferred`, `deferred_queue_full`, `duplicate`, `stale`, `ignored` and `rejected`;
+sources are `node` and `retry`. All reason/state labels use fixed enumerations;
 error text, paths, hashes, request IDs and heights are never labels.
 
 The legacy `estimated_ips` uses existing receipt-time elapsed work and truncation

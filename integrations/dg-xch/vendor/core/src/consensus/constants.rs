@@ -1,3 +1,4 @@
+// Modified by Chia Network for timelord-app; see integrations/dg-xch/VENDORING.md
 use crate::blockchain::sized_bytes::Bytes32;
 use std::fmt::Display;
 use std::str::FromStr;
@@ -53,6 +54,7 @@ impl ChiaNetwork {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConsensusConstants {
     #[serde(default)]
     pub rewards: crate::consensus::block_rewards::RewardSchedule,
@@ -531,14 +533,14 @@ pub const FARMER_REWARD_PREFIXES: [(Bytes32, Bytes32); 10] = [
 ];
 
 fn default_filter_window_size() -> u8 {
-    16
+    super::filter_schedule::LEGACY_FILTER_WINDOW_SIZE
 }
 fn is_default_filter_window_size(value: &u8) -> bool {
     *value == default_filter_window_size()
 }
 
 fn default_max_effective_plot_filter_bits() -> u8 {
-    13
+    super::filter_schedule::LEGACY_MAX_EFFECTIVE_PLOT_FILTER_BITS
 }
 fn is_default_max_effective_plot_filter_bits(value: &u8) -> bool {
     *value == default_max_effective_plot_filter_bits()
@@ -551,4 +553,30 @@ fn is_default_plot_filter_v2_relative_height(
     value: &super::filter_schedule::FilterSchedule,
 ) -> bool {
     *value == super::filter_schedule::LEGACY_SCHEDULE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removed_plot_filter_count_field_is_rejected() {
+        let constants = ConsensusConstants {
+            difficulty_constant_factor: 1u128 << 60,
+            ..MAINNET
+        };
+        let mut value = serde_json::to_value(constants).unwrap();
+        // ConsensusConstants borrows a static bech32 prefix, so bind the input to 'static.
+        let valid = Box::leak(value.to_string().into_boxed_str());
+        assert!(serde_json::from_str::<ConsensusConstants>(valid).is_ok());
+        value.as_object_mut().unwrap().insert(
+            "plot_filter_v2_relative_height_count".into(),
+            serde_json::json!(7),
+        );
+        let json = Box::leak(value.to_string().into_boxed_str());
+        assert!(
+            serde_json::from_str::<ConsensusConstants>(json).is_err(),
+            "fork-era count must not silently reshape the schedule"
+        );
+    }
 }

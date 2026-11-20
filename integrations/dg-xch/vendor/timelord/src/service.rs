@@ -1,3 +1,4 @@
+// Modified by Chia Network for timelord-app; see integrations/dg-xch/VENDORING.md
 use crate::worker::{MAX_ITERATIONS, ProofRequest, ProofResult, run_isolated};
 use dg_xch_core::blockchain::class_group_element::ClassgroupElement;
 use dg_xch_core::consensus::chain_definition::ChainSelection;
@@ -67,6 +68,18 @@ impl Config {
 pub(crate) type Socket =
     tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
+pub fn timelord_handshake(network: &str) -> Handshake {
+    let mut greeting = handshake(network, NodeType::Timelord, 0);
+    if !greeting
+        .capabilities
+        .iter()
+        .any(|capability| capability.0 == 6)
+    {
+        greeting.capabilities.push((6, "1".to_owned()));
+    }
+    greeting
+}
+
 pub(crate) async fn connect(
     config: &Config,
     tls: Arc<rustls::ClientConfig>,
@@ -94,7 +107,7 @@ pub(crate) async fn connect(
     socket
         .send(encode(
             ProtocolMessageTypes::Handshake,
-            &handshake(&network, NodeType::Timelord, 0),
+            &timelord_handshake(&network),
             None,
         )?)
         .await

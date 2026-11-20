@@ -1,31 +1,37 @@
+// Added by Chia Network for timelord-app; see integrations/dg-xch/VENDORING.md
 //! Validated bounded schedule. Ordering and length are owned by consensus.
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::io::{Error, ErrorKind};
+/// Maximum number of relative-height entries a filter schedule can hold.
+pub const MAX: usize = 9;
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct FilterSchedule {
-    heights: [u32; 9],
+    heights: [u32; MAX],
     len: u8,
 }
 impl FilterSchedule {
-    pub const fn fixed(heights: [u32; 9]) -> Self {
+    pub const fn fixed(heights: [u32; MAX]) -> Self {
         let mut i = 0;
-        while i < 9 {
+        while i < MAX {
             assert!(heights[i] > 0);
             if i > 0 {
                 assert!(heights[i - 1] > heights[i]);
             }
             i += 1;
         }
-        Self { heights, len: 9 }
+        Self {
+            heights,
+            len: MAX as u8,
+        }
     }
     pub fn try_from_slice(values: &[u32]) -> Result<Self, Error> {
-        if values.len() > 9 || values.contains(&0) || values.windows(2).any(|p| p[0] <= p[1]) {
+        if values.len() > MAX || values.contains(&0) || values.windows(2).any(|p| p[0] <= p[1]) {
             return Err(Error::new(
                 ErrorKind::InvalidData,
-                "filter heights must be at most nine positive descending values",
+                format!("filter heights must be at most {MAX} positive descending values"),
             ));
         }
-        let mut heights = [0; 9];
+        let mut heights = [0; MAX];
         heights[..values.len()].copy_from_slice(values);
         Ok(Self {
             heights,
@@ -37,14 +43,13 @@ impl FilterSchedule {
     }
     pub fn base_bits(&self, height: u32, fork: u32, initial: u8) -> u8 {
         let relative = height.saturating_sub(fork);
-        if relative == 0 {
-            return initial;
-        }
         self.entries()
             .iter()
             .enumerate()
             .find(|(_, h)| relative >= **h)
-            .map_or(initial, |(i, _)| initial.saturating_sub(self.len - i as u8))
+            .map_or(initial, |(i, _)| {
+                initial.saturating_sub(u8::try_from(usize::from(self.len) - i).unwrap_or(u8::MAX))
+            })
     }
 }
 impl Serialize for FilterSchedule {
@@ -62,6 +67,10 @@ impl<'de> Deserialize<'de> for FilterSchedule {
 pub const LEGACY_SCHEDULE: FilterSchedule = FilterSchedule::fixed([
     50494000, 45444000, 40394000, 35343000, 30298000, 25247000, 20197000, 15146000, 10101000,
 ]);
+/// Frozen legacy filter window. It must not follow the evolving MAINNET constants.
+pub const LEGACY_FILTER_WINDOW_SIZE: u8 = 16;
+/// Frozen legacy effective-filter cap. It must not follow the evolving MAINNET constants.
+pub const LEGACY_MAX_EFFECTIVE_PLOT_FILTER_BITS: u8 = 13;
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -468,6 +468,7 @@ fn process_totals_survive_history_pruning_and_runtime_replacement() {
     metrics.connected();
     metrics.connected();
     metrics.submitted(SubmissionKind::Infusion, Duration::from_millis(2));
+    metrics.unfinished_candidate(UnfinishedOutcome::Deferred, UnfinishedSource::Retry);
     metrics.duration(
         Chain::Reward,
         ProofStage::Verification,
@@ -481,6 +482,10 @@ fn process_totals_survive_history_pruning_and_runtime_replacement() {
     );
     assert_eq!(
         metrics.counter("asic_recoveries_total", &["SERIAL-A", "1"]),
+        1
+    );
+    assert_eq!(
+        metrics.counter("unfinished_candidates_total", &["deferred", "retry"]),
         1
     );
     let before = metrics.render(&shared, crate::unix_now()).unwrap();

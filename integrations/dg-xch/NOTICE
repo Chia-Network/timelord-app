@@ -1,5 +1,6 @@
-Timelord Mac maintains vendored copies of dg_xch_core, dg_xch_servers and
-dg_xch_timelord from GalactechsLLC dg_xch_utils (Apache License 2.0).
+Timelord Mac maintains vendored copies of dg_xch_core and dg_xch_timelord from
+GalactechsLLC dg_xch_utils (Apache License 2.0). dg_xch_servers comes from the
+unchanged upstream Git pin below.
 Imported compatibility snapshot: 3b50863ee641c67e4c46b9a18640001e0c94833f
 https://github.com/cameroncooper/dg_xch_utils
 Original upstream and unchanged dependency pin:
@@ -10,6 +11,10 @@ The vendored source is modified for Chia HF2 timelord compatibility, shared
 consensus encodings, candidate failure isolation and validated filter schedules.
 See vendor-origin.json, VENDORING.md, crate licenses and Git history for provenance.
 The app maintains the native-client adapter and application lifecycle separately.
+
+Vendored files changed from the imported source carry a "Modified by Chia Network"
+header, and files added locally carry an "Added by Chia Network" header. Any
+future edit to an unmodified vendored file must add the header.
 
 PoS2 witness verification uses Chia Network chia-pos2 1.0.0 (Apache-2.0),
 https://github.com/Chia-Network/pos2.
