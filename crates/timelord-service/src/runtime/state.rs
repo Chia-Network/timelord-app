@@ -213,7 +213,6 @@ impl RuntimeState {
         self.scheduler_height = None;
         self.scheduler_deficit = None;
         self.pending = [0; 3];
-        self.archive = None;
         // Session proof counters belong to the node they were sent to: the
         // configuration checkpoint must not treat proofs sent to the previous
         // node as evidence that the new profile works.

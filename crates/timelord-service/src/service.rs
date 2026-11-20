@@ -121,6 +121,8 @@ impl Run {
             let mut state = self.shared.runtime.lock().expect("runtime");
             state.reset_node_context();
             if new_context {
+                // Restored history belongs to the previous node context.
+                state.archive = None;
                 // Chain measurements from another node never join this chart.
                 state.observations = Default::default();
                 state.estimated_observations = Default::default();

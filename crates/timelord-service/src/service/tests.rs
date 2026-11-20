@@ -161,6 +161,48 @@ async fn owners_and_routes_survive_inventory_updates_and_a_node_profile_switch()
     std::fs::remove_dir_all(dir).unwrap();
 }
 #[tokio::test]
+async fn same_scope_node_reload_keeps_the_restored_chart_archive() {
+    let dir = fixture_dir("node-reload-archive");
+    let history = dir.join("history.json");
+    let config = Config::default();
+    let now = unix_now();
+    let mut seeded = runtime::RuntimeState::new(false);
+    seeded.estimated(timelord_core::Chain::Challenge, 1.0e6, now, "b0", 0);
+    let store = history_store::Store::new(history.clone(), &config).unwrap();
+    store
+        .save(&store.capture(&seeded, now, now).pruned(now))
+        .unwrap();
+    drop(store);
+    let (node_requests, _node_reloads) = tokio::sync::mpsc::channel(1);
+    let mut run = start_run(
+        config,
+        None,
+        history,
+        &HashMap::new(),
+        unix_now(),
+        operational::State::fixture(),
+        Arc::new(safety::Store::open(&dir.join("config.toml")).unwrap()),
+        node_requests,
+    )
+    .await
+    .unwrap();
+    let (current, _state) = watch::channel(run.shared.clone());
+    assert!(run.shared.runtime.lock().unwrap().archive.is_some());
+    // Certificate-only reloads stay in the same history scope.
+    let mut reloaded = run.shared.config.clone();
+    reloaded.node.certificate = Some(dir.join("new.cert"));
+    reloaded.node.ca_certificate = Some(dir.join("new.ca"));
+    run.replace_node(reloaded, &current).await.unwrap();
+    assert!(run.shared.runtime.lock().unwrap().archive.is_some());
+    // A different node is a new context: the old archive must not join it.
+    let mut moved = run.shared.config.clone();
+    moved.node.host = "other-node".into();
+    run.replace_node(moved, &current).await.unwrap();
+    assert!(run.shared.runtime.lock().unwrap().archive.is_none());
+    run.stop().await.unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[tokio::test]
 async fn engine_sockets_need_a_unique_identity_and_reach_their_board_pool() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
