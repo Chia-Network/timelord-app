@@ -53,6 +53,13 @@ current Chia consensus. Native ASIC proving and verification remain separate.
 
 ## Updating the snapshot
 
+The vendor check verifies the `vendor_sha256` manifest and the change notices in
+`vendor-origin.json`. After a reviewed vendor change, run
+`python3 tools/check-dgx-vendor --update` to record the new hashes.
+`python3 tools/check-dgx-vendor --source <checkout>` re-verifies every
+`source_sha256` entry against a local checkout of the recorded fork revision and
+prints a diff summary; it does not fetch from the network.
+
 1. Fetch a proposed upstream revision into an explicit temporary checkout. Never
    edit Cargo's source cache or infer a nearby checkout.
 2. Compare its core and timelord crate directories against the recorded source revision and
