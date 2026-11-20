@@ -19,6 +19,7 @@ fn input() -> Input {
         temperature: Some(40.),
         temperature_limit: 55.,
         paused: false,
+        disturbed: false,
     }
 }
 fn policy() -> Policy {
@@ -319,6 +320,8 @@ fn idle_and_unattributed_proofs_cannot_promote_a_setting() {
             timestamp_unix: 200 + n as u64,
             work_started_unix: 50,
             ips: 950000.,
+            board_id: None,
+            engine: None,
         })
         .collect();
     assert_eq!(
@@ -748,4 +751,41 @@ fn recovery_yields_a_trial_without_lowering_a_healthy_clock_or_learning_it_early
     assert!(
         matches!(p.observe(401,i),Some(Action::Set(point,_)) if point.frequency_mhz<current.frequency_mhz)
     );
+}
+
+#[test]
+fn disturbance_holds_settings_and_discards_shared_restart_bursts() {
+    let mut p = policy();
+    // Past the settling window, a burst during a disturbance is not evidence.
+    let held = p.observe(
+        10,
+        Input {
+            recoveries: 25,
+            disturbed: true,
+            ..input()
+        },
+    );
+    assert!(held.is_none());
+    assert_eq!(p.status.state, "holding");
+    // The first undisturbed tick restarts observation rather than counting
+    // restarts that happened while held.
+    assert!(
+        p.observe(
+            11,
+            Input {
+                recoveries: 50,
+                ..input()
+            }
+        )
+        .is_none()
+    );
+    // Real instability afterwards still backs off once settled.
+    let backoff = p.observe(
+        20,
+        Input {
+            recoveries: 80,
+            ..input()
+        },
+    );
+    assert!(matches!(backoff, Some(Action::Set(point, _)) if point.frequency_mhz < 1450.));
 }

@@ -40,24 +40,40 @@ Run/Pause intent and replaces crashed workers with capped retries. It has no USB
 node or proof-arithmetic dependencies. See [deployment](docs/deployment.md) for
 installation, SSH control, migration and remaining physical qualification gates.
 
-USB disconnects and unreadable sensor data stop only the affected client. The
-service retries after 1, 5, then at most every 30 seconds without exhausting a
-retry budget, and finds a returning board by serial even if its USB location
-changes. Other boards and the full-node session keep running. Overtemperature
-retries after a 30-second cooldown using a low-power probe and fresh cool
-telemetry; invalid proofs retry after 10 seconds at a conservative setting and
-must pass a private native verification check before receiving production work.
-Retries have no exhaustion limit, including in Manual mode. A recovery setting
-can be below the configured tuning minimum; saved preferences remain unchanged.
-Missing telemetry never bypasses native control checks. The dashboard reports
-the recovery reason and next retry time.
+A board's trouble stays on that board. Unplugging it, a stuck USB write or a
+failed proof session stops only its own native client; the other boards and the
+full-node session keep running, and a returning board is found by serial even
+if its USB location changes. Only overheating and invalid proofs are saved as
+safety restrictions (cooldown, low-power probe or private verified proof, then a
+recovery clock limit that relaxes after hours of fault-free running). An
+unconfirmed stop only means a cautious start, after which the board returns to
+its saved setting once it has produced verified work. Retries never exhaust.
+
+Availability comes first: a board that is working always carries work. Only
+hardware evidence (overheating, an invalid proof, a stuck or dead native client)
+or an operator's **Keep out of rotation** takes a board out. Pulling a cable is
+not a failure: after a native client dies the service checks USB, and a board
+that is no longer attached is simply looked for again. USB can still list a
+pulled board for a moment, so a stop counted as a failure is taken back when
+the board turns out to be missing within two minutes. Each board's reliability
+is saved per serial and survives restarts and network switches; it only decides
+which chain a board carries. After a real failure the board is on probation
+(1 min to 2 h, growing with repeated failures) and prefers the infused-challenge
+chain while more reliable boards carry the challenge and reward chains. The
+dashboard shows each board's state, failure streak and recent history, with
+**Retry now** (clears the streak), **Keep out of rotation** and **Enable**.
 
 Automatic layouts route chains among available boards: one board runs three
 engines, two run two plus one, and three run one each. Each native owner keeps
-three identified engine sockets available; unused engines remain idle. Route
-changes cancel only affected chain sessions and retain healthy native owners
-and the full-node connection. Each layout uses its own learned tuning profile.
-Explicit serial-pinned chain assignments retain their mapping instead.
+three identified engine sockets available; unused engines remain idle. The
+challenge and reward chains go to the most reliable boards. A chain stays on
+its board while that board is healthy; chains move back to a returning board
+only at the next peak. Route changes cancel only affected chain sessions, never
+replace healthy native owners or the node connection, and briefly hold
+Automatic tuning on every board so a shared-bus disturbance is not mistaken for
+instability. Explicit serial-pinned chain assignments retain their mapping instead.
+
+Switching the full-node profile applies without restarting ASIC boards.
 
 The persistent supervisor prevents idle system sleep while Run is requested,
 including worker recovery, and releases the assertion after Pause cleanup or
@@ -176,9 +192,12 @@ original upstream revision.
 Normal Cargo checks and builds require no fork or local overrides. Offline
 fixtures and this post-fork trial do not establish activation replay, sustained
 hardware stability or production compatibility.
-Live configuration reload and start-at-login service registration are not implemented. Chart history is checkpointed to disk for up to
+Switching the full-node profile applies live; other configuration edits still
+need a supervised restart. Start-at-login service registration is not implemented. Chart history is checkpointed to disk for up to
 24 hours and restored after service restarts, with downtime shown as gaps. Current
-uptime, proof counts and health still start fresh for each service run.
+uptime and proof counts start fresh for each service run, and proof counts also
+for each node-profile switch. Board reliability (failure streaks, probation and
+safety restrictions) is saved per serial and survives restarts.
 
 See [architecture](docs/architecture.md) for process ownership, proof verification
 and tuning behavior. Licensed under [Apache-2.0](LICENSE); dependencies retain their

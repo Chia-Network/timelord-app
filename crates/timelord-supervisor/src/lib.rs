@@ -215,6 +215,10 @@ pub struct Response {
     pub error: Option<String>,
 }
 
+/// One bounded control transaction. Mutations are acknowledged once intent is
+/// durable and any worker retirement has started (Reload: after validation);
+/// they never wait for retirement. Follow `phase`, `worker_pid` and
+/// `worker_generation` in later Status reads to observe completion.
 pub async fn request(
     config: &Path,
     command: Control,

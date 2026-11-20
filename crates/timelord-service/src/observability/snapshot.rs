@@ -37,7 +37,7 @@ pub struct Readiness {
 fn board_usable(h: &crate::runtime::HardwareState, managed: bool, now: u64) -> bool {
     !h.lifecycle.status().latched_fault
         && if managed {
-            h.lifecycle.capacity(now, true).exploration_ready
+            h.lifecycle.accepts_work()
                 && h.temperature_c.is_some_and(f64::is_finite)
                 && h.temperature_unix <= now
                 && now - h.temperature_unix <= 30
@@ -66,8 +66,8 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> Snapshot {
     let process = shared.process.snapshot();
     let mut samples = Samples::default();
     let incomplete = || {
-        if process.healthy() {
-            "reconfiguring"
+        if process.phase == crate::operational::Phase::Stopping && process.failure.is_none() {
+            "stopping"
         } else {
             "service_unavailable"
         }

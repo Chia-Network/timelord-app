@@ -334,15 +334,15 @@ async fn execute(backend: Arc<AsicBackend>, plan: WorkPlan) -> Result<Completed>
     let (cc, rc, icc) = tokio::try_join!(cc, rc, icc)?;
     let mut speeds = vec![(Chain::Challenge, cc.1), (Chain::Reward, rc.1)];
     if let Some((_, speed)) = &icc {
-        speeds.push((Chain::InfusedChallenge, *speed));
+        speeds.push((Chain::InfusedChallenge, speed.clone()));
     }
     let bundle_ready = Instant::now();
     for (chain, timing) in &speeds {
-        backend.observe_duration(
-            *chain,
-            ProofStage::BundleWait,
-            bundle_ready.saturating_duration_since(timing.ready_at),
-        );
+        let waited = bundle_ready.saturating_duration_since(timing.ready_at);
+        backend.observe_duration(*chain, ProofStage::BundleWait, waited);
+        if waited > Duration::from_secs(10) {
+            backend.bundle_delayed(*chain);
+        }
         tracing::info!(
             ?chain,
             generation = plan.generation,
@@ -587,6 +587,9 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                                         state.scheduler_initialized=scheduler.initialized();
                                         state.scheduler_height=Some(peak.reward_chain_block.height);
                                         state.scheduler_deficit=Some(peak.deficit);
+                                        // A peak is the routing boundary for
+                                        // optional rebalancing.
+                                        state.peak_epoch = state.peak_epoch.wrapping_add(1);
                                     }
                                     infusion_submitted_at = None;
                                     let work=infused_from_peak(&peak,scheduler.generation(),bits,minimum_deficit)?;

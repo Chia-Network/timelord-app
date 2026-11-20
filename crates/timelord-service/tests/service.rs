@@ -82,7 +82,7 @@ fn helper_reports_real_socket_state_without_claiming_productivity() {
         .unwrap();
     let mut fixture = Fixture { child, directory };
     let before = wait_for(status_port, 0);
-    assert_eq!(before["api_version"], 1);
+    assert_eq!(before["api_version"], 2);
     assert_eq!(before["production_enabled"], false);
     assert!(before["delivered_ips"].is_null());
     assert!(before["latest_proof_unix"].is_null());
@@ -97,34 +97,44 @@ fn helper_reports_real_socket_state_without_claiming_productivity() {
     assert!(String::from_utf8_lossy(&probe.stderr).contains("Pause Timelord"));
 
     assert_eq!(wait_for(status_port, 0)["service_pid"], fixture.child.id());
-    let mut clients: Vec<_> = (0..3)
-        .map(|_| TcpStream::connect(("127.0.0.1", board_port)).unwrap())
+    // Engine sockets must identify their physical engine; an anonymous socket
+    // is closed without claiming a slot.
+    let mut anonymous = TcpStream::connect(("127.0.0.1", board_port)).unwrap();
+    anonymous
+        .set_read_timeout(Some(Duration::from_secs(4)))
+        .unwrap();
+    anonymous.write_all(b"STOP").unwrap();
+    assert!(matches!(anonymous.read(&mut [0]), Ok(0) | Err(_)));
+    let clients: Vec<_> = (0..3)
+        .map(|engine| {
+            let mut socket = TcpStream::connect(("127.0.0.1", board_port)).unwrap();
+            socket
+                .write_all(format!("TLENGINE 1 {engine}\n").as_bytes())
+                .unwrap();
+            socket
+        })
         .collect();
     wait_for(status_port, 3);
-    let mut extra = TcpStream::connect(("127.0.0.1", board_port)).unwrap();
-    extra
-        .set_read_timeout(Some(Duration::from_secs(1)))
+    let mut duplicate = TcpStream::connect(("127.0.0.1", board_port)).unwrap();
+    duplicate.write_all(b"TLENGINE 1 0\n").unwrap();
+    duplicate
+        .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
-    match extra.read(&mut [0]) {
+    match duplicate.read(&mut [0]) {
         Ok(0) => {}
         Err(error)
             if matches!(
                 error.kind(),
                 std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
             ) => {}
-        result => panic!("Excess client was not rejected: {result:?}"),
+        result => panic!("Duplicate engine socket was not rejected: {result:?}"),
     }
-    assert_eq!(wait_for(status_port, 3)["production_enabled"], false);
-    for client in &mut clients {
-        client
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        client.write_all(b"STOP").unwrap();
-        let mut ack = [0; 3];
-        client.read_exact(&mut ack).unwrap();
-        assert_eq!(&ack, b"ACK");
-    }
-    wait_for(status_port, 0);
+    // Connected sockets are not productivity.
+    let connected = wait_for(status_port, 3);
+    assert_eq!(connected["production_enabled"], false);
+    assert!(connected["latest_proof_unix"].is_null());
+    assert_eq!(connected["boards"][0]["routing_state"], "unavailable");
+    drop(clients);
     let output = Command::new(env!("CARGO_BIN_EXE_timelord-service"))
         .args(["status", "--config"])
         .arg(&config)
@@ -161,11 +171,11 @@ fn helper_reports_real_socket_state_without_claiming_productivity() {
     // The restarted helper must expose it without claiming current productivity.
     let configured: timelord_core::Config =
         toml::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    // The chart scope is the node context; samples carry their own board.
     let scope = serde_json::to_vec(&(
         configured.node.network.clone(),
         &configured.node.host,
         configured.node.port,
-        configured.assignments().unwrap(),
     ))
     .unwrap();
     let scope: String = dg_xch_core::utils::hash_256(scope)

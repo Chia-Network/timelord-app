@@ -27,7 +27,7 @@ health as failed on the local status endpoint while proof work continues.
 
 | Endpoint | Response |
 | --- | --- |
-| `/metrics` | Prometheus text format, available through node/board outages and topology replacement |
+| `/metrics` | Prometheus text format, available through node/board outages and node-profile switches |
 | `/healthz` | Plain `200 Ok` while essential supervision tasks function; `503` after an unexpected exit or during shutdown |
 | `/readyz` | JSON `{"ready":true,"reason":"ready"}` with 200; otherwise 503 and a fixed reason |
 
@@ -42,14 +42,16 @@ have socket capacity, and have temperature telemetry no older than 30 seconds.
 Unmanaged clients must verify work in their current connection generation.
 ICC is required only while the adapter has ICC work pending. An idle ICC engine
 and paused automatic tuning do not independently fail readiness. A node outage or
-recoverable board failure affects readiness, not liveness. Topology replacement
-is live but temporarily unready. Reasons are `setup_required`,
+recoverable board failure affects readiness, not liveness. A route change keeps
+the service live and ready while one board can serve each required chain. Reasons are `setup_required`,
 `waiting_for_node`, `waiting_for_chain_state`, `waiting_for_clients`,
-`reconfiguring`, `service_unavailable`, and `ready`.
+`stopping`, `service_unavailable`, and `ready`.
 
 ## Metric contract
 
-All application series carry `network` (`mainnet` or `testnet11`). Prometheus
+All application series carry `network` (`mainnet`, `testnet11` or a custom
+network name). It follows a live node-profile switch: counters continue under the
+new label, so compare rates per network rather than raw totals. Prometheus
 supplies region, instance, job and deployment labels. Board labels use configured
 serials, falling back to configured IDs. Physical engine numbers are `0`, `1`,
 `2`; recovery events without an engine use `unknown`. Socket slots are not
@@ -74,7 +76,10 @@ All names below have the prefix `chia_timelord_`:
 | `version`, `build_info` | gauge; `version`, plus `revision` on build info | Actual service package version / build revision, value 1 |
 | `process_start_time_seconds` | gauge | Start of this service process |
 | `healthy`, `ready` | gauge | Probe state, 0 or 1 |
-| `topology_changes_total` | counter | Applied topology replacement attempts |
+| `topology_changes_total` | counter | Applied chain-route changes |
+| `chain_moves_total` | counter | Chains moved between boards by route changes |
+| `board_failures_total{board}` | counter | Native owner failures counted against board reliability (absence is not counted) |
+| `delayed_bundles_total{chain}` | counter | Verified chain proofs that waited over 10 seconds for their bundle partner |
 | `estimated_ips` | gauge | Latest validated completion from any chain in this node session |
 | `chain_estimated_ips` | gauge; `chain` | Latest validated completion for each chain in this session |
 | `proofs_verified_total`, `proof_verification_failures_total` | counter; `chain` | Native verifier outcomes for scheduled work; failures include priming checks |

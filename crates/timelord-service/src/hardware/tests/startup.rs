@@ -8,17 +8,16 @@ async fn temperature_only_client_releases_initialization_but_is_retired_without_
         "id='temperature-only'\nname='Temperature only'\nclient_port=18110\nprofile='manual'",
     )
     .unwrap();
-    let shared = Arc::new(Shared {
-        native: None,
-        config: Default::default(),
-        assignments: vec![],
-        clients: Default::default(),
-        process: crate::operational::State::fixture(),
-        scope: crate::runtime::RuntimeScope::Production,
-        runtime: Default::default(),
-        started_unix: crate::unix_now(),
-        service_started_unix: crate::unix_now(),
-    });
+    let shared = Arc::new(crate::Shared::new(
+        None,
+        Default::default(),
+        std::sync::Arc::new(std::sync::Mutex::new(crate::runtime::RuntimeState::new(
+            false,
+        ))),
+        crate::operational::State::fixture(),
+        crate::unix_now(),
+        crate::unix_now(),
+    ));
     let child = Command::new("/bin/sh")
         .args([
             "-c",
@@ -41,14 +40,13 @@ printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2"#,
     // native-client tests, without changing the production lock contract.
     let initialization: &'static tokio::sync::Mutex<()> =
         Box::leak(Box::new(tokio::sync::Mutex::new(())));
-    let (ready, initialized) = oneshot::channel();
     let (_stop, rx) = watch::channel(false);
     let startup = startup(&shared, &board).await.unwrap();
     let owner = tokio::spawn(supervise(
         shared.clone(),
+        crate::hardware::fixture_backend(&shared),
         board.clone(),
         child,
-        ready,
         rx,
         initialization.lock().await,
         None,
@@ -80,8 +78,10 @@ printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2"#,
         .unwrap()
         .unwrap()
         .unwrap_err();
-    assert!(error.to_string().contains("initialization timed out"));
-    assert!(initialized.await.is_err());
+    assert!(
+        format!("{error:#}").contains("initialization timed out"),
+        "{error:#}"
+    );
     assert!(initialization.try_lock().is_ok());
     assert!(
         shared.runtime.lock().unwrap().boards[&board.id]
@@ -135,21 +135,20 @@ printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
             .unwrap();
     board.profile = profile;
     board.serial = Some("fixture".into());
-    let shared = Arc::new(Shared {
-        native: Some(Arc::new(Facts {
+    let shared = Arc::new(crate::Shared::new(
+        Some(Arc::new(Facts {
             hash: "fixture".into(),
             host: "fixture".into(),
             frequencies: vec![1450.],
         })),
-        config: Default::default(),
-        assignments: vec![],
-        clients: Default::default(),
-        process: crate::operational::State::fixture(),
-        scope: crate::runtime::RuntimeScope::Production,
-        runtime: Default::default(),
-        started_unix: crate::unix_now(),
-        service_started_unix: crate::unix_now(),
-    });
+        Default::default(),
+        std::sync::Arc::new(std::sync::Mutex::new(crate::runtime::RuntimeState::new(
+            false,
+        ))),
+        crate::operational::State::fixture(),
+        crate::unix_now(),
+        crate::unix_now(),
+    ));
     let progress = shared.process.progress.clone();
     let preparing = progress.begin(
         timelord_supervisor::progress::Resource::BoardPreparation(
@@ -161,14 +160,13 @@ printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
     );
     let initialization: &'static tokio::sync::Mutex<()> =
         Box::leak(Box::new(tokio::sync::Mutex::new(())));
-    let (ready, mut initialized) = oneshot::channel();
     let (stop, rx) = watch::channel(false);
     let startup = startup(&shared, &board).await.unwrap();
     let owner = tokio::spawn(supervise(
         shared.clone(),
+        crate::hardware::fixture_backend(&shared),
         board.clone(),
         child,
-        ready,
         rx,
         initialization.lock().await,
         Some(preparing),
@@ -214,10 +212,11 @@ printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
         profile == ProfileMode::Automatic,
         "Automatic ACK releases USB setup; Manual requires hardware telemetry"
     );
-    assert!(matches!(
-        initialized.try_recv(),
-        Err(oneshot::error::TryRecvError::Empty)
-    ));
+    assert!(
+        !shared.runtime.lock().unwrap().boards[&board.id]
+            .lifecycle
+            .accepts_work()
+    );
     std::fs::write(dir.join("temperature"), "release telemetry").unwrap();
     let waiting = std::time::Instant::now();
     while !shared
@@ -250,18 +249,15 @@ printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
     }
     std::fs::write(dir.join("ready"), "release readiness").unwrap();
     let waiting = std::time::Instant::now();
-    loop {
-        match initialized.try_recv() {
-            Ok(()) => break,
-            Err(oneshot::error::TryRecvError::Empty) => {
-                assert!(
-                    waiting.elapsed() < Duration::from_secs(3),
-                    "ready signal did not arrive"
-                );
-                tokio::task::yield_now().await;
-            }
-            Err(error) => panic!("valid ready signal lost after slow setup: {error}"),
-        }
+    while !shared.runtime.lock().unwrap().boards[&board.id]
+        .lifecycle
+        .accepts_work()
+    {
+        assert!(
+            waiting.elapsed() < Duration::from_secs(3),
+            "owner did not become ready after slow setup"
+        );
+        tokio::task::yield_now().await;
     }
     tokio::time::resume();
     assert!(initialization.try_lock().is_ok());
@@ -294,10 +290,9 @@ async fn thermal_initialization_after_another_fault_records_the_thermal_stop() {
             board.id.clone(),
             crate::runtime::HardwareState {
                 lifecycle: crate::board_lifecycle::BoardLifecycle::fixture(
-                    crate::board_lifecycle::Phase::Fault,
+                    crate::board_lifecycle::Phase::Reconnecting,
                     false,
                     Some(crate::board_lifecycle::Fault::InvalidProof),
-                    Some(true),
                     1,
                 ),
                 ..Default::default()
@@ -305,17 +300,17 @@ async fn thermal_initialization_after_another_fault_records_the_thermal_stop() {
         );
         state
     };
-    let shared = Arc::new(Shared {
-        native: None,
-        assignments: config.assignments().unwrap(),
-        config,
-        clients: Default::default(),
-        process: crate::operational::State::fixture(),
-        scope: crate::runtime::RuntimeScope::Production,
-        runtime: Arc::new(std::sync::Mutex::new(runtime)),
-        started_unix: crate::unix_now(),
-        service_started_unix: crate::unix_now(),
-    });
+    let shared = Arc::new(
+        crate::Shared::new(
+            None,
+            config,
+            Arc::new(std::sync::Mutex::new(runtime)),
+            crate::operational::State::fixture(),
+            crate::unix_now(),
+            crate::unix_now(),
+        )
+        .routed_by_config(),
+    );
     let child = Command::new("/bin/sh")
         .args([
             "-c",
@@ -331,7 +326,6 @@ printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2"#,
         .spawn()
         .unwrap();
     let startup = startup(&shared, &board).await.unwrap();
-    let (ready, _ready) = oneshot::channel();
     let (_stop, rx) = watch::channel(false);
     let initialization: &'static tokio::sync::Mutex<()> =
         Box::leak(Box::new(tokio::sync::Mutex::new(())));
@@ -339,9 +333,9 @@ printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2"#,
         Duration::from_secs(5),
         supervise(
             shared.clone(),
+            crate::hardware::fixture_backend(&shared),
             board.clone(),
             child,
-            ready,
             rx,
             initialization.lock().await,
             None,

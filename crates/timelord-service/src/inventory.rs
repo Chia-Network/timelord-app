@@ -175,7 +175,35 @@ async fn probe(helper: &Path, driver: &Path, timeout: Duration) -> Result<Vec<De
     }
 }
 
+/// Fixture inventories keyed by native client path, so concurrent tests
+/// cannot see each other's boards. Production never consults this.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use super::Device;
+    use std::{collections::HashMap, path::PathBuf, sync::Mutex};
+    static DEVICES: Mutex<Option<HashMap<PathBuf, Vec<Device>>>> = Mutex::new(None);
+    pub fn set(binary: PathBuf, devices: Vec<Device>) {
+        DEVICES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(binary, devices);
+    }
+    pub fn get(binary: &PathBuf) -> Option<Vec<Device>> {
+        DEVICES.lock().unwrap().as_ref()?.get(binary).cloned()
+    }
+}
+
 pub async fn discover(config: &Config) -> Result<Vec<Device>> {
+    #[cfg(test)]
+    if let Some(devices) = config
+        .hardware
+        .client_binary
+        .as_ref()
+        .and_then(fixture::get)
+    {
+        return Ok(devices);
+    }
     #[cfg(target_os = "macos")]
     {
         let helper = std::env::current_exe()?;
@@ -209,16 +237,6 @@ pub fn board_location(board: &timelord_core::BoardConfig, devices: &[Device]) ->
 
 #[cfg(all(test, target_os = "macos"))]
 mod driver_path_tests;
-
-/// Resolve only physically enumerated boards, preserving the stored registry.
-/// The returned plan never changes the on-disk configuration.
-pub async fn connected_configuration(config: Config) -> Result<Config> {
-    if config.hardware.client_binary.is_none() {
-        return Ok(config);
-    }
-    let devices = discover(&config).await?;
-    connected_plan(config, devices)
-}
 
 pub(crate) fn connected_plan(mut config: Config, devices: Vec<Device>) -> Result<Config> {
     // Preserve each board's identity and settings while it is unplugged. Learned
@@ -303,45 +321,6 @@ pub(crate) fn connected_plan(mut config: Config, devices: Vec<Device>) -> Result
     Ok(config)
 }
 
-/// Debounce successful physical inventories. Enumeration failures break the
-/// streak; they are never interpreted as unplugged boards.
-type TopologyKey = Vec<(String, Option<String>, Option<u32>)>;
-#[derive(Default)]
-pub struct TopologyChange(crate::stable_change::StableChange<TopologyKey>);
-impl TopologyChange {
-    pub fn observe(&mut self, current: &Config, candidate: Result<Config>) -> Option<Config> {
-        self.observe_at(current, candidate, std::time::Instant::now())
-    }
-    fn observe_at(
-        &mut self,
-        current: &Config,
-        candidate: Result<Config>,
-        now: std::time::Instant,
-    ) -> Option<Config> {
-        fn key(config: &Config) -> Vec<(String, Option<String>, Option<u32>)> {
-            let mut key: Vec<_> = config
-                .hardware
-                .boards
-                .iter()
-                .map(|b| (b.id.clone(), b.serial.clone(), b.device_location))
-                .collect();
-            key.sort();
-            key
-        }
-        let candidate = match candidate {
-            Ok(candidate) => candidate,
-            Err(error) => {
-                tracing::debug!(%error, "USB inventory unavailable; retaining current topology");
-                self.0.reset();
-                return None;
-            }
-        };
-        self.0
-            .observe_at(&key(current), key(&candidate), now)
-            .then_some(candidate)
-    }
-}
-
 pub async fn live_configuration(shared: &crate::Shared) -> Result<Config> {
     // Explicit administrator mappings retain their fixed chain ownership.
     if shared.config.hardware.client_binary.is_none()
@@ -358,30 +337,7 @@ pub async fn live_configuration(shared: &crate::Shared) -> Result<Config> {
         0,
         timelord_supervisor::progress::Stage::Discovery,
     );
-    // Only confirm admissions that were already pending when this probe began.
-    let pending: std::collections::HashMap<_, _> = shared
-        .runtime
-        .lock()
-        .expect("runtime")
-        .boards
-        .iter()
-        .filter_map(|(id, h)| {
-            h.lifecycle
-                .admitted_inventory_epoch()
-                .map(|epoch| (id.clone(), epoch))
-        })
-        .collect();
     let mut devices = discover(&shared.config).await?;
-    {
-        let mut state = shared.runtime.lock().expect("runtime");
-        for board in &shared.config.hardware.boards {
-            if let Some(hardware) = state.boards.get_mut(&board.id)
-                && let Some(epoch) = pending.get(&board.id)
-            {
-                confirm_admitted_presence(hardware, board, &devices, *epoch);
-            }
-        }
-    }
     preserve_managed_boards(
         &shared.config,
         &mut devices,
@@ -391,37 +347,25 @@ pub async fn live_configuration(shared: &crate::Shared) -> Result<Config> {
     connected_plan(shared.config.clone(), devices)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Observation {
+    Missing,
+    Present,
+    Ambiguous,
+}
+
 pub(crate) fn board_observation(
     board: &timelord_core::BoardConfig,
     devices: &[Device],
-) -> crate::board_lifecycle::Inventory {
+) -> Observation {
     let matches = devices
         .iter()
         .filter(|device| device.serial.is_some() && device.serial == board.serial)
         .count();
-    inventory_observation(matches)
-}
-
-fn confirm_admitted_presence(
-    hardware: &mut crate::runtime::HardwareState,
-    board: &timelord_core::BoardConfig,
-    devices: &[Device],
-    epoch: u64,
-) {
-    let matches = devices
-        .iter()
-        .filter(|d| d.serial.is_some() && d.serial == board.serial)
-        .count();
-    hardware
-        .lifecycle
-        .observe_inventory(epoch, inventory_observation(matches));
-}
-
-fn inventory_observation(matches: usize) -> crate::board_lifecycle::Inventory {
     match matches {
-        0 => crate::board_lifecycle::Inventory::Missing,
-        1 => crate::board_lifecycle::Inventory::Present,
-        _ => crate::board_lifecycle::Inventory::Ambiguous,
+        0 => Observation::Missing,
+        1 => Observation::Present,
+        _ => Observation::Ambiguous,
     }
 }
 

@@ -32,7 +32,9 @@ public struct HistoryProjection: Sendable {
         histories = Dictionary(boards.map { board in
             let localEvents = (globals + (byBoard[board.id] ?? [])).sorted { $0.offset < $1.offset }.map(\.element)
             let chains = Dictionary( board.assignedChains.compactMap(Chain.init(rawValue:)).map { chain in
-                let samples = (proofs[chain] ?? []).map { proof in
+                // Samples carry their board: a chain that moved keeps each
+                // board's own history instead of being relabelled.
+                let samples = (proofs[chain] ?? []).filter { $0.boardId == nil || $0.boardId == board.id }.map { proof in
                     ProofObservation(date: Date(timeIntervalSince1970: proof.timestampUnix), ips: proof.ips,
                         id: "proof-\(proof.id)", sequence: proof.id, boardID: board.id)
                 }

@@ -59,10 +59,23 @@ final class ServiceController {
             errorMessage = supervisor?.error
         } catch { errorMessage = error.localizedDescription; throw error }
     }
+    /// What a control transaction waits for after the supervisor acknowledges it.
+    private enum Completion {
+        /// Acknowledgment is the result (Resume: the tick starts the worker).
+        case acknowledged
+        /// Pause is durable on acknowledgment; wait until the worker family is retired.
+        case paused
+        /// Reload is acknowledged after validation, once retirement has started;
+        /// wait for the replacement worker, a Pause, or a reported failure.
+        case replaced
+    }
+    /// Bounds the wait after acknowledgment. Graceful retirement is bounded by
+    /// the supervisor (about 15 s); the rest covers starting the replacement.
+    static let completionTimeout: TimeInterval = 90
 
     /// Fresh revision protects a remote administrator's concurrent Pause/Run.
     @discardableResult
-    private func control(_ command: SupervisorClient.Command) async throws -> SupervisorStatus {
+    private func control(_ command: SupervisorClient.Command, completion: Completion = .acknowledged) async throws -> SupervisorStatus {
         guard !changingIntent else { throw ConfigurationError.message("A background service change is already in progress.") }
         controlEpoch &+= 1
         changingIntent = true; defer { changingIntent = false; onChange?() }
@@ -74,12 +87,49 @@ final class ServiceController {
         }
         observe(current)
         do {
-            supervisor = try await client.send(command, expectedRevision: current.revision)
-            errorMessage = supervisor?.error
+            let acknowledged = try await client.send(command, expectedRevision: current.revision)
+            supervisor = acknowledged
+            let settled = try await awaitCompletion(completion, before: current, acknowledged: acknowledged)
+            supervisor = settled
+            errorMessage = settled.error
             return current
         } catch {
             if let refreshed = try? await client.send(.status) { observe(refreshed) }
             errorMessage = error.localizedDescription; throw error
+        }
+    }
+    /// The supervisor never blocks a control request on worker retirement, so
+    /// completion is observed through status: the phase, the owned worker PID
+    /// and the worker generation, which increases with every started worker.
+    private func awaitCompletion(_ completion: Completion, before: SupervisorStatus, acknowledged: SupervisorStatus) async throws -> SupervisorStatus {
+        guard completion != .acknowledged else { return acknowledged }
+        let deadline = Date().addingTimeInterval(Self.completionTimeout)
+        var status = acknowledged
+        while true {
+            supervisor = status
+            // A durable Pause (ours or a concurrent administrator's) settles both waits.
+            if status.mode == .paused && (status.phase == .paused || status.phase == .stateError) { return status }
+            if let error = status.error, status.phase == .stopping, error.hasPrefix("Worker cleanup failed") {
+                throw ConfigurationError.message(error)
+            }
+            switch completion {
+            case .acknowledged:
+                return status
+            case .paused:
+                // Someone resumed while we waited; the Pause no longer applies.
+                if status.mode == .running { return status }
+            case .replaced:
+                if status.phase == .workerStarted && status.workerGeneration > before.workerGeneration { return status }
+                if status.phase == .recovering || status.phase == .stateError {
+                    throw ConfigurationError.message(status.error ?? "The background service did not restart after reload.")
+                }
+            }
+            guard Date() < deadline else {
+                let detail = status.error.map { ": \($0)" } ?? ""
+                throw ConfigurationError.message("The background service is still \(status.phase.rawValue)\(detail). Check its status before retrying.")
+            }
+            try await Task.sleep(nanoseconds: 200_000_000)
+            status = try await client.send(.status)
         }
     }
     private func observe(_ status: SupervisorStatus) {
@@ -87,8 +137,8 @@ final class ServiceController {
         hasObservedSupervisor = true
     }
     func start() async throws -> Bool { try await control(.resume).mode == .paused }
-    func stop() async throws { try await control(.pause) }
-    func reload() async throws { try await control(.reload) }
+    func stop() async throws { try await control(.pause, completion: .paused) }
+    func reload() async throws { try await control(.reload, completion: .replaced) }
 
     /// Only an explicit setup action opens the macOS administrator approval prompt.
     /// The installer validates ownership/signatures and refuses competing workers.

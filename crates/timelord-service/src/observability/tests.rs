@@ -38,7 +38,6 @@ fn fixture() -> (Arc<Shared>, Arc<Metrics>, HttpState) {
                 crate::board_lifecycle::Phase::Connected,
                 true,
                 None,
-                None,
                 1,
             ),
             temperature_c: Some(40.),
@@ -48,20 +47,18 @@ fn fixture() -> (Arc<Shared>, Arc<Metrics>, HttpState) {
             ..Default::default()
         },
     );
-    let shared = Arc::new(Shared {
-        native: None,
-        assignments: config.assignments().unwrap(),
-        config,
-        clients: Arc::new(Mutex::new(std::collections::BTreeSet::from([
-            ("a".into(), 0),
-            ("a".into(), 1),
-        ]))),
-        process: process.clone(),
-        scope: crate::runtime::RuntimeScope::Production,
-        runtime: Arc::new(Mutex::new(runtime)),
-        started_unix: now,
-        service_started_unix: now,
-    });
+    let shared = Arc::new(
+        crate::Shared::new(
+            None,
+            config,
+            Arc::new(Mutex::new(runtime)),
+            process.clone(),
+            now,
+            now,
+        )
+        .routed_by_config()
+        .connected("a", &[0, 1]),
+    );
     let (_, current) = watch::channel(shared.clone());
     let http = HttpState { current, process };
     (shared, metrics, http)
@@ -166,17 +163,18 @@ async fn readiness_requires_initialization_fresh_managed_telemetry_or_verified_g
     // No filesystem access: a missing/unmanaged native binary changes the readiness source.
     let mut config = shared.config.clone();
     config.hardware.client_binary = None;
-    shared = Arc::new(Shared {
-        native: None,
-        config,
-        assignments: shared.assignments.clone(),
-        clients: shared.clients.clone(),
-        process: shared.process.clone(),
-        scope: shared.scope,
-        runtime: shared.runtime.clone(),
-        started_unix: shared.started_unix,
-        service_started_unix: shared.service_started_unix,
-    });
+    shared = Arc::new(
+        crate::Shared::new(
+            None,
+            config,
+            shared.runtime.clone(),
+            shared.process.clone(),
+            shared.started_unix,
+            shared.service_started_unix,
+        )
+        .with_clients(shared.clients.clone())
+        .routed(shared.assignments()),
+    );
     let (_, current) = watch::channel(shared.clone());
     http.current = current;
     assert_eq!(
@@ -191,7 +189,7 @@ async fn readiness_requires_initialization_fresh_managed_telemetry_or_verified_g
         .get_mut("a")
         .unwrap()
         .lifecycle
-        .verified(1, 0);
+        .verified(1, 0, 1);
     shared
         .runtime
         .lock()
@@ -200,7 +198,7 @@ async fn readiness_requires_initialization_fresh_managed_telemetry_or_verified_g
         .get_mut("a")
         .unwrap()
         .lifecycle
-        .verified(1, 1);
+        .verified(1, 1, 1);
     assert_eq!(response(http.clone(), "/readyz").await.0, StatusCode::OK);
     // A reused socket slot needs a new proof; a verified predecessor is insufficient.
     shared
@@ -224,7 +222,7 @@ async fn readiness_requires_initialization_fresh_managed_telemetry_or_verified_g
         .get_mut("a")
         .unwrap()
         .lifecycle
-        .verified(1, 1);
+        .verified(1, 1, 1);
     shared
         .runtime
         .lock()
@@ -239,12 +237,12 @@ async fn readiness_requires_initialization_fresh_managed_telemetry_or_verified_g
         response(http.clone(), "/readyz").await.0,
         StatusCode::SERVICE_UNAVAILABLE
     );
-    shared.process.reconfigure();
+    shared.process.stop();
     assert!(
         response(http.clone(), "/readyz")
             .await
             .2
-            .contains("reconfiguring")
+            .contains("stopping")
     );
     let body = response(http, "/metrics").await.2;
     assert!(!body.contains("chia_timelord_chain_assignment{"));
@@ -400,7 +398,7 @@ fn raw_temperature_and_assignments_are_current_and_use_stable_identity() {
         .unwrap()
         .lifecycle
         .testing()
-        .retry();
+        .fault(crate::board_lifecycle::Fault::Transport, "lost".into(), now);
     let body = metrics.render(&shared, now).unwrap();
     assert_eq!(value(&body, "chia_timelord_raw_ips", &[]), None);
     assert_eq!(value(&body, "chia_timelord_board_up", &[]), Some(0.));
@@ -419,20 +417,16 @@ fn serial_identity_survives_owner_change_and_obsolete_gauges_disappear() {
         .boards
         .insert("new-owner".into(), hardware);
     metrics.register_boards(&config);
-    let moved = Shared {
-        native: None,
-        assignments: config.assignments().unwrap(),
+    let moved = crate::Shared::new(
+        None,
         config,
-        clients: Arc::new(Mutex::new(std::collections::BTreeSet::from([
-            ("new-owner".into(), 0),
-            ("new-owner".into(), 1),
-        ]))),
-        process: shared.process.clone(),
-        scope: shared.scope,
-        runtime: shared.runtime.clone(),
-        started_unix: now,
-        service_started_unix: now,
-    };
+        shared.runtime.clone(),
+        shared.process.clone(),
+        now,
+        now,
+    )
+    .routed_by_config()
+    .connected("new-owner", &[0, 1]);
     let body = metrics.render(&moved, now).unwrap();
     assert_eq!(
         value(&body, "chia_timelord_board_up", &["board=\"SERIAL-A\""]),
@@ -453,17 +447,14 @@ fn serial_identity_survives_owner_change_and_obsolete_gauges_disappear() {
         value(&body, "chia_timelord_board_temperature_celsius", &[]),
         None
     );
-    let removed = Shared {
-        native: None,
-        config: Config::default(),
-        assignments: vec![],
-        clients: Default::default(),
-        process: moved.process.clone(),
-        scope: moved.scope,
-        runtime: moved.runtime.clone(),
-        started_unix: now,
-        service_started_unix: now,
-    };
+    let removed = crate::Shared::new(
+        None,
+        Config::default(),
+        moved.runtime.clone(),
+        moved.process.clone(),
+        now,
+        now,
+    );
     let body = metrics.render(&removed, now).unwrap();
     assert!(!body.contains("chia_timelord_chain_assignment{"));
     assert!(!body.contains("chia_timelord_board_state{"));
@@ -658,11 +649,6 @@ fn incomplete_snapshots_never_republish_a_previous_productive_gauge() {
             .contains("chia_timelord_estimated_ips{")
     );
     let process = shared.process.clone();
-    process.reconfigure();
-    let reconfiguring = metrics.render(&shared, crate::unix_now()).unwrap();
-    assert!(!reconfiguring.contains("chia_timelord_estimated_ips{"));
-    assert!(!reconfiguring.contains("chia_timelord_chain_estimated_ips{"));
-    process.resume();
     shared.runtime.lock().unwrap().node = "disconnected".into();
     assert!(
         !metrics
@@ -671,13 +657,10 @@ fn incomplete_snapshots_never_republish_a_previous_productive_gauge() {
             .contains("chia_timelord_estimated_ips{")
     );
     shared.runtime.lock().unwrap().node = "authenticated".into();
-    process.essential_failure();
-    assert!(
-        !metrics
-            .render(&shared, crate::unix_now())
-            .unwrap()
-            .contains("chia_timelord_estimated_ips{")
-    );
+    process.stop();
+    let stopping = metrics.render(&shared, crate::unix_now()).unwrap();
+    assert!(!stopping.contains("chia_timelord_estimated_ips{"));
+    assert!(!stopping.contains("chia_timelord_chain_estimated_ips{"));
 }
 
 #[test]

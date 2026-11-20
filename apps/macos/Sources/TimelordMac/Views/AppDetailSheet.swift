@@ -7,7 +7,7 @@ struct AppDetailSheet: View {
     var body: some View {
         switch selection {
         case .board(let id):
-            if let board = model.snapshot.boards.first(where: { $0.id == id }) { BoardDetailSheet(board: board, snapshot: model.snapshot).id(id) }
+            if let board = model.snapshot.boards.first(where: { $0.id == id }) { BoardDetailSheet(board: board, snapshot: model.snapshot, act: { action, minutes in Task { await model.boardAction(id, action, minutes: minutes) } }).id(id) }
             else { VStack { SheetHeader(title: "Board unavailable"); Text("This board is no longer connected.").padding(24) } }
         case .node: NodeConnectionSheet(model: model)
         case .boards: BoardSetupSheet(model: model)

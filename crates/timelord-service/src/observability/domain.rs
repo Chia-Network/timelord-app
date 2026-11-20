@@ -200,9 +200,10 @@ pub fn restart_reason(error: &anyhow::Error) -> RestartReason {
             NativeFailureKind::Thermal => RestartReason::Thermal,
             NativeFailureKind::SensorUnavailable => RestartReason::Sensor,
             NativeFailureKind::Readback => RestartReason::Readback,
-            NativeFailureKind::ControlClosed | NativeFailureKind::Protocol => {
-                RestartReason::Process
-            }
+            NativeFailureKind::ControlClosed
+            | NativeFailureKind::Protocol
+            | NativeFailureKind::Stalled
+            | NativeFailureKind::Exited => RestartReason::Process,
         }
     } else if let Some(failure) = error.downcast_ref::<crate::asic::AsicFailure>() {
         if failure.verification {

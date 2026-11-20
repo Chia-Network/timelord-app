@@ -6,7 +6,6 @@ use timelord_supervisor::progress::Progress;
 pub enum Phase {
     #[default]
     Running,
-    Reconfiguring,
     Stopping,
 }
 #[derive(Clone, Copy, Debug, Default)]
@@ -34,6 +33,7 @@ pub struct State {
     lifecycle: Mutex<Snapshot>,
     pub progress: Arc<Progress>,
     pub metrics: Arc<crate::observability::Metrics>,
+    pub board_history: crate::board_history::Store,
 }
 impl State {
     pub fn new(metrics: Arc<crate::observability::Metrics>) -> Arc<Self> {
@@ -41,6 +41,7 @@ impl State {
             lifecycle: Mutex::new(Snapshot::default()),
             progress: Arc::default(),
             metrics,
+            board_history: Default::default(),
         })
     }
     #[cfg(test)]
@@ -62,12 +63,6 @@ impl State {
     pub fn essential_failure(&self) {
         self.lifecycle.lock().expect("process lifecycle").failure = Some(Failure::Essential);
         self.progress.fail();
-    }
-    pub fn reconfigure(&self) {
-        self.phase(Phase::Reconfiguring);
-    }
-    pub fn resume(&self) {
-        self.phase(Phase::Running);
     }
     pub fn stop(&self) {
         self.phase(Phase::Stopping);
@@ -92,20 +87,15 @@ mod tests {
         assert!(process.progress.snapshot(1, 1).unwrap().failed);
     }
     #[test]
-    fn reconfiguration_never_clears_failure_or_revives_shutdown() {
+    fn observer_failure_keeps_production_and_shutdown_is_final() {
         let process = State::fixture();
-        process.reconfigure();
-        assert!(process.snapshot().healthy());
-        assert!(!process.snapshot().ready());
         process.fail();
-        process.resume();
         assert!(!process.snapshot().healthy());
         assert!(
             process.snapshot().producing(),
             "observer failure does not stop proof work"
         );
         process.stop();
-        process.resume();
         assert_eq!(process.snapshot().phase, Phase::Stopping);
         assert!(!process.snapshot().producing());
     }

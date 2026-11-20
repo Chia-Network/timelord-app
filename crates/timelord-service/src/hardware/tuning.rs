@@ -25,6 +25,11 @@ pub(super) struct Tuning {
     pub(super) raw_window: crate::assignment::RawWindow,
     pub(super) last_record_unix: u64,
     pub(super) journal: Option<Journal>,
+    /// A cautious start holds tuning and saves no profile until the owner has
+    /// returned to its best-known point.
+    pub(super) cautious: bool,
+    /// The learned profile for the current engine count.
+    pub(super) learned: Option<automatic::Learned>,
 }
 fn exploration_allowed(
     state: &crate::runtime::RuntimeState,
@@ -33,10 +38,9 @@ fn exploration_allowed(
     owns_trial: bool,
 ) -> bool {
     owns_trial
-        && !state.experiments.admission_pending()
+        && !state.disturbed(now)
         && state.boards.get(board_id).is_some_and(|hardware| {
-            hardware.lifecycle.capacity(now, true).exploration_ready
-                && now.saturating_sub(hardware.temperature_unix) <= 30
+            hardware.lifecycle.accepts_work() && now.saturating_sub(hardware.temperature_unix) <= 30
         })
 }
 impl Tuning {
@@ -75,14 +79,18 @@ impl Tuning {
             } else {
                 None
             },
+            // The best-known stable point survives provisional saves.
+            stable_point: if clean >= board.automatic.healthy_seconds && !self.policy.in_trial() {
+                Some(self.policy.point)
+            } else {
+                self.learned.as_ref().and_then(|l| l.stable_point)
+            },
         };
-        let health = if clean >= board.automatic.healthy_seconds && !self.policy.in_trial() {
-            self.journal
-                .as_ref()
-                .map(|j| (j.store.clone(), j.token, self.serial.clone()))
-        } else {
-            None
-        };
+        if entry.stable_point.is_some() {
+            let mut learned = entry.clone();
+            learned.active_seconds = clean;
+            self.learned = Some(learned);
+        }
         let stage = progress.begin(
             timelord_supervisor::progress::Resource::OptionalCheckpoint,
             0,
@@ -91,13 +99,7 @@ impl Tuning {
         );
         crate::optional_io::spawn("automatic-checkpoint", move || {
             let (_permit, _stage) = (permit, stage);
-            automatic::save(&path, entry)?;
-            if let Some((store, token, serial)) = health
-                && let Err(error) = store.healthy_profile_saved(&serial, token)
-            {
-                tracing::warn!(%error, "Healthy safety evidence unavailable; retaining safe restriction");
-            }
-            Ok(())
+            automatic::save(&path, entry)
         })
     }
     // Optional persistence has a bounded wait, but a native fault is never
@@ -157,6 +159,98 @@ impl Tuning {
             }
         }
     }
+    fn publish(&mut self, shared: &Shared, board: &BoardConfig, state: &str, message: &str) {
+        self.policy.status.state = state.into();
+        self.policy.status.message = message.into();
+        shared
+            .runtime
+            .lock()
+            .expect("runtime")
+            .boards
+            .entry(board.id.clone())
+            .or_default()
+            .automatic = Some(self.policy.status.clone());
+    }
+    /// A route change gave this board a different number of active engines.
+    /// Apply the setting learned for that count; without one, never keep a
+    /// faster clock than the configured start for more active engines.
+    async fn change_engine_count(
+        &mut self,
+        control: &mut NativeControl,
+        shared: &Shared,
+        board: &BoardConfig,
+        log: &mut ClientLog,
+        shutdown: &mut watch::Receiver<bool>,
+        engines: usize,
+    ) -> Result<()> {
+        let now = crate::unix_now();
+        let facts = shared
+            .native
+            .as_ref()
+            .context("Automatic capabilities were not prepared")?
+            .clone();
+        let learned = facts.learned(&shared.config, board, engines).await?;
+        let current = self.policy.point;
+        let target = match &learned {
+            Some(entry) => automatic::initial_point(board, Some(entry)),
+            None => {
+                let start = automatic::initial_point(board, None);
+                Point {
+                    frequency_mhz: if engines > self.engines {
+                        current.frequency_mhz.min(start.frequency_mhz)
+                    } else {
+                        current.frequency_mhz
+                    },
+                    voltage_v: current.voltage_v,
+                }
+            }
+        };
+        tracing::info!(board=%board.name, from=self.engines, to=engines, frequency_mhz=target.frequency_mhz, learned=learned.is_some(), "Active engine count changed; applying the setting for the new count");
+        let actual = if target != current {
+            let lowering = target.frequency_mhz <= current.frequency_mhz
+                && target.voltage_v <= current.voltage_v;
+            match self
+                .journal_point(target, log, shared, board, shutdown)
+                .await?
+            {
+                JournalDecision::Durable => {}
+                JournalDecision::Cancelled => return Ok(()),
+                JournalDecision::Superseded => bail!("Native owner journal token was superseded"),
+                JournalDecision::Unavailable(error) if !lowering => {
+                    tracing::warn!(error=%format!("{error:#}"), "Operating-point journal unavailable; keeping the current setting");
+                    return Ok(());
+                }
+                JournalDecision::Unavailable(_) => {}
+            }
+            control
+                .change_with_logs(target, 5, log, shared, board)
+                .await
+                .context("Applying the setting for a new engine count")?
+        } else {
+            current
+        };
+        self.policy = Policy::new(
+            board.automatic.clone(),
+            actual,
+            now,
+            facts.frequencies.clone(),
+        );
+        if let Some(entry) = &learned {
+            self.policy.restore(entry);
+        }
+        self.policy.synchronize_recoveries(
+            shared.runtime.lock().expect("runtime").boards[&board.id].recoveries,
+        );
+        self.learned = learned;
+        self.engines = engines;
+        self.raw_window = Default::default();
+        self.last_record_unix = now;
+        let mut state = shared.runtime.lock().expect("runtime");
+        let hardware = state.boards.entry(board.id.clone()).or_default();
+        hardware.frequency_mhz = Some(actual.frequency_mhz);
+        hardware.voltage_v = Some(actual.voltage_v);
+        Ok(())
+    }
     pub(super) async fn tick(
         &mut self,
         control: &mut NativeControl,
@@ -166,37 +260,29 @@ impl Tuning {
         shutdown: &mut watch::Receiver<bool>,
     ) -> Result<()> {
         let now = crate::unix_now();
-        if shared.persistent_owners() {
-            let engines = shared
-                .assignments()
-                .iter()
-                .filter(|a| a.board_id == board.id)
-                .count();
-            if engines == 0 {
-                self.policy.interrupt_trial(now);
-                self.experiment.take();
-                return Ok(());
-            }
-            if engines != self.engines {
-                self.experiment.take();
-                self.engines = engines;
-                self.raw_window = Default::default();
-                if let Some(facts) = &shared.native {
-                    self.policy = Policy::new(
-                        board.automatic.clone(),
-                        self.policy.point,
-                        now,
-                        facts.frequencies.clone(),
-                    );
-                }
-                self.last_record_unix = now;
-            }
-        }
-        let gate = shared.runtime.lock().expect("runtime").experiments.clone();
-        if gate.admission_pending() {
+        let engines = shared.engines(&board.id);
+        if engines == 0 {
             self.policy.interrupt_trial(now);
             self.experiment.take();
+            self.publish(shared, board, "idle", "No chains routed to this board");
+            return Ok(());
         }
+        if self.cautious {
+            self.experiment.take();
+            self.publish(
+                shared,
+                board,
+                "cautious",
+                "Started cautiously; returning to the saved setting after verified work",
+            );
+            return Ok(());
+        }
+        if engines != self.engines {
+            self.experiment.take();
+            self.change_engine_count(control, shared, board, log, shutdown, engines)
+                .await?;
+        }
+        let gate = shared.runtime.lock().expect("runtime").experiments.clone();
         if self.experiment.is_none() {
             self.experiment = gate.trial();
         }
@@ -223,14 +309,18 @@ impl Tuning {
                 .filter(|a| a.board_id == board.id)
                 .map(|a| a.chain)
                 .collect();
+            // Only this board's own proofs are evidence about its setting.
+            let own =
+                |o: &&crate::runtime::Observation| o.board_id.as_deref() == Some(board.id.as_str());
             let latest = state
                 .observations
                 .iter()
                 .rev()
+                .filter(own)
                 .find(|o| chains.contains(&o.chain))
                 .map(|o| o.timestamp_unix);
             let score = automatic::phase_score(
-                state.observations.iter(),
+                state.observations.iter().filter(own),
                 &chains,
                 self.policy
                     .epoch
@@ -253,6 +343,7 @@ impl Tuning {
                 temperature: hardware.temperature_c,
                 temperature_limit: board.temperature_limit_c,
                 paused: state.tuning_paused,
+                disturbed: state.disturbed(now),
             }
         };
         let healthy = input.healthy && !input.paused;
@@ -310,7 +401,7 @@ impl Tuning {
                 let actual = control
                     .change_with_logs(point, 5, log, shared, board)
                     .await
-                    .with_context(|| board.name.clone())?;
+                    .context("Applying automatic setting")?;
                 if let Some(metrics) = shared.metrics() {
                     let kind = match reason.kind {
                         automatic::ChangeKind::Trial => {
@@ -387,42 +478,35 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    #[tokio::test]
-    async fn exploration_is_local_to_the_candidate_but_exclusive_with_trials_and_admission() {
+    #[test]
+    fn exploration_needs_a_serving_board_its_own_trial_and_no_disturbance() {
         use crate::board_lifecycle::{BoardLifecycle, Fault, Phase};
         let mut state = crate::runtime::RuntimeState::default();
         state.boards.insert(
             "healthy".into(),
             crate::runtime::HardwareState {
-                lifecycle: BoardLifecycle::fixture(Phase::Connected, true, None, Some(true), 1),
+                lifecycle: BoardLifecycle::fixture(Phase::Connected, true, None, 1),
                 temperature_unix: 100,
                 ..Default::default()
             },
         );
         state.boards.insert(
-            "quarantined-manual".into(),
+            "restricted".into(),
             crate::runtime::HardwareState {
                 lifecycle: BoardLifecycle::fixture(
-                    Phase::Quarantined,
+                    Phase::InvalidProof,
                     false,
                     Some(Fault::InvalidProof),
-                    Some(true),
                     1,
                 ),
                 ..Default::default()
             },
         );
-        // An absent pinned board has no runtime entry at all.
         let gate = state.experiments.clone();
         let trial = gate.trial().unwrap();
         assert!(exploration_allowed(&state, "healthy", 100, true));
-        assert!(!exploration_allowed(
-            &state,
-            "quarantined-manual",
-            100,
-            true
-        ));
-        assert!(!exploration_allowed(&state, "missing-pinned", 100, true));
+        assert!(!exploration_allowed(&state, "restricted", 100, true));
+        assert!(!exploration_allowed(&state, "missing", 100, true));
         assert!(!exploration_allowed(&state, "healthy", 131, true));
         assert!(!exploration_allowed(
             &state,
@@ -430,34 +514,18 @@ mod tests {
             100,
             gate.trial().is_some()
         ));
-        state.boards.get_mut("healthy").unwrap().lifecycle.fault(
-            Fault::Transport,
-            "own failure".into(),
-            100,
-        );
+        // Another board starting or retiring holds exploration everywhere.
+        state.disturb(100, 20);
         assert!(!exploration_allowed(&state, "healthy", 100, true));
-        state.boards.get_mut("healthy").unwrap().lifecycle =
-            BoardLifecycle::fixture(Phase::Connected, true, None, Some(true), 1);
-        let admission = gate.admission();
-        tokio::pin!(admission);
-        tokio::select! {
-            biased;
-            _ = &mut admission => panic!("admission bypassed the active trial"),
-            _ = tokio::task::yield_now() => {}
-        }
-        assert!(gate.admission_pending());
+        state.disturbed_until_unix = 0;
+        state
+            .boards
+            .get_mut("healthy")
+            .unwrap()
+            .lifecycle
+            .testing()
+            .fault(Fault::Transport, "own failure".into(), 100);
         assert!(!exploration_allowed(&state, "healthy", 100, true));
-        drop(trial);
-        let admission = admission.await;
-        assert!(!exploration_allowed(
-            &state,
-            "healthy",
-            100,
-            gate.trial().is_some()
-        ));
-        drop(admission);
-        let trial = gate.trial().unwrap();
-        assert!(exploration_allowed(&state, "healthy", 100, true));
         drop(trial);
     }
     #[tokio::test]
@@ -488,8 +556,8 @@ printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
             voltage_v: 1.,
         };
         let token = store.begin_owner("fixture", point).unwrap();
-        let shared = Shared {
-            native: if config
+        let shared = crate::Shared::new(
+            if config
                 .hardware
                 .boards
                 .iter()
@@ -499,26 +567,23 @@ printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
             } else {
                 None
             },
-            assignments: config.assignments().unwrap(),
             config,
-            process: crate::operational::State::fixture(),
-            scope: crate::runtime::RuntimeScope::Production,
-            runtime: Arc::new(std::sync::Mutex::new({
+            Arc::new(std::sync::Mutex::new({
                 let mut state = crate::runtime::RuntimeState::default();
                 state.safety = Some(store.clone());
                 state
             })),
-            clients: Default::default(),
-            started_unix: 0,
-            service_started_unix: 0,
-        };
+            crate::operational::State::fixture(),
+            0,
+            0,
+        )
+        .routed_by_config();
         let startup = startup(&shared, &board).await.unwrap();
         let mut child = launch(&shared, &board, &startup).await.unwrap();
         let mut owner = NativeOwner::attach(&board, &mut child).unwrap();
-        let (ready, _rx) = oneshot::channel();
-        let mut log = ClientLog::new(child.stderr.take().unwrap(), ready);
+        let mut log = ClientLog::new(child.stderr.take().unwrap());
         owner
-            .initialize(&shared, &board, &mut log, startup)
+            .initialize(&shared, &board, &mut log, &startup)
             .await
             .unwrap();
         let tuning = Tuning {
@@ -534,6 +599,8 @@ printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
                 store: store.clone(),
                 token,
             }),
+            cautious: false,
+            learned: None,
         };
         let (entered, waiting) = std::sync::mpsc::channel();
         let (release, done) = std::sync::mpsc::channel();

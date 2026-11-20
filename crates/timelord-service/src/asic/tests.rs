@@ -1,7 +1,26 @@
 use super::*;
 use dg_xch_core::blockchain::sized_bytes::Bytes32;
+use timelord_core::Config;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use vdf_client_protocol::Checkpoint;
+fn offers_for(
+    backend: &AsicBackend,
+    config: &Config,
+) -> std::collections::HashMap<String, mpsc::Sender<Lease>> {
+    config
+        .hardware
+        .boards
+        .iter()
+        .map(|b| (b.id.clone(), backend.add_board(&b.id)))
+        .collect()
+}
+fn route(board: &str, chain: Chain, engine: u8) -> Assignment {
+    Assignment {
+        board_id: board.into(),
+        chain,
+        engine,
+    }
+}
 fn work(iterations: u64, bits: usize) -> ProofRequest {
     ProofRequest {
         generation: 1,
@@ -30,39 +49,17 @@ fn canonical() -> UnverifiedProof {
     }
 }
 #[test]
-fn backend_routes_using_the_resolved_plan_without_recomputing_board_order() {
-    let mut config = Config::default();
-    config.hardware.boards = (0..3)
-        .map(|i| {
-            toml::from_str(&format!(
-                "id='b{i}'\nname='B{i}'\nclient_port={}",
-                18110 + i
-            ))
-            .unwrap()
-        })
-        .collect();
-    let mut plan = config.assignments().unwrap();
-    plan[0].board_id = "b2".into();
-    plan[2].board_id = "b0".into();
-    let (backend, _) = AsicBackend::new(
-        &config,
-        &plan,
-        Default::default(),
-        crate::operational::State::fixture(),
-    )
-    .unwrap();
-    assert_eq!(
-        backend
-            .lanes
-            .iter()
-            .map(|(chain, lane)| (*chain, lane.board.as_str()))
-            .collect::<Vec<_>>(),
-        vec![
-            (Chain::Challenge, "b2"),
-            (Chain::Reward, "b1"),
-            (Chain::InfusedChallenge, "b0")
-        ]
-    );
+fn backend_routes_follow_live_runtime_routes() {
+    let runtime: Arc<SyncMutex<crate::runtime::RuntimeState>> = Default::default();
+    let backend = AsicBackend::new(runtime.clone(), crate::operational::State::fixture());
+    assert!(backend.route(Chain::Challenge).is_none());
+    runtime.lock().unwrap().routing = vec![Assignment {
+        board_id: "b2".into(),
+        chain: Chain::Challenge,
+        engine: 1,
+    }];
+    assert_eq!(backend.route(Chain::Challenge).unwrap().board_id, "b2");
+    assert!(backend.route(Chain::Reward).is_none());
 }
 #[test]
 fn converts_and_verifies_canonical_cpp_checkpoints_and_rejects_corruption() {
@@ -94,27 +91,34 @@ async fn setup() -> (
     let runtime = {
         let mut fixture = crate::runtime::RuntimeState::new(false);
         fixture.metric_epoch = metrics.begin_session();
+        // One fixture socket on engine 0 serves whichever chain a test uses.
+        fixture.routing = vec![
+            route("a", Chain::Challenge, 0),
+            route("a", Chain::InfusedChallenge, 0),
+        ];
+        fixture
+            .boards
+            .entry("a".into())
+            .or_default()
+            .lifecycle
+            .testing()
+            .serve(crate::unix_now());
         fixture
     };
-    let (backend, offers) = AsicBackend::new(
-        &config,
-        &config.assignments().unwrap(),
-        Arc::new(SyncMutex::new(runtime)),
-        process,
-    )
-    .unwrap();
+    let backend = AsicBackend::new(Arc::new(SyncMutex::new(runtime)), process);
+    let offer = backend.add_board("a");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client = TcpStream::connect(listener.local_addr().unwrap())
         .await
         .unwrap();
     let (socket, _) = listener.accept().await.unwrap();
     let clients = Arc::new(SyncMutex::new(BTreeSet::from([("a".into(), 0)])));
-    offers["a"]
+    offer
         .send(Lease {
             socket,
             board: "a".into(),
             slot: 0,
-            generation: 0,
+            generation: 1,
             clients: clients.clone(),
         })
         .await
@@ -176,23 +180,24 @@ async fn icc_primer_does_not_supply_unmanaged_readiness_evidence() {
         fixture.metric_epoch = metrics.begin_session();
         fixture.scheduler_initialized = true;
         fixture.node = "authenticated".into();
+        fixture.routing = vec![
+            route("a", Chain::InfusedChallenge, 0),
+            route("a", Chain::Challenge, 1),
+            route("a", Chain::Reward, 2),
+        ];
         fixture
     }));
-    let assignments = config.assignments().unwrap();
-    let (backend, offers) =
-        AsicBackend::new(&config, &assignments, runtime.clone(), process.clone()).unwrap();
+    let backend = AsicBackend::new(runtime.clone(), process.clone());
+    let offers = offers_for(&backend, &config);
     let backend = Arc::new(backend);
-    let shared = crate::Shared {
-        native: None,
+    let shared = crate::Shared::new(
+        None,
         config,
-        assignments,
-        clients: Default::default(),
+        runtime.clone(),
         process,
-        scope: crate::runtime::RuntimeScope::Production,
-        runtime: runtime.clone(),
-        started_unix: crate::unix_now(),
-        service_started_unix: crate::unix_now(),
-    };
+        crate::unix_now(),
+        crate::unix_now(),
+    );
     runtime
         .lock()
         .unwrap()
@@ -201,7 +206,7 @@ async fn icc_primer_does_not_supply_unmanaged_readiness_evidence() {
         .or_default()
         .lifecycle
         .testing()
-        .start_native();
+        .serve(crate::unix_now());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     for (slot, chain, record_metric) in [
         (0, Chain::InfusedChallenge, false),
@@ -218,7 +223,7 @@ async fn icc_primer_does_not_supply_unmanaged_readiness_evidence() {
                 socket,
                 board: "a".into(),
                 slot,
-                generation: 0,
+                generation: 1,
                 clients: shared.clients.clone(),
             })
             .await
@@ -251,7 +256,7 @@ async fn icc_primer_does_not_supply_unmanaged_readiness_evidence() {
             );
             assert_eq!(
                 board.lifecycle.verified_generation(),
-                record_metric.then_some(0)
+                record_metric.then_some(1)
             );
         }
         assert_eq!(
@@ -262,41 +267,56 @@ async fn icc_primer_does_not_supply_unmanaged_readiness_evidence() {
     }
 }
 #[tokio::test]
-async fn failed_board_reconnects_without_retiring_a_healthy_chain_session() {
+async fn a_dropped_session_retries_on_its_owner_and_repeated_failures_retire_only_that_board() {
     let config:Config=toml::from_str("[[hardware.boards]]\nid='healthy'\nname='Healthy'\nclient_port=18110\n[[hardware.boards]]\nid='failed'\nname='Failed'\nclient_port=18111").unwrap();
     let runtime = Arc::new(SyncMutex::new(crate::runtime::RuntimeState::default()));
-    let (backend, offers) = AsicBackend::new(
-        &config,
-        &config.assignments().unwrap(),
-        runtime.clone(),
-        crate::operational::State::fixture(),
-    )
-    .unwrap();
+    {
+        let mut state = runtime.lock().unwrap();
+        state.routing = vec![
+            route("healthy", Chain::Challenge, 0),
+            route("failed", Chain::InfusedChallenge, 0),
+        ];
+        for board in ["healthy", "failed"] {
+            state
+                .boards
+                .entry(board.into())
+                .or_default()
+                .lifecycle
+                .testing()
+                .serve(crate::unix_now());
+        }
+    }
+    let backend = AsicBackend::new(runtime.clone(), crate::operational::State::fixture());
+    let offers = offers_for(&backend, &config);
     let backend = Arc::new(backend);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let clients = Arc::new(SyncMutex::new(BTreeSet::new()));
-    let mut sockets = Vec::new();
-    for board in ["healthy", "failed"] {
-        let client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (socket, _) = listener.accept().await.unwrap();
-        clients.lock().unwrap().insert((board.into(), 0));
-        offers[board]
-            .send(Lease {
-                socket,
-                board: board.into(),
-                slot: 0,
-                generation: 0,
-                clients: clients.clone(),
-            })
-            .await
-            .ok()
-            .unwrap();
-        sockets.push(client);
-    }
-    let mut healthy = sockets.remove(0);
-    let mut failed = sockets.remove(0);
+    let connect = |board: &'static str, generation: u64| {
+        let listener = &listener;
+        let clients = clients.clone();
+        let offer = offers[board].clone();
+        async move {
+            let client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (socket, _) = listener.accept().await.unwrap();
+            clients.lock().unwrap().insert((board.into(), 0));
+            offer
+                .send(Lease {
+                    socket,
+                    board: board.into(),
+                    slot: 0,
+                    generation,
+                    clients,
+                })
+                .await
+                .ok()
+                .unwrap();
+            client
+        }
+    };
+    let mut healthy = connect("healthy", 1).await;
+    let mut failed = connect("failed", 1).await;
     let bad = tokio::spawn({
         let backend = backend.clone();
         async move {
@@ -308,6 +328,17 @@ async fn failed_board_reconnects_without_retiring_a_healthy_chain_session() {
     handshake(&mut failed).await;
     assert_eq!(requested(&mut failed).await, 20);
     drop(failed);
+    // One dropped session retries on the same owner.
+    let mut retry = connect("failed", 1).await;
+    handshake(&mut retry).await;
+    assert_eq!(requested(&mut retry).await, 20);
+    assert!(
+        runtime.lock().unwrap().boards["failed"]
+            .lifecycle
+            .accepts_work()
+    );
+    drop(retry);
+    // A second failure within the window retires only that owner.
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if runtime
@@ -315,7 +346,7 @@ async fn failed_board_reconnects_without_retiring_a_healthy_chain_session() {
                 .unwrap()
                 .boards
                 .get("failed")
-                .is_some_and(|b| b.lifecycle.status().phase == crate::board_lifecycle::Phase::Fault)
+                .is_some_and(|b| b.lifecycle.needs_retirement())
             {
                 break;
             }
@@ -346,48 +377,11 @@ async fn failed_board_reconnects_without_retiring_a_healthy_chain_session() {
         .unwrap()
         .lifecycle
         .testing()
-        .begin_attempt(crate::unix_now());
-    runtime
-        .lock()
-        .unwrap()
-        .boards
-        .get_mut("failed")
-        .unwrap()
-        .lifecycle
-        .testing()
-        .start_native();
+        .serve(crate::unix_now());
     // A queued socket from the dead process is discarded, never assigned to the replacement.
-    let stale = TcpStream::connect(listener.local_addr().unwrap())
-        .await
-        .unwrap();
-    let (socket, _) = listener.accept().await.unwrap();
-    offers["failed"]
-        .send(Lease {
-            socket,
-            board: "failed".into(),
-            slot: 1,
-            generation: 0,
-            clients: clients.clone(),
-        })
-        .await
-        .ok()
-        .unwrap();
+    let stale = connect("failed", 1).await;
     drop(stale);
-    let mut replacement = TcpStream::connect(listener.local_addr().unwrap())
-        .await
-        .unwrap();
-    let (socket, _) = listener.accept().await.unwrap();
-    offers["failed"]
-        .send(Lease {
-            socket,
-            board: "failed".into(),
-            slot: 0,
-            generation: 1,
-            clients: clients.clone(),
-        })
-        .await
-        .ok()
-        .unwrap();
+    let mut replacement = connect("failed", 2).await;
     let replacement_fixture = tokio::spawn(async move {
         handshake(&mut replacement).await;
         assert_eq!(requested(&mut replacement).await, 20);
@@ -410,12 +404,53 @@ async fn failed_board_reconnects_without_retiring_a_healthy_chain_session() {
     assert_eq!(state.estimated_observations.len(), 3);
     assert!(
         state
+            .estimated_observations
+            .iter()
+            .any(|o| o.board_id.as_deref() == Some("failed") && o.engine == Some(0))
+    );
+    assert!(
+        state
             .events
             .iter()
             .any(|e| e.board_id.as_deref() == Some("failed")
                 && e.kind == "board_fault"
                 && e.end_unix.is_some())
     );
+}
+#[tokio::test]
+async fn a_routed_engine_that_never_connects_retires_its_owner_immediately() {
+    let runtime = Arc::new(SyncMutex::new(crate::runtime::RuntimeState::default()));
+    {
+        let mut state = runtime.lock().unwrap();
+        state.routing = vec![route("stuck", Chain::Challenge, 1)];
+        state
+            .boards
+            .entry("stuck".into())
+            .or_default()
+            .lifecycle
+            .testing()
+            .serve(crate::unix_now());
+    }
+    let backend = AsicBackend::new(runtime.clone(), crate::operational::State::fixture());
+    let _offer = backend.add_board("stuck");
+    assert!(!backend.lane_failed("stuck", 1, &anyhow::Error::new(ClientWaitTimeout)));
+    assert!(
+        runtime.lock().unwrap().boards["stuck"]
+            .lifecycle
+            .needs_retirement()
+    );
+    // An ordinary session error on a fresh owner is retried first.
+    runtime
+        .lock()
+        .unwrap()
+        .boards
+        .get_mut("stuck")
+        .unwrap()
+        .lifecycle
+        .testing()
+        .serve(crate::unix_now());
+    assert!(backend.lane_failed("stuck", 2, &anyhow::anyhow!("early eof")));
+    assert!(!backend.lane_failed("stuck", 2, &anyhow::anyhow!("early eof")));
 }
 #[tokio::test]
 async fn invalid_proof_latches_only_its_board_and_never_publishes_an_ips_sample() {
@@ -453,7 +488,10 @@ async fn invalid_proof_latches_only_its_board_and_never_publishes_an_ips_sample(
         let state = backend.runtime.lock().unwrap();
         assert_eq!(state.failed_proofs, 1);
         assert!(state.estimated_observations.is_empty());
-        assert_eq!(state.boards["a"].lifecycle.status().phase.as_str(), "fault");
+        assert_eq!(
+            state.boards["a"].lifecycle.status().phase.as_str(),
+            "invalid_proof"
+        );
     }
     assert!(!pending.is_finished());
     pending.abort();
@@ -474,13 +512,10 @@ fn discriminant_starts_before_a_client_is_available_and_cancellation_releases_la
     runtime.block_on(async {
         let config: Config =
             toml::from_str("[[hardware.boards]]\nid='a'\nname='A'\nclient_port=18110\n").unwrap();
-        let (backend, _offers) = AsicBackend::new(
-            &config,
-            &config.assignments().unwrap(),
-            Default::default(),
-            crate::operational::State::fixture(),
-        )
-        .unwrap();
+        let runtime: Arc<SyncMutex<crate::runtime::RuntimeState>> = Default::default();
+        runtime.lock().unwrap().routing = config.assignments().unwrap();
+        let backend = AsicBackend::new(runtime, crate::operational::State::fixture());
+        let _offers = offers_for(&backend, &config);
         let backend = Arc::new(backend);
         let proving = tokio::spawn({
             let backend = backend.clone();
@@ -701,25 +736,19 @@ async fn live_route_failover_preserves_the_healthy_engine_session() {
         },
     ];
     let mut runtime = crate::runtime::RuntimeState::new(false);
-    runtime.routing = Some(plan.clone());
+    runtime.routing = plan.clone();
     for id in ["b0", "b1"] {
         runtime.boards.entry(id.into()).or_default().lifecycle =
             crate::board_lifecycle::BoardLifecycle::fixture(
                 crate::board_lifecycle::Phase::Connected,
                 true,
                 None,
-                Some(true),
                 0,
             );
     }
     let runtime = Arc::new(SyncMutex::new(runtime));
-    let (backend, offers) = AsicBackend::new(
-        &config,
-        &plan,
-        runtime.clone(),
-        crate::operational::State::fixture(),
-    )
-    .unwrap();
+    let backend = AsicBackend::new(runtime.clone(), crate::operational::State::fixture());
+    let offers = offers_for(&backend, &config);
     let backend = Arc::new(backend);
     let clients = Arc::new(SyncMutex::new(BTreeSet::new()));
     let mut sockets = Vec::new();
@@ -784,7 +813,7 @@ async fn live_route_failover_preserves_the_healthy_engine_session() {
         .prove_when_available(Chain::Reward, work(1, 64), true)
         .await
         .unwrap();
-    runtime.lock().unwrap().routing.as_mut().unwrap()[0] = Assignment {
+    runtime.lock().unwrap().routing[0] = Assignment {
         board_id: "b1".into(),
         engine: 0,
         chain: Chain::Challenge,
@@ -826,23 +855,17 @@ async fn recovery_proofs_use_the_live_owner_pool_without_publishing_or_trusting_
         .push(toml::from_str("id='a'\nname='A'\nprofile='manual'\nclient_port=18110").unwrap());
     let plan = config.assignments().unwrap();
     let mut state = crate::runtime::RuntimeState::new(false);
-    state.routing = Some(plan.clone());
+    state.routing = plan.clone();
     state.boards.entry("a".into()).or_default().lifecycle =
         crate::board_lifecycle::BoardLifecycle::fixture(
             crate::board_lifecycle::Phase::Checking,
             true,
             Some(crate::board_lifecycle::Fault::InvalidProof),
-            None,
             0,
         );
     let runtime = Arc::new(SyncMutex::new(state));
-    let (backend, offers) = AsicBackend::new(
-        &config,
-        &plan,
-        runtime.clone(),
-        crate::operational::State::fixture(),
-    )
-    .unwrap();
+    let backend = AsicBackend::new(runtime.clone(), crate::operational::State::fixture());
+    let offers = offers_for(&backend, &config);
     for invalid in [false, true] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut peer = TcpStream::connect(listener.local_addr().unwrap())

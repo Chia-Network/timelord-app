@@ -51,6 +51,9 @@ pub struct Learned {
     pub performance: Option<crate::assignment::Performance>,
     #[serde(default)]
     pub retest: Option<RetestState>,
+    /// The last point that ran healthily long enough to be trusted.
+    #[serde(default)]
+    pub stable_point: Option<Point>,
 }
 impl Learned {
     fn physical_mask(&self) -> Option<u8> {
@@ -130,6 +133,61 @@ pub fn learned(
         })
         .max_by_key(|e| e.updated_unix))
 }
+/// Margin below a previous native build's stable point when no profile exists
+/// for the running build.
+pub const INHERIT_MARGIN_MHZ: f64 = 50.;
+/// A start hint from the most recent profile of an earlier native build for the
+/// same board, engine count and host: its stable point minus a margin. It is a
+/// starting point only; limits and ceilings are relearned for the new build.
+pub fn inherited(
+    config: &Config,
+    board: &timelord_core::BoardConfig,
+    engines: usize,
+    hash: &str,
+    host: &str,
+    frequencies: &[f64],
+) -> Result<Option<Point>> {
+    let Some(path) = config.hardware.automatic_state.as_ref() else {
+        return Ok(None);
+    };
+    let Ok(saved) = cache(path) else {
+        return Ok(None);
+    };
+    let start = initial_point(board, None);
+    Ok(saved
+        .entries
+        .into_iter()
+        .filter(|e| {
+            Some(&e.serial) == board.serial.as_ref()
+                && e.engines == engines
+                && e.physical_mask() == timelord_core::engine_mask(engines)
+                && e.client_sha256 != hash
+                && e.host == host
+        })
+        .max_by_key(|e| e.updated_unix)
+        .and_then(|e| {
+            e.stable_point
+                .or((e.active_seconds >= board.automatic.healthy_seconds).then_some(e.point))
+        })
+        .and_then(|stable| {
+            let target = stable.frequency_mhz - INHERIT_MARGIN_MHZ;
+            frequencies
+                .iter()
+                .copied()
+                .filter(|&f| f <= target && f > start.frequency_mhz)
+                .reduce(f64::max)
+                .filter(|&f| {
+                    board
+                        .automatic
+                        .contains(f, stable.voltage_v.max(start.voltage_v))
+                })
+                .map(|frequency_mhz| Point {
+                    frequency_mhz,
+                    voltage_v: stable.voltage_v.max(start.voltage_v),
+                })
+        }))
+}
+#[cfg(test)]
 pub fn initial(
     config: &Config,
     board: &timelord_core::BoardConfig,
@@ -283,6 +341,7 @@ mod tests {
                             cooldown_seconds: 0,
                             performance: None,
                             retest: None,
+                            stable_point: None,
                         },
                     )
                     .unwrap()
@@ -326,6 +385,7 @@ mod tests {
             cooldown_seconds: 30,
             performance: None,
             retest: None,
+            stable_point: None,
         };
         save(&path, entry.clone()).unwrap();
         assert_eq!(
@@ -384,5 +444,79 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn a_new_native_build_starts_below_the_previous_builds_stable_point() {
+        let dir = std::env::temp_dir().join(format!("tl-inherit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("profiles.json");
+        let _ = std::fs::remove_file(&path);
+        let mut config = Config::default();
+        config.hardware.automatic_state = Some(path.clone());
+        let board: timelord_core::BoardConfig =
+            toml::from_str("id='a'\nname='A'\nserial='S'\nclient_port=18110\nprofile='automatic'")
+                .unwrap();
+        let frequencies: Vec<f64> = (140..=180).map(|f| f64::from(f) * 10.).collect();
+        let entry =
+            |hash: &str, frequency_mhz: f64, active_seconds: u64, stable: Option<f64>| Learned {
+                serial: "S".into(),
+                engines: 1,
+                engine_mask: timelord_core::engine_mask(1),
+                host: "mac".into(),
+                client_sha256: hash.into(),
+                point: Point {
+                    frequency_mhz,
+                    voltage_v: 1.,
+                },
+                active_seconds,
+                updated_unix: crate::unix_now(),
+                ceiling_mhz: 2200.,
+                cooldown_seconds: 0,
+                performance: None,
+                retest: None,
+                stable_point: stable.map(|frequency_mhz| Point {
+                    frequency_mhz,
+                    voltage_v: 1.,
+                }),
+            };
+        save(&path, entry("old", 1640., 0, Some(1660.))).unwrap();
+        assert_eq!(
+            inherited(&config, &board, 1, "new", "mac", &frequencies)
+                .unwrap()
+                .map(|p| p.frequency_mhz),
+            Some(1610.)
+        );
+        // The running build's own profile is never "inherited".
+        assert!(
+            inherited(&config, &board, 1, "old", "mac", &frequencies)
+                .unwrap()
+                .is_none()
+        );
+        // Another host or engine count shares nothing.
+        assert!(
+            inherited(&config, &board, 1, "new", "other", &frequencies)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            inherited(&config, &board, 2, "new", "mac", &frequencies)
+                .unwrap()
+                .is_none()
+        );
+        // A provisional point without a stable record is not a hint.
+        save(&path, entry("old", 1700., 0, None)).unwrap();
+        assert!(
+            inherited(&config, &board, 1, "new", "mac", &frequencies)
+                .unwrap()
+                .is_none()
+        );
+        // A hint at or below the configured start is useless.
+        save(&path, entry("old", 1480., 600, None)).unwrap();
+        assert!(
+            inherited(&config, &board, 1, "new", "mac", &frequencies)
+                .unwrap()
+                .is_none()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -1,18 +1,16 @@
 //! Explicit hardware diagnostic. Never runs as part of normal startup or tests.
-use crate::{
-    Shared, asic::AsicBackend, hardware, runtime::RuntimeState, service::client_listener, unix_now,
-};
+use crate::{Shared, asic::AsicBackend, hardware, runtime::RuntimeState, unix_now};
 use anyhow::{Context, Result, bail};
 use dg_xch_core::blockchain::{class_group_element::ClassgroupElement, sized_bytes::Bytes32};
 use dg_xch_timelord::worker::ProofRequest;
 use serde::Serialize;
 use std::{
-    collections::BTreeSet,
+    path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use timelord_core::{Chain, Config};
-use tokio::{net::TcpListener, sync::watch, task::JoinSet};
+use tokio::{sync::watch, task::JoinSet};
 
 #[derive(Serialize)]
 pub struct CheckedProof {
@@ -24,9 +22,10 @@ pub struct CheckedProof {
     session_ips: f64,
 }
 
-/// Exercise concurrent chains, retained sessions, and a challenge reset. These
-/// synthetic proofs are verified locally and are never submitted to a node.
-pub async fn check(mut config: Config) -> Result<Vec<CheckedProof>> {
+/// Exercise concurrent chains, retained sessions, and a challenge reset through
+/// the production owner path. These synthetic proofs are verified locally and
+/// never submitted to a node.
+pub async fn check(mut config: Config, config_path: &Path) -> Result<Vec<CheckedProof>> {
     if config.hardware.client_binary.is_none() || config.hardware.boards.is_empty() {
         bail!("Choose a native ASIC client and explicitly bound boards first");
     }
@@ -37,50 +36,42 @@ pub async fn check(mut config: Config) -> Result<Vec<CheckedProof>> {
             board.profile = timelord_core::ProfileMode::Manual;
         }
     }
-    let assignments = config.assignments().map_err(anyhow::Error::msg)?;
-    let mut listeners = vec![];
-    for board in &config.hardware.boards {
-        let capacity = assignments
-            .iter()
-            .filter(|a| a.board_id == board.id)
-            .count() as u8;
-        if capacity > 0 {
-            let listener =
-                TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, board.client_port)).await?;
-            listeners.push((board.id.clone(), capacity, listener));
-        }
-    }
     let process = crate::operational::State::new(crate::observability::Metrics::new(
         config.node.network.clone(),
     )?);
-    let runtime = Arc::new(Mutex::new(RuntimeState::new(false)));
-    let (backend, offers) =
-        AsicBackend::new(&config, &assignments, runtime.clone(), process.clone())?;
-    let backend = Arc::new(backend);
-    let shared = Arc::new(Shared {
-        native: None,
+    // Owner epochs and safety restrictions are physical facts the next
+    // production start must see; reliability health is not changed.
+    let safety = Arc::new(crate::safety::Store::open(config_path)?.diagnostic());
+    let mut runtime = RuntimeState::new(false);
+    hardware::restore_lifecycles(&config, &mut runtime.boards, &safety);
+    runtime.safety = Some(safety);
+    let runtime = Arc::new(Mutex::new(runtime));
+    let backend = Arc::new(AsicBackend::new(runtime.clone(), process.clone()));
+    runtime.lock().expect("runtime").prover = Arc::downgrade(&backend);
+    let shared = Arc::new(Shared::new(
+        None,
         config,
-        assignments,
-        clients: Arc::new(Mutex::new(BTreeSet::new())),
+        runtime.clone(),
         process,
-        scope: crate::runtime::RuntimeScope::Production,
-        runtime,
-        started_unix: unix_now(),
-        service_started_unix: crate::unix_now(),
-    });
+        unix_now(),
+        unix_now(),
+    ));
     let (stop, shutdown) = watch::channel(false);
-    let mut listeners_tasks = JoinSet::new();
-    for (id, capacity, listener) in listeners {
-        listeners_tasks.spawn(client_listener(
-            listener,
-            id.clone(),
-            capacity,
-            shared.clone(),
-            shutdown.clone(),
-            offers.get(&id).cloned(),
-        ));
-    }
-    let mut supervisor = tokio::spawn(hardware::run(shared.clone(), backend.clone(), shutdown));
+    let (_updates, receiver) = watch::channel(shared.clone());
+    let mut supervisor = tokio::spawn(hardware::continuous::run(
+        shared.clone(),
+        backend.clone(),
+        receiver,
+        shutdown,
+    ));
+    let routed = async {
+        while runtime.lock().expect("runtime").routing.len() < 3 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(120), routed)
+        .await
+        .context("Boards did not become ready for the hardware check")?;
     let workload = async {
         let mut checked = vec![];
         // Round two must reuse each session; round three must reset it.
@@ -131,9 +122,6 @@ pub async fn check(mut config: Config) -> Result<Vec<CheckedProof>> {
     let _ = stop.send(true);
     if !supervisor_finished {
         supervisor.await.context("ASIC supervisor failed")??;
-    }
-    while let Some(result) = listeners_tasks.join_next().await {
-        result??;
     }
     result
 }

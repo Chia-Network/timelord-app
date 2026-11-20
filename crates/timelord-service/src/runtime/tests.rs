@@ -296,32 +296,26 @@ async fn fixture(server_name: &str, board_fault: bool, custom: bool) -> Result<(
             "failed".into(),
             HardwareState {
                 lifecycle: crate::board_lifecycle::BoardLifecycle::fixture(
-                    crate::board_lifecycle::Phase::Fault,
+                    crate::board_lifecycle::Phase::InvalidProof,
                     false,
                     Some(crate::board_lifecycle::Fault::InvalidProof),
-                    None,
                     0,
                 ),
                 ..Default::default()
             },
         );
-        let (backend, _offers) = AsicBackend::new(
-            &config,
-            &config.assignments().map_err(anyhow::Error::msg)?,
-            runtime.clone(),
-            process.clone(),
-        )?;
-        let shared = Arc::new(Shared {
-            native: None,
-            assignments: config.assignments().map_err(anyhow::Error::msg)?,
-            config,
-            clients: Default::default(),
-            process,
-            scope: crate::runtime::RuntimeScope::Production,
-            runtime,
-            started_unix: unix_now(),
-            service_started_unix: crate::unix_now(),
-        });
+        let backend = AsicBackend::new(runtime.clone(), process.clone());
+        let shared = Arc::new(
+            crate::Shared::new(
+                None,
+                config,
+                runtime,
+                process,
+                unix_now(),
+                crate::unix_now(),
+            )
+            .routed_by_config(),
+        );
         let session = tokio::spawn(session(shared, Arc::new(backend)));
         let result = tokio::time::timeout(Duration::from_secs(3), task).await;
         session.abort();
@@ -347,17 +341,14 @@ async fn fixture(server_name: &str, board_fault: bool, custom: bool) -> Result<(
 async fn submissions_count_only_successful_sends() {
     let metrics = crate::observability::Metrics::new(timelord_core::Network::Mainnet).unwrap();
     let process = crate::operational::State::new(metrics.clone());
-    let shared = Shared {
-        native: None,
-        config: Config::default(),
-        assignments: vec![],
-        clients: Default::default(),
+    let shared = crate::Shared::new(
+        None,
+        Config::default(),
+        Arc::new(std::sync::Mutex::new(RuntimeState::new(false))),
         process,
-        scope: crate::runtime::RuntimeScope::Production,
-        runtime: Arc::new(std::sync::Mutex::new(RuntimeState::new(false))),
-        started_unix: unix_now(),
-        service_started_unix: unix_now(),
-    };
+        unix_now(),
+        unix_now(),
+    );
     let stage = shared.process.progress.begin(
         timelord_supervisor::progress::Resource::Scheduler,
         0,
@@ -382,17 +373,14 @@ async fn submission_transitions_the_scheduler_owner_instead_of_replacing_it() {
     use timelord_supervisor::progress::{Resource, Stage};
     let metrics = crate::observability::Metrics::new(timelord_core::Network::Mainnet).unwrap();
     let process = crate::operational::State::new(metrics.clone());
-    let shared = Shared {
-        native: None,
-        config: Config::default(),
-        assignments: vec![],
-        clients: Default::default(),
+    let shared = crate::Shared::new(
+        None,
+        Config::default(),
+        Arc::new(std::sync::Mutex::new(RuntimeState::new(false))),
         process,
-        scope: crate::runtime::RuntimeScope::Production,
-        runtime: Arc::new(std::sync::Mutex::new(RuntimeState::new(false))),
-        started_unix: unix_now(),
-        service_started_unix: unix_now(),
-    };
+        unix_now(),
+        unix_now(),
+    );
     let process = shared.process.clone();
     let guard = process
         .progress

@@ -69,6 +69,21 @@ struct BoardStatus {
     native_pid: Option<u32>,
     automatic: Option<automatic::Status>,
     latest_proof_unix: Option<u64>,
+    /// How routing currently treats this board: serving, probation (serving,
+    /// preferring the infused-challenge chain), disabled or unavailable (not
+    /// serving: starting, recovering, absent).
+    routing_state: &'static str,
+    consecutive_failures: u32,
+    failures_last_hour: usize,
+    probation_until_unix: Option<u64>,
+    disabled_until_unix: Option<u64>,
+    last_failure: Option<String>,
+    last_failure_unix: Option<u64>,
+    /// Started cautiously after an unconfirmed stop; returns to its saved
+    /// setting after verified work.
+    cautious: bool,
+    /// Recent board events, newest last.
+    history: Vec<crate::board_history::Event>,
 }
 
 async fn health(State(http): State<observability::HttpState>) -> Json<serde_json::Value> {
@@ -86,7 +101,7 @@ async fn status(State(http): State<observability::HttpState>) -> Json<Status> {
     Json(Status {
         diagnostic_logging: timelord_supervisor::logging::Writer::stderr_stats(),
         configuration_fallback: shared.process.progress.using_last_good(),
-        api_version: 1,
+        api_version: 2,
         service_pid: std::process::id(),
         service_state: "ready",
         timelord_state: runtime.phase.clone(),
@@ -110,67 +125,98 @@ async fn status(State(http): State<observability::HttpState>) -> Json<Status> {
             .hardware
             .boards
             .iter()
-            .map(|b| BoardStatus {
-                id: b.id.clone(),
-                name: b.name.clone(),
-                client_port: b.client_port,
-                assigned_chains: assignments
-                    .iter()
-                    .filter(|a| a.board_id == b.id)
-                    .map(|a| a.chain)
-                    .collect(),
-                assigned_engines: assignments
-                    .iter()
-                    .filter(|a| a.board_id == b.id)
-                    .map(|a| a.engine)
-                    .collect(),
-                connected_clients: clients.iter().filter(|(id, _)| id == &b.id).count(),
-                hardware_state: runtime
+            .map(|b| {
+                let now = unix_now();
+                let health = runtime
+                    .safety
+                    .as_ref()
+                    .map(|store| store.policy(b).health)
+                    .unwrap_or_default();
+                let serving = runtime
                     .boards
                     .get(&b.id)
-                    .map(|b| b.lifecycle.status().phase.as_str().to_owned())
-                    .unwrap_or_else(|| "not_inspected".into()),
-                raw_speeds: runtime
-                    .boards
-                    .get(&b.id)
-                    .map(|b| b.raw_speeds.clone())
-                    .unwrap_or_default(),
-                temperature_c: runtime.boards.get(&b.id).and_then(|b| b.temperature_c),
-                temperature_limit_c: b.temperature_limit_c,
-                frequency_mhz: runtime.boards.get(&b.id).and_then(|b| b.frequency_mhz),
-                voltage_v: runtime.boards.get(&b.id).and_then(|b| b.voltage_v),
-                profile: b.profile_name(),
-                device_location: runtime
-                    .boards
-                    .get(&b.id)
-                    .and_then(|h| h.device_location)
-                    .or(b.device_location),
-                serial: b.serial.clone(),
-                recoveries: runtime.boards.get(&b.id).map(|b| b.recoveries).unwrap_or(0),
-                fault_kind: runtime.boards.get(&b.id).and_then(|b| b.fault_kind),
-                recovery_reason: runtime
-                    .boards
-                    .get(&b.id)
-                    .and_then(|h| h.recovery_reason.clone()),
-                retry_after_unix: runtime.boards.get(&b.id).and_then(|h| h.retry_after_unix),
-                native_pid: runtime.boards.get(&b.id).and_then(|h| h.native_pid),
-                automatic: runtime.boards.get(&b.id).and_then(|b| b.automatic.clone()),
-                latest_proof_unix: runtime
-                    .observations
-                    .iter()
-                    .rev()
-                    .find(|o| {
-                        o.work_started_unix
-                            >= runtime
-                                .boards
-                                .get(&b.id)
-                                .map(|h| h.lifecycle.status().started_unix)
-                                .unwrap_or(0)
-                            && assignments
-                                .iter()
-                                .any(|a| a.board_id == b.id && a.chain == o.chain)
-                    })
-                    .map(|o| o.timestamp_unix),
+                    .is_some_and(|h| h.lifecycle.accepts_work());
+                BoardStatus {
+                    routing_state: match health.tier(now) {
+                        crate::hardware::health::Tier::Disabled => "disabled",
+                        _ if !serving => "unavailable",
+                        crate::hardware::health::Tier::Probation => "probation",
+                        crate::hardware::health::Tier::Trusted => "serving",
+                    },
+                    consecutive_failures: health.consecutive_failures,
+                    failures_last_hour: health.failures_within(now, 3600),
+                    probation_until_unix: Some(health.probation_until_unix).filter(|&u| u > now),
+                    disabled_until_unix: health.disabled_until_unix.filter(|&u| u > now),
+                    last_failure: health.last_failure.clone(),
+                    last_failure_unix: Some(health.last_failure_unix).filter(|&u| u > 0),
+                    cautious: runtime.boards.get(&b.id).is_some_and(|h| h.cautious),
+                    history: b
+                        .serial
+                        .as_deref()
+                        .map(|serial| {
+                            let events = shared.process.board_history.events(serial);
+                            events[events.len().saturating_sub(20)..].to_vec()
+                        })
+                        .unwrap_or_default(),
+                    id: b.id.clone(),
+                    name: b.name.clone(),
+                    client_port: b.client_port,
+                    assigned_chains: assignments
+                        .iter()
+                        .filter(|a| a.board_id == b.id)
+                        .map(|a| a.chain)
+                        .collect(),
+                    assigned_engines: assignments
+                        .iter()
+                        .filter(|a| a.board_id == b.id)
+                        .map(|a| a.engine)
+                        .collect(),
+                    connected_clients: clients.iter().filter(|(id, _)| id == &b.id).count(),
+                    hardware_state: runtime
+                        .boards
+                        .get(&b.id)
+                        .map(|b| b.lifecycle.status().phase.as_str().to_owned())
+                        .unwrap_or_else(|| "not_inspected".into()),
+                    raw_speeds: runtime
+                        .boards
+                        .get(&b.id)
+                        .map(|b| b.raw_speeds.clone())
+                        .unwrap_or_default(),
+                    temperature_c: runtime.boards.get(&b.id).and_then(|b| b.temperature_c),
+                    temperature_limit_c: b.temperature_limit_c,
+                    frequency_mhz: runtime.boards.get(&b.id).and_then(|b| b.frequency_mhz),
+                    voltage_v: runtime.boards.get(&b.id).and_then(|b| b.voltage_v),
+                    profile: b.profile_name(),
+                    device_location: runtime
+                        .boards
+                        .get(&b.id)
+                        .and_then(|h| h.device_location)
+                        .or(b.device_location),
+                    serial: b.serial.clone(),
+                    recoveries: runtime.boards.get(&b.id).map(|b| b.recoveries).unwrap_or(0),
+                    fault_kind: runtime.boards.get(&b.id).and_then(|b| b.fault_kind),
+                    recovery_reason: runtime
+                        .boards
+                        .get(&b.id)
+                        .and_then(|h| h.recovery_reason.clone()),
+                    retry_after_unix: runtime.boards.get(&b.id).and_then(|h| h.retry_after_unix),
+                    native_pid: runtime.boards.get(&b.id).and_then(|h| h.native_pid),
+                    automatic: runtime.boards.get(&b.id).and_then(|b| b.automatic.clone()),
+                    latest_proof_unix: runtime
+                        .observations
+                        .iter()
+                        .rev()
+                        .find(|o| {
+                            o.board_id.as_deref() == Some(b.id.as_str())
+                                && o.work_started_unix
+                                    >= runtime
+                                        .boards
+                                        .get(&b.id)
+                                        .map(|h| h.lifecycle.status().started_unix)
+                                        .unwrap_or(0)
+                        })
+                        .map(|o| o.timestamp_unix),
+                }
             })
             .collect(),
         connected_client_count: clients.len(),
@@ -189,8 +235,7 @@ async fn status(State(http): State<observability::HttpState>) -> Json<Status> {
 
 async fn history(State(http): State<observability::HttpState>) -> Json<serde_json::Value> {
     let shared = http.current.borrow().clone();
-    let scope = history_store::scope(&shared.config, &shared.assignments())
-        .expect("validated history scope");
+    let scope = history_store::scope(&shared.config).expect("validated history scope");
     let saved = {
         let runtime = shared.runtime.lock().expect("runtime");
         history_store::Snapshot::capture(scope, &runtime, shared.started_unix, unix_now())

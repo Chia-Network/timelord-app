@@ -1,6 +1,7 @@
-//! Durable board admission. An unclean owner never becomes a clean restart merely
-//! because its process disappeared. Invalid recovery metadata is archived; fresh
-//! initialization, exclusive ownership and proof verification establish current state.
+//! Durable per-serial board state: native-owner epochs, safety restrictions,
+//! cautious starts and reliability. Only overheating and invalid proofs are
+//! safety restrictions; an unconfirmed shutdown only requires a cautious start.
+use crate::hardware::health::Health;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -14,128 +15,166 @@ use std::{
 };
 use timelord_supervisor::{InstanceLock, Paths};
 
-const MAX_BYTES: u64 = 65536;
+const MAX_BYTES: u64 = 256 * 1024;
 const MAX_BOARDS: usize = 64;
+const SCHEMA_VERSION: u32 = 2;
+/// Fault-free serving needed before a lowered recovery ceiling rises 50 MHz.
+pub const CEILING_RELAX_SECONDS: u64 = 6 * 3600;
 #[cfg(test)]
 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {
     Thermal,
     InvalidProof,
-    UncleanOwner,
 }
 impl Reason {
-    /// Restrictions only strengthen until verified admission clears them.
+    /// Restrictions only strengthen until the live owner clears them.
     pub fn merge(self, next: Self) -> Self {
-        match (self, next) {
-            (Self::Thermal, _) | (_, Self::Thermal) => Self::Thermal,
-            (Self::InvalidProof, _) | (_, Self::InvalidProof) => Self::InvalidProof,
-            _ => Self::UncleanOwner,
+        if self == Self::Thermal || next == Self::Thermal {
+            Self::Thermal
+        } else {
+            Self::InvalidProof
+        }
+    }
+    fn cooldown_seconds(self) -> u64 {
+        match self {
+            Self::Thermal => 30,
+            Self::InvalidProof => 10,
         }
     }
 }
-/// Immutable journal policy shared by restoration, capacity and native startup.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacyReason {
+    Thermal,
+    InvalidProof,
+    UncleanOwner,
+}
+
+/// Immutable journal policy shared by restoration, routing and native startup.
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Policy {
     pub restriction: Option<Reason>,
-    pub force_safe: bool,
+    pub cautious: bool,
     pub retry_after_unix: u64,
+    pub health: Health,
 }
 impl Policy {
-    fn from_saved(saved: &Board, _board: &timelord_core::BoardConfig) -> Self {
-        Self {
-            restriction: saved.quarantine,
-            force_safe: saved.force_safe,
-            retry_after_unix: saved.retry_after_unix,
-        }
-    }
-    pub fn hold_reason(self, now: u64) -> Option<String> {
+    pub fn hold_reason(&self, now: u64) -> Option<String> {
         self.restriction
             .filter(|_| self.retry_after_unix > now)
             .map(|reason| {
-                format!(
-                    "Retrying after {reason:?}; next attempt in {} seconds",
-                    self.retry_after_unix.saturating_sub(now)
-                )
+                let wait = self.retry_after_unix.saturating_sub(now);
+                match reason {
+                    Reason::Thermal => format!(
+                        "Cooling down after reaching the temperature limit; next check in {wait} seconds"
+                    ),
+                    Reason::InvalidProof => format!(
+                        "Rechecking after an invalid proof; next check in {wait} seconds"
+                    ),
+                }
             })
     }
 }
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Qualification {
-    pub engines: u8,
-    pub engine_mask: u8,
-    pub host: String,
-    pub client_sha256: String,
-    pub point: crate::automatic::Point,
-}
-impl Qualification {
-    fn validate(&self) -> Result<()> {
-        ensure!(
-            (1..=3).contains(&self.engines)
-                && self.engine_mask > 0
-                && self.engine_mask <= 7
-                && self.engine_mask.count_ones() == u32::from(self.engines),
-            "Invalid qualification engine mask"
-        );
-        ensure!(
-            self.host.len() <= 128 && !self.host.is_empty(),
-            "Invalid qualification host"
-        );
-        ensure!(
-            self.client_sha256.len() == 64
-                && self.client_sha256.bytes().all(|b| b.is_ascii_hexdigit()),
-            "Invalid qualification binary hash"
-        );
-        ensure!(
-            self.point.frequency_mhz.is_finite()
-                && (200.0..=2200.0).contains(&self.point.frequency_mhz)
-                && self.point.voltage_v.is_finite()
-                && (0.7..=1.0).contains(&self.point.voltage_v),
-            "Invalid qualification operating point"
-        );
-        Ok(())
-    }
-}
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Board {
     pub owner_active: bool,
-    #[serde(default)]
     pub owner_epoch: u64,
-    pub quarantine: Option<Reason>,
-    pub force_safe: bool,
-    pub qualification: Option<Qualification>,
+    pub restriction: Option<Reason>,
+    pub cautious: bool,
     pub updated_unix: u64,
     pub retry_after_unix: u64,
     pub last_point: Option<crate::automatic::Point>,
-    #[serde(default)]
-    pub admission_frequency_mhz: Option<f64>,
+    pub recovery_ceiling_mhz: Option<f64>,
+    pub safety_clear_since_unix: u64,
+    pub health: Health,
 }
-#[derive(Clone, Serialize, Deserialize)]
+/// Reads schema 1 (quarantine/force_safe/qualification) and schema 2.
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct StoredBoard {
+    owner_active: bool,
+    #[serde(default)]
+    owner_epoch: u64,
+    #[serde(default)]
+    restriction: Option<Reason>,
+    #[serde(default)]
+    quarantine: Option<LegacyReason>,
+    #[serde(default)]
+    cautious: bool,
+    #[serde(default)]
+    force_safe: bool,
+    #[serde(default)]
+    #[allow(dead_code)]
+    qualification: Option<serde_json::Value>,
+    #[serde(default)]
+    updated_unix: u64,
+    #[serde(default)]
+    retry_after_unix: u64,
+    #[serde(default)]
+    last_point: Option<crate::automatic::Point>,
+    #[serde(default)]
+    recovery_ceiling_mhz: Option<f64>,
+    #[serde(default)]
+    admission_frequency_mhz: Option<f64>,
+    #[serde(default)]
+    safety_clear_since_unix: u64,
+    #[serde(default)]
+    health: Health,
+}
+impl StoredBoard {
+    fn upgrade(self, now: u64) -> Board {
+        let (restriction, legacy_unclean) = match self.quarantine {
+            Some(LegacyReason::Thermal) => (Some(Reason::Thermal), false),
+            Some(LegacyReason::InvalidProof) => (Some(Reason::InvalidProof), false),
+            Some(LegacyReason::UncleanOwner) => (None, true),
+            None => (None, false),
+        };
+        let ceiling = self.recovery_ceiling_mhz.or(self.admission_frequency_mhz);
+        Board {
+            owner_active: self.owner_active,
+            owner_epoch: self.owner_epoch,
+            restriction: self.restriction.or(restriction),
+            cautious: self.cautious || self.force_safe || legacy_unclean,
+            updated_unix: self.updated_unix,
+            retry_after_unix: self.retry_after_unix,
+            last_point: self.last_point,
+            recovery_ceiling_mhz: ceiling,
+            safety_clear_since_unix: if self.safety_clear_since_unix == 0 && ceiling.is_some() {
+                now
+            } else {
+                self.safety_clear_since_unix
+            },
+            health: self.health,
+        }
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredState {
+    schema_version: u32,
+    boards: BTreeMap<String, StoredBoard>,
+}
+#[derive(Clone, Default, Serialize)]
 struct Saved {
     schema_version: u32,
     boards: BTreeMap<String, Board>,
 }
-impl Default for Saved {
-    fn default() -> Self {
-        Self {
-            schema_version: 1,
-            boards: BTreeMap::new(),
-        }
-    }
-}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OwnerToken(u64);
+pub struct OwnerToken(pub(crate) u64);
 
 pub struct Store {
     path: PathBuf,
     state: Mutex<Saved>,
     update_order: Mutex<()>,
-    healthy: Mutex<BTreeMap<String, OwnerToken>>,
     progress: Option<std::sync::Arc<timelord_supervisor::progress::Progress>>,
+    /// A hardware check shares the physical facts (owner epochs, cautious
+    /// starts, restrictions) but never changes reliability health: its forced
+    /// settings and synthetic work say nothing about how a board serves.
+    keep_health: bool,
 }
 fn serial_valid(serial: &str) -> bool {
     !serial.is_empty() && serial.len() <= 15 && serial.bytes().all(|b| (33..=126).contains(&b))
@@ -199,33 +238,56 @@ fn lease_root() -> Result<PathBuf> {
     Ok(home.join(".timelord-usb-locks"))
 }
 
+fn valid_point(point: crate::automatic::Point) -> bool {
+    point.frequency_mhz.is_finite()
+        && (200.0..=2200.0).contains(&point.frequency_mhz)
+        && point.voltage_v.is_finite()
+        && (0.7..=1.0).contains(&point.voltage_v)
+}
+
 fn validate_saved(state: &Saved) -> Result<()> {
     ensure!(
-        state.schema_version == 1 && state.boards.len() <= MAX_BOARDS,
-        "Unsupported or oversized board safety state"
+        state.boards.len() <= MAX_BOARDS,
+        "Oversized board safety state"
     );
     for (serial, board) in &state.boards {
         ensure!(serial_valid(serial), "Invalid saved board identity");
-        if let Some(q) = &board.qualification {
-            q.validate()?;
-        }
         ensure!(
             board
-                .admission_frequency_mhz
+                .recovery_ceiling_mhz
                 .is_none_or(|f| f.is_finite() && (200.0..=2200.0).contains(&f)),
-            "Invalid saved admission frequency"
+            "Invalid saved recovery ceiling"
         );
-        if let Some(point) = board.last_point {
-            ensure!(
-                point.frequency_mhz.is_finite()
-                    && (200.0..=2200.0).contains(&point.frequency_mhz)
-                    && point.voltage_v.is_finite()
-                    && (0.7..=1.0).contains(&point.voltage_v),
-                "Invalid saved operating point"
-            );
-        }
+        ensure!(
+            board.last_point.is_none_or(valid_point),
+            "Invalid saved operating point"
+        );
+        ensure!(board.health.validate(), "Invalid saved board health");
     }
     Ok(())
+}
+
+fn parse(bytes: &[u8], now: u64) -> Result<Saved> {
+    ensure!(
+        bytes.len() as u64 <= MAX_BYTES,
+        "Board safety state exceeds limit"
+    );
+    let stored: StoredState =
+        serde_json::from_slice(bytes).context("Reading board safety state")?;
+    ensure!(
+        (1..=SCHEMA_VERSION).contains(&stored.schema_version),
+        "Unsupported board safety state version"
+    );
+    let saved = Saved {
+        schema_version: SCHEMA_VERSION,
+        boards: stored
+            .boards
+            .into_iter()
+            .map(|(serial, board)| (serial, board.upgrade(now)))
+            .collect(),
+    };
+    validate_saved(&saved)?;
+    Ok(saved)
 }
 
 impl Store {
@@ -250,17 +312,7 @@ impl Store {
                 );
                 let mut bytes = Vec::new();
                 file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
-                let parsed = (|| {
-                    ensure!(
-                        bytes.len() as u64 <= MAX_BYTES,
-                        "Board safety state exceeds limit"
-                    );
-                    let saved: Saved =
-                        serde_json::from_slice(&bytes).context("Reading board safety state")?;
-                    validate_saved(&saved)?;
-                    Ok::<_, anyhow::Error>(saved)
-                })();
-                match parsed {
+                match parse(&bytes, crate::unix_now()) {
                     Ok(saved) => saved,
                     Err(error) => {
                         let stamp = std::time::SystemTime::now()
@@ -272,31 +324,28 @@ impl Store {
                         ));
                         fs::rename(&path, &archived)
                             .context("Preserving invalid board recovery metadata")?;
-                        tracing::warn!(%error, path=%archived.display(), "Archived invalid recovery metadata; boards will establish fresh current state");
+                        tracing::warn!(%error, path=%archived.display(), "Archived invalid recovery metadata; boards will start cautiously");
                         Saved::default()
                     }
                 }
             }
         };
+        state.schema_version = SCHEMA_VERSION;
         for board in state.boards.values_mut() {
             if board.owner_active {
-                // The prior worker did not confirm native-owner shutdown. This
-                // also covers a crash during fault-journal persistence.
-                board.quarantine.get_or_insert(Reason::UncleanOwner);
-                board.force_safe = true;
-                board.qualification = None;
+                // The prior worker did not confirm native shutdown. The board's
+                // physical state is unknown, which needs a cautious start but is
+                // not evidence of a safety fault.
+                board.cautious = true;
                 board.owner_active = false;
-                if board.quarantine == Some(Reason::UncleanOwner) {
-                    board.retry_after_unix = 0;
-                }
             }
         }
         Ok(Self {
             path,
             state: Mutex::new(state),
             update_order: Mutex::new(()),
-            healthy: Mutex::new(BTreeMap::new()),
             progress: None,
+            keep_health: false,
         })
     }
     #[cfg(test)]
@@ -305,9 +354,16 @@ impl Store {
         entered: std::sync::mpsc::Sender<()>,
         release: std::sync::mpsc::Receiver<()>,
     ) {
-        let _guard = self.state.lock().expect("fixture safety");
+        // A stalled critical journal writer: it owns the writer order while
+        // its disk I/O hangs. Readers of the published state are not blocked.
+        let _guard = self.update_order.lock().expect("fixture safety");
         let _ = entered.send(());
         let _ = release.recv_timeout(std::time::Duration::from_secs(2));
+    }
+    /// For the explicit hardware check: see `keep_health`.
+    pub fn diagnostic(mut self) -> Self {
+        self.keep_health = true;
+        self
     }
     pub fn monitored(
         mut self,
@@ -323,6 +379,9 @@ impl Store {
             .boards
             .get(serial)
             .cloned()
+    }
+    pub fn health(&self, serial: &str) -> Health {
+        self.board(serial).map(|b| b.health).unwrap_or_default()
     }
     pub fn lease(&self, serial: &str) -> Result<InstanceLock> {
         ensure!(
@@ -378,35 +437,12 @@ impl Store {
         if !accepts(board) {
             return Ok(false);
         }
-        // Optional learned-profile persistence only supplies evidence. Coalesce
-        // its relaxation into required journal work; it never owns this writer.
-        let healthy = self
-            .healthy
-            .lock()
-            .expect("healthy evidence")
-            .remove(serial);
-        if healthy == Some(OwnerToken(board.owner_epoch))
-            && board.owner_active
-            && board.quarantine.is_none()
-        {
-            board.force_safe = false;
-        }
         change(board);
         board.updated_unix = crate::unix_now();
         if !relaxing {
-            // Publish restrictions before I/O, but never publish a coalesced
-            // relaxation unless the complete transaction is durable.
-            let mut restrictive = next.clone();
-            if let Some(old) = self.state.lock().expect("safety").boards.get(serial)
-                && old.force_safe
-            {
-                restrictive
-                    .boards
-                    .get_mut(serial)
-                    .expect("board")
-                    .force_safe = true;
-            }
-            *self.state.lock().expect("safety") = restrictive;
+            // Publish restrictions before I/O; a relaxation is published only
+            // once the complete transaction is durable.
+            *self.state.lock().expect("safety") = next.clone();
         }
         self.save(&next)?;
         *self.state.lock().expect("safety") = next;
@@ -416,32 +452,21 @@ impl Store {
         board
             .serial
             .as_ref()
-            .and_then(|serial| {
-                self.state
-                    .lock()
-                    .expect("safety")
-                    .boards
-                    .get(serial)
-                    .map(|saved| Policy::from_saved(saved, board))
+            .and_then(|serial| self.board(serial))
+            .map(|saved| Policy {
+                restriction: saved.restriction,
+                cautious: saved.cautious,
+                retry_after_unix: saved.retry_after_unix,
+                health: saved.health,
             })
-            .unwrap_or_else(|| Policy {
-                force_safe: true,
+            // A board never seen before has unknown physical state.
+            .unwrap_or(Policy {
+                cautious: true,
                 ..Policy::default()
             })
     }
-    pub fn needs_self_test(&self, serial: &str, q: &Qualification) -> bool {
-        self.board(serial).is_none_or(|b| {
-            b.owner_active || b.quarantine.is_some() || b.qualification.as_ref() != Some(q)
-        })
-    }
     pub fn begin_owner(&self, serial: &str, point: crate::automatic::Point) -> Result<OwnerToken> {
-        ensure!(
-            point.frequency_mhz.is_finite()
-                && (200.0..=2200.0).contains(&point.frequency_mhz)
-                && point.voltage_v.is_finite()
-                && (0.7..=1.0).contains(&point.voltage_v),
-            "Invalid native operating point"
-        );
+        ensure!(valid_point(point), "Invalid native operating point");
         let mut token = OwnerToken(0);
         self.update(serial, false, |b| {
             b.owner_active = true;
@@ -451,22 +476,15 @@ impl Store {
         })?;
         Ok(token)
     }
-    /// A matching live owner has established fresh reset/readback and cool
-    /// telemetry. This clears recovery restrictions without inventing a closed
-    /// owner or claiming an offline proof qualification.
+    /// A matching live owner established fresh reset/readback and cool
+    /// telemetry and is about to resume from a low-power probe.
     pub fn prepare_recovery_point(
         &self,
         serial: &str,
         token: OwnerToken,
         point: crate::automatic::Point,
     ) -> Result<bool> {
-        ensure!(
-            point.frequency_mhz.is_finite()
-                && (200. ..=2200.).contains(&point.frequency_mhz)
-                && point.voltage_v.is_finite()
-                && (0.7..=1.).contains(&point.voltage_v),
-            "Invalid recovery operating point"
-        );
+        ensure!(valid_point(point), "Invalid recovery operating point");
         self.transition(
             serial,
             false,
@@ -474,17 +492,32 @@ impl Store {
             |b| b.last_point = Some(point),
         )
     }
+    /// The live owner passed its recovery checks; clear safety restrictions.
     pub fn recovered(&self, serial: &str, token: OwnerToken) -> Result<bool> {
         self.transition(
             serial,
             true,
             |b| b.owner_active && b.owner_epoch == token.0,
             |b| {
-                b.quarantine = None;
+                if b.restriction.take().is_some() {
+                    b.safety_clear_since_unix = crate::unix_now();
+                }
                 b.retry_after_unix = 0;
-                b.qualification = None;
             },
         )
+    }
+    /// The live owner verified work at its cautious point and returned to its
+    /// best-known setting.
+    pub fn clear_cautious(&self, serial: &str, token: OwnerToken) -> Result<bool> {
+        self.transition(
+            serial,
+            true,
+            |b| b.owner_active && b.owner_epoch == token.0 && b.restriction.is_none(),
+            |b| b.cautious = false,
+        )
+    }
+    pub fn mark_cautious(&self, serial: &str) -> Result<()> {
+        self.update(serial, false, |b| b.cautious = true)
     }
     pub fn owner_token(&self, serial: &str) -> Option<OwnerToken> {
         self.board(serial)
@@ -498,69 +531,91 @@ impl Store {
         token: OwnerToken,
         point: crate::automatic::Point,
     ) -> Result<bool> {
-        ensure!(
-            point.frequency_mhz.is_finite()
-                && (200.0..=2200.0).contains(&point.frequency_mhz)
-                && point.voltage_v.is_finite()
-                && (0.7..=1.0).contains(&point.voltage_v),
-            "Invalid native operating point"
-        );
+        ensure!(valid_point(point), "Invalid native operating point");
         self.transition(
             serial,
             false,
-            |b| b.owner_active && b.owner_epoch == token.0 && b.quarantine.is_none(),
+            |b| b.owner_active && b.owner_epoch == token.0 && b.restriction.is_none(),
             |b| b.last_point = Some(point),
         )
     }
     pub fn closed(&self, serial: &str) -> Result<()> {
         self.update(serial, true, |b| b.owner_active = false)
     }
-    pub fn quarantine(&self, serial: &str, reason: Reason) -> Result<()> {
+    /// Record overheating or an invalid proof. The first fault at a point
+    /// lowers the recovery ceiling 50 MHz below that point.
+    pub fn restrict(&self, serial: &str, reason: Reason) -> Result<()> {
         self.update(serial, false, |b| {
-            let first_failure =
-                b.quarantine.is_none() || b.quarantine == Some(Reason::UncleanOwner);
-            let incoming = reason;
-            let reason = b
-                .quarantine
-                .map_or(reason, |previous| previous.merge(reason));
-            if first_failure
-                && matches!(incoming, Reason::Thermal | Reason::InvalidProof)
+            if b.restriction.is_none()
                 && let Some(point) = b.last_point
             {
                 let next = (point.frequency_mhz - 50.).max(200.);
-                b.admission_frequency_mhz =
-                    Some(b.admission_frequency_mhz.map_or(next, |old| old.min(next)));
+                b.recovery_ceiling_mhz =
+                    Some(b.recovery_ceiling_mhz.map_or(next, |old| old.min(next)));
             }
-            b.quarantine = Some(reason);
-            b.force_safe = true;
-            b.qualification = None;
-            b.retry_after_unix = crate::unix_now().saturating_add(match reason {
-                Reason::Thermal => 30,
-                Reason::InvalidProof => 10,
-                Reason::UncleanOwner => 0,
-            });
+            let reason = b
+                .restriction
+                .map_or(reason, |previous| previous.merge(reason));
+            b.restriction = Some(reason);
+            b.cautious = true;
+            b.safety_clear_since_unix = crate::unix_now();
+            b.retry_after_unix = crate::unix_now().saturating_add(reason.cooldown_seconds());
         })
     }
-    /// Called only after fresh cool telemetry, verified offline proofs on every
-    /// selected engine, and confirmed retirement of that test's native owner.
-    pub fn qualify(&self, serial: &str, q: Qualification) -> Result<()> {
-        q.validate()?;
-        self.update(serial, true, |b| {
-            b.qualification = Some(q);
-            b.quarantine = None;
-            b.owner_active = false;
-            b.retry_after_unix = 0;
-        })
+    /// After sustained fault-free serving, raise a lowered recovery ceiling one
+    /// step. Returns the new ceiling when it changed.
+    pub fn relax_ceiling(&self, serial: &str, token: OwnerToken) -> Result<Option<Option<f64>>> {
+        let now = crate::unix_now();
+        let mut changed = None;
+        self.transition(
+            serial,
+            true,
+            |b| {
+                b.owner_active
+                    && b.owner_epoch == token.0
+                    && b.restriction.is_none()
+                    && b.recovery_ceiling_mhz.is_some()
+                    && now.saturating_sub(b.safety_clear_since_unix) >= CEILING_RELAX_SECONDS
+            },
+            |b| {
+                let raised = b
+                    .recovery_ceiling_mhz
+                    .map(|f| f + 50.)
+                    .filter(|f| *f < crate::hardware::CAUTIOUS_CEILING_MHZ);
+                b.recovery_ceiling_mhz = raised;
+                b.safety_clear_since_unix = now;
+                changed = Some(raised);
+            },
+        )?;
+        Ok(changed)
     }
-    pub fn healthy_profile_saved(&self, serial: &str, token: OwnerToken) -> Result<()> {
-        ensure!(serial_valid(serial), "Invalid persistent board serial");
-        let mut pending = self.healthy.lock().expect("healthy evidence");
-        ensure!(
-            pending.contains_key(serial) || pending.len() < MAX_BOARDS,
-            "Healthy evidence registry is full"
-        );
-        pending.insert(serial.into(), token);
-        Ok(())
+    /// Reliability updates. A failure is restrictive and published before I/O.
+    pub fn record_failure(&self, serial: &str, reason: &str) -> Result<Health> {
+        if self.keep_health {
+            return Ok(self.health(serial));
+        }
+        let mut health = Health::default();
+        self.update(serial, false, |b| {
+            b.health.record_failure(crate::unix_now(), reason);
+            health = b.health.clone();
+        })?;
+        Ok(health)
+    }
+    pub fn update_health(
+        &self,
+        serial: &str,
+        relaxing: bool,
+        change: impl FnOnce(&mut Health),
+    ) -> Result<Health> {
+        if self.keep_health {
+            return Ok(self.health(serial));
+        }
+        let mut health = Health::default();
+        self.update(serial, relaxing, |b| {
+            change(&mut b.health);
+            health = b.health.clone();
+        })?;
+        Ok(health)
     }
     fn save(&self, state: &Saved) -> Result<()> {
         let bytes = serde_json::to_vec(state)?;
@@ -597,151 +652,190 @@ mod tests {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
-    fn qualification() -> Qualification {
-        Qualification {
-            engines: 1,
-            engine_mask: 2,
-            host: "fixture".into(),
-            client_sha256: "a".repeat(64),
-            point: crate::automatic::Point {
-                frequency_mhz: 1450.,
-                voltage_v: 1.,
-            },
+    fn point(frequency_mhz: f64) -> crate::automatic::Point {
+        crate::automatic::Point {
+            frequency_mhz,
+            voltage_v: 1.,
         }
     }
-    #[test]
-    fn one_policy_projection_covers_manual_holds_cooldown_and_safe_startup() {
-        let fixture = Fixture::new();
-        let store = Store::open(&fixture.config()).unwrap();
-        let mut board: timelord_core::BoardConfig = toml::from_str("id='a'\nname='A'\nserial='A'\nclient_port=18110\nprofile='manual'\nfrequency_mhz=1450.0\nvoltage_v=1.0").unwrap();
-        store.begin_owner("A", qualification().point).unwrap();
-        store.quarantine("A", Reason::InvalidProof).unwrap();
-        let policy = store.policy(&board);
-        assert_eq!(policy.restriction, Some(Reason::InvalidProof));
-        assert!(policy.force_safe);
-        assert!(
-            policy.hold_reason(u64::MAX).is_none(),
-            "Manual faults must retry without a settings change"
-        );
-        board.frequency_mhz = 1460.;
-        assert!(store.policy(&board).hold_reason(u64::MAX).is_none());
-        assert!(store.policy(&board).hold_reason(0).is_some());
-        store.qualify("A", qualification()).unwrap();
-        let policy = store.policy(&board);
-        assert_eq!(policy.restriction, None);
-        assert_eq!(policy.retry_after_unix, 0);
-        assert!(
-            policy.force_safe,
-            "verified admission does not silently relax force_safe"
-        );
+    fn board(serial: &str) -> timelord_core::BoardConfig {
+        toml::from_str(&format!(
+            "id='a'\nname='A'\nserial='{serial}'\nclient_port=18110\nprofile='manual'"
+        ))
+        .unwrap()
     }
     #[test]
-    fn fault_and_unclean_ownership_survive_worker_replacement_and_verified_admission_is_explicit() {
+    fn unknown_and_unconfirmed_boards_start_cautiously_without_a_restriction() {
         let f = Fixture::new();
         let store = Store::open(&f.config()).unwrap();
-        store.begin_owner("A", qualification().point).unwrap();
-        let recovered = Store::open(&f.config()).unwrap();
-        let board = recovered.board("A").unwrap();
-        assert_eq!(board.quarantine, Some(Reason::UncleanOwner));
-        assert_eq!(board.retry_after_unix, 0);
-        assert!(board.force_safe);
-        assert!(board.qualification.is_none());
-        recovered.quarantine("A", Reason::InvalidProof).unwrap();
-        drop(recovered);
-        let recovered = Store::open(&f.config()).unwrap();
-        assert_eq!(
-            recovered.board("A").unwrap().quarantine,
-            Some(Reason::InvalidProof)
-        );
-        recovered.qualify("A", qualification()).unwrap();
-        recovered.begin_owner("A", qualification().point).unwrap();
-        recovered.closed("A").unwrap();
-        let clean = Store::open(&f.config()).unwrap();
-        assert!(clean.board("A").unwrap().quarantine.is_none());
-        assert!(clean.board("A").unwrap().force_safe);
-        clean.begin_owner("A", qualification().point).unwrap();
-        clean
-            .healthy_profile_saved("A", clean.owner_token("A").unwrap())
-            .unwrap();
-        clean.closed("A").unwrap();
-        assert!(
-            !Store::open(&f.config())
-                .unwrap()
-                .board("A")
-                .unwrap()
-                .force_safe
-        );
+        assert!(store.policy(&board("A")).cautious);
+        let token = store.begin_owner("A", point(1450.)).unwrap();
+        assert!(store.clear_cautious("A", token).unwrap());
+        assert!(!store.policy(&board("A")).cautious);
+        // The worker disappears without confirming native shutdown.
+        let reopened = Store::open(&f.config()).unwrap();
+        let policy = reopened.policy(&board("A"));
+        assert!(policy.cautious);
+        assert_eq!(policy.restriction, None);
+        assert!(policy.hold_reason(0).is_none());
+        assert!(!reopened.board("A").unwrap().owner_active);
     }
     #[test]
-    fn thermal_quarantine_wins_in_both_orders_and_keeps_its_cooldown() {
+    fn schema_one_journals_upgrade_without_reviving_unclean_quarantine() {
+        let f = Fixture::new();
+        let store = Store::open(&f.config()).unwrap();
+        fs::write(
+            &store.path,
+            br#"{"schema_version":1,"boards":{"A":{"owner_active":false,"owner_epoch":4,"quarantine":"unclean_owner","force_safe":true,"qualification":null,"updated_unix":1,"retry_after_unix":0,"last_point":{"frequency_mhz":1470.0,"voltage_v":1.0},"admission_frequency_mhz":null},"B":{"owner_active":true,"owner_epoch":9,"quarantine":"thermal","force_safe":false,"qualification":null,"updated_unix":1,"retry_after_unix":5,"last_point":null,"admission_frequency_mhz":1400.0}}}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&store.path, fs::Permissions::from_mode(0o600)).unwrap();
+        let upgraded = Store::open(&f.config()).unwrap();
+        let a = upgraded.board("A").unwrap();
+        assert_eq!(a.restriction, None);
+        assert!(a.cautious);
+        assert_eq!(a.owner_epoch, 4);
+        let b = upgraded.board("B").unwrap();
+        assert_eq!(b.restriction, Some(Reason::Thermal));
+        assert_eq!(b.recovery_ceiling_mhz, Some(1400.));
+        assert!(b.cautious && !b.owner_active);
+        assert!(b.safety_clear_since_unix > 0);
+        // A write produces schema 2 that reads back identically.
+        upgraded.closed("A").unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(&upgraded.path).unwrap()).unwrap();
+        assert_eq!(saved["schema_version"], 2);
+        assert!(saved["boards"]["A"].get("quarantine").is_none());
+        assert_eq!(Store::open(&f.config()).unwrap().board("B").unwrap(), b);
+    }
+    #[test]
+    fn thermal_wins_in_both_orders_keeps_cooldown_and_lowers_ceiling_once() {
         for order in [
             [Reason::Thermal, Reason::InvalidProof],
             [Reason::InvalidProof, Reason::Thermal],
         ] {
             let f = Fixture::new();
             let store = Store::open(&f.config()).unwrap();
-            store.begin_owner("A", qualification().point).unwrap();
+            store.begin_owner("A", point(1600.)).unwrap();
             for reason in order {
-                store.quarantine("A", reason).unwrap();
+                store.restrict("A", reason).unwrap();
             }
-            let now = crate::unix_now();
-            store.quarantine("A", Reason::UncleanOwner).unwrap();
-            let board = Store::open(&f.config()).unwrap().board("A").unwrap();
-            assert_eq!(board.quarantine, Some(Reason::Thermal));
-            assert!(board.retry_after_unix >= now + 30);
-            assert!(board.qualification.is_none());
+            let saved = store.board("A").unwrap();
+            assert_eq!(saved.restriction, Some(Reason::Thermal));
+            assert_eq!(saved.recovery_ceiling_mhz, Some(1550.));
+            assert!(saved.cautious);
+            assert!(
+                store
+                    .policy(&board("A"))
+                    .hold_reason(crate::unix_now())
+                    .is_some()
+            );
         }
     }
     #[test]
-    fn repeated_bad_points_lower_admission_but_transport_faults_do_not() {
+    fn only_the_current_live_owner_clears_restrictions_and_cautious_starts() {
         let f = Fixture::new();
         let store = Store::open(&f.config()).unwrap();
-        let mut point = qualification().point;
-        store.begin_owner("A", point).unwrap();
-        store.quarantine("A", Reason::UncleanOwner).unwrap();
-        assert!(store.board("A").unwrap().admission_frequency_mhz.is_none());
-        store.quarantine("A", Reason::InvalidProof).unwrap();
-        assert_eq!(
-            store.board("A").unwrap().admission_frequency_mhz,
-            Some(1400.)
+        let old = store.begin_owner("A", point(1450.)).unwrap();
+        store.restrict("A", Reason::InvalidProof).unwrap();
+        let current = store.begin_owner("A", point(1400.)).unwrap();
+        assert!(!store.recovered("A", old).unwrap());
+        assert!(
+            !store.clear_cautious("A", current).unwrap(),
+            "restriction first"
         );
-        point.frequency_mhz = 1400.;
-        let token = store.begin_owner("A", point).unwrap();
-        // A fresh initialized owner resumes; a new actual bad proof can lower
-        // the point again. Re-checkpointing the old fault cannot do so.
+        assert!(store.recovered("A", current).unwrap());
+        assert!(store.clear_cautious("A", current).unwrap());
+        let record = store.board("A").unwrap();
+        assert!(record.restriction.is_none() && !record.cautious && record.owner_active);
+        assert!(!store.set_point("A", old, point(1500.)).unwrap());
+        assert!(store.set_point("A", current, point(1500.)).unwrap());
+    }
+    #[test]
+    fn lowered_ceiling_relaxes_only_after_sustained_fault_free_serving() {
+        let f = Fixture::new();
+        let store = Store::open(&f.config()).unwrap();
+        store.begin_owner("A", point(1400.)).unwrap();
+        store.restrict("A", Reason::Thermal).unwrap();
+        let token = store.begin_owner("A", point(1300.)).unwrap();
         store.recovered("A", token).unwrap();
-        store.quarantine("A", Reason::InvalidProof).unwrap();
+        assert_eq!(store.relax_ceiling("A", token).unwrap(), None);
+        // Simulate six fault-free hours.
+        store
+            .update("A", false, |b| {
+                b.safety_clear_since_unix = crate::unix_now() - CEILING_RELAX_SECONDS
+            })
+            .unwrap();
+        assert_eq!(store.relax_ceiling("A", token).unwrap(), Some(Some(1400.)));
+        store
+            .update("A", false, |b| {
+                b.safety_clear_since_unix = crate::unix_now() - CEILING_RELAX_SECONDS
+            })
+            .unwrap();
+        assert_eq!(store.relax_ceiling("A", token).unwrap(), Some(None));
+        assert_eq!(store.board("A").unwrap().recovery_ceiling_mhz, None);
+    }
+    #[test]
+    fn a_hardware_check_keeps_safety_facts_but_not_reliability_health() {
+        let f = Fixture::new();
+        Store::open(&f.config())
+            .unwrap()
+            .record_failure("A", "before")
+            .unwrap();
+        let check = Store::open(&f.config()).unwrap().diagnostic();
         assert_eq!(
-            Store::open(&f.config())
+            check
+                .record_failure("A", "check")
                 .unwrap()
-                .board("A")
-                .unwrap()
-                .admission_frequency_mhz,
-            Some(1350.)
+                .consecutive_failures,
+            1
+        );
+        check
+            .update_health("A", true, |health| health.consecutive_failures = 0)
+            .unwrap();
+        check.restrict("A", Reason::Thermal).unwrap();
+        let production = Store::open(&f.config()).unwrap();
+        assert_eq!(production.health("A").consecutive_failures, 1);
+        assert_eq!(
+            production.board("A").unwrap().restriction,
+            Some(Reason::Thermal)
+        );
+    }
+    #[test]
+    fn health_survives_reopen_and_failures_publish_before_io() {
+        let f = Fixture::new();
+        let store = Store::open(&f.config()).unwrap();
+        for _ in 0..3 {
+            store
+                .record_failure("A", "Waiting for ASIC client timed out")
+                .unwrap();
+        }
+        let reopened = Store::open(&f.config()).unwrap();
+        let health = reopened.health("A");
+        assert_eq!(health.consecutive_failures, 3);
+        assert_eq!(
+            health.tier(crate::unix_now()),
+            crate::hardware::health::Tier::Probation
+        );
+        // A failed write still publishes the restrictive in-memory update.
+        let directory = reopened.path.parent().unwrap().to_owned();
+        let old = f.0.join("saved-directory");
+        fs::rename(&directory, &old).unwrap();
+        fs::write(&directory, b"not a directory").unwrap();
+        assert!(reopened.record_failure("A", "again").is_err());
+        assert_eq!(reopened.health("A").consecutive_failures, 4);
+        assert!(reopened.restrict("A", Reason::InvalidProof).is_err());
+        assert_eq!(
+            reopened.board("A").unwrap().restriction,
+            Some(Reason::InvalidProof)
         );
         assert!(
-            store
-                .begin_owner(
-                    "A",
-                    crate::automatic::Point {
-                        frequency_mhz: f64::NAN,
-                        voltage_v: 1.
-                    }
-                )
-                .is_err()
+            reopened
+                .clear_cautious("A", OwnerToken(0))
+                .is_ok_and(|v| !v)
         );
-        assert!(
-            store
-                .begin_owner(
-                    "A",
-                    crate::automatic::Point {
-                        frequency_mhz: 1450.,
-                        voltage_v: 1.01
-                    }
-                )
-                .is_err()
-        );
-        assert!(store.board("B").is_none());
+        fs::remove_file(&directory).unwrap();
+        fs::rename(old, &directory).unwrap();
     }
     #[test]
     fn production_lease_home_is_owned_and_outside_temporary_storage() {
@@ -750,7 +844,7 @@ mod tests {
         assert!(fs::metadata(home).unwrap().is_dir());
     }
     #[test]
-    fn leases_are_exclusive_and_invalid_metadata_is_archived_for_fresh_recovery() {
+    fn leases_are_exclusive_and_invalid_metadata_is_archived_for_cautious_recovery() {
         let f = Fixture::new();
         let store = Store::open(&f.config()).unwrap();
         let serial = format!("fixture{:x}", std::process::id());
@@ -763,11 +857,11 @@ mod tests {
         assert!(second.lease(&separate).is_ok());
         drop(lease);
         assert!(second.lease(&serial).is_ok());
-        store.quarantine("A", Reason::Thermal).unwrap();
-        assert!(store.board("B").is_none());
+        store.restrict("A", Reason::Thermal).unwrap();
         fs::write(&store.path, b"malformed").unwrap();
         let fresh = Store::open(&f.config()).unwrap();
         assert!(fresh.board("A").is_none());
+        assert!(fresh.policy(&board("A")).cautious);
         let archived = fs::read_dir(store.path.parent().unwrap())
             .unwrap()
             .filter_map(Result::ok)
@@ -779,36 +873,9 @@ mod tests {
             })
             .unwrap();
         assert_eq!(fs::read(archived.path()).unwrap(), b"malformed");
-        assert!(!store.path.exists());
     }
     #[test]
-    fn failed_persistence_cannot_clear_quarantine_or_unclean_ownership() {
-        let f = Fixture::new();
-        let store = Store::open(&f.config()).unwrap();
-        store.begin_owner("A", qualification().point).unwrap();
-        let old = f.0.join("saved-directory");
-        let directory = store.path.parent().unwrap().to_owned();
-        fs::rename(&directory, &old).unwrap();
-        fs::write(&directory, b"not a directory").unwrap();
-        assert!(store.quarantine("A", Reason::InvalidProof).is_err());
-        assert!(store.qualify("A", qualification()).is_err());
-        assert_eq!(
-            store.board("A").unwrap().quarantine,
-            Some(Reason::InvalidProof)
-        );
-        assert!(store.closed("A").is_err());
-        assert!(store.board("A").unwrap().owner_active);
-        fs::remove_file(&directory).unwrap();
-        fs::rename(old, &directory).unwrap();
-        let recovered = Store::open(&f.config()).unwrap();
-        assert_eq!(
-            recovered.board("A").unwrap().quarantine,
-            Some(Reason::UncleanOwner)
-        );
-        assert!(recovered.board("A").unwrap().force_safe);
-    }
-    #[test]
-    fn linked_insecure_and_invalid_qualification_state_cannot_admit_a_board() {
+    fn linked_or_insecure_state_is_rejected() {
         let f = Fixture::new();
         let store = Store::open(&f.config()).unwrap();
         store.closed("A").unwrap();
@@ -822,97 +889,24 @@ mod tests {
         fs::remove_file(&store.path).unwrap();
         symlink(f.0.join("missing"), &store.path).unwrap();
         assert!(Store::open(&f.config()).is_err());
-        let mut invalid = qualification();
-        invalid.engine_mask = 7;
-        assert!(store.qualify("A", invalid).is_err());
-    }
-    #[test]
-    fn optional_healthy_evidence_never_waits_for_the_critical_writer() {
-        let f = Fixture::new();
-        let store = Store::open(&f.config()).unwrap();
-        store.begin_owner("A", qualification().point).unwrap();
-        store.quarantine("A", Reason::UncleanOwner).unwrap();
-        store.qualify("A", qualification()).unwrap();
-        let token = store.begin_owner("A", qualification().point).unwrap();
-        {
-            let _blocked_writer = store.update_order.lock().unwrap();
-            store.healthy_profile_saved("A", token).unwrap();
-            assert!(store.board("A").unwrap().force_safe);
-        }
-        store.closed("A").unwrap();
-        assert!(!store.board("A").unwrap().force_safe);
-    }
-    #[test]
-    fn delayed_point_cannot_revive_a_retired_owner_or_change_its_successor() {
-        let f = Fixture::new();
-        let store = Store::open(&f.config()).unwrap();
-        let point = qualification().point;
-        let old = store.begin_owner("A", point).unwrap();
-        store.closed("A").unwrap();
-        let changed = crate::automatic::Point {
-            frequency_mhz: 1500.,
-            ..point
-        };
-        assert!(!store.set_point("A", old, changed).unwrap());
-        assert!(!store.board("A").unwrap().owner_active);
-        let current = store.begin_owner("A", point).unwrap();
-        assert!(!store.set_point("A", old, changed).unwrap());
-        assert_eq!(store.owner_token("A"), Some(current));
-        assert_eq!(store.board("A").unwrap().last_point, Some(point));
-        assert!(store.set_point("A", current, changed).unwrap());
-        assert_eq!(store.board("A").unwrap().owner_epoch, current.0);
-        store.quarantine("A", Reason::Thermal).unwrap();
-        assert!(!store.set_point("A", current, point).unwrap());
-    }
-    #[test]
-    fn stale_healthy_evidence_cannot_relax_a_successor() {
-        let f = Fixture::new();
-        let store = Store::open(&f.config()).unwrap();
-        let point = qualification().point;
-        let old = store.begin_owner("A", point).unwrap();
-        store.quarantine("A", Reason::InvalidProof).unwrap();
-        store.qualify("A", qualification()).unwrap();
-        let successor = store.begin_owner("A", point).unwrap();
-        store.healthy_profile_saved("A", old).unwrap();
-        assert!(store.set_point("A", successor, point).unwrap());
-        assert!(store.board("A").unwrap().force_safe);
-        store.healthy_profile_saved("A", successor).unwrap();
-        assert!(store.set_point("A", successor, point).unwrap());
-        assert!(!store.board("A").unwrap().force_safe);
-        store.closed("A").unwrap();
-        assert!(
-            !Store::open(&f.config())
-                .unwrap()
-                .board("A")
-                .unwrap()
-                .force_safe
-        );
     }
     #[test]
     fn queued_old_point_cannot_modify_a_successor() {
         let f = Fixture::new();
         let store = std::sync::Arc::new(Store::open(&f.config()).unwrap());
-        let point = qualification().point;
-        let old = store.begin_owner("A", point).unwrap();
+        let old = store.begin_owner("A", point(1450.)).unwrap();
         let (release, wait) = std::sync::mpsc::channel();
         let queued = store.clone();
         let job = std::thread::spawn(move || {
             wait.recv().unwrap();
-            queued.set_point(
-                "A",
-                old,
-                crate::automatic::Point {
-                    frequency_mhz: 1500.,
-                    ..point
-                },
-            )
+            queued.set_point("A", old, point(1500.))
         });
         store.closed("A").unwrap();
-        let successor = store.begin_owner("A", point).unwrap();
+        let successor = store.begin_owner("A", point(1450.)).unwrap();
         release.send(()).unwrap();
         assert!(!job.join().unwrap().unwrap());
         assert_eq!(store.owner_token("A"), Some(successor));
-        assert_eq!(store.board("A").unwrap().last_point, Some(point));
+        assert_eq!(store.board("A").unwrap().last_point, Some(point(1450.)));
     }
     #[test]
     fn queued_writer_cannot_replace_the_critical_holders_watchdog() {
@@ -923,10 +917,10 @@ mod tests {
                 .unwrap()
                 .monitored(progress.clone()),
         );
-        let token = store.begin_owner("A", qualification().point).unwrap();
+        let token = store.begin_owner("A", point(1450.)).unwrap();
         let held = store.state.lock().unwrap();
         let first = store.clone();
-        let first = std::thread::spawn(move || first.set_point("A", token, qualification().point));
+        let first = std::thread::spawn(move || first.set_point("A", token, point(1450.)));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let id = loop {
             if let Some(work) = progress.snapshot(0, 1).and_then(|snapshot| {
@@ -941,7 +935,7 @@ mod tests {
         let (started, waiting) = std::sync::mpsc::channel();
         let second = std::thread::spawn(move || {
             started.send(()).unwrap();
-            second.set_point("A", token, qualification().point)
+            second.set_point("A", token, point(1450.))
         });
         waiting.recv().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -957,49 +951,5 @@ mod tests {
         drop(held);
         assert!(first.join().unwrap().unwrap());
         assert!(second.join().unwrap().unwrap());
-    }
-}
-
-#[cfg(test)]
-mod recovery_tests {
-    use super::*;
-    #[test]
-    fn every_fault_expires_and_only_the_current_live_owner_can_clear_it() {
-        for (index, reason) in [Reason::Thermal, Reason::InvalidProof, Reason::UncleanOwner]
-            .into_iter()
-            .enumerate()
-        {
-            let path = std::env::temp_dir()
-                .join(format!("tl-recovery-policy-{}-{index}", std::process::id()));
-            std::fs::create_dir_all(&path).unwrap();
-            let store = Store::open(&path.join("config.toml")).unwrap();
-            let point = crate::automatic::Point {
-                frequency_mhz: 1450.,
-                voltage_v: 1.,
-            };
-            let old = store.begin_owner("fixture", point).unwrap();
-            store.quarantine("fixture", reason).unwrap();
-            let board: timelord_core::BoardConfig = toml::from_str(
-                "id='a'\nname='A'\nserial='fixture'\nclient_port=18110\nprofile='manual'",
-            )
-            .unwrap();
-            assert!(
-                store.policy(&board).hold_reason(u64::MAX).is_none(),
-                "{reason:?} cannot require intervention"
-            );
-            let current = store.begin_owner("fixture", point).unwrap();
-            assert!(!store.recovered("fixture", old).unwrap());
-            assert_eq!(store.board("fixture").unwrap().quarantine, Some(reason));
-            assert!(store.recovered("fixture", current).unwrap());
-            let record = store.board("fixture").unwrap();
-            assert!(record.owner_active);
-            assert!(record.quarantine.is_none());
-            assert_eq!(record.retry_after_unix, 0);
-            assert!(
-                record.qualification.is_none(),
-                "Initialization must not invent proof evidence"
-            );
-            std::fs::remove_dir_all(path).unwrap();
-        }
     }
 }
