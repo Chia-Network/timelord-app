@@ -137,7 +137,7 @@ pub fn validate_identity(node: &NodeConfig) -> Result<()> {
         .first()
         .context("Client certificate is empty")?;
     let parsed = x509_cert::Certificate::from_der(leaf.as_ref())?;
-    for extension in parsed.tbs_certificate.extensions.iter().flatten() {
+    for extension in parsed.tbs_certificate().extensions().into_iter().flatten() {
         if extension.extn_id.to_string() == "2.5.29.19"
             && x509_cert::ext::pkix::BasicConstraints::from_der(extension.extn_value.as_bytes())?.ca
         {
@@ -146,8 +146,8 @@ pub fn validate_identity(node: &NodeConfig) -> Result<()> {
     }
     for root in dg_xch_core::ssl::load_certs(ca.to_str().context("Invalid CA certificate path")?)? {
         let root = x509_cert::Certificate::from_der(root.as_ref())?;
-        if root.tbs_certificate.subject_public_key_info
-            == parsed.tbs_certificate.subject_public_key_info
+        if root.tbs_certificate().subject_public_key_info()
+            == parsed.tbs_certificate().subject_public_key_info()
         {
             bail!("The client must use its own key, not the CA signing key");
         }
@@ -263,7 +263,7 @@ pub fn import(config_path: &Path, manifest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
     #[test]
     fn imports_a_dedicated_identity_and_rejects_ca_keys_and_escaping_paths_without_replacing_config()
      {
@@ -277,10 +277,11 @@ mod tests {
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         let ca_key = KeyPair::generate().unwrap();
         let ca = params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::from_params(&params, &ca_key);
         let client_key = KeyPair::generate().unwrap();
         let client = CertificateParams::new(vec!["fixture-client".into()])
             .unwrap()
-            .signed_by(&client_key, &ca, &ca_key)
+            .signed_by(&client_key, &issuer)
             .unwrap();
         fs::write(source.join("client.crt"), client.pem()).unwrap();
         fs::write(source.join("client.key"), client_key.serialize_pem()).unwrap();

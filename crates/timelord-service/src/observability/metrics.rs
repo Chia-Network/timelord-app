@@ -73,7 +73,7 @@ impl Metrics {
             &[],
         )?;
         registry.register(Box::new(chain_moves_total.clone()))?;
-        chain_moves_total.with_label_values(&[]);
+        chain_moves_total.with_label_values(&[] as &[&str]);
         let delayed_bundles_total = IntCounterVec::new(
             Opts::new(
                 "delayed_bundles_total",
@@ -113,7 +113,7 @@ impl Metrics {
             &[],
         )?;
         registry.register(Box::new(topology_changes_total.clone()))?;
-        topology_changes_total.with_label_values(&[]);
+        topology_changes_total.with_label_values(&[] as &[&str]);
         let asic_recoveries_total = IntCounterVec::new(
             Opts::new("asic_recoveries_total", "asic recoveries total"),
             &["board", "engine"],
@@ -134,7 +134,7 @@ impl Metrics {
             &[],
         )?;
         registry.register(Box::new(node_reconnects_total.clone()))?;
-        node_reconnects_total.with_label_values(&[]);
+        node_reconnects_total.with_label_values(&[] as &[&str]);
         let peak_updates_total = IntCounterVec::new(
             Opts::new("peak_updates_total", "peak updates total"),
             &["result"],
@@ -330,7 +330,9 @@ impl Metrics {
         self.board_failures_total.with_label_values(&[board]).inc();
     }
     pub fn chains_moved(&self, count: u64) {
-        self.chain_moves_total.with_label_values(&[]).inc_by(count);
+        self.chain_moves_total
+            .with_label_values(&[] as &[&str])
+            .inc_by(count);
     }
     pub fn bundle_delayed(&self, c: Chain) {
         self.delayed_bundles_total
@@ -338,7 +340,9 @@ impl Metrics {
             .inc();
     }
     pub fn topology_changed(&self) {
-        self.topology_changes_total.with_label_values(&[]).inc();
+        self.topology_changes_total
+            .with_label_values(&[] as &[&str])
+            .inc();
     }
     pub fn verification_failed(&self, c: Chain) {
         self.proof_verification_failures_total
@@ -380,12 +384,12 @@ impl Metrics {
     }
     pub fn node_message_received(&self) {
         self.last_node_message_timestamp_seconds
-            .with_label_values(&[])
+            .with_label_values(&[] as &[&str])
             .set(crate::unix_now() as i64);
     }
     pub fn peak_received(&self) {
         self.last_peak_received_timestamp_seconds
-            .with_label_values(&[])
+            .with_label_values(&[] as &[&str])
             .set(crate::unix_now() as i64);
     }
     pub fn begin_session(&self) -> u64 {
@@ -404,7 +408,9 @@ impl Metrics {
     }
     pub fn connected(&self) {
         if self.ever_connected.swap(true, Ordering::Relaxed) {
-            self.node_reconnects_total.with_label_values(&[]).inc();
+            self.node_reconnects_total
+                .with_label_values(&[] as &[&str])
+                .inc();
         }
     }
     pub fn verified(&self, epoch: u64, c: Chain, ips: f64) {
