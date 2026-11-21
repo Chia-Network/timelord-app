@@ -306,23 +306,16 @@ fn parse(bytes: &[u8], now: u64) -> Result<Saved> {
     Ok(saved)
 }
 
-#[derive(Clone, Copy)]
-enum OpenMode {
-    Production,
-    Inspect,
-}
-
 impl Store {
     pub fn open(config: &Path) -> Result<Self> {
-        Self::load(config, OpenMode::Production)
+        Self::load(config, true)
     }
     /// Read-only inspection for the explicit hardware check: report a journal
     /// reset without creating, replacing, or archiving the journal.
     pub fn inspect(config: &Path) -> Result<Self> {
-        Self::load(config, OpenMode::Inspect)
+        Self::load(config, false)
     }
-    fn load(config: &Path, mode: OpenMode) -> Result<Self> {
-        let production = matches!(mode, OpenMode::Production);
+    fn load(config: &Path, production: bool) -> Result<Self> {
         let paths = Paths::for_config(config)?;
         let path = paths.directory.join("board-safety.json");
         let (mut state, journal_reset, persist_default) = match fs::symlink_metadata(&path) {
@@ -520,6 +513,12 @@ impl Store {
     }
     pub fn begin_owner(&self, serial: &str, point: crate::automatic::Point) -> Result<OwnerToken> {
         ensure!(valid_point(point), "Invalid native operating point");
+        // Inspection must not write defaults over a reset journal. Production
+        // open persists or archives the reset first, then may start boards.
+        ensure!(
+            !(self.keep_health && self.journal_reset.is_some()),
+            "Board safety journal is missing or unreadable; start the worker once before starting boards so the reset is recorded and the journal archived"
+        );
         let mut token = OwnerToken(0);
         self.update(serial, false, |b| {
             b.owner_active = true;

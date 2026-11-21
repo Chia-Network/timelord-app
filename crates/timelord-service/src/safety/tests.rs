@@ -33,6 +33,17 @@ fn board(serial: &str) -> timelord_core::BoardConfig {
     ))
     .unwrap()
 }
+fn corrupt_archive(directory: &Path) -> bool {
+    fs::read_dir(directory)
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("board-safety-corrupt-")
+        })
+}
 #[test]
 fn unknown_and_unconfirmed_boards_start_cautiously_without_a_restriction() {
     let f = Fixture::new();
@@ -337,6 +348,20 @@ fn a_hardware_check_does_not_replace_a_missing_or_unreadable_journal() {
     assert_eq!(inspected.journal_reset(), Some(JournalReset::Missing));
     assert!(!journal.exists());
 
+    let error = crate::diagnostics::prepare_store(&f.config())
+        .map(|_| ())
+        .expect_err("check-hardware must refuse a missing journal");
+    let text = format!("{error:#}");
+    assert!(text.contains("missing or unreadable"), "{text}");
+    assert!(text.contains("start the worker"), "{text}");
+    assert!(!journal.exists());
+
+    let error = inspected
+        .begin_owner("A", point(1450.))
+        .expect_err("begin_owner must refuse a reset inspect store");
+    assert!(format!("{error:#}").contains("start the worker"));
+    assert!(!journal.exists());
+
     let production = Store::open(&f.config()).unwrap();
     assert_eq!(production.journal_reset(), Some(JournalReset::Missing));
     assert!(journal.exists());
@@ -346,27 +371,40 @@ fn a_hardware_check_does_not_replace_a_missing_or_unreadable_journal() {
     let inspected = Store::inspect(&f.config()).unwrap();
     assert_eq!(inspected.journal_reset(), Some(JournalReset::Unreadable));
     assert_eq!(fs::read(&journal).unwrap(), b"malformed");
-    assert!(
-        fs::read_dir(&paths.directory)
-            .unwrap()
-            .filter_map(Result::ok)
-            .all(|entry| !entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("board-safety-corrupt-"))
-    );
+    assert!(!corrupt_archive(&paths.directory));
+
+    let error = crate::diagnostics::prepare_store(&f.config())
+        .map(|_| ())
+        .expect_err("check-hardware must refuse an unreadable journal");
+    let text = format!("{error:#}");
+    assert!(text.contains("missing or unreadable"), "{text}");
+    assert!(text.contains("start the worker"), "{text}");
+    assert_eq!(fs::read(&journal).unwrap(), b"malformed");
+    assert!(!corrupt_archive(&paths.directory));
+
+    let error = inspected
+        .begin_owner("A", point(1450.))
+        .expect_err("begin_owner must refuse an unreadable inspect store");
+    assert!(format!("{error:#}").contains("start the worker"));
+    assert_eq!(fs::read(&journal).unwrap(), b"malformed");
+    assert!(!corrupt_archive(&paths.directory));
 
     let production = Store::open(&f.config()).unwrap();
     assert_eq!(production.journal_reset(), Some(JournalReset::Unreadable));
-    assert!(
-        fs::read_dir(&paths.directory)
-            .unwrap()
-            .filter_map(Result::ok)
-            .any(|entry| entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("board-safety-corrupt-"))
-    );
+    assert!(corrupt_archive(&paths.directory));
+}
+#[test]
+fn a_hardware_check_cannot_take_the_worker_lock() {
+    let f = Fixture::new();
+    let paths = timelord_supervisor::Paths::for_config(&f.config()).unwrap();
+    Store::open(&f.config()).unwrap();
+    let _held = InstanceLock::acquire(&paths.worker_lock).unwrap();
+    let error = crate::diagnostics::prepare_store(&f.config())
+        .map(|_| ())
+        .expect_err("check-hardware must not take a held worker lock");
+    let text = format!("{error:#}");
+    assert!(text.contains("check-hardware"), "{text}");
+    assert!(text.contains("Another owner holds"), "{text}");
 }
 #[test]
 fn opening_fails_when_the_default_journal_cannot_be_written() {

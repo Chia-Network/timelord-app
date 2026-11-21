@@ -116,9 +116,10 @@ has already written a journal. The value is at most 1 per process and is exporte
 only by a process that performed a reset, so use the raw value, not `increase()`.
 The alert fires on the first scrape of a process that reset a previously written
 journal. `keep_firing_for: 5m` ignores short scrape failures so the alert does not
-flap. It clears when the worker target is not scraped for that hold time: a clean
-restart that loads the journal, or the worker is stopped, paused, or crashed.
-`TimelordScrapeFailed` may then cover an outage. `missing` means a journal whose
+flap. It clears when the series has been absent for that hold time: a clean
+restart is still scraped but no longer exposes the series, or the worker is
+stopped, paused, or crashed. `TimelordScrapeFailed` may then cover an outage.
+`missing` means a journal whose
 write had been attempted on this host was absent; the write-lock sidecar remains
 after an attempted write, including a failed first persist. A first start that
 creates the journal does not increment the metric. `unreadable` is a parse or
