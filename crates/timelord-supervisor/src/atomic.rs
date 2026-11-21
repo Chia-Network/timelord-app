@@ -18,6 +18,16 @@ fn sidecar(path: &Path, suffix: &str) -> Result<PathBuf> {
 pub fn pending(path: &Path) -> Result<PathBuf> {
     sidecar(path, ".pending")
 }
+/// Whether `write` has ever run for this target, inferred from its stable
+/// write-lock sidecar. The lock file is created on first write and never
+/// unlinked, so its presence outlives the target itself.
+pub fn was_written(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(&sidecar(path, ".write.lock")?) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
 pub fn write(path: &Path, bytes: &[u8]) -> Result<()> {
     ensure!(
         bytes.len() <= 64 * 1024 * 1024,

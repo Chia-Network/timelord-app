@@ -306,6 +306,7 @@ fn leases_are_exclusive_and_invalid_metadata_is_archived_for_cautious_recovery()
 #[test]
 fn a_missing_journal_is_created_and_a_later_gap_is_a_reset() {
     let f = Fixture::new();
+    timelord_supervisor::Paths::for_config(&f.config()).unwrap();
     let store = Store::open(&f.config()).unwrap();
     assert_eq!(store.journal_reset(), None);
     let assert_private = |path: &Path| {
@@ -321,6 +322,22 @@ fn a_missing_journal_is_created_and_a_later_gap_is_a_reset() {
     let recreated = Store::open(&f.config()).unwrap();
     assert_eq!(recreated.journal_reset(), Some(JournalReset::Missing));
     assert_private(&recreated.path);
+}
+#[test]
+fn opening_fails_when_the_default_journal_cannot_be_written() {
+    let f = Fixture::new();
+    let paths = timelord_supervisor::Paths::for_config(&f.config()).unwrap();
+    let journal = paths.directory.join("board-safety.json");
+    let lock = paths.directory.join(format!(
+        ".{}.write.lock",
+        journal.file_name().unwrap().to_string_lossy()
+    ));
+    let _held = timelord_supervisor::InstanceLock::acquire(&lock).unwrap();
+    let error = Store::open(&f.config()).err().expect("open must fail");
+    assert!(
+        format!("{error:#}").contains("Persisting default board safety journal"),
+        "{error:#}"
+    );
 }
 #[test]
 fn linked_or_insecure_state_is_rejected() {

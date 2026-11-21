@@ -306,34 +306,20 @@ fn parse(bytes: &[u8], now: u64) -> Result<Saved> {
     Ok(saved)
 }
 
-fn supervisor_state_existed(config: &Path) -> bool {
-    let directory = config
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let (Ok(directory), Some(stem)) = (directory.canonicalize(), config.file_name()) else {
-        return false;
-    };
-    fs::symlink_metadata(directory.join(format!(".{}-supervisor", stem.to_string_lossy()))).is_ok()
-}
-
 impl Store {
     pub fn open(config: &Path) -> Result<Self> {
-        let state_existed = supervisor_state_existed(config);
         let paths = Paths::for_config(config)?;
         let path = paths.directory.join("board-safety.json");
-        let mut journal_reset = None;
-        let mut persist_default = false;
-        let mut state = match fs::symlink_metadata(&path) {
+        let was_written = timelord_supervisor::atomic::was_written(&path)?;
+        let (mut state, journal_reset, persist_default) = match fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                persist_default = true;
-                if state_existed {
+                if was_written {
                     tracing::warn!(path=%path.display(), "Board safety journal was gone; boards start from cautious defaults");
-                    journal_reset = Some(JournalReset::Missing);
+                    (Saved::default(), Some(JournalReset::Missing), true)
                 } else {
                     tracing::info!(path=%path.display(), "No board safety journal yet; boards start from cautious defaults and a default journal is being created");
+                    (Saved::default(), None, true)
                 }
-                Saved::default()
             }
             Err(e) => return Err(e.into()),
             Ok(_) => {
@@ -352,7 +338,7 @@ impl Store {
                 let mut bytes = Vec::new();
                 file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
                 match parse(&bytes, crate::unix_now()) {
-                    Ok(saved) => saved,
+                    Ok(saved) => (saved, None, false),
                     Err(error) => {
                         let stamp = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)?
@@ -364,9 +350,7 @@ impl Store {
                         fs::rename(&path, &archived)
                             .context("Preserving invalid board recovery metadata")?;
                         tracing::error!(%error, path=%archived.display(), "Archived unreadable board safety journal; boards will start from cautious defaults and prior restrictions are not loaded");
-                        journal_reset = Some(JournalReset::Unreadable);
-                        persist_default = true;
-                        Saved::default()
+                        (Saved::default(), Some(JournalReset::Unreadable), true)
                     }
                 }
             }
@@ -391,7 +375,9 @@ impl Store {
         };
         if persist_default {
             let state = store.state.lock().expect("safety");
-            store.save(&state)?;
+            store
+                .save(&state)
+                .context("Persisting default board safety journal")?;
         }
         Ok(store)
     }
