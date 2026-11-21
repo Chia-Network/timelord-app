@@ -1,12 +1,12 @@
 # Rust timelord integration
 
-The app maintains `core` and `timelord` under `vendor/`, imported from
-compatibility snapshot `3b50863ee641c67e4c46b9a18640001e0c94833f` and modified in
-this repository. `servers` is not vendored; it and other unchanged dependencies
-use original upstream revision `ca437be562cec5f0514f6edd4c794adfe382dd8a`,
-Apache-2.0.
-See [VENDORING.md](VENDORING.md), vendor-origin.json, upstream.toml, LICENSE,
-NOTICE and Cargo.lock for maintenance instructions and exact provenance.
+The app uses dg_xch as Git dependencies on the Chia-Network fork
+https://github.com/Chia-Network/dg_xch_utils, pinned to one revision for every
+dg_xch crate. The fork carries upstream `ca437be562cec5f0514f6edd4c794adfe382dd8a`,
+the HF2 compatibility commits through `3b50863ee641c67e4c46b9a18640001e0c94833f`,
+and our signed patches. Apache-2.0.
+See [VENDORING.md](VENDORING.md), upstream.toml, LICENSE, NOTICE and Cargo.lock for
+maintenance instructions and exact provenance.
 
 The app links the public regular Scheduler, protocol/consensus types, TLS/framing
 helpers and VDF verifier. Our `runtime.rs` owns the node session and injects our
@@ -16,7 +16,7 @@ service/CLI is not used: it constructs a CpuBackend and recomputes each request.
 Custom Chia network imports resolve the exact exported network ID and supported
 constant overrides in our `network.rs` adapter, using pinned Mainnet constants as
 the baseline. They do not use upstream's DGX seed-derived chain format. Current HF2 filter schedules and strength parameters are applied explicitly.
-The maintained vendor copies supply PoS2 witness verification, consensus hashing and
+The fork's maintained core and timelord supply PoS2 witness verification, consensus hashing and
 message codecs. Offline custom import/handshake tests alone do not establish
 transition support or live consensus acceptance.
 
@@ -157,7 +157,7 @@ absent-root compatibility; custom relative filter schedules retain their length.
 `hf2-testnet-deployment.json` records actual m6mini submissions and full-node
 acceptance of PoS2 blocks, beginning at height 10554. It does not establish an
 activation replay or sustained hardware stability. That historical deployment used the compatibility fork. Current builds use
-maintained vendor copies with the review fixes described in VENDORING.md.
+the Chia-Network fork with the review fixes described in VENDORING.md.
 Standard builds require no local checkout or Cargo override.
 
 ## Maintained vendor deployment (November 15)
