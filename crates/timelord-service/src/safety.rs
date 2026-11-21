@@ -313,7 +313,7 @@ impl Store {
         let mut journal_reset = None;
         let mut state = match fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tracing::error!(error=%e, path=%path.display(), "Board safety journal is missing; boards will start from cautious defaults and prior restrictions are not loaded");
+                tracing::info!(path=%path.display(), "No board safety journal yet; boards start from cautious defaults");
                 journal_reset = Some(JournalReset::Missing);
                 Saved::default()
             }
