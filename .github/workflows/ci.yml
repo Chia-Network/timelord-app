@@ -10,8 +10,10 @@ on:
 permissions:
   contents: read
 
+# Only a newer push to the same pull request cancels a run. Every other run
+# (main, dispatch, release) gets its own group and always finishes.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: true
 
 env:

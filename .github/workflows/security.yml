@@ -11,8 +11,10 @@ on:
 permissions:
   contents: read
 
+# Only a newer push to the same pull request cancels a run. Every other run
+# (main, schedule, dispatch) gets its own group and always finishes.
 concurrency:
-  group: security-${{ github.workflow }}-${{ github.ref }}
+  group: security-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
