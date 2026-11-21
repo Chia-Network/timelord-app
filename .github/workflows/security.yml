@@ -36,7 +36,7 @@ jobs:
         run: cargo audit --file Cargo.lock
 
   codeql:
-    name: CodeQL (${{ matrix.language }})
+    name: CodeQL (${{ matrix.language }}${{ matrix.variant }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
@@ -59,6 +59,11 @@ jobs:
           - language: swift
             runner: macos-15
             build-mode: manual
+          # TEMP: measure macos-26 for Swift CodeQL; remove before merge
+          - language: swift
+            runner: macos-26
+            build-mode: manual
+            variant: -macos-26
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -74,4 +79,4 @@ jobs:
       - name: Analyze
         uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
         with:
-          category: /language:${{ matrix.language }}
+          category: /language:${{ matrix.language }}${{ matrix.variant }}
