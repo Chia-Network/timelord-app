@@ -166,6 +166,41 @@ fn a_hardware_check_keeps_safety_facts_but_not_reliability_health() {
     );
 }
 #[test]
+fn forgive_is_refused_after_an_interleaved_retry_and_accepted_on_a_clean_path() {
+    let f = Fixture::new();
+    let store = Store::open(&f.config()).unwrap();
+    let (before, after) = store.record_failure("A", "x").unwrap();
+    let now = crate::unix_now();
+    store
+        .update_health("A", true, |health| health.retry_now(now))
+        .unwrap();
+    let retried = store.health("A");
+    assert!(!store.forgive("A", &after, before.clone()).unwrap());
+    assert_eq!(store.health("A"), retried);
+
+    let clean = Fixture::new();
+    let store = Store::open(&clean.config()).unwrap();
+    let (before, after) = store.record_failure("A", "x").unwrap();
+    assert!(store.forgive("A", &after, before.clone()).unwrap());
+    assert_eq!(store.health("A"), before);
+
+    let f = Fixture::new();
+    Store::open(&f.config())
+        .unwrap()
+        .record_failure("A", "x")
+        .unwrap();
+    let production = Store::open(&f.config()).unwrap();
+    let post_failure = production.health("A");
+    let diagnostic = Store::open(&f.config()).unwrap().diagnostic();
+    assert!(
+        !diagnostic
+            .forgive("A", &post_failure, Health::default())
+            .unwrap()
+    );
+    assert_eq!(Store::open(&f.config()).unwrap().health("A"), post_failure);
+}
+
+#[test]
 fn health_survives_reopen_and_failures_publish_before_io() {
     let f = Fixture::new();
     let store = Store::open(&f.config()).unwrap();
