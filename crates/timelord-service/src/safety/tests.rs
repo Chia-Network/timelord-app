@@ -184,22 +184,48 @@ fn forgive_is_refused_after_an_interleaved_retry_and_accepted_on_a_clean_path() 
     assert!(store.forgive("A", &after, before.clone()).unwrap());
     assert_eq!(store.health("A"), before);
 
-    let f = Fixture::new();
-    Store::open(&f.config())
+    let diagnostic_dir = Fixture::new();
+    Store::open(&diagnostic_dir.config())
         .unwrap()
         .record_failure("A", "x")
         .unwrap();
-    let production = Store::open(&f.config()).unwrap();
+    let production = Store::open(&diagnostic_dir.config()).unwrap();
     let post_failure = production.health("A");
-    let diagnostic = Store::open(&f.config()).unwrap().diagnostic();
+    let diagnostic = Store::open(&diagnostic_dir.config()).unwrap().diagnostic();
     assert!(
         !diagnostic
             .forgive("A", &post_failure, Health::default())
             .unwrap()
     );
-    assert_eq!(Store::open(&f.config()).unwrap().health("A"), post_failure);
+    assert_eq!(
+        Store::open(&diagnostic_dir.config()).unwrap().health("A"),
+        post_failure
+    );
 }
-
+#[test]
+fn forgive_reads_health_under_the_writer_order() {
+    let f = Fixture::new();
+    let store = std::sync::Arc::new(Store::open(&f.config()).unwrap());
+    let (before, after) = store.record_failure("A", "x").unwrap();
+    let order = store.update_order.lock().unwrap();
+    let queued = store.clone();
+    let job = std::thread::spawn(move || queued.forgive("A", &after, before));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let now = crate::unix_now();
+    store
+        .state
+        .lock()
+        .unwrap()
+        .boards
+        .get_mut("A")
+        .unwrap()
+        .health
+        .retry_now(now);
+    let retried = store.health("A");
+    drop(order);
+    assert!(!job.join().unwrap().unwrap());
+    assert_eq!(store.health("A"), retried);
+}
 #[test]
 fn health_survives_reopen_and_failures_publish_before_io() {
     let f = Fixture::new();
