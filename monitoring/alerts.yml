@@ -62,6 +62,7 @@ groups:
         expr: |
           chia_timelord_safety_journal_resets_total{job="timelord-app"} > 0
         for: 0m
+        keep_firing_for: 5m
         labels:
           severity: warning
         annotations:

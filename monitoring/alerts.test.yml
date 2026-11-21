@@ -233,11 +233,50 @@ tests:
         severity: warning
       exp_annotations:
         summary: Board safety journal was replaced with defaults
-- name: a safety journal reset clears when the next start loads the journal
+- name: a safety journal reset survives one failed scrape without re-firing
   interval: 1m
   input_series:
   - series: chia_timelord_safety_journal_resets_total{job="timelord-app",instance="fixture:9258",network="mainnet",reason="missing"}
-    values: 1 1 stale stale
+    values: 1 1 stale 1 1
+  alert_rule_test:
+  - eval_time: 2m
+    alertname: TimelordSafetyJournalReset
+    exp_alerts:
+    - exp_labels:
+        job: timelord-app
+        instance: fixture:9258
+        network: mainnet
+        reason: missing
+        severity: warning
+      exp_annotations:
+        summary: Board safety journal was replaced with defaults
+  - eval_time: 3m
+    alertname: TimelordSafetyJournalReset
+    exp_alerts:
+    - exp_labels:
+        job: timelord-app
+        instance: fixture:9258
+        network: mainnet
+        reason: missing
+        severity: warning
+      exp_annotations:
+        summary: Board safety journal was replaced with defaults
+  - eval_time: 4m
+    alertname: TimelordSafetyJournalReset
+    exp_alerts:
+    - exp_labels:
+        job: timelord-app
+        instance: fixture:9258
+        network: mainnet
+        reason: missing
+        severity: warning
+      exp_annotations:
+        summary: Board safety journal was replaced with defaults
+- name: a safety journal reset clears after the hold once the journal is loaded
+  interval: 1m
+  input_series:
+  - series: chia_timelord_safety_journal_resets_total{job="timelord-app",instance="fixture:9258",network="mainnet",reason="missing"}
+    values: 1 1 stale stale stale stale stale stale stale
   alert_rule_test:
   - eval_time: 1m
     alertname: TimelordSafetyJournalReset
@@ -250,7 +289,18 @@ tests:
         severity: warning
       exp_annotations:
         summary: Board safety journal was replaced with defaults
-  - eval_time: 3m
+  - eval_time: 6m
+    alertname: TimelordSafetyJournalReset
+    exp_alerts:
+    - exp_labels:
+        job: timelord-app
+        instance: fixture:9258
+        network: mainnet
+        reason: missing
+        severity: warning
+      exp_annotations:
+        summary: Board safety journal was replaced with defaults
+  - eval_time: 8m
     alertname: TimelordSafetyJournalReset
     exp_alerts: []
 - name: counter resets with continuing work do not look like stalls
