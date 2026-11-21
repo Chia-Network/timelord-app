@@ -44,6 +44,18 @@ fn corrupt_archive(directory: &Path) -> bool {
                 .starts_with("board-safety-corrupt-")
         })
 }
+fn corrupt_archive_bytes(directory: &Path) -> Option<Vec<u8>> {
+    fs::read_dir(directory)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("board-safety-corrupt-")
+        })
+        .map(|entry| fs::read(entry.path()).unwrap())
+}
 #[test]
 fn unknown_and_unconfirmed_boards_start_cautiously_without_a_restriction() {
     let f = Fixture::new();
@@ -312,7 +324,9 @@ fn leases_are_exclusive_and_invalid_metadata_is_archived_for_cautious_recovery()
         })
         .unwrap();
     assert_eq!(fs::read(archived.path()).unwrap(), b"malformed");
-    assert_eq!(Store::open(&f.config()).unwrap().journal_reset(), None);
+    let missing = Store::open(&f.config()).unwrap();
+    assert_eq!(missing.journal_reset(), Some(JournalReset::Missing));
+    assert!(!missing.path.exists());
 }
 #[test]
 fn a_missing_journal_is_created_and_a_later_gap_is_a_reset() {
@@ -330,9 +344,35 @@ fn a_missing_journal_is_created_and_a_later_gap_is_a_reset() {
     assert_private(&store.path);
     assert_eq!(Store::open(&f.config()).unwrap().journal_reset(), None);
     fs::remove_file(&store.path).unwrap();
-    let recreated = Store::open(&f.config()).unwrap();
-    assert_eq!(recreated.journal_reset(), Some(JournalReset::Missing));
-    assert_private(&recreated.path);
+    let missing = Store::open(&f.config()).unwrap();
+    assert_eq!(missing.journal_reset(), Some(JournalReset::Missing));
+    assert!(!missing.path.exists());
+    let still_missing = Store::open(&f.config()).unwrap();
+    assert_eq!(still_missing.journal_reset(), Some(JournalReset::Missing));
+    assert!(!still_missing.path.exists());
+    still_missing.begin_owner("A", point(1450.)).unwrap();
+    assert_private(&still_missing.path);
+    let recovered = Store::open(&f.config()).unwrap();
+    assert_eq!(recovered.journal_reset(), None);
+}
+#[test]
+fn an_unreadable_journal_is_archived_and_then_reported_missing() {
+    let f = Fixture::new();
+    let paths = timelord_supervisor::Paths::for_config(&f.config()).unwrap();
+    let journal = paths.directory.join("board-safety.json");
+    Store::open(&f.config()).unwrap();
+    fs::write(&journal, b"malformed").unwrap();
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+    let unreadable = Store::open(&f.config()).unwrap();
+    assert_eq!(unreadable.journal_reset(), Some(JournalReset::Unreadable));
+    assert!(!journal.exists());
+    assert_eq!(
+        corrupt_archive_bytes(&paths.directory),
+        Some(b"malformed".to_vec())
+    );
+    let missing = Store::open(&f.config()).unwrap();
+    assert_eq!(missing.journal_reset(), Some(JournalReset::Missing));
+    assert!(!journal.exists());
 }
 #[test]
 fn a_hardware_check_does_not_replace_a_missing_or_unreadable_journal() {
@@ -364,7 +404,7 @@ fn a_hardware_check_does_not_replace_a_missing_or_unreadable_journal() {
 
     let production = Store::open(&f.config()).unwrap();
     assert_eq!(production.journal_reset(), Some(JournalReset::Missing));
-    assert!(journal.exists());
+    assert!(!journal.exists());
 
     fs::write(&journal, b"malformed").unwrap();
     fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
@@ -391,6 +431,7 @@ fn a_hardware_check_does_not_replace_a_missing_or_unreadable_journal() {
 
     let production = Store::open(&f.config()).unwrap();
     assert_eq!(production.journal_reset(), Some(JournalReset::Unreadable));
+    assert!(!journal.exists());
     assert!(corrupt_archive(&paths.directory));
 }
 #[test]
@@ -411,8 +452,8 @@ fn opening_fails_when_the_default_journal_cannot_be_written() {
     let f = Fixture::new();
     let paths = timelord_supervisor::Paths::for_config(&f.config()).unwrap();
     let journal = paths.directory.join("board-safety.json");
-    let lock = timelord_supervisor::atomic::write_lock(&journal).unwrap();
-    let _held = timelord_supervisor::InstanceLock::acquire(&lock).unwrap();
+    let pending = timelord_supervisor::atomic::pending(&journal).unwrap();
+    fs::create_dir(&pending).unwrap();
     let error = Store::open(&f.config()).err().expect("open must fail");
     assert!(
         format!("{error:#}").contains("Persisting default board safety journal"),

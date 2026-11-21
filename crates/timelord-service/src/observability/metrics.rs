@@ -73,7 +73,7 @@ impl Metrics {
         let safety_journal_resets_total = IntCounterVec::new(
             Opts::new(
                 "safety_journal_resets_total",
-                "Processes that replaced a previously written but now missing or unreadable board safety journal with defaults; at most 1 per process, exported only by the resetting process, so use the raw value, not increase()",
+                "Processes that found a previously written but now absent or unreadable board safety journal and started from cautious defaults; at most 1 per process, exported only by the process that reported the reset, so use the raw value, not increase()",
             ),
             &["reason"],
         )?;

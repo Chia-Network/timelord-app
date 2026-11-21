@@ -14,8 +14,8 @@ use timelord_supervisor::InstanceLock;
 use tokio::{sync::watch, task::JoinSet};
 
 /// Take the serving worker lock and inspect the safety journal without
-/// persisting or archiving it. A reset journal must be recorded by a production
-/// open first, so boards never start over in-memory defaults.
+/// persisting or archiving it. A reset journal must be recorded by a real
+/// board-state save first, so boards never start over in-memory defaults.
 pub(crate) fn prepare_store(config_path: &Path) -> Result<(InstanceLock, crate::safety::Store)> {
     let paths = timelord_supervisor::Paths::for_config(config_path)?;
     let worker = InstanceLock::acquire(&paths.worker_lock)
@@ -23,7 +23,7 @@ pub(crate) fn prepare_store(config_path: &Path) -> Result<(InstanceLock, crate::
     let safety = crate::safety::Store::inspect(config_path)?;
     if safety.journal_reset().is_some() {
         bail!(
-            "Board safety journal is missing or unreadable; start the worker once so the reset is recorded and the journal archived before running check-hardware"
+            "Board safety journal is missing or unreadable; start the worker until it has saved board state so the reset is recorded and an unreadable journal is archived before running check-hardware"
         );
     }
     Ok((worker, safety))

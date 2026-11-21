@@ -166,7 +166,7 @@ struct Saved {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnerToken(pub(crate) u64);
 
-/// Why a journal was replaced with cautious defaults at startup.
+/// Why startup reported a missing or unreadable journal and used cautious defaults.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JournalReset {
     Missing,
@@ -321,8 +321,8 @@ impl Store {
         let (mut state, journal_reset, persist_default) = match fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if timelord_supervisor::atomic::write_attempted(&path)? {
-                    tracing::warn!(path=%path.display(), "Board safety journal was gone; boards start from cautious defaults");
-                    (Saved::default(), Some(JournalReset::Missing), production)
+                    tracing::error!(path=%path.display(), "Board safety journal is gone; boards start from cautious defaults and the journal stays absent until the worker records board state, so this reset is reported on every start");
+                    (Saved::default(), Some(JournalReset::Missing), false)
                 } else if production {
                     tracing::info!(path=%path.display(), "No board safety journal yet; boards start from cautious defaults and a default journal is being created");
                     (Saved::default(), None, true)
@@ -359,8 +359,8 @@ impl Store {
                         ));
                         fs::rename(&path, &archived)
                             .context("Preserving invalid board recovery metadata")?;
-                        tracing::error!(%error, path=%archived.display(), "Archived unreadable board safety journal; boards will start from cautious defaults and prior restrictions are not loaded");
-                        (Saved::default(), Some(JournalReset::Unreadable), true)
+                        tracing::error!(%error, path=%archived.display(), "Archived unreadable board safety journal; boards will start from cautious defaults and prior restrictions are not loaded, and the journal stays absent until the worker records board state");
+                        (Saved::default(), Some(JournalReset::Unreadable), false)
                     }
                     Err(error) => {
                         tracing::error!(%error, path=%path.display(), "Unreadable board safety journal; boards start from cautious defaults and prior restrictions are not loaded");
@@ -513,11 +513,11 @@ impl Store {
     }
     pub fn begin_owner(&self, serial: &str, point: crate::automatic::Point) -> Result<OwnerToken> {
         ensure!(valid_point(point), "Invalid native operating point");
-        // Inspection must not write defaults over a reset journal. Production
-        // open persists or archives the reset first, then may start boards.
+        // Inspection must not write defaults over a reset journal. A real
+        // board-state save writes the journal and clears the reported reset.
         ensure!(
             !(self.keep_health && self.journal_reset.is_some()),
-            "Board safety journal is missing or unreadable; start the worker once before starting boards so the reset is recorded and the journal archived"
+            "Board safety journal is missing or unreadable; start the worker until it has saved board state so the reset is recorded and an unreadable journal is archived"
         );
         let mut token = OwnerToken(0);
         self.update(serial, false, |b| {

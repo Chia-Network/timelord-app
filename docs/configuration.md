@@ -329,9 +329,10 @@ clients for a bounded synthetic three-chain proof check without a full node.
 Never point it at boards in use. It applies the configured operating point and
 thermal guard, verifies retained sessions and a reset, then stops its own clients.
 It does not train Automatic tuning or change saved settings. It refuses to run
-when the board safety journal is missing or unreadable after a prior write;
-start the worker or service once so the reset is recorded and an unreadable
-journal is archived, then rerun the check. It takes the worker lock, so it does
+when the board safety journal is missing or unreadable after a prior write, and
+stays refused until the worker has saved board state (not merely run once) so the
+reset is recorded and an unreadable journal is archived; then rerun the check. It
+takes the worker lock, so it does
 not run at the same time as the serving worker and fails clearly when that lock
 is held.
 

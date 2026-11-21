@@ -79,7 +79,7 @@ All names below have the prefix `chia_timelord_`:
 | `topology_changes_total` | counter | Applied chain-route changes |
 | `chain_moves_total` | counter | Chains moved between boards by route changes |
 | `board_failures_total{board}` | counter | Native owner failures counted against board reliability (absence is not counted) |
-| `safety_journal_resets_total{reason}` | counter; `reason` (`missing` or `unreadable`) | Processes that replaced a previously written but now absent or unreadable board safety journal with cautious defaults; at most 1 per process and exported only by the process that performed the reset, so use the raw value, not `increase()`; first-start journal creation is not counted |
+| `safety_journal_resets_total{reason}` | counter; `reason` (`missing` or `unreadable`) | Processes that found a previously written but now absent or unreadable board safety journal and started from cautious defaults; at most 1 per process and exported only by the process that reported the reset, so use the raw value, not `increase()`; first-start journal creation is not counted |
 | `delayed_bundles_total{chain}` | counter | Verified chain proofs that waited over 10 seconds for their bundle partner |
 | `estimated_ips` | gauge | Latest validated completion from any chain in this node session |
 | `chain_estimated_ips` | gauge; `chain` | Latest validated completion for each chain in this session |
@@ -121,9 +121,13 @@ restart is still scraped but no longer exposes the series, or the worker is
 stopped, paused, or crashed. `TimelordScrapeFailed` may then cover an outage.
 `missing` means a journal whose
 write had been attempted on this host was absent; the write-lock sidecar remains
-after an attempted write, including a failed first persist. A first start that
-creates the journal does not increment the metric. `unreadable` is a parse or
-validation failure that was archived and replaced with defaults. This signal
+after an attempted write, including a failed first persist. A first start (no
+journal and no write-lock sidecar) creates the journal and does not increment the
+metric. After a previously written journal is missing, the journal stays absent
+and every start reports `missing` until a real board-state save writes it.
+`unreadable` is a parse or validation failure that is archived; the journal is
+left absent, so later starts report `missing`. The `board-safety-corrupt-*`
+archive preserves the original reason. This signal
 catches accidental loss, not a same-UID adversary, who can remove the write-lock
 sidecar as well as the journal.
 
