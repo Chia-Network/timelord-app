@@ -10,8 +10,10 @@ on:
 permissions:
   contents: read
 
+# Only a newer push to the same pull request cancels a run. Every other run
+# (main, dispatch, release) gets its own group and always finishes.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: true
 
 env:
@@ -35,14 +37,12 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
-      - name: Cache Cargo downloads
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Caches dependencies per job, OS and toolchain; workspace crates always rebuild.
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-
+          workspaces: '. -> build/rust'
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check formatting, lint, native fixtures, Rust and Swift tests
         run: bash scripts/check.sh
 
@@ -60,14 +60,13 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-      - name: Cache Cargo downloads
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Release tags build the shipped app from a clean dependency tree.
+      - name: Cache Rust dependencies
+        if: github.ref_type != 'tag'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-
+          workspaces: '. -> build/rust'
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build pinned chiavdf client
         run: bash scripts/build-native.sh
       - name: Assemble and verify developer app
