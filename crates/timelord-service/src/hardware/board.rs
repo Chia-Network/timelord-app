@@ -539,16 +539,15 @@ impl BoardSupervisor {
         if at.elapsed() > FORGIVE_WINDOW {
             return;
         }
-        match self.safety.forgive(serial, &post_failure, previous) {
+        match self.safety.forgive(serial, &post_failure, previous.clone()) {
             Ok(true) => {
-                let health = self.safety.health(serial);
-                tracing::info!(board=%self.board.name, consecutive_failures=health.consecutive_failures, "ASIC was unplugged; its last stop is no longer counted as a failure");
+                tracing::info!(board=%self.board.name, consecutive_failures=previous.consecutive_failures, "ASIC was unplugged; its last stop is no longer counted as a failure");
                 crate::board_history::record(
                     &self.shared,
                     &self.board,
                     "failure_forgiven",
                     Some(&format!("{} was unplugged", self.board.name)),
-                    Some(&health),
+                    Some(&previous),
                 );
             }
             Ok(false) => {
