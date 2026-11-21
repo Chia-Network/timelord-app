@@ -4,6 +4,7 @@ use super::{
     UnfinishedOutcome, UnfinishedSource, board, chain, index, snapshot,
 };
 use crate::Shared;
+use crate::safety::JournalReset;
 use anyhow::Result;
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder,
@@ -325,10 +326,6 @@ impl Metrics {
                 .with_label_values(labels)
                 .get(),
             "board_failures_total" => self.board_failures_total.with_label_values(labels).get(),
-            "safety_journal_resets_total" => self
-                .safety_journal_resets_total
-                .with_label_values(labels)
-                .get(),
             "chain_moves_total" => self.chain_moves_total.with_label_values(labels).get(),
             "operating_point_changes_total" => self
                 .operating_point_changes_total
@@ -343,9 +340,9 @@ impl Metrics {
     pub fn board_failed(&self, board: &str) {
         self.board_failures_total.with_label_values(&[board]).inc();
     }
-    pub fn safety_journal_reset(&self, reason: &str) {
+    pub fn safety_journal_reset(&self, reset: JournalReset) {
         self.safety_journal_resets_total
-            .with_label_values(&[reason])
+            .with_label_values(&[reset.label()])
             .inc();
     }
     pub fn chains_moved(&self, count: u64) {

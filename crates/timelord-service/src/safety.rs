@@ -173,7 +173,7 @@ pub enum JournalReset {
     Unreadable,
 }
 impl JournalReset {
-    pub fn reason(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Missing => "missing",
             Self::Unreadable => "unreadable",

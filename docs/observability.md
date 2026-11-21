@@ -79,6 +79,7 @@ All names below have the prefix `chia_timelord_`:
 | `topology_changes_total` | counter | Applied chain-route changes |
 | `chain_moves_total` | counter | Chains moved between boards by route changes |
 | `board_failures_total{board}` | counter | Native owner failures counted against board reliability (absence is not counted) |
+| `safety_journal_resets_total{reason}` | counter; `reason` (`missing` or `unreadable`) | Starts that replaced a missing or unreadable board safety journal with cautious defaults |
 | `delayed_bundles_total{chain}` | counter | Verified chain proofs that waited over 10 seconds for their bundle partner |
 | `estimated_ips` | gauge | Latest validated completion from any chain in this node session |
 | `chain_estimated_ips` | gauge; `chain` | Latest validated completion for each chain in this session |
@@ -108,6 +109,9 @@ All names below have the prefix `chia_timelord_`:
 | `operating_point_changes_total` | counter; `board,reason` | Acknowledged trial, backoff or restore writes |
 | `proof_duration_seconds` | histogram; `chain,stage` | Observed proof pipeline boundaries below |
 | `submission_duration_seconds` | histogram; `kind` | Successful bundle write duration |
+
+Alert on `safety_journal_resets_total` only with `reason="unreadable"`; a missing
+journal on first start is expected.
 
 Chains are `challenge`, `reward`, `infused_challenge`. Bundle kinds are `signage`,
 `infusion`, `end_of_sub_slot`. Unfinished candidate outcomes are `admitted`,
