@@ -166,11 +166,27 @@ struct Saved {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnerToken(pub(crate) u64);
 
+/// Why a journal was replaced with cautious defaults at startup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JournalReset {
+    Missing,
+    Unreadable,
+}
+impl JournalReset {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Unreadable => "unreadable",
+        }
+    }
+}
+
 pub struct Store {
     path: PathBuf,
     state: Mutex<Saved>,
     update_order: Mutex<()>,
     progress: Option<std::sync::Arc<timelord_supervisor::progress::Progress>>,
+    journal_reset: Option<JournalReset>,
     /// A hardware check shares the physical facts (owner epochs, cautious
     /// starts, restrictions) but never changes reliability health: its forced
     /// settings and synthetic work say nothing about how a board serves.
@@ -294,8 +310,13 @@ impl Store {
     pub fn open(config: &Path) -> Result<Self> {
         let paths = Paths::for_config(config)?;
         let path = paths.directory.join("board-safety.json");
+        let mut journal_reset = None;
         let mut state = match fs::symlink_metadata(&path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Saved::default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::error!(error=%e, path=%path.display(), "Board safety journal is missing; boards will start from cautious defaults and prior restrictions are not loaded");
+                journal_reset = Some(JournalReset::Missing);
+                Saved::default()
+            }
             Err(e) => return Err(e.into()),
             Ok(_) => {
                 let file = OpenOptions::new()
@@ -324,7 +345,8 @@ impl Store {
                         ));
                         fs::rename(&path, &archived)
                             .context("Preserving invalid board recovery metadata")?;
-                        tracing::warn!(%error, path=%archived.display(), "Archived invalid recovery metadata; boards will start cautiously");
+                        tracing::error!(%error, path=%archived.display(), "Archived unreadable board safety journal; boards will start from cautious defaults and prior restrictions are not loaded");
+                        journal_reset = Some(JournalReset::Unreadable);
                         Saved::default()
                     }
                 }
@@ -345,8 +367,13 @@ impl Store {
             state: Mutex::new(state),
             update_order: Mutex::new(()),
             progress: None,
+            journal_reset,
             keep_health: false,
         })
+    }
+    /// Why startup replaced the journal with defaults, if it did.
+    pub fn journal_reset(&self) -> Option<JournalReset> {
+        self.journal_reset
     }
     #[cfg(test)]
     pub fn held_fixture(
@@ -859,6 +886,8 @@ mod tests {
     fn leases_are_exclusive_and_invalid_metadata_is_archived_for_cautious_recovery() {
         let f = Fixture::new();
         let store = Store::open(&f.config()).unwrap();
+        assert_eq!(store.journal_reset(), Some(JournalReset::Missing));
+        assert!(store.board("A").is_none());
         let serial = format!("fixture{:x}", std::process::id());
         let separate = format!("other{:x}", std::process::id());
         let other = Fixture::new();
@@ -872,6 +901,7 @@ mod tests {
         store.restrict("A", Reason::Thermal).unwrap();
         fs::write(&store.path, b"malformed").unwrap();
         let fresh = Store::open(&f.config()).unwrap();
+        assert_eq!(fresh.journal_reset(), Some(JournalReset::Unreadable));
         assert!(fresh.board("A").is_none());
         assert!(fresh.policy(&board("A")).cautious);
         let archived = fs::read_dir(store.path.parent().unwrap())

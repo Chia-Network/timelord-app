@@ -50,6 +50,7 @@ pub struct Metrics {
     ever_connected: AtomicBool,
     clients_started: Mutex<BTreeSet<String>>,
     board_failures_total: IntCounterVec,
+    safety_journal_resets_total: IntCounterVec,
     chain_moves_total: IntCounterVec,
     delayed_bundles_total: IntCounterVec,
     /// Applied to every family at encode time, so a live node-profile switch
@@ -68,6 +69,14 @@ impl Metrics {
             &["board"],
         )?;
         registry.register(Box::new(board_failures_total.clone()))?;
+        let safety_journal_resets_total = IntCounterVec::new(
+            Opts::new(
+                "safety_journal_resets_total",
+                "Starts that replaced a missing or unreadable board safety journal with defaults",
+            ),
+            &["reason"],
+        )?;
+        registry.register(Box::new(safety_journal_resets_total.clone()))?;
         let chain_moves_total = IntCounterVec::new(
             Opts::new("chain_moves_total", "Chains moved between boards"),
             &[],
@@ -256,6 +265,7 @@ impl Metrics {
             ever_connected: AtomicBool::new(false),
             clients_started: Mutex::new(BTreeSet::new()),
             board_failures_total,
+            safety_journal_resets_total,
             chain_moves_total,
             delayed_bundles_total,
             network: Mutex::new(network),
@@ -315,6 +325,10 @@ impl Metrics {
                 .with_label_values(labels)
                 .get(),
             "board_failures_total" => self.board_failures_total.with_label_values(labels).get(),
+            "safety_journal_resets_total" => self
+                .safety_journal_resets_total
+                .with_label_values(labels)
+                .get(),
             "chain_moves_total" => self.chain_moves_total.with_label_values(labels).get(),
             "operating_point_changes_total" => self
                 .operating_point_changes_total
@@ -328,6 +342,11 @@ impl Metrics {
     }
     pub fn board_failed(&self, board: &str) {
         self.board_failures_total.with_label_values(&[board]).inc();
+    }
+    pub fn safety_journal_reset(&self, reason: &str) {
+        self.safety_journal_resets_total
+            .with_label_values(&[reason])
+            .inc();
     }
     pub fn chains_moved(&self, count: u64) {
         self.chain_moves_total
