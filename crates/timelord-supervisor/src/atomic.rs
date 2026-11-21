@@ -25,7 +25,7 @@ pub fn write_lock(path: &Path) -> Result<PathBuf> {
 /// write-lock sidecar. The sidecar is created at the start of `write`, before the
 /// staged file is renamed, so a failed first write still counts as attempted.
 /// The lock file is never unlinked, so its presence outlives the target itself.
-pub fn was_written(path: &Path) -> Result<bool> {
+pub fn write_attempted(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(&write_lock(path)?) {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),

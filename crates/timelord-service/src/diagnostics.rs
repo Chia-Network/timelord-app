@@ -41,7 +41,7 @@ pub async fn check(mut config: Config, config_path: &Path) -> Result<Vec<Checked
     )?);
     // Owner epochs and safety restrictions are physical facts the next
     // production start must see; reliability health is not changed.
-    let safety = Arc::new(crate::safety::Store::open(config_path)?.diagnostic());
+    let safety = Arc::new(crate::safety::Store::inspect(config_path)?);
     let mut runtime = RuntimeState::new(false);
     hardware::restore_lifecycles(&config, &mut runtime.boards, &safety);
     runtime.safety = Some(safety);

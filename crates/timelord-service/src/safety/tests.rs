@@ -151,7 +151,7 @@ fn a_hardware_check_keeps_safety_facts_but_not_reliability_health() {
         .unwrap()
         .record_failure("A", "before")
         .unwrap();
-    let check = Store::open(&f.config()).unwrap().diagnostic();
+    let check = Store::inspect(&f.config()).unwrap();
     let checked = check.record_failure("A", "check").unwrap();
     assert_eq!(checked.1.consecutive_failures, 1);
     check
@@ -191,7 +191,7 @@ fn forgive_is_refused_after_an_interleaved_retry_and_accepted_on_a_clean_path() 
         .unwrap();
     let production = Store::open(&diagnostic_dir.config()).unwrap();
     let post_failure = production.health("A");
-    let diagnostic = Store::open(&diagnostic_dir.config()).unwrap().diagnostic();
+    let diagnostic = Store::inspect(&diagnostic_dir.config()).unwrap();
     assert!(
         !diagnostic
             .forgive("A", &post_failure, Health::default())
@@ -322,6 +322,51 @@ fn a_missing_journal_is_created_and_a_later_gap_is_a_reset() {
     let recreated = Store::open(&f.config()).unwrap();
     assert_eq!(recreated.journal_reset(), Some(JournalReset::Missing));
     assert_private(&recreated.path);
+}
+#[test]
+fn a_hardware_check_does_not_replace_a_missing_or_unreadable_journal() {
+    let f = Fixture::new();
+    let paths = timelord_supervisor::Paths::for_config(&f.config()).unwrap();
+    let journal = paths.directory.join("board-safety.json");
+    let first = Store::open(&f.config()).unwrap();
+    assert_eq!(first.journal_reset(), None);
+    assert!(journal.exists());
+
+    fs::remove_file(&journal).unwrap();
+    let inspected = Store::inspect(&f.config()).unwrap();
+    assert_eq!(inspected.journal_reset(), Some(JournalReset::Missing));
+    assert!(!journal.exists());
+
+    let production = Store::open(&f.config()).unwrap();
+    assert_eq!(production.journal_reset(), Some(JournalReset::Missing));
+    assert!(journal.exists());
+
+    fs::write(&journal, b"malformed").unwrap();
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+    let inspected = Store::inspect(&f.config()).unwrap();
+    assert_eq!(inspected.journal_reset(), Some(JournalReset::Unreadable));
+    assert_eq!(fs::read(&journal).unwrap(), b"malformed");
+    assert!(
+        fs::read_dir(&paths.directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("board-safety-corrupt-"))
+    );
+
+    let production = Store::open(&f.config()).unwrap();
+    assert_eq!(production.journal_reset(), Some(JournalReset::Unreadable));
+    assert!(
+        fs::read_dir(&paths.directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("board-safety-corrupt-"))
+    );
 }
 #[test]
 fn opening_fails_when_the_default_journal_cannot_be_written() {

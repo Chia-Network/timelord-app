@@ -306,18 +306,36 @@ fn parse(bytes: &[u8], now: u64) -> Result<Saved> {
     Ok(saved)
 }
 
+#[derive(Clone, Copy)]
+enum OpenMode {
+    Production,
+    Inspect,
+}
+
 impl Store {
     pub fn open(config: &Path) -> Result<Self> {
+        Self::load(config, OpenMode::Production)
+    }
+    /// Read-only inspection for the explicit hardware check: report a journal
+    /// reset without creating, replacing, or archiving the journal.
+    pub fn inspect(config: &Path) -> Result<Self> {
+        Self::load(config, OpenMode::Inspect)
+    }
+    fn load(config: &Path, mode: OpenMode) -> Result<Self> {
+        let production = matches!(mode, OpenMode::Production);
         let paths = Paths::for_config(config)?;
         let path = paths.directory.join("board-safety.json");
         let (mut state, journal_reset, persist_default) = match fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if timelord_supervisor::atomic::was_written(&path)? {
+                if timelord_supervisor::atomic::write_attempted(&path)? {
                     tracing::warn!(path=%path.display(), "Board safety journal was gone; boards start from cautious defaults");
-                    (Saved::default(), Some(JournalReset::Missing), true)
-                } else {
+                    (Saved::default(), Some(JournalReset::Missing), production)
+                } else if production {
                     tracing::info!(path=%path.display(), "No board safety journal yet; boards start from cautious defaults and a default journal is being created");
                     (Saved::default(), None, true)
+                } else {
+                    tracing::info!(path=%path.display(), "No board safety journal yet; boards start from cautious defaults");
+                    (Saved::default(), None, false)
                 }
             }
             Err(e) => return Err(e.into()),
@@ -338,7 +356,7 @@ impl Store {
                 file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
                 match parse(&bytes, crate::unix_now()) {
                     Ok(saved) => (saved, None, false),
-                    Err(error) => {
+                    Err(error) if production => {
                         let stamp = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)?
                             .as_nanos();
@@ -350,6 +368,10 @@ impl Store {
                             .context("Preserving invalid board recovery metadata")?;
                         tracing::error!(%error, path=%archived.display(), "Archived unreadable board safety journal; boards will start from cautious defaults and prior restrictions are not loaded");
                         (Saved::default(), Some(JournalReset::Unreadable), true)
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, path=%path.display(), "Unreadable board safety journal; boards start from cautious defaults and prior restrictions are not loaded");
+                        (Saved::default(), Some(JournalReset::Unreadable), false)
                     }
                 }
             }
@@ -370,7 +392,7 @@ impl Store {
             update_order: Mutex::new(()),
             progress: None,
             journal_reset,
-            keep_health: false,
+            keep_health: !production,
         };
         if persist_default {
             let state = store.state.lock().expect("safety");
@@ -395,11 +417,6 @@ impl Store {
         let _guard = self.update_order.lock().expect("fixture safety");
         let _ = entered.send(());
         let _ = release.recv_timeout(std::time::Duration::from_secs(2));
-    }
-    /// For the explicit hardware check: see `keep_health`.
-    pub fn diagnostic(mut self) -> Self {
-        self.keep_health = true;
-        self
     }
     pub fn monitored(
         mut self,
