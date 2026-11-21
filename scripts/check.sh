@@ -8,13 +8,8 @@ bash scripts/bundle-icon-test.sh
 bash scripts/release-inputs-test.sh
 bash scripts/prepare-release-test.sh
 mkdir -p build
-python3 tools/check-dgx-vendor
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-# Workspace feature unification can hide disabled-feature regressions.
-cargo clippy -p dg_xch_core --no-default-features --lib --locked -- -D warnings
-cargo clippy -p dg_xch_core --no-default-features --features bls --lib --locked -- -D warnings
-cargo clippy -p dg_xch_core --no-default-features --features chia-hf2 --lib --locked -- -D warnings
 TIMELORD_TEST_EXPOSITION="$PROJECT_ROOT/build/observability.prom" cargo test --workspace --locked
 promtool check metrics < build/observability.prom
 promtool check rules monitoring/alerts.yml

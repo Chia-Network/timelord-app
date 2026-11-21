@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/timelord-core", "crates/vdf-client-protocol", "crates/timelord-service", "crates/timelord-supervisor", "integrations/dg-xch/vendor/core", "integrations/dg-xch/vendor/timelord"]
+members = ["crates/timelord-core", "crates/vdf-client-protocol", "crates/timelord-service", "crates/timelord-supervisor"]
 resolver = "3"
 
 [workspace.package]
@@ -20,11 +20,13 @@ tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net", "i
 toml = "1.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-dg_xch_core = { git = "https://github.com/GalactechsLLC/dg_xch_utils", rev = "ca437be562cec5f0514f6edd4c794adfe382dd8a", default-features = false, features = ["bls"] }
-dg_xch_timelord = { git = "https://github.com/GalactechsLLC/dg_xch_utils", rev = "ca437be562cec5f0514f6edd4c794adfe382dd8a" }
-dg_xch_servers = { git = "https://github.com/GalactechsLLC/dg_xch_utils", rev = "ca437be562cec5f0514f6edd4c794adfe382dd8a" }
-dg_xch_vdf = { git = "https://github.com/GalactechsLLC/dg_xch_utils", rev = "ca437be562cec5f0514f6edd4c794adfe382dd8a" }
-dg_xch_serialize = { git = "https://github.com/GalactechsLLC/dg_xch_utils", rev = "ca437be562cec5f0514f6edd4c794adfe382dd8a" }
+# dg_xch crates come from the Chia-Network fork branch chia/timelord-app-deps;
+# see integrations/dg-xch/VENDORING.md. Keep all five on the same rev.
+dg_xch_core = { git = "https://github.com/Chia-Network/dg_xch_utils", rev = "a7d288357ec89c54121a329d6f9867ed472e8922", default-features = false, features = ["bls"] }
+dg_xch_timelord = { git = "https://github.com/Chia-Network/dg_xch_utils", rev = "a7d288357ec89c54121a329d6f9867ed472e8922" }
+dg_xch_servers = { git = "https://github.com/Chia-Network/dg_xch_utils", rev = "a7d288357ec89c54121a329d6f9867ed472e8922" }
+dg_xch_vdf = { git = "https://github.com/Chia-Network/dg_xch_utils", rev = "a7d288357ec89c54121a329d6f9867ed472e8922" }
+dg_xch_serialize = { git = "https://github.com/Chia-Network/dg_xch_utils", rev = "a7d288357ec89c54121a329d6f9867ed472e8922" }
 x509-cert = "0.3"
 num-bigint = "0.5"
 futures-util = "0.3"
@@ -35,9 +37,3 @@ tokio-tungstenite = "0.28"
 [profile.release]
 lto = "thin"
 codegen-units = 1
-
-# Redirect the upstream Git packages to the maintained vendor copies throughout the graph.
-# Only core and timelord are vendored; see integrations/dg-xch/VENDORING.md.
-[patch."https://github.com/GalactechsLLC/dg_xch_utils"]
-dg_xch_core = { path = "integrations/dg-xch/vendor/core" }
-dg_xch_timelord = { path = "integrations/dg-xch/vendor/timelord" }
