@@ -1,4 +1,5 @@
 use super::*;
+use std::os::unix::fs::PermissionsExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 use timelord_core::Network;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -404,6 +405,135 @@ async fn no_boards_wait_for_hardware_without_claiming_node_failure() {
         run.stop().await.unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
+}
+fn automatic_board() -> timelord_core::BoardConfig {
+    toml::from_str("id='a'\nname='A'\nserial='auto'\nprofile='automatic'\nclient_port=0").unwrap()
+}
+fn lost_journal(name: &str) -> (PathBuf, PathBuf, PathBuf, Config) {
+    let dir = fixture_dir(name);
+    let config_path = dir.join("config.toml");
+    let history_path = dir.join("history.json");
+    crate::safety::Store::open(&config_path).unwrap();
+    let journal = timelord_supervisor::Paths::for_config(&config_path)
+        .unwrap()
+        .directory
+        .join("board-safety.json");
+    std::fs::remove_file(&journal).unwrap();
+    assert_eq!(
+        crate::safety::Store::inspect(&config_path)
+            .unwrap()
+            .journal_reset(),
+        Some(crate::safety::JournalReset::Missing)
+    );
+    let mut config = Config::default();
+    config.service.status_listen = "127.0.0.1:0".parse().unwrap();
+    (dir, config_path, history_path, config)
+}
+fn assert_journal_still_lost(dir: &std::path::Path, config_path: &std::path::Path) {
+    let journal = timelord_supervisor::Paths::for_config(config_path)
+        .unwrap()
+        .directory
+        .join("board-safety.json");
+    assert_eq!(
+        crate::safety::Store::inspect(config_path)
+            .unwrap()
+            .journal_reset(),
+        Some(crate::safety::JournalReset::Missing)
+    );
+    assert!(!journal.exists());
+    assert_eq!(
+        crate::safety::Store::open(config_path)
+            .unwrap()
+            .journal_reset(),
+        Some(crate::safety::JournalReset::Missing)
+    );
+    assert!(!journal.exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+#[tokio::test]
+async fn a_prepare_failure_leaves_a_lost_safety_journal_absent() {
+    let (dir, config_path, history_path, mut config) = lost_journal("lost-prepare");
+    config.hardware.boards.push(automatic_board());
+    let error = serve(
+        config,
+        history_path,
+        config_path.clone(),
+        false,
+        std::future::pending(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("Automatic mode requires a native client"),
+        "{error:#}"
+    );
+    assert_journal_still_lost(&dir, &config_path);
+}
+#[tokio::test]
+async fn a_control_socket_file_leaves_a_lost_safety_journal_absent() {
+    let (dir, config_path, history_path, mut config) = lost_journal("lost-control");
+    let socket = dir.join("control.sock");
+    std::fs::write(&socket, b"not a socket").unwrap();
+    config.service.control_socket = Some(socket);
+    let error = serve(
+        config,
+        history_path,
+        config_path.clone(),
+        false,
+        std::future::pending(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("Private control path is not an owned socket"),
+        "{error:#}"
+    );
+    assert_journal_still_lost(&dir, &config_path);
+}
+#[tokio::test]
+async fn shutdown_during_prepare_leaves_a_lost_safety_journal_absent() {
+    let (dir, config_path, history_path, mut config) = lost_journal("lost-shutdown");
+    let script = dir.join("slow-client");
+    std::fs::write(&script, b"#!/bin/sh\nexec sleep 2\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    config.hardware.client_binary = Some(script);
+    config.hardware.boards.push(automatic_board());
+    serve(
+        config,
+        history_path,
+        config_path.clone(),
+        false,
+        tokio::time::sleep(Duration::from_millis(500)),
+    )
+    .await
+    .unwrap();
+    assert_journal_still_lost(&dir, &config_path);
+}
+#[tokio::test]
+async fn check_hardware_refuses_after_a_failed_start_on_a_lost_journal() {
+    let (dir, config_path, history_path, mut config) = lost_journal("lost-check-hardware");
+    config.hardware.boards.push(automatic_board());
+    let error = serve(
+        config,
+        history_path,
+        config_path.clone(),
+        false,
+        std::future::pending(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("Automatic mode requires a native client"),
+        "{error:#}"
+    );
+    let error = crate::diagnostics::prepare_store(&config_path)
+        .map(|_| ())
+        .expect_err("check-hardware must refuse a lost journal");
+    let text = format!("{error:#}");
+    assert!(text.contains("missing or unreadable"), "{text}");
+    assert!(text.contains("start the worker"), "{text}");
+    assert!(text.contains("saved board state"), "{text}");
+    assert_journal_still_lost(&dir, &config_path);
 }
 #[tokio::test]
 async fn reload_node_accepts_only_saved_node_changes_from_the_real_config_file() {

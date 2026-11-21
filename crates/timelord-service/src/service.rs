@@ -171,6 +171,9 @@ async fn start_run(
     };
     runtime.boards = board_states.clone();
     hardware::restore_lifecycles(&config, &mut runtime.boards, &safety);
+    if let Some(reset) = safety.journal_reset() {
+        process.metrics.safety_journal_reset(reset);
+    }
     runtime.safety = Some(safety);
     process.metrics.register_boards(&config);
     runtime.transition(

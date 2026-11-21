@@ -10,7 +10,24 @@ use std::{
     time::{Duration, Instant},
 };
 use timelord_core::{Chain, Config};
+use timelord_supervisor::InstanceLock;
 use tokio::{sync::watch, task::JoinSet};
+
+/// Take the serving worker lock and inspect the safety journal without
+/// persisting or archiving it. A reset journal must be recorded by a real
+/// board-state save first, so boards never start over in-memory defaults.
+pub(crate) fn prepare_store(config_path: &Path) -> Result<(InstanceLock, crate::safety::Store)> {
+    let paths = timelord_supervisor::Paths::for_config(config_path)?;
+    let worker = InstanceLock::acquire(&paths.worker_lock)
+        .context("Another timelord worker is running; stop it before running check-hardware")?;
+    let safety = crate::safety::Store::inspect(config_path)?;
+    if safety.journal_reset().is_some() {
+        bail!(
+            "Board safety journal is missing or unreadable; start the worker until it has saved board state so the reset is recorded and an unreadable journal is archived before running check-hardware"
+        );
+    }
+    Ok((worker, safety))
+}
 
 #[derive(Serialize)]
 pub struct CheckedProof {
@@ -40,8 +57,10 @@ pub async fn check(mut config: Config, config_path: &Path) -> Result<Vec<Checked
         config.node.network.clone(),
     )?);
     // Owner epochs and safety restrictions are physical facts the next
-    // production start must see; reliability health is not changed.
-    let safety = Arc::new(crate::safety::Store::open(config_path)?.diagnostic());
+    // production start must see; reliability health is not changed. The worker
+    // lock stays held for the whole check, including the board work below.
+    let (_worker, safety) = prepare_store(config_path)?;
+    let safety = Arc::new(safety);
     let mut runtime = RuntimeState::new(false);
     hardware::restore_lifecycles(&config, &mut runtime.boards, &safety);
     runtime.safety = Some(safety);

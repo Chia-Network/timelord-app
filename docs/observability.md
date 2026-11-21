@@ -79,6 +79,7 @@ All names below have the prefix `chia_timelord_`:
 | `topology_changes_total` | counter | Applied chain-route changes |
 | `chain_moves_total` | counter | Chains moved between boards by route changes |
 | `board_failures_total{board}` | counter | Native owner failures counted against board reliability (absence is not counted) |
+| `safety_journal_resets_total{reason}` | counter; `reason` (`missing` or `unreadable`) | Processes that found a previously written but now absent or unreadable board safety journal and started from cautious defaults; at most 1 per process and exported only by the process that reported the reset, so use the raw value, not `increase()`; first-start journal creation is not counted |
 | `delayed_bundles_total{chain}` | counter | Verified chain proofs that waited over 10 seconds for their bundle partner |
 | `estimated_ips` | gauge | Latest validated completion from any chain in this node session |
 | `chain_estimated_ips` | gauge; `chain` | Latest validated completion for each chain in this session |
@@ -108,6 +109,32 @@ All names below have the prefix `chia_timelord_`:
 | `operating_point_changes_total` | counter; `board,reason` | Acknowledged trial, backoff or restore writes |
 | `proof_duration_seconds` | histogram; `chain,stage` | Observed proof pipeline boundaries below |
 | `submission_duration_seconds` | histogram; `kind` | Successful bundle write duration |
+
+Alert on the raw `safety_journal_resets_total` value being greater than zero for
+either `reason="unreadable"` or `reason="missing"`; both are unexpected after a host
+has already written a journal. The value is at most 1 per process and is exported
+only by a process that reported a reset, so use the raw value, not `increase()`.
+The alert fires on the first scrape of a process that reported a previously
+written journal as missing or unreadable. A restart before any board-state save
+re-reports the reset, so the series is still exposed and the alert keeps firing;
+that is intended. `keep_firing_for: 5m` ignores short scrape failures so the
+alert does not flap. The series clears only once a start has saved board state and
+a later restart does not re-report, and the series has then been absent for that
+hold time (or the worker is stopped, paused, or crashed). `TimelordScrapeFailed`
+may then cover an outage. If the worker dies after the first board-state save but
+before the first scrape, the next start loads a valid journal and does not
+re-report, so the signal can be lost.
+`missing` means a journal whose
+write had been attempted on this host was absent; the write-lock sidecar remains
+after an attempted write, including a failed first persist. A first start (no
+journal and no write-lock sidecar) creates the journal and does not increment the
+metric. After a previously written journal is missing, the journal stays absent
+and every start reports `missing` until a real board-state save writes it.
+`unreadable` is a parse or validation failure that is archived; the journal is
+left absent, so later starts report `missing`. The `board-safety-corrupt-*`
+archive preserves the original reason. This signal
+catches accidental loss, not a same-UID adversary, who can remove the write-lock
+sidecar as well as the journal.
 
 Chains are `challenge`, `reward`, `infused_challenge`. Bundle kinds are `signage`,
 `infusion`, `end_of_sub_slot`. Unfinished candidate outcomes are `admitted`,
