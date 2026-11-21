@@ -590,16 +590,33 @@ impl Store {
         Ok(changed)
     }
     /// Reliability updates. A failure is restrictive and published before I/O.
-    pub fn record_failure(&self, serial: &str, reason: &str) -> Result<Health> {
+    /// Returns the health from before and after this one transaction.
+    pub fn record_failure(&self, serial: &str, reason: &str) -> Result<(Health, Health)> {
         if self.keep_health {
-            return Ok(self.health(serial));
+            let health = self.health(serial);
+            return Ok((health.clone(), health));
         }
-        let mut health = Health::default();
+        let mut before = Health::default();
+        let mut after = Health::default();
         self.update(serial, false, |b| {
+            before = b.health.clone();
             b.health.record_failure(crate::unix_now(), reason);
-            health = b.health.clone();
+            after = b.health.clone();
         })?;
-        Ok(health)
+        Ok((before, after))
+    }
+    /// Take back a failure only if health is still exactly what the failure
+    /// left, so an operator action that won the race is never overwritten.
+    pub fn forgive(&self, serial: &str, expected: &Health, previous: Health) -> Result<bool> {
+        if self.keep_health {
+            return Ok(false);
+        }
+        self.transition(
+            serial,
+            true,
+            |b| b.health == *expected,
+            |b| b.health = previous,
+        )
     }
     pub fn update_health(
         &self,
@@ -783,13 +800,8 @@ mod tests {
             .record_failure("A", "before")
             .unwrap();
         let check = Store::open(&f.config()).unwrap().diagnostic();
-        assert_eq!(
-            check
-                .record_failure("A", "check")
-                .unwrap()
-                .consecutive_failures,
-            1
-        );
+        let checked = check.record_failure("A", "check").unwrap();
+        assert_eq!(checked.1.consecutive_failures, 1);
         check
             .update_health("A", true, |health| health.consecutive_failures = 0)
             .unwrap();

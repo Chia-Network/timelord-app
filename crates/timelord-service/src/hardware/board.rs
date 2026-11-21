@@ -153,6 +153,14 @@ struct BoardSupervisor {
 /// How long after a counted failure a board found missing proves the failure
 /// was an unplug.
 const FORGIVE_WINDOW: Duration = Duration::from_secs(120);
+/// Classified once so recovery never reconstructs why the owner stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    Absent,
+    Held,
+    Unplugged,
+    Failed,
+}
 pub(super) async fn supervise_board(
     shared: Arc<Shared>,
     backend: Arc<crate::asic::AsicBackend>,
@@ -415,35 +423,37 @@ impl BoardSupervisor {
         missing
     }
     async fn recover(&mut self, error: anyhow::Error) -> Duration {
-        let mut absent = error.is::<BoardAbsent>() || error.is::<OperatorHold>();
-        if !absent
-            && classify(&error) == crate::board_lifecycle::Fault::Transport
-            && self.unplugged().await
-        {
-            tracing::info!(board=%self.board.name, error=%format!("{error:#}"), "ASIC was unplugged; not counted as a failure");
-            absent = true;
-            // This stop was the unplug; an earlier failure stays counted.
-            self.forgivable = None;
+        let fault = classify(&error);
+        let stop = if error.is::<BoardAbsent>() {
+            Stop::Absent
+        } else if error.is::<OperatorHold>() {
+            Stop::Held
+        } else if fault == crate::board_lifecycle::Fault::Transport && self.unplugged().await {
+            Stop::Unplugged
+        } else {
+            Stop::Failed
+        };
+        match stop {
+            Stop::Absent => self.forgive(),
+            Stop::Unplugged => {
+                tracing::info!(board=%self.board.name, error=%format!("{error:#}"), "ASIC was unplugged; not counted as a failure");
+                // This stop was the unplug; an earlier failure stays counted.
+                self.forgivable = None;
+            }
+            Stop::Held | Stop::Failed => {}
         }
-        if absent && error.is::<BoardAbsent>() {
-            self.forgive();
-        }
+        let absent = stop != Stop::Failed;
         let shared = &self.shared;
         let board = &self.board;
-        let reason = if absent && !error.is::<BoardAbsent>() && !error.is::<OperatorHold>() {
+        let reason = if stop == Stop::Unplugged {
             format!("{} was unplugged", board.name)
         } else {
             format!("{error:#}")
         };
         self.previous_failure = crate::observability::restart_reason(&error);
-        let fault = classify(&error);
         let thermal = fault == crate::board_lifecycle::Fault::Thermal;
         // Only failures of a board that was found count against its
         // reliability. Unplugged boards are simply looked for again.
-        let before = board
-            .serial
-            .as_deref()
-            .map(|serial| self.safety.health(serial));
         let delay = if absent {
             self.timing.absent
         } else {
@@ -452,10 +462,9 @@ impl BoardSupervisor {
                 .as_deref()
                 .map(|serial| self.safety.record_failure(serial, &reason))
             {
-                Some(Ok(health)) => {
+                Some(Ok((before, after))) => {
                     self.forgivable = if fault == crate::board_lifecycle::Fault::Transport {
-                        before
-                            .map(|previous| (previous, health.clone(), tokio::time::Instant::now()))
+                        Some((before, after.clone(), tokio::time::Instant::now()))
                     } else {
                         None
                     };
@@ -468,9 +477,9 @@ impl BoardSupervisor {
                         board,
                         "failure",
                         Some(&reason),
-                        Some(&health),
+                        Some(&after),
                     );
-                    self.timing.restart_delay(&health)
+                    self.timing.restart_delay(&after)
                 }
                 Some(Err(saved)) => {
                     tracing::error!(error=%format!("{saved:#}"), "Board failure could not be recorded");
@@ -530,16 +539,9 @@ impl BoardSupervisor {
         if at.elapsed() > FORGIVE_WINDOW {
             return;
         }
-        if self.safety.health(serial) != post_failure {
-            // An operator retry/disable/enable (or any other update) acted
-            // after the failure; never overwrite that decision.
-            return;
-        }
-        match self
-            .safety
-            .update_health(serial, true, |health| *health = previous)
-        {
-            Ok(health) => {
+        match self.safety.forgive(serial, &post_failure, previous) {
+            Ok(true) => {
+                let health = self.safety.health(serial);
                 tracing::info!(board=%self.board.name, consecutive_failures=health.consecutive_failures, "ASIC was unplugged; its last stop is no longer counted as a failure");
                 crate::board_history::record(
                     &self.shared,
@@ -548,6 +550,10 @@ impl BoardSupervisor {
                     Some(&format!("{} was unplugged", self.board.name)),
                     Some(&health),
                 );
+            }
+            Ok(false) => {
+                // An operator retry/disable/enable (or any other update) acted
+                // after the failure; never overwrite that decision.
             }
             Err(saved) => {
                 tracing::error!(error=%format!("{saved:#}"), "Unplugged board's failure could not be forgiven")
