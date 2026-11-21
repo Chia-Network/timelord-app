@@ -56,6 +56,9 @@ tests:
     alertname: TimelordThermalStop
     exp_alerts: []
   - eval_time: 125m
+    alertname: TimelordSafetyJournalReset
+    exp_alerts: []
+  - eval_time: 125m
     alertname: TimelordNoVerifiedProgressMainnet
     exp_alerts: []
   - eval_time: 125m
@@ -199,6 +202,40 @@ tests:
         severity: critical
       exp_annotations:
         summary: An ASIC stopped at its temperature guard
+- name: a missing safety journal is unexpected
+  interval: 1m
+  input_series:
+  - series: chia_timelord_safety_journal_resets_total{job="timelord-app",instance="fixture:9258",network="mainnet",reason="missing"}
+    values: 0 0 1 1
+  alert_rule_test:
+  - eval_time: 3m
+    alertname: TimelordSafetyJournalReset
+    exp_alerts:
+    - exp_labels:
+        job: timelord-app
+        instance: fixture:9258
+        network: mainnet
+        reason: missing
+        severity: warning
+      exp_annotations:
+        summary: Board safety journal was replaced with defaults
+- name: an unreadable safety journal is unexpected
+  interval: 1m
+  input_series:
+  - series: chia_timelord_safety_journal_resets_total{job="timelord-app",instance="fixture:9258",network="mainnet",reason="unreadable"}
+    values: 0 0 1 1
+  alert_rule_test:
+  - eval_time: 3m
+    alertname: TimelordSafetyJournalReset
+    exp_alerts:
+    - exp_labels:
+        job: timelord-app
+        instance: fixture:9258
+        network: mainnet
+        reason: unreadable
+        severity: warning
+      exp_annotations:
+        summary: Board safety journal was replaced with defaults
 - name: counter resets with continuing work do not look like stalls
   interval: 1m
   input_series:
