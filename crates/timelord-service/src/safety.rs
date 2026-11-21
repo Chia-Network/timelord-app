@@ -306,15 +306,33 @@ fn parse(bytes: &[u8], now: u64) -> Result<Saved> {
     Ok(saved)
 }
 
+fn supervisor_state_existed(config: &Path) -> bool {
+    let directory = config
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let (Ok(directory), Some(stem)) = (directory.canonicalize(), config.file_name()) else {
+        return false;
+    };
+    fs::symlink_metadata(directory.join(format!(".{}-supervisor", stem.to_string_lossy()))).is_ok()
+}
+
 impl Store {
     pub fn open(config: &Path) -> Result<Self> {
+        let state_existed = supervisor_state_existed(config);
         let paths = Paths::for_config(config)?;
         let path = paths.directory.join("board-safety.json");
         let mut journal_reset = None;
+        let mut persist_default = false;
         let mut state = match fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tracing::info!(path=%path.display(), "No board safety journal yet; boards start from cautious defaults");
-                journal_reset = Some(JournalReset::Missing);
+                persist_default = true;
+                if state_existed {
+                    tracing::warn!(path=%path.display(), "Board safety journal was gone; boards start from cautious defaults");
+                    journal_reset = Some(JournalReset::Missing);
+                } else {
+                    tracing::info!(path=%path.display(), "No board safety journal yet; boards start from cautious defaults and a default journal is being created");
+                }
                 Saved::default()
             }
             Err(e) => return Err(e.into()),
@@ -347,6 +365,7 @@ impl Store {
                             .context("Preserving invalid board recovery metadata")?;
                         tracing::error!(%error, path=%archived.display(), "Archived unreadable board safety journal; boards will start from cautious defaults and prior restrictions are not loaded");
                         journal_reset = Some(JournalReset::Unreadable);
+                        persist_default = true;
                         Saved::default()
                     }
                 }
@@ -362,14 +381,19 @@ impl Store {
                 board.owner_active = false;
             }
         }
-        Ok(Self {
+        let store = Self {
             path,
             state: Mutex::new(state),
             update_order: Mutex::new(()),
             progress: None,
             journal_reset,
             keep_health: false,
-        })
+        };
+        if persist_default {
+            let state = store.state.lock().expect("safety");
+            store.save(&state)?;
+        }
+        Ok(store)
     }
     /// Why startup replaced the journal with defaults, if it did.
     pub fn journal_reset(&self) -> Option<JournalReset> {

@@ -79,7 +79,7 @@ All names below have the prefix `chia_timelord_`:
 | `topology_changes_total` | counter | Applied chain-route changes |
 | `chain_moves_total` | counter | Chains moved between boards by route changes |
 | `board_failures_total{board}` | counter | Native owner failures counted against board reliability (absence is not counted) |
-| `safety_journal_resets_total{reason}` | counter; `reason` (`missing` or `unreadable`) | Starts that replaced a missing or unreadable board safety journal with cautious defaults |
+| `safety_journal_resets_total{reason}` | counter; `reason` (`missing` or `unreadable`) | Starts after the supervisor state directory existed that replaced a gone or unreadable board safety journal with cautious defaults; first-start journal creation is not counted |
 | `delayed_bundles_total{chain}` | counter | Verified chain proofs that waited over 10 seconds for their bundle partner |
 | `estimated_ips` | gauge | Latest validated completion from any chain in this node session |
 | `chain_estimated_ips` | gauge; `chain` | Latest validated completion for each chain in this session |
@@ -110,8 +110,12 @@ All names below have the prefix `chia_timelord_`:
 | `proof_duration_seconds` | histogram; `chain,stage` | Observed proof pipeline boundaries below |
 | `submission_duration_seconds` | histogram; `kind` | Successful bundle write duration |
 
-Alert on `safety_journal_resets_total` only with `reason="unreadable"`; a missing
-journal on first start is expected.
+Alert on `safety_journal_resets_total` with either `reason="unreadable"` or
+`reason="missing"`; both are unexpected after a host has already run. A first
+start that creates the journal does not increment the metric. `missing` means the
+journal was gone after the supervisor state directory already existed;
+`unreadable` is a parse or validation failure that was archived and replaced with
+defaults.
 
 Chains are `challenge`, `reward`, `infused_challenge`. Bundle kinds are `signage`,
 `infusion`, `end_of_sub_slot`. Unfinished candidate outcomes are `admitted`,

@@ -246,7 +246,7 @@ fn production_lease_home_is_owned_and_outside_temporary_storage() {
 fn leases_are_exclusive_and_invalid_metadata_is_archived_for_cautious_recovery() {
     let f = Fixture::new();
     let store = Store::open(&f.config()).unwrap();
-    assert_eq!(store.journal_reset(), Some(JournalReset::Missing));
+    assert_eq!(store.journal_reset(), None);
     assert!(store.board("A").is_none());
     let serial = format!("fixture{:x}", std::process::id());
     let separate = format!("other{:x}", std::process::id());
@@ -275,6 +275,26 @@ fn leases_are_exclusive_and_invalid_metadata_is_archived_for_cautious_recovery()
         })
         .unwrap();
     assert_eq!(fs::read(archived.path()).unwrap(), b"malformed");
+    assert_eq!(Store::open(&f.config()).unwrap().journal_reset(), None);
+}
+#[test]
+fn a_missing_journal_is_created_and_a_later_gap_is_a_reset() {
+    let f = Fixture::new();
+    let store = Store::open(&f.config()).unwrap();
+    assert_eq!(store.journal_reset(), None);
+    let assert_private = |path: &Path| {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+    };
+    assert_private(&store.path);
+    assert_eq!(Store::open(&f.config()).unwrap().journal_reset(), None);
+    fs::remove_file(&store.path).unwrap();
+    let recreated = Store::open(&f.config()).unwrap();
+    assert_eq!(recreated.journal_reset(), Some(JournalReset::Missing));
+    assert_private(&recreated.path);
 }
 #[test]
 fn linked_or_insecure_state_is_rejected() {
