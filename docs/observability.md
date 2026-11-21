@@ -79,7 +79,7 @@ All names below have the prefix `chia_timelord_`:
 | `topology_changes_total` | counter | Applied chain-route changes |
 | `chain_moves_total` | counter | Chains moved between boards by route changes |
 | `board_failures_total{board}` | counter | Native owner failures counted against board reliability (absence is not counted) |
-| `safety_journal_resets_total{reason}` | counter; `reason` (`missing` or `unreadable`) | Starts that replaced a previously written but now gone or unreadable board safety journal with cautious defaults; first-start journal creation is not counted |
+| `safety_journal_resets_total{reason}` | counter; `reason` (`missing` or `unreadable`) | Processes that replaced a previously written but now absent or unreadable board safety journal with cautious defaults; first-start journal creation is not counted |
 | `delayed_bundles_total{chain}` | counter | Verified chain proofs that waited over 10 seconds for their bundle partner |
 | `estimated_ips` | gauge | Latest validated completion from any chain in this node session |
 | `chain_estimated_ips` | gauge; `chain` | Latest validated completion for each chain in this session |
@@ -110,13 +110,16 @@ All names below have the prefix `chia_timelord_`:
 | `proof_duration_seconds` | histogram; `chain,stage` | Observed proof pipeline boundaries below |
 | `submission_duration_seconds` | histogram; `kind` | Successful bundle write duration |
 
-Alert on `safety_journal_resets_total` with either `reason="unreadable"` or
-`reason="missing"`; both are unexpected after a host has already written a
-journal. `missing` means a journal previously written on this host was absent. A
-first start that creates the journal does not increment the metric. `unreadable`
-is a parse or validation failure that was archived and replaced with defaults.
-This signal catches accidental loss, not a same-UID adversary, who can remove the
-write-lock sidecar as well as the journal.
+Alert on `safety_journal_resets_total` being greater than zero for either
+`reason="unreadable"` or `reason="missing"`; both are unexpected after a host has
+already written a journal. The alert fires on the first scrape of a process that
+replaced a previously written journal with defaults and clears after the next start
+that loads the journal. `missing` means a journal whose write had been attempted on
+this host was absent; the write-lock sidecar remains after an attempted write,
+including a failed first persist. A first start that creates the journal does not
+increment the metric. `unreadable` is a parse or validation failure that was
+archived and replaced with defaults. This signal catches accidental loss, not a
+same-UID adversary, who can remove the write-lock sidecar as well as the journal.
 
 Chains are `challenge`, `reward`, `infused_challenge`. Bundle kinds are `signage`,
 `infusion`, `end_of_sub_slot`. Unfinished candidate outcomes are `admitted`,

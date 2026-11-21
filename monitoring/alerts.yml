@@ -60,7 +60,7 @@ groups:
           summary: An ASIC stopped at its temperature guard
       - alert: TimelordSafetyJournalReset
         expr: |
-          increase(chia_timelord_safety_journal_resets_total{job="timelord-app"}[5m]) > 0
+          chia_timelord_safety_journal_resets_total{job="timelord-app"} > 0
         for: 0m
         labels:
           severity: warning
