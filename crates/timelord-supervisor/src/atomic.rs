@@ -18,11 +18,15 @@ fn sidecar(path: &Path, suffix: &str) -> Result<PathBuf> {
 pub fn pending(path: &Path) -> Result<PathBuf> {
     sidecar(path, ".pending")
 }
-/// Whether `write` has ever run for this target, inferred from its stable
-/// write-lock sidecar. The lock file is created on first write and never
-/// unlinked, so its presence outlives the target itself.
+pub fn write_lock(path: &Path) -> Result<PathBuf> {
+    sidecar(path, ".write.lock")
+}
+/// Whether a write has been attempted for this target, inferred from its stable
+/// write-lock sidecar. The sidecar is created at the start of `write`, before the
+/// staged file is renamed, so a failed first write still counts as attempted.
+/// The lock file is never unlinked, so its presence outlives the target itself.
 pub fn was_written(path: &Path) -> Result<bool> {
-    match fs::symlink_metadata(&sidecar(path, ".write.lock")?) {
+    match fs::symlink_metadata(&write_lock(path)?) {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e.into()),
@@ -37,7 +41,7 @@ pub fn write(path: &Path, bytes: &[u8]) -> Result<()> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let _lock = InstanceLock::acquire(&sidecar(path, ".write.lock")?)?;
+    let _lock = InstanceLock::acquire(&write_lock(path)?)?;
     let temporary = pending(path)?;
     match fs::symlink_metadata(&temporary) {
         Ok(m) => {

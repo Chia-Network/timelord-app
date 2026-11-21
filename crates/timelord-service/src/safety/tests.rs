@@ -328,10 +328,7 @@ fn opening_fails_when_the_default_journal_cannot_be_written() {
     let f = Fixture::new();
     let paths = timelord_supervisor::Paths::for_config(&f.config()).unwrap();
     let journal = paths.directory.join("board-safety.json");
-    let lock = paths.directory.join(format!(
-        ".{}.write.lock",
-        journal.file_name().unwrap().to_string_lossy()
-    ));
+    let lock = timelord_supervisor::atomic::write_lock(&journal).unwrap();
     let _held = timelord_supervisor::InstanceLock::acquire(&lock).unwrap();
     let error = Store::open(&f.config()).err().expect("open must fail");
     assert!(

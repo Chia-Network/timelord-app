@@ -310,10 +310,9 @@ impl Store {
     pub fn open(config: &Path) -> Result<Self> {
         let paths = Paths::for_config(config)?;
         let path = paths.directory.join("board-safety.json");
-        let was_written = timelord_supervisor::atomic::was_written(&path)?;
         let (mut state, journal_reset, persist_default) = match fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if was_written {
+                if timelord_supervisor::atomic::was_written(&path)? {
                     tracing::warn!(path=%path.display(), "Board safety journal was gone; boards start from cautious defaults");
                     (Saved::default(), Some(JournalReset::Missing), true)
                 } else {
