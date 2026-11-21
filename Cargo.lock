@@ -637,7 +637,7 @@ dependencies = [
 [[package]]
 name = "dg_parser_macro"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=a7d288357ec89c54121a329d6f9867ed472e8922#a7d288357ec89c54121a329d6f9867ed472e8922"
 dependencies = [
  "bytes",
  "dg_xch_serialize",
@@ -651,7 +651,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_clients"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=a7d288357ec89c54121a329d6f9867ed472e8922#a7d288357ec89c54121a329d6f9867ed472e8922"
 dependencies = [
  "async-trait",
  "blst",
@@ -676,6 +676,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_core"
 version = "3.0.0"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=a7d288357ec89c54121a329d6f9867ed472e8922#a7d288357ec89c54121a329d6f9867ed472e8922"
 dependencies = [
  "async-trait",
  "blst",
@@ -693,7 +694,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "log",
- "num-bigint 0.4.8",
+ "num-bigint 0.5.1",
  "num-integer",
  "num-traits",
  "once_cell",
@@ -719,7 +720,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_keys"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=a7d288357ec89c54121a329d6f9867ed472e8922#a7d288357ec89c54121a329d6f9867ed472e8922"
 dependencies = [
  "bech32",
  "bip39",
@@ -735,7 +736,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_macros"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=a7d288357ec89c54121a329d6f9867ed472e8922#a7d288357ec89c54121a329d6f9867ed472e8922"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -746,7 +747,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_pos"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=a7d288357ec89c54121a329d6f9867ed472e8922#a7d288357ec89c54121a329d6f9867ed472e8922"
 dependencies = [
  "dg_xch_core",
  "dg_xch_pos1",
@@ -758,7 +759,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_pos1"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=a7d288357ec89c54121a329d6f9867ed472e8922#a7d288357ec89c54121a329d6f9867ed472e8922"
 dependencies = [
  "async-trait",
  "blake3",
@@ -783,7 +784,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_pos2"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=a7d288357ec89c54121a329d6f9867ed472e8922#a7d288357ec89c54121a329d6f9867ed472e8922"
 dependencies = [
  "aes",
  "blake3",
@@ -794,12 +795,12 @@ dependencies = [
 [[package]]
 name = "dg_xch_pos_common"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=a7d288357ec89c54121a329d6f9867ed472e8922#a7d288357ec89c54121a329d6f9867ed472e8922"
 
 [[package]]
 name = "dg_xch_puzzles"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=a7d288357ec89c54121a329d6f9867ed472e8922#a7d288357ec89c54121a329d6f9867ed472e8922"
 dependencies = [
  "blst",
  "dg_parser_macro",
@@ -808,7 +809,7 @@ dependencies = [
  "hex",
  "lazy_static",
  "log",
- "num-bigint 0.4.8",
+ "num-bigint 0.5.1",
  "num-integer",
  "num-traits",
  "tokio",
@@ -817,7 +818,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_serialize"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=a7d288357ec89c54121a329d6f9867ed472e8922#a7d288357ec89c54121a329d6f9867ed472e8922"
 dependencies = [
  "log",
  "serde",
@@ -827,7 +828,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_servers"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=a7d288357ec89c54121a329d6f9867ed472e8922#a7d288357ec89c54121a329d6f9867ed472e8922"
 dependencies = [
  "async-trait",
  "blst",
@@ -856,10 +857,10 @@ dependencies = [
 [[package]]
 name = "dg_xch_timelord"
 version = "3.0.0"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=a7d288357ec89c54121a329d6f9867ed472e8922#a7d288357ec89c54121a329d6f9867ed472e8922"
 dependencies = [
  "dg_xch_core",
  "dg_xch_pos",
- "dg_xch_serialize",
  "dg_xch_servers",
  "dg_xch_vdf",
  "futures-util",
@@ -874,11 +875,11 @@ dependencies = [
 [[package]]
 name = "dg_xch_vdf"
 version = "3.0.0"
-source = "git+https://github.com/GalactechsLLC/dg_xch_utils?rev=ca437be562cec5f0514f6edd4c794adfe382dd8a#ca437be562cec5f0514f6edd4c794adfe382dd8a"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=a7d288357ec89c54121a329d6f9867ed472e8922#a7d288357ec89c54121a329d6f9867ed472e8922"
 dependencies = [
  "dg_xch_core",
  "gmp-mpfr-sys",
- "num-bigint 0.4.8",
+ "num-bigint 0.5.1",
  "num-integer",
  "num-traits",
  "rug",
@@ -1631,7 +1632,6 @@ checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
 dependencies = [
  "num-integer",
  "num-traits",
- "serde",
 ]
 
 [[package]]
@@ -1642,6 +1642,7 @@ checksum = "93e7820bc0a80a0238e650327316f929ba18d5be054b647490a3a6a339f3e7c0"
 dependencies = [
  "num-integer",
  "num-traits",
+ "serde",
 ]
 
 [[package]]

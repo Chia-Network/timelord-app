@@ -93,10 +93,8 @@ fn current_unfinished_envelope_is_exact_and_does_not_silently_ignore_mmr() {
 #[test]
 fn invalid_candidate_does_not_reset_the_scheduler_or_discard_later_work() {
     use dg_xch_core::protocols::timelord::{NewPeakTimelord, NewUnfinishedBlockTimelord};
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../../integrations/dg-xch/vendor/timelord/tests/fixtures/chia_hf2.json"
-    ))
-    .unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../fixtures/dg-xch/chia_hf2.json")).unwrap();
     let node = crate::network::tests::node();
     let mut constants = crate::network::resolve(&node).unwrap().constants;
     constants.hard_fork_height = 0;
