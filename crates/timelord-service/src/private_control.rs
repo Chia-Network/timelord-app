@@ -15,8 +15,11 @@ use tokio::{
     net::{UnixListener, UnixStream},
     sync::{Semaphore, watch},
 };
-/// Private-control transactions allowed at once; a local client must not queue
-/// unbounded handlers ahead of the service.
+/// Private-control transactions allowed at once. This matches the node-reload
+/// channel capacity in service.rs (`tokio::sync::mpsc::channel(4)`). Excess
+/// same-user requests deliberately queue by waiting for a permit rather than
+/// being shed, so a local client cannot spawn unbounded handlers ahead of the
+/// service.
 const MAX_IN_FLIGHT: usize = 4;
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -229,12 +232,10 @@ async fn run_with(
             })=> {
                 let Some((socket,_))=accepted else { continue; };
                 // Reserve a slot before spawning so waiting tasks stay bounded.
+                // Excess requests queue here for a permit by design.
                 let permit = tokio::select! {
                     _=shutdown.changed()=>break,
-                    permit=in_flight.clone().acquire_owned()=>match permit {
-                        Ok(permit)=>permit,
-                        Err(_)=>break,
-                    },
+                    permit=in_flight.clone().acquire_owned()=>permit.expect("private-control semaphore is never closed"),
                 };
                 // Bounded same-user transaction; no unauthenticated public HTTP mutation.
                 // A node-profile switch drains the old session; allow it longer.
