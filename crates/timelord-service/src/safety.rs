@@ -318,17 +318,19 @@ impl Store {
     fn load(config: &Path, production: bool) -> Result<Self> {
         let paths = Paths::for_config(config)?;
         let path = paths.directory.join("board-safety.json");
-        let (mut state, journal_reset, persist_default) = match fs::symlink_metadata(&path) {
+        let mut first_start = false;
+        let (mut state, journal_reset) = match fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if timelord_supervisor::atomic::write_attempted(&path)? {
                     tracing::error!(path=%path.display(), "Board safety journal is gone; boards start from cautious defaults and the journal stays absent until the worker records board state, so this reset is reported on every start");
-                    (Saved::default(), Some(JournalReset::Missing), false)
+                    (Saved::default(), Some(JournalReset::Missing))
                 } else if production {
                     tracing::info!(path=%path.display(), "No board safety journal yet; boards start from cautious defaults and a default journal is being created");
-                    (Saved::default(), None, true)
+                    first_start = true;
+                    (Saved::default(), None)
                 } else {
                     tracing::info!(path=%path.display(), "No board safety journal yet; boards start from cautious defaults");
-                    (Saved::default(), None, false)
+                    (Saved::default(), None)
                 }
             }
             Err(e) => return Err(e.into()),
@@ -348,7 +350,7 @@ impl Store {
                 let mut bytes = Vec::new();
                 file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
                 match parse(&bytes, crate::unix_now()) {
-                    Ok(saved) => (saved, None, false),
+                    Ok(saved) => (saved, None),
                     Err(error) if production => {
                         let stamp = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)?
@@ -360,11 +362,11 @@ impl Store {
                         fs::rename(&path, &archived)
                             .context("Preserving invalid board recovery metadata")?;
                         tracing::error!(%error, path=%archived.display(), "Archived unreadable board safety journal; boards will start from cautious defaults and prior restrictions are not loaded, and the journal stays absent until the worker records board state");
-                        (Saved::default(), Some(JournalReset::Unreadable), false)
+                        (Saved::default(), Some(JournalReset::Unreadable))
                     }
                     Err(error) => {
                         tracing::error!(%error, path=%path.display(), "Unreadable board safety journal; boards start from cautious defaults and prior restrictions are not loaded");
-                        (Saved::default(), Some(JournalReset::Unreadable), false)
+                        (Saved::default(), Some(JournalReset::Unreadable))
                     }
                 }
             }
@@ -387,7 +389,7 @@ impl Store {
             journal_reset,
             keep_health: !production,
         };
-        if persist_default {
+        if first_start {
             let state = store.state.lock().expect("safety");
             store
                 .save(&state)
@@ -395,7 +397,8 @@ impl Store {
         }
         Ok(store)
     }
-    /// Why startup replaced the journal with defaults, if it did.
+    /// Why startup reported a missing or unreadable journal and used cautious
+    /// defaults, if it did.
     pub fn journal_reset(&self) -> Option<JournalReset> {
         self.journal_reset
     }

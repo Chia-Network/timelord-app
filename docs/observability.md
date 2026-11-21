@@ -113,12 +113,17 @@ All names below have the prefix `chia_timelord_`:
 Alert on the raw `safety_journal_resets_total` value being greater than zero for
 either `reason="unreadable"` or `reason="missing"`; both are unexpected after a host
 has already written a journal. The value is at most 1 per process and is exported
-only by a process that performed a reset, so use the raw value, not `increase()`.
-The alert fires on the first scrape of a process that reset a previously written
-journal. `keep_firing_for: 5m` ignores short scrape failures so the alert does not
-flap. It clears when the series has been absent for that hold time: a clean
-restart is still scraped but no longer exposes the series, or the worker is
-stopped, paused, or crashed. `TimelordScrapeFailed` may then cover an outage.
+only by a process that reported a reset, so use the raw value, not `increase()`.
+The alert fires on the first scrape of a process that reported a previously
+written journal as missing or unreadable. A restart before any board-state save
+re-reports the reset, so the series is still exposed and the alert keeps firing;
+that is intended. `keep_firing_for: 5m` ignores short scrape failures so the
+alert does not flap. The series clears only once a start has saved board state and
+a later restart does not re-report, and the series has then been absent for that
+hold time (or the worker is stopped, paused, or crashed). `TimelordScrapeFailed`
+may then cover an outage. If the worker dies after the first board-state save but
+before the first scrape, the next start loads a valid journal and does not
+re-report, so the signal can be lost.
 `missing` means a journal whose
 write had been attempted on this host was absent; the write-lock sidecar remains
 after an attempted write, including a failed first persist. A first start (no

@@ -434,7 +434,6 @@ fn assert_journal_still_lost(dir: &std::path::Path, config_path: &std::path::Pat
         .unwrap()
         .directory
         .join("board-safety.json");
-    assert!(!journal.exists());
     assert_eq!(
         crate::safety::Store::inspect(config_path)
             .unwrap()

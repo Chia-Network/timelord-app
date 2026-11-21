@@ -331,10 +331,9 @@ thermal guard, verifies retained sessions and a reset, then stops its own client
 It does not train Automatic tuning or change saved settings. It refuses to run
 when the board safety journal is missing or unreadable after a prior write, and
 stays refused until the worker has saved board state (not merely run once) so the
-reset is recorded and an unreadable journal is archived; then rerun the check. It
-takes the worker lock, so it does
-not run at the same time as the serving worker and fails clearly when that lock
-is held.
+reset is recorded and an unreadable journal is archived; then rerun the check.
+It takes the worker lock, so it does not run at the same time as the serving
+worker and fails clearly when that lock is held.
 
 The status/history HTTP API is read-only and bound to loopback. Same-user,
 mode-0600 Unix IPC handles Pause/Resume tuning. `service.control_socket` optionally

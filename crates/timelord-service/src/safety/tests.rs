@@ -34,15 +34,7 @@ fn board(serial: &str) -> timelord_core::BoardConfig {
     .unwrap()
 }
 fn corrupt_archive(directory: &Path) -> bool {
-    fs::read_dir(directory)
-        .unwrap()
-        .filter_map(Result::ok)
-        .any(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("board-safety-corrupt-")
-        })
+    corrupt_archive_bytes(directory).is_some()
 }
 fn corrupt_archive_bytes(directory: &Path) -> Option<Vec<u8>> {
     fs::read_dir(directory)
