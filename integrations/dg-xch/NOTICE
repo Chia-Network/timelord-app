@@ -2,7 +2,7 @@ Timelord Mac uses dg_xch crates (dg_xch_core, dg_xch_timelord, dg_xch_servers an
 their dependencies) from GalactechsLLC dg_xch_utils (Apache License 2.0), built
 from the Chia-Network fork:
 https://github.com/Chia-Network/dg_xch_utils
-Revision: 41d52b62921a221fd34744b5494cf7faec2f844d (branch chia/timelord-app-deps)
+Revision: 7c3e1f3c52b16e95dc8de113fd2713f80d18c179 (branch chia/timelord-app-deps)
 Original upstream: https://github.com/GalactechsLLC/dg_xch_utils
 Upstream base: ca437be562cec5f0514f6edd4c794adfe382dd8a
 HF2 compatibility commits: https://github.com/cameroncooper/dg_xch_utils
