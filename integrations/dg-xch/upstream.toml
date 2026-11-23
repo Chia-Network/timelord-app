@@ -1,6 +1,6 @@
 repository = "https://github.com/Chia-Network/dg_xch_utils"
 branch = "chia/timelord-app-deps"
-revision = "36fa93cc83ef800b0334b2b617e46f6e03f849b5"
+revision = "41d52b62921a221fd34744b5494cf7faec2f844d"
 patches_branch = "chia/timelord-app-patches"
 patches_revision = "dbb06123259a7f54dfcd4268bdcb09b5b80361d2"
 upstream_repository = "https://github.com/GalactechsLLC/dg_xch_utils"

@@ -686,7 +686,7 @@ dependencies = [
 [[package]]
 name = "dg_parser_macro"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=36fa93cc83ef800b0334b2b617e46f6e03f849b5#36fa93cc83ef800b0334b2b617e46f6e03f849b5"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=41d52b62921a221fd34744b5494cf7faec2f844d#41d52b62921a221fd34744b5494cf7faec2f844d"
 dependencies = [
  "bytes",
  "dg_xch_serialize",
@@ -700,7 +700,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_clients"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=36fa93cc83ef800b0334b2b617e46f6e03f849b5#36fa93cc83ef800b0334b2b617e46f6e03f849b5"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=41d52b62921a221fd34744b5494cf7faec2f844d#41d52b62921a221fd34744b5494cf7faec2f844d"
 dependencies = [
  "async-trait",
  "blst",
@@ -725,7 +725,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_core"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=36fa93cc83ef800b0334b2b617e46f6e03f849b5#36fa93cc83ef800b0334b2b617e46f6e03f849b5"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=41d52b62921a221fd34744b5494cf7faec2f844d#41d52b62921a221fd34744b5494cf7faec2f844d"
 dependencies = [
  "async-trait",
  "blst",
@@ -768,7 +768,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_keys"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=36fa93cc83ef800b0334b2b617e46f6e03f849b5#36fa93cc83ef800b0334b2b617e46f6e03f849b5"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=41d52b62921a221fd34744b5494cf7faec2f844d#41d52b62921a221fd34744b5494cf7faec2f844d"
 dependencies = [
  "bech32",
  "bip39",
@@ -784,7 +784,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_macros"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=36fa93cc83ef800b0334b2b617e46f6e03f849b5#36fa93cc83ef800b0334b2b617e46f6e03f849b5"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=41d52b62921a221fd34744b5494cf7faec2f844d#41d52b62921a221fd34744b5494cf7faec2f844d"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -795,7 +795,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_pos"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=36fa93cc83ef800b0334b2b617e46f6e03f849b5#36fa93cc83ef800b0334b2b617e46f6e03f849b5"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=41d52b62921a221fd34744b5494cf7faec2f844d#41d52b62921a221fd34744b5494cf7faec2f844d"
 dependencies = [
  "dg_xch_core",
  "dg_xch_pos1",
@@ -807,7 +807,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_pos1"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=36fa93cc83ef800b0334b2b617e46f6e03f849b5#36fa93cc83ef800b0334b2b617e46f6e03f849b5"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=41d52b62921a221fd34744b5494cf7faec2f844d#41d52b62921a221fd34744b5494cf7faec2f844d"
 dependencies = [
  "async-trait",
  "blake3",
@@ -832,7 +832,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_pos2"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=36fa93cc83ef800b0334b2b617e46f6e03f849b5#36fa93cc83ef800b0334b2b617e46f6e03f849b5"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=41d52b62921a221fd34744b5494cf7faec2f844d#41d52b62921a221fd34744b5494cf7faec2f844d"
 dependencies = [
  "aes",
  "blake3",
@@ -843,12 +843,12 @@ dependencies = [
 [[package]]
 name = "dg_xch_pos_common"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=36fa93cc83ef800b0334b2b617e46f6e03f849b5#36fa93cc83ef800b0334b2b617e46f6e03f849b5"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=41d52b62921a221fd34744b5494cf7faec2f844d#41d52b62921a221fd34744b5494cf7faec2f844d"
 
 [[package]]
 name = "dg_xch_puzzles"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=36fa93cc83ef800b0334b2b617e46f6e03f849b5#36fa93cc83ef800b0334b2b617e46f6e03f849b5"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=41d52b62921a221fd34744b5494cf7faec2f844d#41d52b62921a221fd34744b5494cf7faec2f844d"
 dependencies = [
  "blst",
  "dg_parser_macro",
@@ -866,7 +866,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_serialize"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=36fa93cc83ef800b0334b2b617e46f6e03f849b5#36fa93cc83ef800b0334b2b617e46f6e03f849b5"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=41d52b62921a221fd34744b5494cf7faec2f844d#41d52b62921a221fd34744b5494cf7faec2f844d"
 dependencies = [
  "log",
  "serde",
@@ -876,7 +876,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_servers"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=36fa93cc83ef800b0334b2b617e46f6e03f849b5#36fa93cc83ef800b0334b2b617e46f6e03f849b5"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=41d52b62921a221fd34744b5494cf7faec2f844d#41d52b62921a221fd34744b5494cf7faec2f844d"
 dependencies = [
  "async-trait",
  "blst",
@@ -905,7 +905,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_timelord"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=36fa93cc83ef800b0334b2b617e46f6e03f849b5#36fa93cc83ef800b0334b2b617e46f6e03f849b5"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=41d52b62921a221fd34744b5494cf7faec2f844d#41d52b62921a221fd34744b5494cf7faec2f844d"
 dependencies = [
  "dg_xch_core",
  "dg_xch_pos",
@@ -923,7 +923,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_vdf"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=36fa93cc83ef800b0334b2b617e46f6e03f849b5#36fa93cc83ef800b0334b2b617e46f6e03f849b5"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=41d52b62921a221fd34744b5494cf7faec2f844d#41d52b62921a221fd34744b5494cf7faec2f844d"
 dependencies = [
  "dg_xch_core",
  "gmp-mpfr-sys",
