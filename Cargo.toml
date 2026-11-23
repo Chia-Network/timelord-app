@@ -22,11 +22,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # dg_xch crates come from the Chia-Network fork branch chia/timelord-app-deps;
 # see integrations/dg-xch/VENDORING.md. Keep all five on the same rev.
-dg_xch_core = { git = "https://github.com/Chia-Network/dg_xch_utils", rev = "a7d288357ec89c54121a329d6f9867ed472e8922", default-features = false, features = ["bls"] }
-dg_xch_timelord = { git = "https://github.com/Chia-Network/dg_xch_utils", rev = "a7d288357ec89c54121a329d6f9867ed472e8922" }
-dg_xch_servers = { git = "https://github.com/Chia-Network/dg_xch_utils", rev = "a7d288357ec89c54121a329d6f9867ed472e8922" }
-dg_xch_vdf = { git = "https://github.com/Chia-Network/dg_xch_utils", rev = "a7d288357ec89c54121a329d6f9867ed472e8922" }
-dg_xch_serialize = { git = "https://github.com/Chia-Network/dg_xch_utils", rev = "a7d288357ec89c54121a329d6f9867ed472e8922" }
+dg_xch_core = { git = "https://github.com/Chia-Network/dg_xch_utils", rev = "36fa93cc83ef800b0334b2b617e46f6e03f849b5", default-features = false, features = ["bls"] }
+dg_xch_timelord = { git = "https://github.com/Chia-Network/dg_xch_utils", rev = "36fa93cc83ef800b0334b2b617e46f6e03f849b5" }
+dg_xch_servers = { git = "https://github.com/Chia-Network/dg_xch_utils", rev = "36fa93cc83ef800b0334b2b617e46f6e03f849b5" }
+dg_xch_vdf = { git = "https://github.com/Chia-Network/dg_xch_utils", rev = "36fa93cc83ef800b0334b2b617e46f6e03f849b5" }
+dg_xch_serialize = { git = "https://github.com/Chia-Network/dg_xch_utils", rev = "36fa93cc83ef800b0334b2b617e46f6e03f849b5" }
 x509-cert = "0.3"
 num-bigint = "0.5"
 futures-util = "0.3"

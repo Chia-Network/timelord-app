@@ -20,7 +20,8 @@ The fork keeps changes in two layers so the first stays easy to offer upstream:
   - `parse_u128` through serde_json numbers, so `arbitrary_precision` keeps working.
   - Recoverable unfinished-block admission with bounded deferral and per-peak retry.
 - `chia/timelord-app-deps`: `chia/timelord-app-patches` plus dependency alignment
-  with this workspace (currently num-bigint 0.5). The app pins this branch's head.
+  with this workspace (currently num-bigint 0.5, and rsa 0.10 / x509-cert 0.3 /
+  der 0.8 for certificate generation). The app pins this branch's head.
 
 Changes that existed only because of vendoring (explicit package metadata, Git pins
 inside crate manifests, removed upstream tests/benches, sqlx and prometheus removal,
