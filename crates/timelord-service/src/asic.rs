@@ -206,7 +206,7 @@ impl AsicBackend {
             crate::observability::Activity::new(
                 self.runtime.clone(),
                 chain,
-                self.metrics().cloned(),
+                self.metrics().map(Arc::as_ref),
             )
         });
         loop {

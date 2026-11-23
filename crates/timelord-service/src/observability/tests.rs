@@ -537,18 +537,10 @@ fn process_totals_survive_history_pruning_and_runtime_replacement() {
 #[test]
 fn pending_activity_counts_cancellation_but_not_completed_work() {
     let (shared, metrics, _) = fixture();
-    let activity = Activity::new(
-        shared.runtime.clone(),
-        Chain::Challenge,
-        Some(metrics.clone()),
-    );
+    let activity = Activity::new(shared.runtime.clone(), Chain::Challenge, Some(&metrics));
     assert_eq!(shared.runtime.lock().unwrap().pending[0], 1);
     drop(activity);
-    let mut completed = Activity::new(
-        shared.runtime.clone(),
-        Chain::Challenge,
-        Some(metrics.clone()),
-    );
+    let mut completed = Activity::new(shared.runtime.clone(), Chain::Challenge, Some(&metrics));
     completed.finish();
     drop(completed);
     assert_eq!(shared.runtime.lock().unwrap().pending[0], 0);
@@ -578,9 +570,8 @@ async fn exposition_isolated_routes_and_concurrent_scrapes_are_consistent() {
     let producing = tokio::spawn({
         let metrics = metrics.clone();
         let runtime = shared.runtime.clone();
-        let activity_metrics = metrics.clone();
         async move {
-            let mut activity = Activity::new(runtime, Chain::Challenge, Some(activity_metrics));
+            let mut activity = Activity::new(runtime, Chain::Challenge, Some(&metrics));
             for _ in 0..50 {
                 metrics.verified(epoch, Chain::Challenge, 999_999.9);
                 tokio::task::yield_now().await;

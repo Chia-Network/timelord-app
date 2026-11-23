@@ -7,18 +7,19 @@ use std::{
 use timelord_core::Chain;
 
 /// A request remains pending while its board recovers. Dropping it records cancellation.
-pub struct Activity {
+pub struct Activity<'a> {
     runtime: Arc<Mutex<crate::runtime::RuntimeState>>,
     chain: Chain,
-    metrics: Option<Arc<super::Metrics>>,
+    // Production owners lend their handle; admission work observes nothing.
+    metrics: Option<&'a super::Metrics>,
     started: Instant,
     finished: bool,
 }
-impl Activity {
+impl<'a> Activity<'a> {
     pub fn new(
         runtime: Arc<Mutex<crate::runtime::RuntimeState>>,
         c: Chain,
-        metrics: Option<Arc<super::Metrics>>,
+        metrics: Option<&'a super::Metrics>,
     ) -> Self {
         {
             let mut state = runtime.lock().expect("runtime");
@@ -34,7 +35,7 @@ impl Activity {
     }
     pub fn finish(&mut self) {
         self.finished = true;
-        if let Some(metrics) = &self.metrics {
+        if let Some(metrics) = self.metrics {
             metrics.duration(
                 self.chain,
                 ProofStage::RequestToVerified,
@@ -43,13 +44,13 @@ impl Activity {
         }
     }
 }
-impl Drop for Activity {
+impl Drop for Activity<'_> {
     fn drop(&mut self) {
         let mut state = self.runtime.lock().expect("runtime");
         state.pending[index(self.chain)] = state.pending[index(self.chain)].saturating_sub(1);
         drop(state);
         if !self.finished
-            && let Some(metrics) = &self.metrics
+            && let Some(metrics) = self.metrics
         {
             metrics.cancelled(self.chain);
         }
