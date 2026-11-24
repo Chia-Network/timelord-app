@@ -71,9 +71,9 @@ reaped, a final bounded 3-second drop: about 34.1 seconds worst case, still
 within the 35-second launchd `ExitTimeOut`. An in-flight Reload validation is
 cancelled on supervisor shutdown and its validator child is reaped, so shutdown
 stays within that budget rather than waiting for validation. On an existing
-installation the first `launchctl bootout`
-still runs under the old 20-second `ExitTimeOut` plist unless the service is
-paused first and its worker family has retired before bootout. Pause is persisted
+installation the first `launchctl bootout` still runs under the old 20-second
+`ExitTimeOut` plist unless the service is paused first and its worker family has
+retired before bootout. Pause is persisted
 before acknowledgment; poll `status` until `phase` is `paused` and `worker_pid`
 is null to confirm the family has retired. Reload first validates the requested
 file (a rejected file keeps the running worker and returns an error), then starts
