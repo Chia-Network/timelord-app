@@ -333,7 +333,7 @@ final class TimelordModel: ObservableObject {
             || candidate.node != saved.node
     }
     private var hasRuntimeSettingsChanges: Bool {
-        Self.hasRuntimeChanges(configuration.normalizedForPersistence(), from: savedConfiguration)
+        Self.hasRuntimeChanges(configuration.resolvedForPersistence(against: savedConfiguration), from: savedConfiguration)
     }
     var settingsDoneTitle: String {
         guard canControlService && (hasRuntimeSettingsChanges || configurationNeedsRestart) else { return "Done" }
@@ -350,7 +350,7 @@ final class TimelordModel: ObservableObject {
         }
         if canControlService {
             let pending = hasRuntimeSettingsChanges || configurationNeedsRestart
-            let nodeOnly = pendingChangeIsNodeOnly && Self.onlyNodeDiffers(savedConfiguration, configuration.normalizedForPersistence())
+            let nodeOnly = pendingChangeIsNodeOnly && Self.onlyNodeDiffers(savedConfiguration, configuration.resolvedForPersistence(against: savedConfiguration))
             return pending
                 ? (nodeOnly ? "Save & Restart switches the full-node connection. ASIC boards keep running." : "Save & Restart applies your changes and briefly restarts Timelord.")
                 : "Your settings are saved. Timelord keeps running."
@@ -395,16 +395,16 @@ final class TimelordModel: ObservableObject {
         guard !operationInProgress else { return false }
         operationInProgress = true; defer { operationInProgress = false }
         do {
-            let updated = configuration.normalizedForPersistence()
+            let updated = configuration.resolvedForPersistence(against: savedConfiguration)
             let runtimeChanged = Self.hasRuntimeChanges(updated, from: savedConfiguration)
             let nodeOnly = Self.onlyNodeDiffers(savedConfiguration, updated)
             try await configurationClient.save(updated)
             let persisted = try await configurationClient.load()
             // Keep edits made while the helper was saving, but adopt its profile
             // migration whenever the submitted configuration is still current.
-            // Incomplete RPC drafts were stripped for validation, so restore the
+            // Incomplete RPC drafts were resolved for validation, so restore the
             // form state the user is still filling in.
-            if configuration.normalizedForPersistence() == updated {
+            if configuration.resolvedForPersistence(against: savedConfiguration) == updated {
                 configuration = persisted.restoringIncompleteRPCDrafts(from: configuration)
             }
             savedConfiguration = persisted

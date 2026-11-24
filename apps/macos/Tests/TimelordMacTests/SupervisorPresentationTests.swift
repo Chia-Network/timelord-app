@@ -342,6 +342,70 @@ final class SupervisorPresentationTests: XCTestCase {
             "Saving for a board refresh must not clear the half-filled RPC form")
     }
 
+    func testIncompleteRPCDraftKeepsLastSavedRPCInSingleNodeMode() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        let rpc = completeRPC(host: "rpc.single.fixture")
+        var configuration = runnableConfiguration(host: "single.fixture")
+        configuration.node.rpc = rpc
+        try fixture.writeConfiguration(configuration)
+        let model = fixture.model(configuration)
+        var node = model.configuration.node
+        node.rpc?.host = ""
+        model.configuration.node = node
+
+        await model.testNode()
+        XCTAssertEqual(model.connectionResult, "Authenticated fixture node.")
+        XCTAssertEqual(model.configuration.node.rpc?.host, "",
+            "The form keeps the blank-host draft")
+        let persisted = try decode(fixture.configurationURL)
+        XCTAssertEqual(persisted.node.rpc, rpc,
+            "An incomplete draft must not erase already-saved RPC settings")
+    }
+
+    func testIncompleteRPCDraftKeepsLastSavedRPCPerProfile() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        let savedRPC = completeRPC(host: "rpc.first.fixture")
+        var first = runnableConfiguration(host: "first.fixture").node
+        first.rpc = savedRPC
+        var second = runnableConfiguration(host: "second.fixture").node
+        second.certificate = "/fixture/second.crt"
+        var profiles = ConnectionProfiles(); profiles.activeId = "first"
+        profiles.profiles = [
+            ConnectionProfile(id: "first", name: "First", node: first),
+            ConnectionProfile(id: "second", name: "Second", node: second),
+        ]
+        var configuration = AppConfiguration(); configuration.connections = profiles
+        try fixture.writeConfiguration(configuration)
+        let model = fixture.model(configuration)
+        var node = model.configuration.node
+        node.rpc?.host = ""
+        model.configuration.node = node
+
+        await model.testNode()
+        XCTAssertEqual(model.connectionResult, "Authenticated fixture node.")
+        XCTAssertEqual(model.configuration.node.rpc?.host, "",
+            "The form keeps the blank-host draft")
+        let persisted = try decode(fixture.configurationURL)
+        XCTAssertEqual(persisted.connections?.profiles[0].node.rpc, savedRPC,
+            "An incomplete draft must not erase the last saved RPC for its profile")
+        XCTAssertNil(persisted.connections?.profiles[1].node.rpc,
+            "A profile without saved RPC settings remains without them")
+    }
+
+    private func completeRPC(host: String) -> NodeRPCConfiguration {
+        NodeRPCConfiguration(
+            host: host, port: 8555, serverName: "chia.net",
+            certificate: "/fixture/rpc.crt", privateKey: "/fixture/rpc.key",
+            caCertificate: "/fixture/rpc-ca.crt")
+    }
+
+    private func decode(_ url: URL) throws -> AppConfiguration {
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode(AppConfiguration.self, from: Data(contentsOf: url))
+    }
+
     private func runnableConfiguration(host: String = "fixture.node") -> AppConfiguration {
         var configuration = AppConfiguration()
         configuration.node.host = host

@@ -25,20 +25,23 @@ public struct AppConfiguration: Codable, Sendable, Equatable {
             }
         }
     }
-    /// An RPC draft with missing credentials is UI state, not a saved setting.
-    /// Dropping it here keeps profile switches and saves valid without forcing
-    /// every caller to know the full-node validation rules.
-    public func normalizedForPersistence() -> Self {
-        var normalized = self
-        if var profiles = normalized.connections, !profiles.profiles.isEmpty {
+    /// Resolve incomplete RPC drafts for saving. A draft is UI state, but it
+    /// must not erase RPC settings that are already saved: an incomplete draft
+    /// falls back to the last saved RPC settings for the same profile. Only an
+    /// explicit `rpc = nil` (toggle off) persists no RPC settings.
+    public func resolvedForPersistence(against saved: Self) -> Self {
+        var resolved = self
+        if var profiles = resolved.connections, !profiles.profiles.isEmpty {
             for index in profiles.profiles.indices {
-                profiles.profiles[index].node.discardIncompleteRPC()
+                let id = profiles.profiles[index].id
+                let savedRPC = saved.connections?.profiles.first { $0.id == id }?.node.rpc
+                profiles.profiles[index].node.resolveIncompleteRPC(using: savedRPC)
             }
-            normalized.connections = profiles
+            resolved.connections = profiles
         } else {
-            normalized.node.discardIncompleteRPC()
+            resolved.node.resolveIncompleteRPC(using: saved.node.rpc)
         }
-        return normalized
+        return resolved
     }
     /// Saving strips incomplete RPC drafts. Put the user's still-editable
     /// drafts back so a connection test or board refresh does not clear the form.
@@ -134,8 +137,9 @@ public struct NodeConfiguration: Codable, Sendable, Equatable {
     public init() {}
     public var hasIdentity: Bool { certificate != nil && privateKey != nil && caCertificate != nil }
     /// The service accepts RPC only when every endpoint and credential is set.
-    public mutating func discardIncompleteRPC() {
-        if rpc?.isComplete != true { rpc = nil }
+    public mutating func resolveIncompleteRPC(using saved: NodeRPCConfiguration?) {
+        guard let rpc, !rpc.isComplete else { return }
+        self.rpc = saved
     }
 }
 public struct NetworkDefinition: Codable, Sendable, Equatable {
