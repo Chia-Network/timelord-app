@@ -35,29 +35,34 @@ pub const KILL_AND_REAP: Duration = Duration::from_secs(3);
 /// Bound on draining the worker's concurrent log pumps under one deadline.
 pub const LOG_DRAIN: Duration = Duration::from_secs(1);
 
-const EXIT_TIME_OUT_MARGIN: Duration = Duration::from_secs(6);
-
 /// Worst-case time to retire a worker: normal graceful wait, group kill/reap,
 /// then one shared log-drain deadline for both pumps.
 pub const WORST_CASE_STOP: Duration = Duration::from_secs(
     NORMAL_GRACEFUL_STOP.as_secs() + KILL_AND_REAP.as_secs() + LOG_DRAIN.as_secs(),
 );
-/// launchd's deadline for the supervisor to exit, with margin over the stop budget.
+
+/// Worst-case time for shutdown to settle a worker. A stop that fails at the
+/// group kill returns after 25 s + 3 s = 28 s without reaching the log drain,
+/// then a CleanupRetry adds 0 s + 3 s + 1 s = 4 s. That 28 + 4 identity equals
+/// WORST_CASE_STOP + KILL_AND_REAP = 29 + 3 = 32 s, because the unused 1 s
+/// drain in WORST_CASE_STOP is exactly the retry's drain.
+pub const SHUTDOWN_WORST_CASE: Duration =
+    Duration::from_secs(WORST_CASE_STOP.as_secs() + KILL_AND_REAP.as_secs());
+
+const EXIT_TIME_OUT_MARGIN: Duration = Duration::from_secs(3);
+
+/// launchd's deadline for the supervisor to exit, with margin over the shutdown
+/// worst case.
 pub const EXIT_TIME_OUT: Duration =
-    Duration::from_secs(WORST_CASE_STOP.as_secs() + EXIT_TIME_OUT_MARGIN.as_secs());
+    Duration::from_secs(SHUTDOWN_WORST_CASE.as_secs() + EXIT_TIME_OUT_MARGIN.as_secs());
 /// Server-side bound on a control-loop reply, including reload validation. It
 /// does not wait for worker retirement, so it is independent of the stop budget.
 pub const CONTROL_SERVER_TIMEOUT: Duration = Duration::from_secs(30);
 /// Client-side bound on a control transaction; must exceed the server bound.
 pub const CONTROL_CLIENT_TIMEOUT: Duration = Duration::from_secs(35);
 
-const _: () = assert!(NORMAL_GRACEFUL_STOP.as_secs() == 25);
-const _: () = assert!(WATCHDOG_GRACEFUL_STOP.as_secs() == 2);
-const _: () = assert!(KILL_AND_REAP.as_secs() == 3);
-const _: () = assert!(LOG_DRAIN.as_secs() == 1);
-const _: () = assert!(WORST_CASE_STOP.as_secs() == 29);
-const _: () = assert!(EXIT_TIME_OUT.as_secs() == 35);
-const _: () = assert!(EXIT_TIME_OUT.as_secs() > WORST_CASE_STOP.as_secs());
+const _: () = assert!(CONTROL_CLIENT_TIMEOUT.as_secs() > CONTROL_SERVER_TIMEOUT.as_secs());
+const _: () = assert!(EXIT_TIME_OUT.as_secs() > SHUTDOWN_WORST_CASE.as_secs());
 const _: () = assert!(WATCHDOG_GRACEFUL_STOP.as_secs() < NORMAL_GRACEFUL_STOP.as_secs());
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -473,6 +478,7 @@ mod stop_budget_tests {
             "<key>ExitTimeOut</key><integer>{}</integer>",
             EXIT_TIME_OUT.as_secs()
         )));
-        assert!(xml.contains("<key>ExitTimeOut</key><integer>35</integer>"));
+        assert!(EXIT_TIME_OUT > SHUTDOWN_WORST_CASE);
+        assert!(SHUTDOWN_WORST_CASE > WORST_CASE_STOP);
     }
 }

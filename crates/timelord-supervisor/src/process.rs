@@ -128,6 +128,21 @@ impl OwnedProcess {
 impl Drop for OwnedProcess {
     fn drop(&mut self) {
         self.signal_group(libc::SIGKILL);
+        if self.child.is_some() {
+            // Cancellation (for example shutdown during Reload validation) must
+            // not leave a zombie. Reap the leader synchronously after SIGKILL;
+            // tokio's Child then observes ECHILD and drops its orphan record.
+            let mut status = 0;
+            loop {
+                let result = unsafe { libc::waitpid(self.pid, &mut status, 0) };
+                if result == -1
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                break;
+            }
+        }
     }
 }
 

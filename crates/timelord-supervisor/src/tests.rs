@@ -631,13 +631,9 @@ async fn resume_and_reload_during_stopping_start_exactly_one_replacement_after_r
 
 #[test]
 fn retirement_grace_depends_on_watchdog_classification() {
-    use timelord_supervisor::progress::{Failure, FailureKind};
-    let failure = |kind, reason: &str| Failure {
-        kind,
-        reason: reason.into(),
-    };
-    let unresponsive = failure(FailureKind::Unresponsive, "heartbeat");
-    let reported = failure(FailureKind::Reported, "essential");
+    use timelord_supervisor::progress::Failure;
+    let unresponsive = Failure::unresponsive("heartbeat");
+    let reported = Failure::reported("essential");
     let normal = timelord_supervisor::NORMAL_GRACEFUL_STOP;
     assert_eq!(
         Cause::Failed {
@@ -660,7 +656,7 @@ fn retirement_grace_depends_on_watchdog_classification() {
 
 #[tokio::test]
 async fn unresponsive_watchdog_failure_reaps_under_the_short_grace() {
-    use timelord_supervisor::progress::{Failure, FailureKind};
+    use timelord_supervisor::progress::Failure;
     let dir = std::env::temp_dir().join(format!("tl-unresponsive-grace-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
@@ -676,12 +672,14 @@ async fn unresponsive_watchdog_failure_reaps_under_the_short_grace() {
     let (snapshots, _) = watch::channel(state.published());
     let started = Instant::now();
     state.begin_retirement(Cause::Failed {
-        watchdog: Some(Failure {
-            kind: FailureKind::Unresponsive,
-            reason: "fixture heartbeat expiry".into(),
-        }),
+        watchdog: Some(Failure::unresponsive("fixture heartbeat expiry")),
     });
-    state.poll_retirement(&snapshots, true).await;
+    tokio::time::timeout(
+        Duration::from_secs(6),
+        state.poll_retirement(&snapshots, true),
+    )
+    .await
+    .expect("unresponsive retirement exceeded 6 s; it must not use the normal 25 s wait");
     assert!(
         started.elapsed() < Duration::from_secs(6),
         "unresponsive retirement took {:?}",
@@ -689,6 +687,150 @@ async fn unresponsive_watchdog_failure_reaps_under_the_short_grace() {
     );
     assert!(reaped(pid));
     assert!(matches!(state.lifecycle, Lifecycle::Backoff { .. }));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn cleanup_retry_skips_the_graceful_wait() {
+    use timelord_supervisor::progress::Failure;
+    let dir = std::env::temp_dir().join(format!("tl-cleanup-retry-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let helper = dir.join("worker");
+    let d = dir.display();
+    fs::write(
+        &helper,
+        format!("#!/bin/sh\ntouch '{d}/alive.'$$\ntrap '' TERM\nwhile :; do sleep 0.1; done\n"),
+    )
+    .unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    let paths = Paths::for_config(&dir.join("config.toml")).unwrap();
+    let (mut state, pid) = running_state(&dir, &helper).await;
+    let (snapshots, _) = watch::channel(state.published());
+    state.lifecycle.worker_mut().unwrap().stop_fail_after_kill = 1;
+    state.begin_retirement(Cause::Failed {
+        watchdog: Some(Failure::unresponsive("fixture cleanup retry")),
+    });
+    state.poll_retirement(&snapshots, true).await;
+    let Lifecycle::CleanupFailed { killed, .. } = &state.lifecycle else {
+        panic!("expected cleanup ownership to be retained")
+    };
+    assert!(
+        *killed,
+        "a stop that reached the group SIGKILL must be marked"
+    );
+    assert_eq!(state.snapshot().worker_pid, Some(pid as u32));
+    let started = Instant::now();
+    state
+        .control(&paths, &helper, command(Control::Pause), &snapshots)
+        .await
+        .unwrap();
+    state.poll_retirement(&snapshots, true).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "CleanupRetry waited for the graceful budget: {:?}",
+        started.elapsed()
+    );
+    assert!(matches!(state.lifecycle, Lifecycle::Paused));
+    assert!(reaped(pid));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn worker_stop_bounds_group_kill_and_log_drain() {
+    let dir = std::env::temp_dir().join(format!("tl-stop-bound-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let helper = dir.join("worker");
+    let d = dir.display();
+    fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\ntrap '' TERM\n\
+             setsid /bin/sh -c 'echo $$ > {d}/grandchild; exec /bin/sleep 15' &\n\
+             while :; do sleep 0.1; done\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    let log = timelord_supervisor::logging::Writer::stderr();
+    let mut worker = Worker::spawn(
+        &helper,
+        &dir.join("config.toml"),
+        &dir.join("progress.sock"),
+        1,
+        &log,
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !dir.join("grandchild").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("detached grandchild did not start");
+    let grandchild: i32 = fs::read_to_string(dir.join("grandchild"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let started = Instant::now();
+    let status = worker.stop(Duration::ZERO).await.unwrap();
+    let bound = KILL_AND_REAP + LOG_DRAIN + Duration::from_secs(1);
+    assert!(
+        started.elapsed() < bound,
+        "Worker::stop took {:?}, bound {:?}",
+        started.elapsed(),
+        bound
+    );
+    assert!(!status.success());
+    unsafe {
+        libc::kill(grandchild, libc::SIGKILL);
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_validation_reaps_the_validator_group() {
+    let dir = std::env::temp_dir().join(format!("tl-validator-cancel-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let helper = dir.join("validator");
+    let pid_file = dir.join("pid");
+    fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec /bin/sleep 30\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        validate_before_reload(&helper, &dir.join("config.toml")),
+    )
+    .await
+    .expect_err("validation should be cancelled");
+    let pid: i32 = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 

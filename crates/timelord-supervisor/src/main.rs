@@ -1,11 +1,11 @@
-mod cause;
 mod monitor;
 mod process;
+mod retirement;
 mod startup;
 use anyhow::{Context, Result, ensure};
-use cause::{Cause, Retiring};
 use clap::{Parser, Subcommand};
 use process::OwnedProcess;
+use retirement::{Cause, Retiring};
 use std::{
     fs,
     io::Write,
@@ -234,8 +234,13 @@ struct Worker {
     watchdog: timelord_supervisor::progress::Watchdog,
     started: Instant,
     progress: Option<(timelord_supervisor::progress::Snapshot, std::time::Instant)>,
+    /// Set once a stop has reached the group SIGKILL, so a later CleanupFailed
+    /// retry skips the SIGTERM wait instead of repeating it.
+    killed: bool,
     #[cfg(test)]
     stop_failures: usize,
+    #[cfg(test)]
+    stop_fail_after_kill: usize,
 }
 impl Worker {
     fn spawn(
@@ -282,8 +287,11 @@ impl Worker {
             watchdog: timelord_supervisor::progress::Watchdog::new(std::time::Instant::now()),
             started: Instant::now(),
             progress: None,
+            killed: false,
             #[cfg(test)]
             stop_failures: 0,
+            #[cfg(test)]
+            stop_fail_after_kill: 0,
         })
     }
     async fn stop(&mut self, graceful: Duration) -> Result<std::process::ExitStatus> {
@@ -296,6 +304,14 @@ impl Worker {
         // The group-wide hard stop remains the bounded fallback.
         self.process.signal_leader(libc::SIGTERM);
         self.process.wait_for_exit(graceful).await?;
+        #[cfg(test)]
+        if self.stop_fail_after_kill > 0 {
+            self.stop_fail_after_kill -= 1;
+            self.process.signal_group(libc::SIGKILL);
+            self.killed = true;
+            anyhow::bail!("Injected worker cleanup failure after group kill");
+        }
+        self.killed = true;
         let result = self.process.kill_and_reap(KILL_AND_REAP).await?;
         if tokio::time::timeout(LOG_DRAIN, async {
             for task in &mut self.log_tasks {
@@ -470,6 +486,8 @@ enum Lifecycle {
         worker: Box<Worker>,
         next: Instant,
         error: String,
+        /// The failed stop had already reached the group SIGKILL.
+        killed: bool,
     },
     Backoff {
         next: Instant,
@@ -616,127 +634,6 @@ impl SupervisorState {
         }
         snapshots.send_replace(self.published());
     }
-    /// Hand a live or cleanup-failed worker to a background retirement task.
-    /// Returns without waiting: the loop keeps serving controls, progress and
-    /// ticks, and `poll_retirement` applies the outcome.
-    fn begin_retirement(&mut self, cause: Cause) {
-        let mut worker = match std::mem::replace(&mut self.lifecycle, Lifecycle::Starting) {
-            Lifecycle::Running(worker) | Lifecycle::CleanupFailed { worker, .. } => worker,
-            other => {
-                self.lifecycle = other;
-                return;
-            }
-        };
-        let pid = worker.process.pid();
-        let uptime = worker.started.elapsed();
-        let graceful = cause.grace();
-        let task = tokio::spawn(async move {
-            let result = worker.stop(graceful).await;
-            (worker, result)
-        });
-        self.lifecycle = Lifecycle::Stopping(Box::new(Retiring {
-            pid,
-            uptime,
-            cause,
-            restart: false,
-            task,
-        }));
-    }
-    /// Apply a finished retirement. With `wait`, block until it finishes
-    /// (shutdown and tests); otherwise return at once if it is still running.
-    async fn poll_retirement(&mut self, snapshots: &watch::Sender<Published>, wait: bool) {
-        if !matches!(&self.lifecycle, Lifecycle::Stopping(retiring) if wait || retiring.task.is_finished())
-        {
-            return;
-        }
-        let Lifecycle::Stopping(retiring) =
-            std::mem::replace(&mut self.lifecycle, Lifecycle::Starting)
-        else {
-            unreachable!()
-        };
-        let Retiring {
-            pid,
-            uptime,
-            cause,
-            restart,
-            task,
-        } = *retiring;
-        let joined = task.await;
-        // Read intent after the task: a Pause accepted while stopping wins.
-        let paused = self.intent.mode == Mode::Paused;
-        self.lifecycle = match joined {
-            Ok((worker, Ok(exit))) => {
-                drop(worker); // Reaped: the group identity is released.
-                match cause {
-                    Cause::Failed { watchdog } => {
-                        let reason = watchdog
-                            .map(|failure| failure.reason)
-                            .unwrap_or_else(|| format!("Worker exited: {exit}"));
-                        self.record_recovery(Some(pid), &reason);
-                        if paused {
-                            Lifecycle::Paused
-                        } else if restart {
-                            Lifecycle::Starting
-                        } else {
-                            let delay = retry_delay(&mut self.failures, Some(uptime));
-                            Lifecycle::Backoff {
-                                next: Instant::now() + Duration::from_secs(delay),
-                                error: format!("{reason}; retry in {delay}s"),
-                            }
-                        }
-                    }
-                    Cause::Requested | Cause::CleanupRetry if paused => Lifecycle::Paused,
-                    Cause::Requested | Cause::CleanupRetry => Lifecycle::Starting,
-                }
-            }
-            Ok((worker, Err(error))) => {
-                if let Cause::Failed { watchdog } = cause {
-                    let reason = watchdog
-                        .map(|failure| failure.reason)
-                        .unwrap_or_else(|| format!("Worker exited; cleanup failed: {error:#}"));
-                    self.record_recovery(Some(pid), &reason);
-                }
-                // Keep the child handle and reserved process-group identity:
-                // neither durable Pause nor a retry grants retirement evidence.
-                Lifecycle::CleanupFailed {
-                    worker,
-                    next: Instant::now() + Duration::from_secs(120),
-                    error: format!("Worker cleanup failed: {error:#}"),
-                }
-            }
-            Err(error) => {
-                // The task dropped the worker, whose owner SIGKILLed the group.
-                // Hold off a replacement rather than assume immediate exit.
-                let error = format!("Worker retirement task failed: {error}");
-                let _ = writeln!(&mut self.log, "{error}");
-                let delay = retry_delay(&mut self.failures, None);
-                Lifecycle::Backoff {
-                    next: Instant::now() + Duration::from_secs(delay),
-                    error,
-                }
-            }
-        };
-        self.publish(snapshots);
-    }
-    /// Retire synchronously, finishing any retirement already in progress.
-    /// Used at shutdown, where blocking the (exiting) loop is intended.
-    async fn retire_now(&mut self, snapshots: &watch::Sender<Published>) -> Result<()> {
-        self.poll_retirement(snapshots, true).await;
-        if self.lifecycle.worker().is_some() {
-            // A worker that already ignored group-SIGKILL gets no further SIGTERM wait.
-            let cause = match self.lifecycle {
-                Lifecycle::CleanupFailed { .. } => Cause::CleanupRetry,
-                _ => Cause::Requested,
-            };
-            self.begin_retirement(cause);
-            self.publish(snapshots);
-            self.poll_retirement(snapshots, true).await;
-        }
-        if let Lifecycle::CleanupFailed { error, .. } = &self.lifecycle {
-            anyhow::bail!("{error}");
-        }
-        Ok(())
-    }
     /// Mutations return once intent is durable and any retirement has started;
     /// clients follow `phase`, `worker_pid` and `worker_generation` to completion.
     async fn control(
@@ -779,7 +676,10 @@ impl SupervisorState {
                     Lifecycle::Stopping(retiring) => retiring.restart |= resuming,
                     Lifecycle::Running(_) if mode == Mode::Running => {}
                     Lifecycle::Running(_) => self.begin_retirement(Cause::Requested),
-                    Lifecycle::CleanupFailed { .. } => self.begin_retirement(Cause::CleanupRetry),
+                    Lifecycle::CleanupFailed { .. } => {
+                        let cause = self.cleanup_cause();
+                        self.begin_retirement(cause)
+                    }
                     _ if mode == Mode::Paused => self.lifecycle = Lifecycle::Paused,
                     Lifecycle::Paused | Lifecycle::StateError(_) => {
                         self.lifecycle = Lifecycle::Starting
@@ -795,7 +695,10 @@ impl SupervisorState {
                     // the replacement reads the configuration when it starts.
                     Lifecycle::Stopping(retiring) => retiring.restart = true,
                     Lifecycle::Running(_) => self.begin_retirement(Cause::Requested),
-                    Lifecycle::CleanupFailed { .. } => self.begin_retirement(Cause::CleanupRetry),
+                    Lifecycle::CleanupFailed { .. } => {
+                        let cause = self.cleanup_cause();
+                        self.begin_retirement(cause)
+                    }
                     Lifecycle::StateError(_) => {}
                     _ if self.intent.mode == Mode::Paused => self.lifecycle = Lifecycle::Paused,
                     _ => self.lifecycle = Lifecycle::Starting,
@@ -831,7 +734,8 @@ impl SupervisorState {
         if matches!(self.lifecycle, Lifecycle::CleanupFailed { next, .. } if Instant::now() >= next)
         {
             // Keep failed cleanup owned and monitored until retirement succeeds.
-            self.begin_retirement(Cause::CleanupRetry);
+            let cause = self.cleanup_cause();
+            self.begin_retirement(cause);
             self.publish(snapshots);
             return Ok(());
         }
@@ -968,10 +872,16 @@ async fn run(
                     }
                 },
                 result = &mut controls => { result??; break; },
-                Some(envelope) = rx.recv() => {
-                    let error = state.control(&paths, &helper, envelope.request, &snapshots).await
-                        .err().map(|error| format!("{error:#}"));
-                    let _ = envelope.reply.send(Response { status: state.snapshot(), error });
+                Some(Envelope { request, reply }) = rx.recv() => {
+                    // A shutdown signal must not wait for Reload validation nor
+                    // let a just-validated Reload start a fresh retirement.
+                    let result = tokio::select! {
+                        result = state.control(&paths, &helper, request, &snapshots) => Some(result),
+                        _ = &mut stop => None,
+                    };
+                    let Some(result) = result else { break };
+                    let error = result.err().map(|error| format!("{error:#}"));
+                    let _ = reply.send(Response { status: state.snapshot(), error });
                 },
                 _ = timer.tick() => state.tick(&helper, &paths.config, &progress_path, &snapshots).await?,
             }

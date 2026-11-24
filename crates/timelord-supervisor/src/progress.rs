@@ -275,6 +275,20 @@ pub struct Failure {
     pub kind: FailureKind,
     pub reason: String,
 }
+impl Failure {
+    pub fn reported(reason: impl Into<String>) -> Self {
+        Self {
+            kind: FailureKind::Reported,
+            reason: reason.into(),
+        }
+    }
+    pub fn unresponsive(reason: impl Into<String>) -> Self {
+        Self {
+            kind: FailureKind::Unresponsive,
+            reason: reason.into(),
+        }
+    }
+}
 pub struct Watchdog {
     started: Instant,
     last: Option<Instant>,
@@ -320,29 +334,23 @@ impl Watchdog {
             .map(|last| now.saturating_duration_since(last).as_secs())
     }
     pub fn failure(&self, now: Instant) -> Option<Failure> {
-        let failure = |kind, reason| Some(Failure { kind, reason });
         if self.failed {
-            return failure(
-                FailureKind::Reported,
-                "Worker reported an essential task failure".into(),
-            );
+            return Some(Failure::reported(
+                "Worker reported an essential task failure",
+            ));
         }
         if self.last.is_none()
             && now.saturating_duration_since(self.started) > Duration::from_secs(120)
         {
-            return failure(
-                FailureKind::Unresponsive,
-                "Worker did not report startup progress within 120 seconds".into(),
-            );
+            return Some(Failure::unresponsive(
+                "Worker did not report startup progress within 120 seconds",
+            ));
         }
         if self
             .last
             .is_some_and(|last| now.saturating_duration_since(last) > Duration::from_secs(30))
         {
-            return failure(
-                FailureKind::Unresponsive,
-                "Worker progress heartbeat expired".into(),
-            );
+            return Some(Failure::unresponsive("Worker progress heartbeat expired"));
         }
         for (lane, work) in self.stages.iter().enumerate() {
             if let Some((work, since)) = work
@@ -350,13 +358,10 @@ impl Watchdog {
                     .allowance()
                     .is_some_and(|limit| now.saturating_duration_since(*since) > limit)
             {
-                return failure(
-                    FailureKind::Reported,
-                    format!(
-                        "Work deadline exceeded: lane={lane} request={} generation={} stage={:?} target={}",
-                        work.id, work.generation, work.stage, work.iterations
-                    ),
-                );
+                return Some(Failure::reported(format!(
+                    "Work deadline exceeded: lane={lane} request={} generation={} stage={:?} target={}",
+                    work.id, work.generation, work.stage, work.iterations
+                )));
             }
         }
         None
@@ -703,6 +708,21 @@ mod tests {
         let deadline = watch.failure(now + Duration::from_secs(61)).unwrap();
         assert_eq!(deadline.kind, FailureKind::Reported);
         assert!(deadline.reason.contains("deadline"));
+
+        // A reported failure is sticky and wins over an expired heartbeat.
+        let mut watch = Watchdog::new(now);
+        let mut report = snapshot(1, Stage::WaitingForClient, 1);
+        report.failed = true;
+        watch.observe(report, now);
+        let sticky = watch.failure(now + Duration::from_secs(31)).unwrap();
+        assert_eq!(sticky.kind, FailureKind::Reported);
+
+        // An expired heartbeat wins over a work deadline when no report arrived.
+        let mut watch = Watchdog::new(now);
+        watch.observe(snapshot(1, Stage::Verifying, 1), now);
+        let silent = watch.failure(now + Duration::from_secs(61)).unwrap();
+        assert_eq!(silent.kind, FailureKind::Unresponsive);
+        assert!(silent.reason.contains("heartbeat"));
     }
 
     #[test]
