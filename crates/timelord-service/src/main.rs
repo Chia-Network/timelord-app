@@ -218,9 +218,7 @@ fn parse_config(path: &Path, text: &str) -> Result<Config> {
             *path = parent.join(&*path);
         }
     }
-    if config.connections.active_id.is_none() && config.connections.profiles.is_empty() {
-        config.remember_connection().map_err(anyhow::Error::msg)?;
-    }
+    config.remember_connection().map_err(anyhow::Error::msg)?;
     config.validate().map_err(anyhow::Error::msg)?;
     network::resolve(&config.node)?;
     for profile in &config.connections.profiles {

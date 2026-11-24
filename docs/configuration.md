@@ -142,17 +142,25 @@ ca_certificate = "private-ca.crt"
 Custom bundles additionally include `network.json` (schema 1): the exact
 `network_id`, `GENESIS_CHALLENGE` and selected constant overrides, export time,
 Chia version and selected configuration overrides. The importer validates the
-network ID/genesis and stores this under `[node.network_definition]`; it does not
-keep a reference to the transfer folder. Network IDs use 1–64 lowercase letters,
-digits or hyphens. Missing or mismatched definitions are rejected before saving.
-Mainnet and Testnet11 continue using their pinned built-in definitions.
+network ID/genesis and stores this in the node's `network_definition` table: the
+top-level `[node]` for a single node, or the active profile's `node` table when
+profiles are used. It does not keep a reference to the transfer folder. Network
+IDs use 1–64 lowercase letters, digits or hyphens. Missing or mismatched
+definitions are rejected before saving. Mainnet and Testnet11 continue using
+their pinned built-in definitions.
 
 Saved connection profiles live in `[connections]` with `active_id` and
 `[[connections.profiles]]` entries containing `id`, `name` and a complete `node`
-table. Existing single-node configurations migrate in memory when read and are persisted
-on the next save or import. The
-top-level `[node]` is the selected profile's runtime projection; saving synchronizes
-its edits into that profile. Imported profiles retain independent credential paths
+table. When profiles are used, `[connections]` is the single persisted source of
+truth: saving writes no `[node]` block, and the runtime node is derived from the
+active profile. A single-node configuration keeps only a plain `[node]` table and
+migrates in memory when read; the next save or import persists it as a profile.
+Files that already contain both tables load cleanly only while `[node]` equals
+the active profile; it is then omitted from the next save. A partial, empty or
+hand-edited `[node]` table with profiles configured is rejected with an
+actionable error instead of being ignored or used, because it would otherwise
+silently override or wipe the profile. Edit the selected profile to change the
+node. Imported profiles retain independent credential paths
 and RPC settings. UI selection is staged until saved; a running worker needs
 Save & Restart to change connections. For CLI administration,
 `select-node --config FILE --profile ID` selects and saves an existing profile
@@ -164,6 +172,18 @@ helper JSON represent integers as `{ integer = "decimal digits" }`, preserving
 the full supported `u128` range through TOML and macOS settings edits. This also
 keeps numeric constants distinct from quoted strings. The resolver checks the
 pinned scheduler's parameter invariants before accepting imports or settings.
+
+Custom constants are strict. Unknown or misspelled names, `null` values (TOML
+cannot represent them), and legacy/current alias pairs supplied together (for
+example `MIN_PLOT_SIZE` with `MIN_PLOT_SIZE_V1`, or `NETWORK_TYPE` with
+`TESTNET`) are rejected instead of silently keeping a mainnet value. The
+exporter copies `network_overrides.constants[<network>]` verbatim, and Chia
+never prunes stale keys, so exports may include historical fork heights
+(`SOFT_FORK4_HEIGHT`–`SOFT_FORK7_HEIGHT`), early testnet freeze keys, the
+derived `AGG_SIG_*` values other than `AGG_SIG_ME_ADDITIONAL_DATA`, and the
+presentation key `BECH32M_PREFIX` that the pinned scheduler does not consume.
+These are type-checked and deliberately ignored; every other key must be one the
+pinned scheduler can apply.
 
 Custom chain constants also form part of the saved-history scope and last-good
 fallback identity. Reusing a network name with another genesis or different

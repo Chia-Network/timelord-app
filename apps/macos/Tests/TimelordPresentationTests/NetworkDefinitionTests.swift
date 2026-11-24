@@ -32,4 +32,20 @@ final class NetworkDefinitionTests: XCTestCase {
         let node = try decoder.decode(NodeConfiguration.self, from: Data("{\"host\":\"localhost\",\"port\":8444,\"network\":\"mainnet\"}".utf8))
         XCTAssertNil(node.networkDefinition)
     }
+
+    func testNetworkConstantsRejectNullBecauseTomlCannotRepresentIt() {
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        for constants in [
+            #"{"GENESIS_CHALLENGE":null}"#,
+            #"{"GENESIS_CHALLENGE":"abababababababababababababababababababababababababababababababab","SOMETHING":null}"#,
+            #"{"GENESIS_CHALLENGE":"abababababababababababababababababababababababababababababababab","SOMETHING":[1,null]}"#,
+        ] {
+            let data = Data("""
+            {"host":"localhost","port":8444,"network":"ephemeral-fixture",
+             "network_definition":{"schema_version":1,"network_id":"ephemeral-fixture",
+              "exported_at":"fixture","chia_version":"fixture","constants":\(constants)}}
+            """.utf8)
+            XCTAssertThrowsError(try decoder.decode(NodeConfiguration.self, from: data), constants)
+        }
+    }
 }

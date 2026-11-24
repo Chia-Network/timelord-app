@@ -50,7 +50,7 @@ pub async fn connect(config: &Config) -> Result<Socket> {
             .context("Choose the node CA certificate")?,
     };
     let tls = identity.client().context("Loading node credentials")?;
-    let network = crate::network::handshake_id(&config.node).to_owned();
+    let network = config.node.network.label().to_owned();
     let server_name = config
         .node
         .server_name

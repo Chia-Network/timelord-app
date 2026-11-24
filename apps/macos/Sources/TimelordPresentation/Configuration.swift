@@ -2,11 +2,79 @@ import Foundation
 
 public struct AppConfiguration: Codable, Sendable, Equatable {
     public var schemaVersion = 1
-    public var node = NodeConfiguration()
     public var connections: ConnectionProfiles?
     public var service = ServiceConfiguration()
     public var hardware = HardwareConfiguration()
+    /// Single-node storage; ignored while `connections.profiles` is non-empty.
+    private var singleNode = NodeConfiguration()
+
+    /// The active node is derived from the active profile. Only a single-node
+    /// configuration stores it directly, so there is no second mutable owner.
+    public var node: NodeConfiguration {
+        get {
+            guard let connections,
+                  let active = connections.profiles.first(where: { $0.id == connections.activeId })
+            else { return singleNode }
+            return active.node
+        }
+        set {
+            if let index = activeProfileIndex {
+                connections?.profiles[index].node = newValue
+            } else {
+                singleNode = newValue
+            }
+        }
+    }
+    private var activeProfileIndex: Int? {
+        guard let connections else { return nil }
+        return connections.profiles.firstIndex { $0.id == connections.activeId }
+    }
+    private var profileConnections: ConnectionProfiles? {
+        guard let connections, !connections.profiles.isEmpty else { return nil }
+        return connections
+    }
+
     public init() {}
+    private enum CodingKeys: String, CodingKey { case schemaVersion, node, connections, service, hardware }
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        service = try container.decode(ServiceConfiguration.self, forKey: .service)
+        hardware = try container.decode(HardwareConfiguration.self, forKey: .hardware)
+        connections = try container.decodeIfPresent(ConnectionProfiles.self, forKey: .connections)
+        let supplied = try container.decodeIfPresent(NodeConfiguration.self, forKey: .node)
+        if profileConnections != nil {
+            guard activeProfileIndex != nil else {
+                throw DecodingError.dataCorruptedError(forKey: .connections, in: container,
+                    debugDescription: "Connection profiles require one existing active profile")
+            }
+            if let supplied, supplied != node {
+                throw DecodingError.dataCorruptedError(forKey: .node, in: container,
+                    debugDescription: "[node] is not used when [[connections.profiles]] are configured; edit the active profile instead")
+            }
+        } else {
+            singleNode = supplied ?? NodeConfiguration()
+        }
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(schemaVersion, forKey: .schemaVersion)
+        try container.encode(service, forKey: .service)
+        try container.encode(hardware, forKey: .hardware)
+        if let profileConnections {
+            try container.encode(profileConnections, forKey: .connections)
+        } else {
+            if let connections { try container.encode(connections, forKey: .connections) }
+            try container.encode(singleNode, forKey: .node)
+        }
+    }
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.schemaVersion == rhs.schemaVersion
+            && lhs.service == rhs.service
+            && lhs.hardware == rhs.hardware
+            && lhs.node == rhs.node
+            && lhs.profileConnections == rhs.profileConnections
+    }
 }
 public struct ConnectionProfiles: Codable, Sendable, Equatable {
     public var activeId: String?
@@ -44,13 +112,17 @@ public struct NetworkDefinition: Codable, Sendable, Equatable {
 }
 
 /// Preserve nested overrides through settings edits. The helper normalizes
-/// integers to {"integer": "decimal digits"} so even u128 stays exact.
+/// integers to {"integer": "decimal digits"} so even u128 stays exact. TOML
+/// cannot represent null, so neither configuration nor definitions accept it.
 public indirect enum NetworkValue: Codable, Sendable, Equatable {
-    case string(String), number(Decimal), bool(Bool), array([NetworkValue]), object([String: NetworkValue]), null
+    case string(String), number(Decimal), bool(Bool), array([NetworkValue]), object([String: NetworkValue])
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
-        if container.decodeNil() { self = .null }
-        else if let value = try? container.decode(Bool.self) { self = .bool(value) }
+        guard !container.decodeNil() else {
+            throw DecodingError.dataCorruptedError(in: container,
+                debugDescription: "Network constant values cannot be null")
+        }
+        if let value = try? container.decode(Bool.self) { self = .bool(value) }
         else if let value = try? container.decode(String.self) { self = .string(value) }
         else if let value = try? container.decode(Decimal.self) { self = .number(value) }
         else if let value = try? container.decode([NetworkValue].self) { self = .array(value) }
@@ -64,7 +136,6 @@ public indirect enum NetworkValue: Codable, Sendable, Equatable {
         case .bool(let value): try container.encode(value)
         case .array(let value): try container.encode(value)
         case .object(let value): try container.encode(value)
-        case .null: try container.encodeNil()
         }
     }
 }

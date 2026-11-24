@@ -2,139 +2,47 @@
 use anyhow::{Context, Result, bail};
 use dg_xch_core::consensus::{
     chain_definition::{ChainSelection, ResolvedChain},
-    constants::MAINNET,
+    constants::{ConsensusConstants, MAINNET},
 };
-use timelord_core::{Network, NodeConfig};
+use std::collections::BTreeMap;
+use timelord_core::{Network, NetworkValue, NodeConfig};
 
-pub fn handshake_id(node: &NodeConfig) -> &str {
-    node.network.label()
-}
+/// Chia override/consensus keys the pinned scheduler does not consume. The
+/// exporter copies `network_overrides.constants[<network>]` verbatim, Chia never
+/// prunes stale keys, and its own loader ignores unknown names, so real exports
+/// across releases carry these. Accept them with their types checked; never
+/// silently ignore arbitrary names.
+const UNUSED_CHIA_CONSTANTS: &[&str] = &[
+    "AGG_SIG_PARENT_ADDITIONAL_DATA",
+    "AGG_SIG_PUZZLE_ADDITIONAL_DATA",
+    "AGG_SIG_AMOUNT_ADDITIONAL_DATA",
+    "AGG_SIG_PUZZLE_AMOUNT_ADDITIONAL_DATA",
+    "AGG_SIG_PARENT_AMOUNT_ADDITIONAL_DATA",
+    "AGG_SIG_PARENT_PUZZLE_ADDITIONAL_DATA",
+    "BECH32M_PREFIX",
+    // Chia 2.3-2.5 shipped these forks; the pinned scheduler has no field yet.
+    "SOFT_FORK4_HEIGHT",
+    "SOFT_FORK5_HEIGHT",
+    "SOFT_FORK6_HEIGHT",
+    "SOFT_FORK7_HEIGHT",
+    // Early testnet overrides that current Chia also ignores.
+    "INITIAL_FREEZE_PERIOD",
+    "INITIAL_FREEZE_END_TIMESTAMP",
+];
 
 pub fn resolve(node: &NodeConfig) -> Result<ResolvedChain> {
+    let identity = node.chain_identity().map_err(anyhow::Error::msg)?;
     let Network::Custom(_) = &node.network else {
         return ChainSelection::from_config(node.network.label(), None)
             .and_then(|chain| chain.resolve())
             .map_err(anyhow::Error::msg);
     };
-    let definition = node
-        .network_definition
-        .as_ref()
-        .context("Missing custom network definition")?;
-    definition
-        .validate(&node.network)
-        .map_err(anyhow::Error::msg)?;
+    let definitions = identity
+        .constants()
+        .context("Custom network definition has no constants")?;
     let mut constants = MAINNET;
     constants.is_testnet = true;
-    for (name, value) in &definition.constants {
-        // These are the fields represented by the pinned upstream constants.
-        // Keep newer fields in the definition; they do not extend its capabilities.
-        macro_rules! numeric {
-            ($($field:ident),* $(,)?) => {
-                match name.to_ascii_lowercase().as_str() {
-                    $(stringify!($field) => {
-                        constants.$field = value.unsigned().map_err(anyhow::Error::msg)
-                            .with_context(|| format!("Invalid network constant {name}"))?;
-                        continue;
-                    })*
-                    _ => {}
-                }
-            };
-        }
-        numeric!(
-            slot_blocks_target,
-            min_blocks_per_challenge_block,
-            max_sub_slot_blocks,
-            num_sps_sub_slot,
-            sub_slot_iters_starting,
-            difficulty_constant_factor,
-            difficulty_starting,
-            difficulty_change_max_factor,
-            sub_epoch_blocks,
-            epoch_blocks,
-            significant_bits,
-            discriminant_size_bits,
-            number_zero_bits_plot_filter,
-            min_plot_size,
-            max_plot_size,
-            sub_slot_time_target,
-            num_sp_intervals_extra,
-            max_future_time,
-            max_future_time2,
-            number_of_timestamps,
-            max_vdf_witness_size,
-            mempool_block_buffer,
-            max_coin_amount,
-            max_block_cost_clvm,
-            cost_per_byte,
-            weight_proof_threshold,
-            weight_proof_recent_blocks,
-            max_block_count_per_requests,
-            blocks_cache_size,
-            max_generator_size,
-            max_generator_ref_list_size,
-            pool_sub_slot_iters,
-            soft_fork2_height,
-            soft_fork3_height,
-            soft_fork8_height,
-            soft_fork9_height,
-            hard_fork_height,
-            hard_fork_fix_height,
-            hard_fork2_height,
-            plot_filter_128_height,
-            plot_filter_64_height,
-            plot_filter_32_height,
-            number_zero_bits_plot_filter_v2,
-            plot_size_v2,
-            filter_window_size,
-            max_effective_plot_filter_bits,
-            min_plot_strength,
-            max_plot_strength,
-            plot_v1_phase_out_epoch_bits,
-            plot_filter_v2_first_adjustment_height,
-            plot_filter_v2_second_adjustment_height,
-            plot_filter_v2_third_adjustment_height,
-        );
-        if name == "PLOT_FILTER_V2_RELATIVE_HEIGHT" {
-            let timelord_core::NetworkValue::Array(values) = value else {
-                bail!("Invalid PLOT_FILTER_V2_RELATIVE_HEIGHT");
-            };
-            let entries: Vec<u32> = values
-                .iter()
-                .map(|v| v.unsigned().map_err(anyhow::Error::msg))
-                .collect::<Result<_>>()?;
-            constants.plot_filter_v2_relative_height =
-                dg_xch_core::consensus::filter_schedule::FilterSchedule::try_from_slice(&entries)?;
-            continue;
-        }
-        match name.as_str() {
-            "GENESIS_CHALLENGE" => constants.genesis_challenge = hex_constant(name, value)?,
-            "AGG_SIG_ME_ADDITIONAL_DATA" => {
-                constants.agg_sig_me_additional_data = hex_constant(name, value)?
-            }
-            "GENESIS_PRE_FARM_POOL_PUZZLE_HASH" => {
-                constants.genesis_pre_farm_pool_puzzle_hash = hex_constant(name, value)?
-            }
-            "GENESIS_PRE_FARM_FARMER_PUZZLE_HASH" => {
-                constants.genesis_pre_farm_farmer_puzzle_hash = hex_constant(name, value)?
-            }
-            "MIN_PLOT_SIZE_V1" => {
-                constants.min_plot_size = value.unsigned().map_err(anyhow::Error::msg)?
-            }
-            "MAX_PLOT_SIZE_V1" => {
-                constants.max_plot_size = value.unsigned().map_err(anyhow::Error::msg)?
-            }
-            "NUMBER_ZERO_BITS_PLOT_FILTER_V1" => {
-                constants.number_zero_bits_plot_filter =
-                    value.unsigned().map_err(anyhow::Error::msg)?
-            }
-            "NETWORK_TYPE" => match value.unsigned::<u64>().ok() {
-                Some(0) => constants.is_testnet = false,
-                Some(1) => constants.is_testnet = true,
-                _ => bail!("Invalid NETWORK_TYPE"),
-            },
-            _ => {}
-        }
-    }
+    apply(&mut constants, definitions)?;
     // Reuse the pinned scheduler's pure constructor to validate all parameters
     // before an import/configuration can replace usable saved settings.
     dg_xch_timelord::scheduler::Scheduler::new(constants, false, None)
@@ -149,14 +57,201 @@ pub fn resolve(node: &NodeConfig) -> Result<ResolvedChain> {
     })
 }
 
+/// Apply every exported constant, rejecting unknown names and alias collisions.
+fn apply(
+    constants: &mut ConsensusConstants,
+    definitions: &BTreeMap<String, NetworkValue>,
+) -> Result<()> {
+    let mut claimed: BTreeMap<&str, &str> = BTreeMap::new();
+    for (name, value) in definitions {
+        let field = canonical_name(name);
+        if let Some(previous) = claimed.insert(field, name) {
+            bail!("Network constants {previous} and {name} are aliases; supply only one");
+        }
+        set(constants, field, name, value)?;
+    }
+    Ok(())
+}
+
+/// Legacy Chia names share the value of their current name.
+fn canonical_name(name: &str) -> &str {
+    match name {
+        "MIN_PLOT_SIZE_V1" => "MIN_PLOT_SIZE",
+        "MAX_PLOT_SIZE_V1" => "MAX_PLOT_SIZE",
+        "NUMBER_ZERO_BITS_PLOT_FILTER_V1" => "NUMBER_ZERO_BITS_PLOT_FILTER",
+        // `NETWORK_TYPE` is Chia's pre-`TESTNET` spelling of the same flag.
+        "NETWORK_TYPE" => "TESTNET",
+        _ => name,
+    }
+}
+
+fn unused_constant(name: &str, value: &NetworkValue) -> Result<()> {
+    match name {
+        "BECH32M_PREFIX" => {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .context("BECH32M_PREFIX must be a nonempty string")?;
+        }
+        name if name.starts_with("AGG_SIG_") => {
+            let text = value.as_str().context("Expected a 32-byte hex value")?;
+            if !timelord_core::is_hex_32(text) {
+                bail!("Network constant {name} must be 32 bytes of hex");
+            }
+        }
+        _ => {
+            value
+                .unsigned::<u64>()
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("Invalid network constant {name}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn set(
+    constants: &mut ConsensusConstants,
+    name: &str,
+    source: &str,
+    value: &NetworkValue,
+) -> Result<()> {
+    // Keys are already validated as uppercase, so this is an exact-name table.
+    macro_rules! numeric {
+        ($(($name:literal, $field:ident)),* $(,)?) => {
+            match name {
+                $(
+                    $name => {
+                        constants.$field = value.unsigned().map_err(anyhow::Error::msg)
+                            .with_context(|| format!("Invalid network constant {source}"))?;
+                        return Ok(());
+                    }
+                )*
+                _ => {}
+            }
+        };
+    }
+    numeric!(
+        ("SLOT_BLOCKS_TARGET", slot_blocks_target),
+        (
+            "MIN_BLOCKS_PER_CHALLENGE_BLOCK",
+            min_blocks_per_challenge_block
+        ),
+        ("MAX_SUB_SLOT_BLOCKS", max_sub_slot_blocks),
+        ("NUM_SPS_SUB_SLOT", num_sps_sub_slot),
+        ("SUB_SLOT_ITERS_STARTING", sub_slot_iters_starting),
+        ("DIFFICULTY_CONSTANT_FACTOR", difficulty_constant_factor),
+        ("DIFFICULTY_STARTING", difficulty_starting),
+        ("DIFFICULTY_CHANGE_MAX_FACTOR", difficulty_change_max_factor),
+        ("SUB_EPOCH_BLOCKS", sub_epoch_blocks),
+        ("EPOCH_BLOCKS", epoch_blocks),
+        ("SIGNIFICANT_BITS", significant_bits),
+        ("DISCRIMINANT_SIZE_BITS", discriminant_size_bits),
+        ("NUMBER_ZERO_BITS_PLOT_FILTER", number_zero_bits_plot_filter),
+        ("MIN_PLOT_SIZE", min_plot_size),
+        ("MAX_PLOT_SIZE", max_plot_size),
+        ("SUB_SLOT_TIME_TARGET", sub_slot_time_target),
+        ("NUM_SP_INTERVALS_EXTRA", num_sp_intervals_extra),
+        ("MAX_FUTURE_TIME", max_future_time),
+        ("MAX_FUTURE_TIME2", max_future_time2),
+        ("NUMBER_OF_TIMESTAMPS", number_of_timestamps),
+        ("MAX_VDF_WITNESS_SIZE", max_vdf_witness_size),
+        ("MEMPOOL_BLOCK_BUFFER", mempool_block_buffer),
+        ("MAX_COIN_AMOUNT", max_coin_amount),
+        ("MAX_BLOCK_COST_CLVM", max_block_cost_clvm),
+        ("COST_PER_BYTE", cost_per_byte),
+        ("WEIGHT_PROOF_THRESHOLD", weight_proof_threshold),
+        ("WEIGHT_PROOF_RECENT_BLOCKS", weight_proof_recent_blocks),
+        ("MAX_BLOCK_COUNT_PER_REQUESTS", max_block_count_per_requests),
+        ("BLOCKS_CACHE_SIZE", blocks_cache_size),
+        ("MAX_GENERATOR_SIZE", max_generator_size),
+        ("MAX_GENERATOR_REF_LIST_SIZE", max_generator_ref_list_size),
+        ("POOL_SUB_SLOT_ITERS", pool_sub_slot_iters),
+        ("SOFT_FORK2_HEIGHT", soft_fork2_height),
+        ("SOFT_FORK3_HEIGHT", soft_fork3_height),
+        ("SOFT_FORK8_HEIGHT", soft_fork8_height),
+        ("SOFT_FORK9_HEIGHT", soft_fork9_height),
+        ("HARD_FORK_HEIGHT", hard_fork_height),
+        ("HARD_FORK_FIX_HEIGHT", hard_fork_fix_height),
+        ("HARD_FORK2_HEIGHT", hard_fork2_height),
+        ("PLOT_FILTER_128_HEIGHT", plot_filter_128_height),
+        ("PLOT_FILTER_64_HEIGHT", plot_filter_64_height),
+        ("PLOT_FILTER_32_HEIGHT", plot_filter_32_height),
+        (
+            "NUMBER_ZERO_BITS_PLOT_FILTER_V2",
+            number_zero_bits_plot_filter_v2
+        ),
+        ("PLOT_SIZE_V2", plot_size_v2),
+        ("FILTER_WINDOW_SIZE", filter_window_size),
+        (
+            "MAX_EFFECTIVE_PLOT_FILTER_BITS",
+            max_effective_plot_filter_bits
+        ),
+        ("MIN_PLOT_STRENGTH", min_plot_strength),
+        ("MAX_PLOT_STRENGTH", max_plot_strength),
+        ("PLOT_V1_PHASE_OUT_EPOCH_BITS", plot_v1_phase_out_epoch_bits),
+        (
+            "PLOT_FILTER_V2_FIRST_ADJUSTMENT_HEIGHT",
+            plot_filter_v2_first_adjustment_height
+        ),
+        (
+            "PLOT_FILTER_V2_SECOND_ADJUSTMENT_HEIGHT",
+            plot_filter_v2_second_adjustment_height
+        ),
+        (
+            "PLOT_FILTER_V2_THIRD_ADJUSTMENT_HEIGHT",
+            plot_filter_v2_third_adjustment_height
+        ),
+    );
+    match name {
+        "PLOT_FILTER_V2_RELATIVE_HEIGHT" => {
+            let NetworkValue::Array(values) = value else {
+                bail!("Network constant {source} must be a list of relative heights");
+            };
+            let entries: Vec<u32> = values
+                .iter()
+                .map(|value| value.unsigned().map_err(anyhow::Error::msg))
+                .collect::<Result<_>>()
+                .with_context(|| format!("Invalid network constant {source}"))?;
+            constants.plot_filter_v2_relative_height =
+                dg_xch_core::consensus::filter_schedule::FilterSchedule::try_from_slice(&entries)
+                    .with_context(|| format!("Invalid network constant {source}"))?;
+        }
+        "GENESIS_CHALLENGE" => constants.genesis_challenge = hex_constant(source, value)?,
+        "AGG_SIG_ME_ADDITIONAL_DATA" => {
+            constants.agg_sig_me_additional_data = hex_constant(source, value)?;
+        }
+        "GENESIS_PRE_FARM_POOL_PUZZLE_HASH" => {
+            constants.genesis_pre_farm_pool_puzzle_hash = hex_constant(source, value)?;
+        }
+        "GENESIS_PRE_FARM_FARMER_PUZZLE_HASH" => {
+            constants.genesis_pre_farm_farmer_puzzle_hash = hex_constant(source, value)?;
+        }
+        "TESTNET" => constants.is_testnet = testnet(source, value)?,
+        _ if UNUSED_CHIA_CONSTANTS.contains(&name) => unused_constant(name, value)?,
+        _ => bail!("Unknown network constant {source}; only Chia consensus constants are accepted"),
+    }
+    Ok(())
+}
+
+fn testnet(name: &str, value: &NetworkValue) -> Result<bool> {
+    match value {
+        NetworkValue::Bool(value) => Ok(*value),
+        _ => match value.unsigned::<u64>().map_err(anyhow::Error::msg)? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => bail!("Network constant {name} must be 0, 1 or a boolean"),
+        },
+    }
+}
+
 fn hex_constant(
     name: &str,
-    value: &timelord_core::NetworkValue,
+    value: &NetworkValue,
 ) -> Result<dg_xch_core::blockchain::sized_bytes::Bytes32> {
     use std::str::FromStr;
-    let text = value.as_str().context("Expected hex network constant")?;
-    if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
-        bail!("Invalid 32-byte hex network constant {name}");
+    let text = value.as_str().context("Expected a 32-byte hex value")?;
+    if !timelord_core::is_hex_32(text) {
+        bail!("Network constant {name} must be 32 bytes of hex");
     }
     dg_xch_core::blockchain::sized_bytes::Bytes32::from_str(text).map_err(anyhow::Error::msg)
 }
@@ -184,7 +279,7 @@ pub fn yaml_overrides(
                     })
                     .collect::<Result<_>>()?,
             ),
-            _ => bail!("Unsupported network override value"),
+            _ => bail!("Unsupported network override value; TOML cannot represent null"),
         })
     }
     if value.is_badvalue() {
@@ -194,153 +289,4 @@ pub fn yaml_overrides(
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
-    pub fn node() -> NodeConfig {
-        NodeConfig { network: "ephemeral-fixture".parse().unwrap(),
-        network_definition: Some(serde_json::from_value(serde_json::json!({
-            "schema_version": 1, "network_id": "ephemeral-fixture",
-            "exported_at": "fixture", "chia_version": "fixture",
-            "constants": {"GENESIS_CHALLENGE": "ab".repeat(32),
-                "DIFFICULTY_STARTING": 250, "DIFFICULTY_CONSTANT_FACTOR": 10052721566054u64,
-                "SUB_SLOT_ITERS_STARTING": 33554432, "HARD_FORK2_HEIGHT": 9216,
-                "MIN_PLOT_SIZE": 18, "NETWORK_TYPE": 1,
-                "PLOT_FILTER_V2_RELATIVE_HEIGHT": [33000, 30000, 27000, 24000, 21000, 18000, 9216]},
-            "config_overrides": {"address_prefix": "txch"}
-        })).unwrap()), ..Default::default() }
-    }
-    #[test]
-    fn custom_id_and_exact_constants_round_trip_without_dgx_derivation() {
-        let node = node();
-        let config = timelord_core::Config {
-            node: node.clone(),
-            ..Default::default()
-        };
-        config.validate().unwrap();
-        let text = toml::to_string_pretty(&config).unwrap();
-        let restored: timelord_core::Config = toml::from_str(&text).unwrap();
-        assert_eq!(restored.node.network_definition, node.network_definition);
-        let resolved = resolve(&restored.node).unwrap();
-        assert_eq!(resolved.handshake_network_id, "ephemeral-fixture");
-        assert_eq!(handshake_id(&node), "ephemeral-fixture");
-        assert_eq!(
-            resolved
-                .constants
-                .genesis_challenge
-                .to_string()
-                .trim_start_matches("0x"),
-            "ab".repeat(32)
-        );
-        assert_eq!(resolved.constants.difficulty_starting, 250);
-        assert_eq!(
-            resolved.constants.difficulty_constant_factor,
-            10052721566054
-        );
-        assert_eq!(resolved.constants.sub_slot_iters_starting, 33554432);
-        assert_eq!(resolved.constants.hard_fork2_height, 9216);
-        assert_eq!(
-            resolved
-                .constants
-                .plot_filter_v2_relative_height
-                .entries()
-                .len(),
-            7
-        );
-        assert_eq!(
-            resolved.constants.plot_filter_v2_relative_height.entries(),
-            &[33000, 30000, 27000, 24000, 21000, 18000, 9216]
-        );
-        assert!(!resolved.allows_bootstrap);
-    }
-    #[test]
-    fn definitions_must_match_and_known_constants_must_have_correct_types() {
-        let mut config = timelord_core::Config {
-            node: node(),
-            ..Default::default()
-        };
-        config.node.network_definition.as_mut().unwrap().network_id = "different".into();
-        assert!(config.validate().is_err());
-        config.node = node();
-        config
-            .node
-            .network_definition
-            .as_mut()
-            .unwrap()
-            .constants
-            .insert("DIFFICULTY_STARTING".into(), "250".to_owned().into());
-        assert!(resolve(&config.node).is_err());
-        config.node.network_definition = None;
-        assert!(config.validate().is_err());
-        assert!("bad\"network".parse::<Network>().is_err());
-    }
-
-    #[test]
-    fn full_u128_constants_survive_json_toml_and_helper_json() {
-        for expected in [1u128 << 67, (1u128 << 127) + 1, u128::MAX] {
-            let mut json = serde_json::to_value(node()).unwrap();
-            // Simulate raw numeric JSON produced by the exporter, not tagged config.
-            json["network_definition"]["constants"]["DIFFICULTY_CONSTANT_FACTOR"] =
-                serde_json::from_str(&expected.to_string()).unwrap();
-            let config = timelord_core::Config {
-                node: serde_json::from_value(json).unwrap(),
-                ..Default::default()
-            };
-            let restored: timelord_core::Config =
-                toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
-            let restored: timelord_core::Config =
-                serde_json::from_str(&serde_json::to_string(&restored).unwrap()).unwrap();
-            assert_eq!(
-                resolve(&restored.node)
-                    .unwrap()
-                    .constants
-                    .difficulty_constant_factor,
-                expected
-            );
-        }
-        let yaml = yaml_rust2::YamlLoader::load_from_str(
-            "DIFFICULTY_CONSTANT_FACTOR: 147573952589676412928",
-        )
-        .unwrap();
-        assert_eq!(
-            yaml_overrides(&yaml[0]).unwrap()["DIFFICULTY_CONSTANT_FACTOR"]
-                .unsigned::<u128>()
-                .unwrap(),
-            1u128 << 67
-        );
-    }
-
-    #[test]
-    fn invalid_scheduler_parameters_cannot_replace_a_saved_config() {
-        let directory =
-            std::env::temp_dir().join(format!("tl-invalid-network-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("config.toml");
-        let mut config = timelord_core::Config {
-            node: node(),
-            ..Default::default()
-        };
-        crate::save(&path, &config).unwrap();
-        let saved = std::fs::read(&path).unwrap();
-        for (name, value) in [
-            ("NUM_SPS_SUB_SLOT", 0),
-            ("DIFFICULTY_STARTING", 0),
-            ("SUB_SLOT_ITERS_STARTING", 0),
-            ("DISCRIMINANT_SIZE_BITS", 17),
-        ] {
-            config.node = node();
-            config
-                .node
-                .network_definition
-                .as_mut()
-                .unwrap()
-                .constants
-                .insert(name.into(), value.into());
-            assert!(crate::save(&path, &config).is_err(), "{name}");
-            assert_eq!(std::fs::read(&path).unwrap(), saved);
-            let edited = directory.join("invalid.toml");
-            std::fs::write(&edited, toml::to_string(&config).unwrap()).unwrap();
-            assert!(crate::load(&edited).is_err(), "{name}");
-        }
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-}
+pub(crate) mod tests;

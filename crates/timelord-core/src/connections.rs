@@ -1,20 +1,59 @@
 use crate::{Config, Network, NodeConfig};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ConnectionProfiles {
     pub active_id: Option<String>,
     pub profiles: Vec<ConnectionProfile>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectionProfile {
     pub id: String,
     pub name: String,
     pub node: NodeConfig,
 }
+/// A `[node]` table is no longer a second owner once profiles are configured.
+pub const STRAY_NODE: &str = "[node] is not used when [[connections.profiles]] are configured; edit the active profile instead";
+
+/// An entry addressable by connection-profile ID.
+pub trait ProfileId {
+    fn profile_id(&self) -> &str;
+}
+impl ProfileId for ConnectionProfile {
+    fn profile_id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// One selection rule shared by persisted profiles and fallback network intent:
+/// a missing `active_id` is only valid when there are no profiles at all.
+fn select_index<T: ProfileId>(
+    active_id: Option<&str>,
+    profiles: &[T],
+) -> Result<Option<usize>, String> {
+    match active_id {
+        Some(active) => profiles
+            .iter()
+            .position(|profile| profile.profile_id() == active)
+            .map(Some)
+            .ok_or_else(|| "Selected connection profile does not exist".into()),
+        None if profiles.is_empty() => Ok(None),
+        None => Err("Connection profiles require one selected profile".into()),
+    }
+}
+pub fn select_profile<'a, T: ProfileId>(
+    active_id: Option<&str>,
+    profiles: &'a [T],
+) -> Result<Option<&'a T>, String> {
+    Ok(select_index(active_id, profiles)?.map(|index| &profiles[index]))
+}
+
 impl ConnectionProfiles {
+    /// Structural validation plus the runtime projection invariant. The runtime
+    /// node is derived from the active profile, so a legacy `[node]` table either
+    /// matches it or is rejected during deserialization.
     pub fn validate(&self, active_node: &NodeConfig) -> Result<(), String> {
         let mut ids = std::collections::HashSet::new();
         for profile in &self.profiles {
@@ -25,16 +64,39 @@ impl ConnectionProfiles {
             }
             profile.node.validate()?;
         }
-        match self
-            .active_id
-            .as_ref()
-            .and_then(|id| self.profiles.iter().find(|p| p.id == *id))
-        {
-            Some(profile) if profile.node == *active_node => {}
-            None if self.active_id.is_none() && self.profiles.is_empty() => {}
-            _ => return Err("Selected connection profile must match the active node".into()),
+        match self.selected()? {
+            Some(profile) if profile.node == *active_node => Ok(()),
+            None => Ok(()),
+            Some(_) => Err("The active connection profile must match [node]".into()),
         }
-        Ok(())
+    }
+    /// The selected profile, or `Ok(None)` for a single-node configuration.
+    pub fn selected(&self) -> Result<Option<&ConnectionProfile>, String> {
+        select_profile(self.active_id.as_deref(), &self.profiles)
+    }
+    pub fn active(&self) -> Option<&ConnectionProfile> {
+        self.selected().ok().flatten()
+    }
+    fn active_mut(&mut self) -> Result<Option<&mut ConnectionProfile>, String> {
+        let index = select_index(self.active_id.as_deref(), &self.profiles)?;
+        Ok(index.map(|index| &mut self.profiles[index]))
+    }
+    /// `[connections]` is the persisted source of truth. A `[node]` table that
+    /// equals the active profile is accepted as legacy input; a diverging one is
+    /// rejected instead of silently overriding or dropping operator edits. With
+    /// no profiles, `[node]` is the runtime node.
+    pub fn resolve_node(&self, node: Option<NodeConfig>) -> Result<NodeConfig, String> {
+        match self.selected()? {
+            Some(profile) => {
+                if let Some(node) = node
+                    && node != profile.node
+                {
+                    return Err(STRAY_NODE.into());
+                }
+                Ok(profile.node.clone())
+            }
+            None => Ok(node.unwrap_or_default()),
+        }
     }
     fn insert(&mut self, node: NodeConfig) -> String {
         let id = (1..)
@@ -62,28 +124,35 @@ impl ConnectionProfiles {
     }
 }
 impl Config {
-    /// Keep `[node]` as the runtime/backward-compatible projection. Profile
-    /// snapshots are synchronized at the persistence and selection boundaries.
-    pub fn remember_connection(&mut self) -> Result<(), String> {
-        if let Some(id) = &self.connections.active_id {
-            let profile = self
-                .connections
-                .profiles
-                .iter_mut()
-                .find(|p| p.id == *id)
-                .ok_or("Selected connection profile does not exist")?;
-            profile.node = self.node.clone();
-        } else if !self.connections.profiles.is_empty() {
-            return Err("Select an existing connection profile".into());
-        } else if self.node.certificate.is_some() {
+    /// Persist a credentialed single-node runtime as its first profile.
+    fn migrate_single_node(&mut self) -> Result<(), String> {
+        if self.connections.profiles.is_empty() && self.node.certificate.is_some() {
             self.node.validate()?;
             self.connections.active_id = Some(self.connections.insert(self.node.clone()));
         }
         Ok(())
     }
+    /// Switching or adding a connection commits the runtime node to the profile
+    /// that currently owns it; the runtime node is never copied between profiles.
+    fn commit_node(&mut self) -> Result<(), String> {
+        if let Some(profile) = self.connections.active_mut()? {
+            profile.node = self.node.clone();
+        }
+        Ok(())
+    }
+    /// Validate the selection and migrate a single-node configuration. Profiles
+    /// own their node, so saving never folds it into a different profile.
+    pub fn remember_connection(&mut self) -> Result<(), String> {
+        if self.connections.profiles.is_empty() {
+            return self.migrate_single_node();
+        }
+        self.connections.selected()?;
+        Ok(())
+    }
     pub fn add_connection(&mut self, node: NodeConfig) -> Result<(), String> {
         node.validate()?;
-        self.remember_connection()?;
+        self.migrate_single_node()?;
+        self.commit_node()?;
         self.connections.active_id = Some(self.connections.insert(node.clone()));
         self.node = node;
         Ok(())
@@ -100,7 +169,7 @@ impl Config {
             .ok_or("Connection profile does not exist")?
             .node
             .clone();
-        self.remember_connection()?;
+        self.commit_node()?;
         self.node = node;
         self.connections.active_id = Some(id.into());
         Ok(())
@@ -109,17 +178,7 @@ impl Config {
 
 impl NodeConfig {
     pub fn validate(&self) -> Result<(), String> {
-        if self.network.label().parse::<Network>()? != self.network {
-            return Err("Invalid network selection".into());
-        }
-        match (&self.network, &self.network_definition) {
-            (Network::Custom(_), Some(definition)) => definition.validate(&self.network)?,
-            (Network::Custom(_), None) => {
-                return Err("Import a definition for this custom network".into());
-            }
-            (_, Some(_)) => return Err("Built-in networks cannot use a custom definition".into()),
-            _ => {}
-        }
+        self.chain_identity()?;
         if self.host.trim().is_empty() || self.port == 0 {
             return Err("Node host and nonzero port are required".into());
         }
@@ -156,31 +215,203 @@ impl NodeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn legacy() -> Config {
-        let mut config = Config::default();
-        config.node.host = "mainnet.fixture".into();
-        config.node.certificate = Some("mainnet.crt".into());
-        config.node.private_key = Some("mainnet.key".into());
-        config.node.ca_certificate = Some("mainnet-ca.crt".into());
-        config.node.rpc = Some(crate::NodeRpcConfig {
-            host: "rpc-mainnet.fixture".into(),
-            port: 8555,
-            server_name: "chia.net".into(),
-            certificate: "rpc-mainnet.crt".into(),
-            private_key: "rpc-mainnet.key".into(),
-            ca_certificate: "rpc-mainnet-ca.crt".into(),
-        });
-        config
+    fn complete(host: &str, network: Network) -> NodeConfig {
+        NodeConfig {
+            host: host.into(),
+            network,
+            certificate: Some(format!("{host}.crt").into()),
+            private_key: Some(format!("{host}.key").into()),
+            ca_certificate: Some(format!("{host}-ca.crt").into()),
+            rpc: Some(crate::NodeRpcConfig {
+                host: format!("rpc-{host}"),
+                port: 8555,
+                server_name: "chia.net".into(),
+                certificate: format!("rpc-{host}.crt").into(),
+                private_key: format!("rpc-{host}.key").into(),
+                ca_certificate: format!("rpc-{host}-ca.crt").into(),
+            }),
+            ..Default::default()
+        }
     }
+    /// Serializes the pre-profile layout so migration tests use real old files.
+    #[derive(Serialize)]
+    struct Legacy<'a> {
+        schema_version: u32,
+        node: &'a NodeConfig,
+        connections: &'a ConnectionProfiles,
+        service: &'a crate::ServiceConfig,
+        hardware: &'a crate::HardwareConfig,
+    }
+    fn legacy_text(config: &Config) -> String {
+        legacy_text_with(config, &config.node)
+    }
+    fn legacy_text_with(config: &Config, node: &NodeConfig) -> String {
+        toml::to_string(&Legacy {
+            schema_version: config.schema_version,
+            node,
+            connections: &config.connections,
+            service: &config.service,
+            hardware: &config.hardware,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn single_node_configuration_keeps_node_and_never_invents_profiles() {
+        let config = Config {
+            node: complete("mainnet.fixture", Network::Mainnet),
+            ..Default::default()
+        };
+        let text = toml::to_string(&config).unwrap();
+        assert!(text.contains("[node]"));
+        let restored: Config = toml::from_str(&text).unwrap();
+        assert_eq!(restored.node, config.node);
+        assert!(restored.connections.profiles.is_empty());
+        assert_eq!(restored.connections.active_id, None);
+        restored.validate().unwrap();
+    }
+
+    #[test]
+    fn profiles_are_the_persisted_truth_and_node_is_derived() {
+        let mut config = Config {
+            node: complete("mainnet.fixture", Network::Mainnet),
+            ..Default::default()
+        };
+        let mut other = complete("testnet.fixture", Network::Testnet11);
+        other.port = 58444;
+        other.rpc = None;
+        config.add_connection(other.clone()).unwrap();
+        let selected = config.connections.active_id.clone().unwrap();
+        let first = config.connections.profiles[0].id.clone();
+        assert_eq!(config.node, other);
+
+        let text = toml::to_string(&config).unwrap();
+        assert!(!text.contains("[node]"), "{text}");
+        let restored: Config = toml::from_str(&text).unwrap();
+        assert_eq!(restored.node, other);
+        assert_eq!(restored.connections, config.connections);
+        restored.validate().unwrap();
+
+        config.select_connection(&first).unwrap();
+        assert_eq!(config.node.host, "mainnet.fixture");
+        config.select_connection(&selected).unwrap();
+        assert_eq!(config.node, other);
+        let before = toml::to_string(&config).unwrap();
+        assert!(config.select_connection("missing").is_err());
+        assert_eq!(toml::to_string(&config).unwrap(), before);
+    }
+
+    #[test]
+    fn matching_legacy_node_table_migrates_and_is_omitted_on_save() {
+        let mut config = Config {
+            node: complete("mainnet.fixture", Network::Mainnet),
+            ..Default::default()
+        };
+        config
+            .add_connection(complete("testnet.fixture", Network::Testnet11))
+            .unwrap();
+        let text = legacy_text(&config);
+        assert!(text.contains("[node]") && text.contains("[connections]"));
+        let restored: Config = toml::from_str(&text).unwrap();
+        assert_eq!(restored.node, config.node);
+        assert_eq!(restored.connections.active().unwrap().node, config.node);
+        restored.validate().unwrap();
+        let saved = toml::to_string(&restored).unwrap();
+        assert!(!saved.contains("[node]"));
+        assert_eq!(
+            toml::from_str::<Config>(&saved).unwrap().node,
+            restored.node
+        );
+    }
+
+    #[test]
+    fn diverging_stray_node_tables_are_rejected_loudly() {
+        let mut config = Config {
+            node: complete("mainnet.fixture", Network::Mainnet),
+            ..Default::default()
+        };
+        config
+            .add_connection(complete("testnet.fixture", Network::Testnet11))
+            .unwrap();
+        config.node.host = "edited.fixture".into();
+        let error = toml::from_str::<Config>(&legacy_text(&config))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("edit the active profile"), "{error}");
+        // `NodeConfig` fills omitted fields with defaults, so a partial table
+        // would otherwise wipe credentials and reset the network to mainnet.
+        let partial = NodeConfig {
+            host: "partial.fixture".into(),
+            ..Default::default()
+        };
+        let error = toml::from_str::<Config>(&legacy_text_with(&config, &partial))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("edit the active profile"), "{error}");
+    }
+
+    #[test]
+    fn diverging_projection_is_rejected_instead_of_silently_dropped() {
+        let mut config = Config {
+            node: complete("mainnet.fixture", Network::Mainnet),
+            ..Default::default()
+        };
+        config
+            .add_connection(complete("testnet.fixture", Network::Testnet11))
+            .unwrap();
+        config.node.host = "unsaved.fixture".into();
+        assert!(config.validate().is_err());
+        // Saving without going through add/select must not quietly fold the
+        // runtime node into a different profile.
+        config.remember_connection().unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn profile_selection_requires_one_existing_active_profile() {
+        let mut config = Config::default();
+        config.connections.profiles = vec![ConnectionProfile {
+            id: "a".into(),
+            name: "A".into(),
+            node: NodeConfig::default(),
+        }];
+        assert!(config.validate().is_err());
+        config.connections.active_id = Some("missing".into());
+        assert!(config.validate().is_err());
+        config.connections.active_id = Some("a".into());
+        config.node = NodeConfig::default();
+        config.validate().unwrap();
+
+        let mut empty = Config::default();
+        empty.connections.active_id = Some("a".into());
+        assert!(empty.validate().is_err());
+
+        let mut duplicate = Config::default();
+        duplicate.connections.profiles = vec![
+            ConnectionProfile {
+                id: "a".into(),
+                name: "A".into(),
+                node: NodeConfig::default(),
+            },
+            ConnectionProfile {
+                id: "a".into(),
+                name: "B".into(),
+                node: NodeConfig::default(),
+            },
+        ];
+        duplicate.connections.active_id = Some("a".into());
+        assert!(duplicate.validate().is_err());
+    }
+
     #[test]
     fn first_import_preserves_legacy_and_switches_complete_connections() {
-        let mut config = legacy();
+        let mut config = Config {
+            node: complete("mainnet.fixture", Network::Mainnet),
+            ..Default::default()
+        };
         let original = config.node.clone();
-        let mut other = original.clone();
-        other.host = "testnet.fixture".into();
+        let mut other = complete("testnet.fixture", Network::Testnet11);
         other.port = 58444;
-        other.network = Network::Testnet11;
-        other.private_key = Some("testnet.key".into());
         other.rpc = None;
         config.add_connection(other.clone()).unwrap();
         let selected = config.connections.active_id.clone().unwrap();
@@ -198,13 +429,14 @@ mod tests {
         let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
         assert_eq!(restored.node, config.node);
         assert_eq!(restored.connections.profiles.len(), 2);
-        let before = toml::to_string(&config).unwrap();
-        assert!(config.select_connection("missing").is_err());
-        assert_eq!(toml::to_string(&config).unwrap(), before);
     }
+
     #[test]
     fn repeated_imports_create_distinct_profiles_and_names() {
-        let mut config = legacy();
+        let mut config = Config {
+            node: complete("mainnet.fixture", Network::Mainnet),
+            ..Default::default()
+        };
         config.add_connection(config.node.clone()).unwrap();
         config.add_connection(config.node.clone()).unwrap();
         assert_eq!(config.connections.profiles.len(), 3);

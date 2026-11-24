@@ -4,8 +4,10 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+/// Only one persisted configuration schema is supported.
+const SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone)]
 pub struct Config {
     pub schema_version: u32,
     pub node: NodeConfig,
@@ -14,10 +16,75 @@ pub struct Config {
     pub hardware: HardwareConfig,
 }
 
+/// Serialized configuration selects exactly one node source: `[connections]`
+/// when profiles are used, otherwise the single `[node]` table.
+#[derive(serde::Serialize)]
+struct ConfigOut<'a> {
+    schema_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node: Option<&'a NodeConfig>,
+    connections: &'a ConnectionProfiles,
+    service: &'a ServiceConfig,
+    hardware: &'a HardwareConfig,
+}
+
+impl Serialize for Config {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        ConfigOut {
+            schema_version: self.schema_version,
+            node: self.connections.profiles.is_empty().then_some(&self.node),
+            connections: &self.connections,
+            service: &self.service,
+            hardware: &self.hardware,
+        }
+        .serialize(serializer)
+    }
+}
+
+/// Legacy files may carry both tables; `[connections]` is authoritative, so a
+/// `[node]` table must equal the active profile (migrated on read) or be absent.
+#[derive(serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ConfigIn {
+    schema_version: u32,
+    node: Option<NodeConfig>,
+    connections: ConnectionProfiles,
+    service: ServiceConfig,
+    hardware: HardwareConfig,
+}
+impl Default for ConfigIn {
+    fn default() -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            node: None,
+            connections: ConnectionProfiles::default(),
+            service: ServiceConfig::default(),
+            hardware: HardwareConfig::default(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Config {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = ConfigIn::deserialize(deserializer)?;
+        let node = wire
+            .connections
+            .resolve_node(wire.node)
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            schema_version: wire.schema_version,
+            node,
+            connections: wire.connections,
+            service: wire.service,
+            hardware: wire.hardware,
+        })
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: SCHEMA_VERSION,
             node: NodeConfig::default(),
             connections: ConnectionProfiles::default(),
             service: ServiceConfig::default(),
@@ -69,9 +136,13 @@ impl Default for NodeConfig {
 }
 
 mod connections;
-pub use connections::{ConnectionProfile, ConnectionProfiles};
+pub use connections::{
+    ConnectionProfile, ConnectionProfiles, ProfileId, STRAY_NODE, select_profile,
+};
 mod network;
-pub use network::{ChainIdentity, Network, NetworkDefinition, NetworkValue};
+pub use network::{
+    ChainIdentity, CustomNetworkId, Network, NetworkDefinition, NetworkValue, is_hex_32,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -288,7 +359,7 @@ pub struct Assignment {
 
 impl Config {
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != 1 {
+        if self.schema_version != SCHEMA_VERSION {
             return Err("Unsupported schema_version; expected 1".into());
         }
         self.node.validate()?;
