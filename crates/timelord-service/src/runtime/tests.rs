@@ -415,3 +415,64 @@ async fn rejects_an_incorrect_tls_server_name() {
 async fn full_node_session_keeps_answering_while_a_board_is_latched_off() {
     fixture("chia.net", true, false).await.unwrap();
 }
+
+struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for LogBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn capture_logs(run: impl FnOnce()) -> String {
+    let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = buffer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_writer(move || LogBuffer(writer.clone()))
+        .finish();
+    tracing::subscriber::with_default(subscriber, run);
+    String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
+}
+
+#[test]
+fn candidates_full_admission_maps_to_its_own_outcome() {
+    assert_eq!(
+        admission_outcome(Admission::CandidatesFull),
+        UnfinishedOutcome::CandidatesFull
+    );
+}
+
+#[test]
+fn candidates_full_logs_a_distinct_warning() {
+    let logs = capture_logs(|| log_admission(Admission::CandidatesFull, None, "retry"));
+    assert!(
+        logs.lines().any(|line| line.contains(" WARN ")
+            && line.contains(
+                "Unfinished block matches the current peak but the scheduled-candidate set is full"
+            )),
+        "{logs}"
+    );
+}
+
+#[test]
+fn retry_candidates_full_counts_only_its_outcome() {
+    let metrics = crate::observability::Metrics::new(timelord_core::Network::Mainnet).unwrap();
+    let hash = dg_xch_core::blockchain::sized_bytes::Bytes32::const_new([9; 32]);
+    handle_retry_outcome((hash, Ok(Admission::CandidatesFull)), &metrics);
+    assert_eq!(
+        metrics.counter("unfinished_candidates_total", &["candidates_full", "retry"]),
+        1
+    );
+    assert_eq!(
+        metrics.counter("unfinished_candidates_total", &["ignored", "retry"]),
+        0
+    );
+    assert_eq!(
+        metrics.counter("unfinished_candidates_total", &["duplicate", "retry"]),
+        0
+    );
+}

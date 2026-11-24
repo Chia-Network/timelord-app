@@ -149,6 +149,7 @@ fn admission_outcome(admission: Admission) -> UnfinishedOutcome {
         Admission::Admitted(_) => UnfinishedOutcome::Admitted,
         Admission::Deferred => UnfinishedOutcome::Deferred,
         Admission::DeferredQueueFull => UnfinishedOutcome::DeferredQueueFull,
+        Admission::CandidatesFull => UnfinishedOutcome::CandidatesFull,
         Admission::Duplicate => UnfinishedOutcome::Duplicate,
         Admission::Stale => UnfinishedOutcome::Stale,
         Admission::Ignored => UnfinishedOutcome::Ignored,
@@ -171,6 +172,10 @@ fn log_admission(admission: Admission, proof_version: Option<u8>, source: &'stat
         Admission::DeferredQueueFull => {
             tracing::warn!(source, "Deferred unfinished block queue is full")
         }
+        Admission::CandidatesFull => tracing::warn!(
+            source,
+            "Unfinished block matches the current peak but the scheduled-candidate set is full"
+        ),
         Admission::Duplicate => tracing::debug!(source, "Ignored duplicate unfinished block"),
         Admission::Stale => tracing::debug!(source, "Ignored stale unfinished block"),
         Admission::Ignored => {

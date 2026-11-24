@@ -679,3 +679,25 @@ fn admission_activity_counts_pending_work_without_a_metric_handle() {
     drop(Activity::new(&runtime, Chain::Challenge, None));
     assert_eq!(runtime.lock().unwrap().pending[0], 0);
 }
+#[test]
+fn candidates_full_is_exported_at_zero_before_any_event() {
+    let (shared, _, _) = fixture();
+    let body = Metrics::new(Network::Mainnet)
+        .unwrap()
+        .render(&shared, crate::unix_now())
+        .unwrap();
+    for source in ["node", "retry"] {
+        assert_eq!(
+            value(
+                &body,
+                "chia_timelord_unfinished_candidates_total",
+                &[
+                    "outcome=\"candidates_full\"",
+                    &format!("source=\"{source}\"")
+                ]
+            ),
+            Some(0.),
+            "{source}"
+        );
+    }
+}
