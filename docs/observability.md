@@ -182,14 +182,15 @@ window, after a five-minute counter lookback. Ordinary ASIC recoveries are allow
 and are not independently an alert. Inspect recovery rates together with delivered
 IPS and temperatures before adjusting a deployment's policy.
 
-Admission saturation is a warning, not a page for one event. The rule requires
-`increase(chia_timelord_unfinished_candidates_total{outcome=~"candidates_full|deferred_queue_full"}[5m]) > 2`
-for 10 minutes, so more than two dropped candidates in any five-minute window must
-persist across consecutive windows. A lone `candidates_full` or
-`deferred_queue_full` event, or a short burst, stays quiet. Keep the `outcome` and
-`source` labels on
-this alert: they distinguish the full candidate set from the full deferred queue
-and node frames from peak retries.
+`TimelordAdmissionSaturated` is a warning for sustained unfinished-block admission
+pressure, not a safety-critical fault. It sums `candidates_full` and
+`deferred_queue_full` across `source`, so drops split between node frames and peak
+retries still count together, and one instance raises one alert rather than one
+per label combination. The rule uses a fifteen-minute window with a five-minute
+hold and a ten-minute keep-firing tail; sparse drops stay quiet, while sustained
+pressure alerts and does not immediately re-fire during short dips. A large burst
+can exceed the threshold, then clears after the window and hold. See
+`monitoring/alerts.yml` for the exact expression.
 
 The example alert set also covers scrape/metric loss, internal failure, sustained
 node disconnection, missing required chain clients, verification failure, thermal

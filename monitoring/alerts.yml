@@ -60,8 +60,11 @@ groups:
           summary: An ASIC stopped at its temperature guard
       - alert: TimelordAdmissionSaturated
         expr: |
-          increase(chia_timelord_unfinished_candidates_total{job="timelord-app",outcome=~"candidates_full|deferred_queue_full"}[5m]) > 2
-        for: 10m
+          sum without (outcome, source) (
+            increase(chia_timelord_unfinished_candidates_total{job="timelord-app",outcome=~"candidates_full|deferred_queue_full"}[15m])
+          ) > 7
+        for: 5m
+        keep_firing_for: 10m
         labels:
           severity: warning
         annotations:
