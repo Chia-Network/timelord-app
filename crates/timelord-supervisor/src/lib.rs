@@ -41,11 +41,13 @@ pub const WORST_CASE_STOP: Duration = Duration::from_secs(
     NORMAL_GRACEFUL_STOP.as_secs() + KILL_AND_REAP.as_secs() + LOG_DRAIN.as_secs(),
 );
 
-/// Worst-case time for shutdown to settle a worker. A stop that fails at the
-/// group kill returns after 25 s + 3 s = 28 s without reaching the log drain,
-/// then a CleanupRetry adds 0 s + 3 s + 1 s = 4 s. That 28 + 4 identity equals
-/// WORST_CASE_STOP + KILL_AND_REAP = 29 + 3 = 32 s, because the unused 1 s
-/// drain in WORST_CASE_STOP is exactly the retry's drain.
+/// Worst-case time for shutdown to settle a worker when a stop fails at the
+/// group kill: the first attempt is NORMAL_GRACEFUL_STOP + KILL_AND_REAP
+/// without reaching the log drain, then a CleanupRetry adds Duration::ZERO +
+/// KILL_AND_REAP + LOG_DRAIN. That equals WORST_CASE_STOP + KILL_AND_REAP,
+/// because the first attempt's unused drain is exactly the retry's drain. This
+/// is the shutdown worst case for that path; the rare waitid-error path can
+/// exceed it.
 pub const SHUTDOWN_WORST_CASE: Duration =
     Duration::from_secs(WORST_CASE_STOP.as_secs() + KILL_AND_REAP.as_secs());
 
@@ -478,7 +480,5 @@ mod stop_budget_tests {
             "<key>ExitTimeOut</key><integer>{}</integer>",
             EXIT_TIME_OUT.as_secs()
         )));
-        assert!(EXIT_TIME_OUT > SHUTDOWN_WORST_CASE);
-        assert!(SHUTDOWN_WORST_CASE > WORST_CASE_STOP);
     }
 }

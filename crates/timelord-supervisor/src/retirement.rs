@@ -142,7 +142,6 @@ impl SupervisorState {
                 // Keep the child handle and reserved process-group identity:
                 // neither durable Pause nor a retry grants retirement evidence.
                 Lifecycle::CleanupFailed {
-                    killed: worker.killed,
                     worker,
                     next: Instant::now() + Duration::from_secs(120),
                     error: format!("Worker cleanup failed: {error:#}"),
@@ -167,7 +166,6 @@ impl SupervisorState {
     pub(crate) async fn retire_now(&mut self, snapshots: &watch::Sender<Published>) -> Result<()> {
         self.poll_retirement(snapshots, true).await;
         if self.lifecycle.worker().is_some() {
-            // A worker that already ignored group-SIGKILL gets no further SIGTERM wait.
             let cause = self.cleanup_cause();
             self.begin_retirement(cause);
             self.publish(snapshots);
@@ -182,7 +180,7 @@ impl SupervisorState {
     /// SIGKILLed; otherwise the worker may still be retiring natively.
     pub(crate) fn cleanup_cause(&self) -> Cause {
         match &self.lifecycle {
-            Lifecycle::CleanupFailed { killed: true, .. } => Cause::CleanupRetry,
+            Lifecycle::CleanupFailed { worker, .. } if worker.killed => Cause::CleanupRetry,
             _ => Cause::Requested,
         }
     }

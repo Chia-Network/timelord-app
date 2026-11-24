@@ -304,14 +304,12 @@ impl Worker {
         // The group-wide hard stop remains the bounded fallback.
         self.process.signal_leader(libc::SIGTERM);
         self.process.wait_for_exit(graceful).await?;
+        self.killed = true;
         #[cfg(test)]
         if self.stop_fail_after_kill > 0 {
             self.stop_fail_after_kill -= 1;
-            self.process.signal_group(libc::SIGKILL);
-            self.killed = true;
             anyhow::bail!("Injected worker cleanup failure after group kill");
         }
-        self.killed = true;
         let result = self.process.kill_and_reap(KILL_AND_REAP).await?;
         if tokio::time::timeout(LOG_DRAIN, async {
             for task in &mut self.log_tasks {
@@ -486,8 +484,6 @@ enum Lifecycle {
         worker: Box<Worker>,
         next: Instant,
         error: String,
-        /// The failed stop had already reached the group SIGKILL.
-        killed: bool,
     },
     Backoff {
         next: Instant,
@@ -873,9 +869,12 @@ async fn run(
                 },
                 result = &mut controls => { result??; break; },
                 Some(Envelope { request, reply }) = rx.recv() => {
-                    // A shutdown signal must not wait for Reload validation nor
-                    // let a just-validated Reload start a fresh retirement.
+                    // Shutdown does not wait for Reload validation. A validation
+                    // that already finished in the same poll may still start a
+                    // Requested retirement, which retire_now finishes within the
+                    // stop budget.
                     let result = tokio::select! {
+                        biased;
                         result = state.control(&paths, &helper, request, &snapshots) => Some(result),
                         _ = &mut stop => None,
                     };
