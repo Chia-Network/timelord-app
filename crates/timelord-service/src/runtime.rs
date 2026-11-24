@@ -387,10 +387,8 @@ fn waiting_for_infusion_confirmation(
     Ok(true)
 }
 async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
-    let process = shared.process.clone();
     let metrics = shared
         .metrics()
-        .cloned()
         .context("Node session requires a production runtime")?;
     {
         let mut state = shared.runtime.lock().expect("runtime");
@@ -425,7 +423,7 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
     let mut active: Option<WorkPlan> = None;
     let mut ready: Option<Completed> = None;
     let mut eligibility = None;
-    let progress = &process.progress;
+    let progress = &shared.process.progress;
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
@@ -579,7 +577,7 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                                 });
                                 let accepted = result?;
                                 for outcome in scheduler.take_retry_outcomes() {
-                                    handle_retry_outcome(outcome, &metrics);
+                                    handle_retry_outcome(outcome, metrics);
                                 }
                                 if accepted {
                                     {
@@ -598,7 +596,7 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                             }
                             ProtocolMessageTypes::NewGenesisTimelord => { if scheduler.set_genesis(decode_exact(message.data.as_slice())?)? { prime_infused(&mut primers,backend.clone(),None); } }
                             ProtocolMessageTypes::NewUnfinishedBlockTimelord => {
-                                let _ = handle_unfinished(&mut scheduler,message.data.as_slice(),&metrics);
+                                let _ = handle_unfinished(&mut scheduler,message.data.as_slice(),metrics);
                             }
                             ProtocolMessageTypes::RequestCompactProofOfTime => {},
                             _ => bail!("Unexpected node protocol message"),

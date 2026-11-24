@@ -179,7 +179,7 @@ impl AsicBackend {
         state.routing.iter().find(|a| a.chain == chain).cloned()
     }
     fn metrics(&self) -> Option<&Arc<crate::observability::Metrics>> {
-        (self.scope == RuntimeScope::Production).then_some(&self.process.metrics)
+        self.scope.metrics(&self.process)
     }
     /// Verify a suspect board without moving live routes or replacing its USB
     /// owner. Admission traffic has no production metrics or node submissions.
@@ -277,9 +277,9 @@ impl AsicBackend {
         }
         let mut activity = record_metric.then(|| {
             crate::observability::Activity::new(
-                self.runtime.clone(),
+                &self.runtime,
                 chain,
-                self.metrics().cloned(),
+                self.metrics().map(Arc::as_ref),
             )
         });
         loop {
@@ -421,7 +421,7 @@ impl AsicBackend {
         let route = self.route(chain).context("No available ASIC for chain")?;
         let board = &route.board_id;
         let physical = Some(route.engine);
-        let metrics = self.metrics().cloned();
+        let metrics = self.metrics();
         let epoch = self.runtime.lock().expect("runtime").metric_epoch;
         let process_progress = self.process.progress.clone();
         let scope = self.scope;
@@ -460,7 +460,7 @@ impl AsicBackend {
             // an async request cannot hide stuck GMP work or queue more of it.
             let seed = work.challenge.const_bytes().to_vec();
             let bits = work.discriminant_bits;
-            let metrics = metrics.clone();
+            let metrics = metrics.cloned();
             Some(
                 arithmetic::spawn(
                     process_progress.clone(),

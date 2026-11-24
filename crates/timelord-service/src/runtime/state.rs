@@ -98,6 +98,14 @@ pub(crate) enum RuntimeScope {
     Admission,
 }
 impl RuntimeScope {
+    /// Process metrics belong to the production service. Admission probes run
+    /// against the same process state but publish no operational telemetry.
+    pub(crate) fn metrics(
+        self,
+        process: &crate::operational::State,
+    ) -> Option<&Arc<crate::observability::Metrics>> {
+        (self == Self::Production).then_some(&process.metrics)
+    }
     pub(crate) fn io(
         self,
         lane: timelord_supervisor::progress::ProofLane,

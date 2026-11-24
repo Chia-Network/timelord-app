@@ -24,8 +24,7 @@ pub fn routes() -> Router<HttpState> {
 }
 async fn metrics(State(state): State<HttpState>) -> impl IntoResponse {
     let shared = state.current.borrow().clone();
-    let metrics = state.process.metrics.clone();
-    match metrics.render(&shared, crate::unix_now()) {
+    match state.process.metrics.render(&shared, crate::unix_now()) {
         Ok(body) => (
             StatusCode::OK,
             [(

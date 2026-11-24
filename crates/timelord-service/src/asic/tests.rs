@@ -698,11 +698,19 @@ async fn cancelled_proof_closes_its_partial_frame_and_releases_the_slot() {
     });
     let proving = tokio::spawn({
         let backend = backend.clone();
-        async move { backend.prove(Chain::Challenge, work(10, 64)).await }
+        async move {
+            backend
+                .prove_when_available(Chain::Challenge, work(10, 64), true)
+                .await
+        }
     });
     received.await.unwrap();
+    assert_eq!(backend.runtime.lock().unwrap().pending[0], 1);
     proving.abort();
     let _ = proving.await;
+    assert_eq!(backend.runtime.lock().unwrap().pending[0], 0);
+    let metrics = &backend.process.metrics;
+    assert_eq!(metrics.counter("work_cancelled_total", &["challenge"]), 1);
     tokio::time::timeout(Duration::from_secs(2), fixture)
         .await
         .unwrap()
@@ -853,9 +861,8 @@ async fn recovery_proofs_use_the_live_owner_pool_without_publishing_or_trusting_
         .hardware
         .boards
         .push(toml::from_str("id='a'\nname='A'\nprofile='manual'\nclient_port=18110").unwrap());
-    let plan = config.assignments().unwrap();
     let mut state = crate::runtime::RuntimeState::new(false);
-    state.routing = plan.clone();
+    state.routing = config.assignments().unwrap();
     state.boards.entry("a".into()).or_default().lifecycle =
         crate::board_lifecycle::BoardLifecycle::fixture(
             crate::board_lifecycle::Phase::Checking,
@@ -925,11 +932,15 @@ async fn recovery_proofs_use_the_live_owner_pool_without_publishing_or_trusting_
         state.boards["a"].lifecycle.status().fault,
         Some(crate::board_lifecycle::Fault::InvalidProof)
     );
-    assert_eq!(
-        backend
-            .process
-            .metrics
-            .counter("proofs_verified_total", &["challenge"]),
-        0
-    );
+    // Admission probes verify without publishing production telemetry.
+    let metrics = &backend.process.metrics;
+    assert_eq!(metrics.counter("proofs_verified_total", &["challenge"]), 0);
+    for stage in ["client_wait", "discriminant"] {
+        assert_eq!(
+            metrics.histogram_count("proof_duration_seconds", &["challenge", stage]),
+            0
+        );
+    }
+    assert_eq!(metrics.session_starts(Chain::Challenge), 0);
+    assert_eq!(metrics.counter("work_cancelled_total", &["challenge"]), 0);
 }
