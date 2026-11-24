@@ -261,9 +261,15 @@ pub fn import(config_path: &Path, manifest: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
+mod test_pki;
+
+#[cfg(test)]
+mod export_roundtrip;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+    use crate::connection::test_pki;
     #[test]
     fn imports_a_dedicated_identity_and_rejects_ca_keys_and_escaping_paths_without_replacing_config()
      {
@@ -273,21 +279,13 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         let source = directory.join("bundle");
         fs::create_dir(&source).unwrap();
-        let mut params = CertificateParams::new(vec!["fixture-ca".into()]).unwrap();
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let ca_key = KeyPair::generate().unwrap();
-        let ca = params.self_signed(&ca_key).unwrap();
-        let issuer = Issuer::from_params(&params, &ca_key);
-        let client_key = KeyPair::generate().unwrap();
-        let client = CertificateParams::new(vec!["fixture-client".into()])
-            .unwrap()
-            .signed_by(&client_key, &issuer)
-            .unwrap();
-        fs::write(source.join("client.crt"), client.pem()).unwrap();
-        fs::write(source.join("client.key"), client_key.serialize_pem()).unwrap();
+        let (issuer, ca_pem, ca_key_pem) = test_pki::ca("fixture-ca");
+        let (client_pem, client_key_pem) = test_pki::leaf(&issuer, &["fixture-client"]);
+        fs::write(source.join("client.crt"), client_pem).unwrap();
+        fs::write(source.join("client.key"), client_key_pem).unwrap();
         fs::set_permissions(source.join("client.key"), fs::Permissions::from_mode(0o600)).unwrap();
-        fs::write(source.join("ca.crt"), ca.pem()).unwrap();
-        fs::write(source.join("ca.key"), ca_key.serialize_pem()).unwrap();
+        fs::write(source.join("ca.crt"), ca_pem).unwrap();
+        fs::write(source.join("ca.key"), ca_key_pem).unwrap();
         fs::set_permissions(source.join("ca.key"), fs::Permissions::from_mode(0o600)).unwrap();
         let chia_root = directory.join("chia-root");
         let ssl = chia_root.join("config/ssl");

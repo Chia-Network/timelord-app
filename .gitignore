@@ -9,3 +9,4 @@
 *.key
 *.pem
 *.crt
+__pycache__/
