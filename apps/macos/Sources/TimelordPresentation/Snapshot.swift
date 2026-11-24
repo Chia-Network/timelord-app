@@ -192,6 +192,8 @@ public struct BoardSnapshot: Identifiable, Sendable {
         case .monitoring: return "Monitoring"
         case .cooldown: return "Recovery cooldown"
         case .waiting: return "Waiting for work"
+        case .holding: return "Settings held while boards change"
+        case .idle: return "Idle · no chains routed"
         case .learning, .unknown(_): return "Learning"
         }
     }
@@ -378,9 +380,7 @@ public enum RoutingState: StatusWireState {
 }
 
 public enum AutomaticState: StatusWireState {
-    case paused, testing, monitoring, cooldown, waiting
-    /// Used by older fixtures; current services report the states above.
-    case learning
+    case paused, testing, monitoring, cooldown, waiting, holding, idle, learning
     case unknown(String)
 
     public static let wireValues: [String: AutomaticState] = [
@@ -389,6 +389,8 @@ public enum AutomaticState: StatusWireState {
         "monitoring": .monitoring,
         "cooldown": .cooldown,
         "waiting": .waiting,
+        "holding": .holding,
+        "idle": .idle,
         "learning": .learning,
     ]
     public static func unrecognized(_ wireValue: String) -> Self { .unknown(wireValue) }

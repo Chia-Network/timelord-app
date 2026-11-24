@@ -761,6 +761,37 @@ extension PresentationTests {
         XCTAssertEqual(missing.phase, .boardMissing)
     }
 
+    func testAutomaticStateDecodesHoldingIdleAndLearning() throws {
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        func status(_ automaticState: String) throws -> ServiceStatus {
+            let board: [String: Any] = [
+                "id": "a", "name": "ASIC 1", "assigned_chains": ["challenge"],
+                "connected_clients": 1, "hardware_state": "connected", "profile": "Automatic",
+                "automatic": [
+                    "state": automaticState, "message": "",
+                    "active_seconds": 0, "cooldown_seconds": 0,
+                ],
+            ]
+            let object: [String: Any] = [
+                "api_version": 2, "service_pid": 42, "timestamp_unix": 1_000_000,
+                "started_unix": 999000, "timelord_state": "waiting_for_clients",
+                "message": "Waiting for ASIC clients", "production_enabled": true,
+                "proofs_delivered": 0, "tuning_paused": false,
+                "full_node": ["host": "fixture", "state": "ready"], "boards": [board],
+            ]
+            return try decoder.decode(ServiceStatus.self, from: JSONSerialization.data(withJSONObject: object))
+        }
+        let holding = LivePresentation.snapshot(status: try status("holding"), now: now)
+        XCTAssertEqual(holding.boards.first?.automatic?.state, .holding)
+        XCTAssertEqual(holding.boards.first?.automaticTitle, "Settings held while boards change")
+        let idle = LivePresentation.snapshot(status: try status("idle"), now: now)
+        XCTAssertEqual(idle.boards.first?.automatic?.state, .idle)
+        XCTAssertEqual(idle.boards.first?.automaticTitle, "Idle · no chains routed")
+        let learning = LivePresentation.snapshot(status: try status("learning"), now: now)
+        XCTAssertEqual(learning.boards.first?.automatic?.state, .learning)
+        XCTAssertEqual(learning.boards.first?.automaticTitle, "Learning")
+    }
+
     func testUnknownStatusValuesDecodeWithoutBreakingOlderApps() throws {
         let object: [String: Any] = [
             "api_version": 99, "service_pid": 42, "timestamp_unix": 1_000_000, "started_unix": 999000,
