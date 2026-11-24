@@ -41,8 +41,8 @@ impl Serialize for Config {
     }
 }
 
-/// Legacy files may carry both `[node]` and `[connections]`; `[node]` was the
-/// runtime projection, so it wins and is folded into the active profile.
+/// Legacy files may carry both tables; profiles are authoritative, so a
+/// `[node]` table is accepted and ignored whenever profiles are used.
 #[derive(serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ConfigIn {
@@ -66,7 +66,7 @@ impl Default for ConfigIn {
 
 impl<'de> Deserialize<'de> for Config {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let mut wire = ConfigIn::deserialize(deserializer)?;
+        let wire = ConfigIn::deserialize(deserializer)?;
         let node = wire.connections.resolve_node(wire.node);
         Ok(Self {
             schema_version: wire.schema_version,

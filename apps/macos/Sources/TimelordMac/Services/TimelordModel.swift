@@ -368,6 +368,13 @@ final class TimelordModel: ObservableObject {
     }
     func saveConfiguration() async {
         guard !operationInProgress else { return }; operationInProgress = true; defer { operationInProgress = false }
+        // Profiles are the persisted source of truth; fold the staged runtime
+        // node into its profile before submitting so the reload is not stale.
+        if var connections = configuration.connections,
+           let index = connections.profiles.firstIndex(where: { $0.id == connections.activeId }) {
+            connections.profiles[index].node = configuration.node
+            configuration.connections = connections
+        }
         do {
             let runtimeChanged = hasRuntimeSettingsChanges
             let nodeOnly = Self.onlyNodeDiffers(savedConfiguration, configuration)

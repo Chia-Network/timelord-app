@@ -110,19 +110,18 @@ struct NetworkOnly {
     network_definition: Option<timelord_core::NetworkDefinition>,
 }
 impl RequestedNetwork {
-    /// A legacy `[node]` table wins; profiles-only files carry their intent in
-    /// the active profile. An unresolvable active profile is not mainnet.
+    /// Profiles are the persisted source of truth: when they exist, their active
+    /// profile carries the network intent and any `[node]` table is ignored. An
+    /// unresolvable active profile is not mainnet.
     fn network(self) -> Result<NetworkOnly> {
-        if let Some(node) = self.node {
-            return Ok(node);
-        }
         let Some(connections) = self.connections else {
-            return Ok(NetworkOnly::default());
+            return Ok(self.node.unwrap_or_default());
         };
         if connections.profiles.is_empty() {
-            return match connections.active_id {
-                None => Ok(NetworkOnly::default()),
-                Some(_) => bail!("Connection profiles have no profiles"),
+            return match (self.node, connections.active_id) {
+                (Some(node), _) => Ok(node),
+                (None, None) => Ok(NetworkOnly::default()),
+                (None, Some(_)) => bail!("Connection profiles have no profiles"),
             };
         }
         let active = connections
@@ -402,7 +401,8 @@ mod tests {
         std::fs::write(&path, toml::to_string(&mainnet).unwrap()).unwrap();
         assert!(load_running(&path).is_err());
 
-        // A legacy [node] table still supplies the intent and wins over profiles.
+        // A legacy [node] table is ignored once profiles exist: the active
+        // profile still selects the chain and edits cannot force mainnet.
         std::fs::write(
             &path,
             "schema_version = 999\n\n[node]\nnetwork = \"mainnet\"\n\n[connections]\n\
@@ -410,7 +410,9 @@ mod tests {
              [connections.profiles.node]\nnetwork = \"testnet11\"\n",
         )
         .unwrap();
-        assert!(load_running(&path).is_err());
+        let (loaded, fallback) = load_running(&path).unwrap();
+        assert!(fallback);
+        assert_eq!(loaded.node.network, "testnet11".parse().unwrap());
 
         // Profiles with no resolvable active profile are not mainnet.
         for connections in ["active_id = \"missing\"\n", ""] {
@@ -433,6 +435,10 @@ mod tests {
              [[connections.profiles]]\nid = \"active\"\nname = \"Active\"\n\
              [connections.profiles.node]\nnetwork = \"mainnet\"\n",
             "schema_version = 999\n[connections]\nactive_id = \"active\"\nprofiles = []\n",
+            // An empty [node] table must not report mainnet intent either.
+            "schema_version = 999\n[node]\n\n[connections]\n\
+             [[connections.profiles]]\nid = \"active\"\nname = \"Active\"\n\
+             [connections.profiles.node]\nnetwork = \"testnet11\"\n",
         ] {
             std::fs::write(&path, text).unwrap();
             assert!(load_running(&path).is_err(), "{text}");

@@ -153,11 +153,12 @@ table. When profiles are used, `[connections]` is the single persisted source of
 truth: saving writes no `[node]` block, and the runtime node is derived from the
 active profile. A single-node configuration keeps only a plain `[node]` table and
 migrates in memory when read; the next save or import persists it as a profile.
-Files that already contain both tables are accepted: their `[node]` table was the
-legacy runtime projection, so it is folded into the active profile on read and
-omitted from the next save. A hand edit of `[node]` therefore still takes effect
-without falling back to the last-good checkpoint; edit the selected profile
-afterwards. Imported profiles retain independent credential paths
+Files that already contain both tables are accepted: `[connections]` is
+authoritative, so the `[node]` table is ignored on read and omitted from the next
+save. Edit the selected profile to change the node; a stale or partial `[node]`
+table can neither change the chain nor wipe profile credentials. The app writes
+staged node edits into the active profile when saving. Imported profiles retain
+independent credential paths
 and RPC settings. UI selection is staged until saved; a running worker needs
 Save & Restart to change connections. For CLI administration,
 `select-node --config FILE --profile ID` selects and saves an existing profile

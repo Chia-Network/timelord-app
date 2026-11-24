@@ -90,6 +90,43 @@ final class ConnectionProfileTests: XCTestCase {
         XCTAssertEqual(model.configuration.connections?.profiles.count, 1)
     }
 
+    func testSavingProjectsTheStagedNodeIntoTheActiveProfile() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("timelord-project-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let helper = directory.appendingPathComponent("helper")
+        let captured = directory.appendingPathComponent("submitted.json")
+        // Capture `configure` input, then return it for the reload.
+        try Data("""
+        #!/bin/sh
+        if [ "$1" = configuration ]; then cat '\(captured.path)'; else cp "$5" '\(captured.path)'; fi
+        """.utf8).write(to: helper)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+        var other = NodeConfiguration(); other.host = "other.fixture"
+        var profiles = ConnectionProfiles(); profiles.activeId = "active"
+        profiles.profiles = [
+            ConnectionProfile(id: "active", name: "Active", node: NodeConfiguration()),
+            ConnectionProfile(id: "other", name: "Other", node: other),
+        ]
+        var config = AppConfiguration(); config.connections = profiles
+        let controller = ServiceController(
+            configURL: directory.appendingPathComponent("config.toml"), helperURL: helper,
+            supervisorURL: helper)
+        let model = TimelordModel(
+            controller: controller, initialConfiguration: config, monitoringEnabled: false)
+        model.configuration.node.host = "edited.fixture"
+        await model.saveConfiguration()
+        XCTAssertNil(model.errorMessage)
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let submitted = try decoder.decode(
+            AppConfiguration.self, from: Data(contentsOf: captured))
+        XCTAssertEqual(submitted.connections?.profiles[0].node.host, "edited.fixture")
+        XCTAssertEqual(submitted.connections?.profiles[1].node.host, "other.fixture")
+        XCTAssertEqual(model.configuration.connections?.profiles[0].node.host, "edited.fixture")
+        XCTAssertEqual(model.configuration.node.host, "edited.fixture")
+        XCTAssertFalse(model.hasUnsavedSettings)
+    }
+
     func testRemovingProfilesSelectsRemainingConnectionAndLastRemovalReturnsToSetup() throws {
         var first = NodeConfiguration(); first.host = "first.fixture"
         first.certificate = "/fixture/first.crt"; first.privateKey = "/fixture/first.key"; first.caCertificate = "/fixture/ca.crt"
