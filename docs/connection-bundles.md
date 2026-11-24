@@ -94,10 +94,11 @@ challenge and exporting Chia version are shown with the selected profile. Remote
 bundle credentials are copied into private app storage, so the transfer folder is
 no longer required. Switching back to Mainnet does not remove the custom profile.
 
-The service uses the exact network ID in its peer handshake and applies exported
-constants represented by the pinned scheduler, with the pinned Chia Mainnet
-constants as the baseline for omitted values. Additional exported constants remain
-saved for provenance; importing them does not implement new consensus features.
+The service uses the exact network ID in its peer handshake and applies every
+exported constant, with the pinned Chia Mainnet constants as the baseline for
+omitted values. Unknown constant names are rejected. Chia keys the pinned
+scheduler does not consume are still accepted with their types checked and kept
+for provenance; they do not implement new consensus features.
 PoS2 verification, transition behavior and active-MMR support are unchanged. Import
 or handshake success does not establish consensus or hardware acceptance. The
 exporter does not test connections or run hardware.

@@ -34,7 +34,6 @@ pub fn local(config: &mut Config, root: &Path) -> Result<()> {
             .canonicalize()
             .context("Node CA certificate not found")?,
     );
-    validate_identity(&node)?;
     // The peer identity cannot authenticate private RPC. Use the installation's
     // existing RPC leaf; never read a CA signing key.
     node.rpc = None;
@@ -97,17 +96,27 @@ pub fn local(config: &mut Config, root: &Path) -> Result<()> {
                     .unwrap_or("config/ssl/ca/private_ca.crt"),
             );
             if certificate.is_file() && private_key.is_file() && ca_certificate.is_file() {
-                node.rpc = Some(timelord_core::NodeRpcConfig {
+                let rpc = timelord_core::NodeRpcConfig {
                     host: "localhost".into(),
                     port,
                     server_name: "chia.net".into(),
                     certificate: certificate.canonicalize()?,
                     private_key: private_key.canonicalize()?,
                     ca_certificate: ca_certificate.canonicalize()?,
-                });
+                };
+                // Sync status is optional. Keep the peer connection usable and
+                // leave unusable credentials out of the saved profile.
+                match validate_rpc_identity(&rpc) {
+                    Ok(()) => node.rpc = Some(rpc),
+                    Err(error) => tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "Ignoring the local full-node RPC identity; sync status remains unavailable"
+                    ),
+                }
             }
         }
     }
+    validate_peer_identity(&node)?;
     let mut candidate = config.clone();
     candidate.add_connection(node).map_err(anyhow::Error::msg)?;
     candidate.validate().map_err(anyhow::Error::msg)?;
@@ -115,20 +124,39 @@ pub fn local(config: &mut Config, root: &Path) -> Result<()> {
     *config = candidate;
     Ok(())
 }
+
+/// Validate the peer identity only. Private RPC is optional and must not stop a
+/// peer session; callers validate it where they use or import it.
+pub fn validate_peer_identity(node: &NodeConfig) -> Result<()> {
+    validate_client_identity(
+        node.certificate
+            .as_deref()
+            .context("Connection bundle has no client certificate")?,
+        node.private_key
+            .as_deref()
+            .context("Connection bundle has no client private key")?,
+        node.ca_certificate
+            .as_deref()
+            .context("Connection bundle has no CA certificate")?,
+    )
+}
+
 pub fn validate_identity(node: &NodeConfig) -> Result<()> {
+    validate_peer_identity(node)?;
+    if let Some(rpc) = &node.rpc {
+        validate_rpc_identity(rpc).context("Invalid RPC connection identity")?;
+    }
+    Ok(())
+}
+
+fn validate_rpc_identity(rpc: &timelord_core::NodeRpcConfig) -> Result<()> {
+    validate_client_identity(&rpc.certificate, &rpc.private_key, &rpc.ca_certificate)
+}
+
+/// A dedicated client leaf, signed by its own configured CA and usable as a
+/// TLS client identity. Shared by the peer and private-RPC connections.
+fn validate_client_identity(certificate: &Path, key: &Path, ca: &Path) -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let certificate = node
-        .certificate
-        .clone()
-        .context("Connection bundle has no client certificate")?;
-    let key = node
-        .private_key
-        .clone()
-        .context("Connection bundle has no client private key")?;
-    let ca = node
-        .ca_certificate
-        .clone()
-        .context("Connection bundle has no CA certificate")?;
     // Inspect the certificate, rather than a filename or PEM formatting.
     use x509_cert::der::Decode;
     let certificates =
@@ -144,21 +172,58 @@ pub fn validate_identity(node: &NodeConfig) -> Result<()> {
             bail!("Use a dedicated client identity, not a CA signing identity");
         }
     }
-    for root in dg_xch_core::ssl::load_certs(ca.to_str().context("Invalid CA certificate path")?)? {
-        let root = x509_cert::Certificate::from_der(root.as_ref())?;
+    let authorities =
+        dg_xch_core::ssl::load_certs(ca.to_str().context("Invalid CA certificate path")?)?;
+    if authorities.is_empty() {
+        bail!("CA certificate is empty");
+    }
+    for authority in &authorities {
+        let root = x509_cert::Certificate::from_der(authority.as_ref())?;
         if root.tbs_certificate().subject_public_key_info()
             == parsed.tbs_certificate().subject_public_key_info()
         {
             bail!("The client must use its own key, not the CA signing key");
         }
     }
+    verify_issued_by(leaf, &certificates[1..], &authorities)?;
     TlsIdentity {
-        certificate,
-        private_key: key,
-        ca_certificate: ca,
+        certificate: certificate.to_owned(),
+        private_key: key.to_owned(),
+        ca_certificate: ca.to_owned(),
     }
     .client()
     .context("Invalid connection identity")?;
+    Ok(())
+}
+
+/// Check the leaf signature against the configured CA. Comparing issuer names
+/// is not enough: a certificate can name the CA yet be signed by another key.
+fn verify_issued_by(
+    leaf: &rustls::pki_types::CertificateDer<'static>,
+    intermediates: &[rustls::pki_types::CertificateDer<'static>],
+    authorities: &[rustls::pki_types::CertificateDer<'static>],
+) -> Result<()> {
+    let mut roots = rustls::RootCertStore::empty();
+    for authority in authorities {
+        roots
+            .add(authority.clone())
+            .map_err(|_| anyhow::anyhow!("CA certificate is not a usable trust anchor"))?;
+    }
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .context("TLS crypto provider is not installed")?;
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        std::sync::Arc::new(roots),
+        provider.clone(),
+    )
+    .build()
+    .context("Invalid CA certificate")?;
+    verifier
+        .verify_client_cert(leaf, intermediates, rustls::pki_types::UnixTime::now())
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "The client certificate failed validation against the configured CA: {error}"
+            )
+        })?;
     Ok(())
 }
 fn bundled_path(directory: &Path, path: Option<&std::path::PathBuf>) -> Result<std::path::PathBuf> {
@@ -261,7 +326,7 @@ pub fn import(config_path: &Path, manifest: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
-mod test_pki;
+mod identity_tests;
 
 #[cfg(test)]
 mod export_roundtrip;
@@ -269,7 +334,7 @@ mod export_roundtrip;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connection::test_pki;
+    use crate::test_pki;
     #[test]
     fn imports_a_dedicated_identity_and_rejects_ca_keys_and_escaping_paths_without_replacing_config()
      {

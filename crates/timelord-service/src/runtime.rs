@@ -30,7 +30,7 @@ pub(crate) use state::RuntimeScope;
 pub use state::{Event, HardwareState, Observation, RawSpeed, RawState, RuntimeState};
 
 pub async fn connect(config: &Config) -> Result<Socket> {
-    crate::connection::validate_identity(&config.node)?;
+    crate::connection::validate_peer_identity(&config.node)?;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let identity = TlsIdentity {
         certificate: config

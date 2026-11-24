@@ -1,5 +1,5 @@
 //! Runs the real Python exporter and imports its output through the Rust importer.
-use super::test_pki;
+use crate::test_pki;
 use dg_xch_servers::transport::TlsIdentity;
 use sha2::{Digest, Sha256};
 use std::{

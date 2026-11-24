@@ -49,7 +49,7 @@ fn decode(bytes: &[u8]) -> Result<NodeSyncStatus> {
 }
 
 pub async fn fetch(rpc: &NodeRpcConfig) -> Result<NodeSyncStatus> {
-    crate::connection::validate_identity(&NodeConfig {
+    crate::connection::validate_peer_identity(&NodeConfig {
         certificate: Some(rpc.certificate.clone()),
         private_key: Some(rpc.private_key.clone()),
         ca_certificate: Some(rpc.ca_certificate.clone()),
@@ -163,7 +163,9 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let task = tokio::spawn(async move {
             let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
-            for _ in 0..3 {
+            // The valid fetch and the rejected server name reach the listener;
+            // the mismatched CA is rejected before the client dials.
+            for _ in 0..2 {
                 let (socket, _) = listener.accept().await.unwrap();
                 if let Ok(mut tls) = acceptor.accept(socket).await {
                     assert!(!tls.get_ref().1.peer_certificates().unwrap().is_empty());
