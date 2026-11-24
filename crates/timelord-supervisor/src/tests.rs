@@ -719,7 +719,7 @@ async fn cleanup_retry_skips_the_graceful_wait() {
     state.poll_retirement(&snapshots, true).await;
     assert!(
         started.elapsed() < Duration::from_secs(5),
-        "CleanupRetry waited for the graceful budget: {:?}",
+        "a group that was already SIGKILLed waited out a graceful budget: {:?}",
         started.elapsed()
     );
     assert!(matches!(state.lifecycle, Lifecycle::Paused));

@@ -56,17 +56,17 @@ pub const WORST_CASE_STOP: Duration = sum(sum(NORMAL_GRACEFUL_STOP, KILL_AND_REA
 
 /// Scheduling allowance for the bounded waits, which poll on 10-20 ms sleeps.
 const WAIT_SLOP: Duration = Duration::from_millis(100);
-/// Reap bounds a failing shutdown can spend: the first stop, the CleanupRetry
-/// and the final `OwnedProcess::Drop`.
+/// Reap bounds a failing shutdown can spend: the first stop, its retry and the
+/// final `OwnedProcess::Drop`.
 const SHUTDOWN_REAP_BOUNDS: u32 = 3;
 
 /// Worst-case time for shutdown to settle a worker. A stop that fails at the
 /// group kill waits out NORMAL_GRACEFUL_STOP and then its own KILL_AND_REAP,
-/// never reaching the log drain; the CleanupRetry spends another KILL_AND_REAP
-/// and fails the same way; the unreaped owner left behind then spends a final
-/// KILL_AND_REAP in `OwnedProcess::Drop` before the supervisor can exit. A
-/// failed attempt never re-grants the graceful wait, so every shutdown path
-/// stays inside this budget.
+/// never reaching the log drain; the retry spends another KILL_AND_REAP and
+/// fails the same way; the unreaped owner left behind then spends a final
+/// KILL_AND_REAP in `OwnedProcess::Drop` before the supervisor can exit. All
+/// attempts share one graceful wait, so every shutdown path stays inside this
+/// budget.
 pub const SHUTDOWN_WORST_CASE: Duration = sum(
     sum(
         NORMAL_GRACEFUL_STOP,
