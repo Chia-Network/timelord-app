@@ -8,6 +8,8 @@ mod config_checkpoint;
 mod connection;
 mod diagnostics;
 mod experiments;
+#[cfg(test)]
+mod export_roundtrip;
 mod hardware;
 mod history_buffer;
 mod history_store;

@@ -38,13 +38,13 @@ The repository includes `tools/export-fullnode-connection`. Run it on the full-n
 computer with the Python environment from that node's existing Chia installation:
 
 ```sh
-export CHIA_ROOT="/Volumes/LaCie/chia/test-2026-11-13-2-chia"
+export CHIA_ROOT="$HOME/.chia/mainnet"
 /path/to/chia/venv/bin/python tools/export-fullnode-connection
 ```
 
-All options are optional:
+Supply the Chia root with `--chia-root PATH` or `$CHIA_ROOT`; if neither is set,
+the tool exits with an error. The remaining options have defaults:
 
-- `--chia-root PATH` overrides `$CHIA_ROOT`. One of these must be supplied.
 - `--node-host HOST` overrides the suggested local routing address. The tool prints
   the suggestion; check that the Timelord Mac can reach it, especially with a VPN
   or multiple interfaces. If detection fails, supply this option explicitly.
@@ -100,56 +100,24 @@ PoS2 verification, transition behavior and active-MMR support are unchanged. Imp
 or handshake success does not establish consensus or hardware acceptance. The
 exporter does not test connections or run hardware.
 
-For a manual bundle instead, follow the steps below.
+## Bundle layout
 
-Use the Python environment from the node's Chia installation. Replace the first
-two values below with that environment's Python executable and the full node's
-address as reachable from the Timelord Mac. This example is for mainnet, port 8444.
-For testnet11, use `network = "testnet11"` and the node's configured peer port.
-
-```sh
-chia_python="/path/to/chia-blockchain/venv/bin/python"
-node_host="192.168.1.49"
-bundle_dir="$HOME/Desktop/Timelord-mainnet-connection"
-
-"$chia_python" - "$bundle_dir" "$node_host" <<'PY'
-import json
-import os
-import sys
-from pathlib import Path
-from chia.ssl.create_ssl import get_chia_ca_crt_key, generate_ca_signed_cert
-
-os.umask(0o077)
-bundle = Path(sys.argv[1])
-bundle.mkdir(mode=0o700, parents=True, exist_ok=False)
-ca_crt, ca_key = get_chia_ca_crt_key()
-generate_ca_signed_cert(ca_crt, ca_key, bundle / "client.crt", bundle / "client.key")
-(bundle / "client.key").chmod(0o600)
-(bundle / "ca.crt").write_bytes(ca_crt)
-(bundle / "connection.toml").write_text(
-    'schema_version = 1\n\n[node]\n'
-    f'host = {json.dumps(sys.argv[2])}\n'
-    'port = 8444\nnetwork = "mainnet"\nserver_name = "chia.net"\n'
-    'certificate = "client.crt"\nprivate_key = "client.key"\n'
-    'ca_certificate = "ca.crt"\n'
-)
-print(f"Created {bundle}")
-PY
-```
-
-This creates a fresh client identity using Chia's public peer CA, without changing
-the full node's certificates. The node's private CA is used separately for RPC.
-The output folder contains:
+The exporter writes:
 
 ```text
-Timelord-mainnet-connection/
+fullnode-NETWORK-connection/
   connection.toml
   client.crt
   client.key
   ca.crt
+  rpc-client.crt
+  rpc-client.key
+  private-ca.crt
+  network.json
+  README.txt
 ```
 
-For reference, the manifest is:
+`connection.toml` is the manifest the importer reads:
 
 ```toml
 schema_version = 1
@@ -162,12 +130,23 @@ server_name = "chia.net"
 certificate = "client.crt"
 private_key = "client.key"
 ca_certificate = "ca.crt"
+
+[node.rpc]
+host = "192.168.1.49"
+port = 8555
+server_name = "chia.net"
+certificate = "rpc-client.crt"
+private_key = "rpc-client.key"
+ca_certificate = "private-ca.crt"
 ```
 
-Credential paths must be relative and stay inside the folder, including through
-symlinks. Keep private keys mode 0600. Transfer the folder privately, for example
-with `scp -r`, and never include a CA signing key (`chia_ca.key` or `private_ca.key`).
-Create a separate client identity for each Timelord installation.
+`[node.rpc]` is omitted only for a deliberate peer-only bundle. For a custom
+network, `network.json` records the network ID, genesis challenge, exported
+constants, Chia version and export time; the importer reads it. Credential paths
+must be relative and stay inside the folder, including through symlinks. Keep
+private keys mode 0600, transfer the folder privately, for example with `scp -r`,
+and never include a CA signing key (`chia_ca.key` or `private_ca.key`). Create a
+separate client identity for each Timelord installation.
 
 ## Add sync status and height
 
@@ -176,32 +155,19 @@ authenticated private full-node RPC connection to display sync status and height
 Without it, proofs can run but node sync status is unavailable.
 Include it for the normal app setup.
 
-On the node computer, generate a dedicated RPC leaf identity using its private
-CA. Set `node_root` to the Chia root and keep the `chia_python` and `bundle_dir`
-variables from above. These paths assume the standard Chia SSL layout; use the
-paths in the node's `config.yaml` if customized.
+If the full node serves authenticated RPC on a reachable private-network address,
+export with `--rpc-host` and `--rpc-port` set to that address and port. If RPC
+stays on loopback, export a tunnel endpoint instead:
 
 ```sh
-node_root="/path/to/chia/mainnet"
-"$chia_python" - "$node_root" "$bundle_dir" <<'PY'
-import os
-import sys
-from pathlib import Path
-from chia.ssl.create_ssl import generate_ca_signed_cert
-
-os.umask(0o077)
-root, bundle = map(Path, sys.argv[1:])
-ca = root / "config/ssl/ca"
-ca_crt = (ca / "private_ca.crt").read_bytes()
-generate_ca_signed_cert(ca_crt, (ca / "private_ca.key").read_bytes(),
-                        bundle / "rpc-client.crt", bundle / "rpc-client.key")
-(bundle / "rpc-client.key").chmod(0o600)
-(bundle / "private-ca.crt").write_bytes(ca_crt)
-PY
+/path/to/chia/venv/bin/python tools/export-fullnode-connection \
+  --chia-root "$HOME/.chia/mainnet" \
+  --node-host 192.168.1.49 \
+  --rpc-host 127.0.0.1 --rpc-port 18555 \
+  --output "$HOME/Desktop/Timelord-mainnet-connection"
 ```
 
-If you choose to keep full-node RPC on loopback, explicitly configure a tunnel
-endpoint with `--rpc-host 127.0.0.1 --rpc-port 18555`. Run this on the Timelord Mac, substituting the node's SSH login/address and
+Run this on the Timelord Mac, substituting the node's SSH login/address and
 configured RPC port (8555 for this example):
 
 ```sh
@@ -209,35 +175,22 @@ ssh -N -o ExitOnForwardFailure=yes \
   -L 127.0.0.1:18555:127.0.0.1:8555 NODE_SSH_LOGIN@NODE_HOST
 ```
 
-Keep that session running while using RPC. The app currently does not create or
-supervise SSH tunnels. For a manually assembled bundle, add the following section
-to `connection.toml`; for an exported bundle, the explicit options above set it
-already (edit the existing section if needed):
+Keep that session running while using RPC. The app does not create or supervise
+SSH tunnels. The exported `[node.rpc]` section already points at the tunnel; to
+change it later, re-export and import the folder again, or edit the selected
+profile's RPC settings in the app. The tunnel's 18555 port is local to the
+Timelord Mac; the peer connection still uses the full node's network address and
+peer port. No CA signing key leaves the node computer.
 
-```toml
-[node.rpc]
-host = "127.0.0.1"
-port = 18555
-server_name = "chia.net"
-certificate = "rpc-client.crt"
-private_key = "rpc-client.key"
-ca_certificate = "private-ca.crt"
-```
-
-For an already-imported bundle, import the updated folder again. The tunnel's
-18555 port is local to the Timelord Mac; the peer connection still uses the full
-node's network address and peer port. No CA signing key leaves the node computer.
-
-If the node already serves authenticated RPC on a reachable private network,
-use that address and its RPC port in `[node.rpc]` instead of the loopback tunnel
-address. A bundle supplies credentials and endpoints; it does not establish a
-tunnel or change the full node's listener settings.
+A bundle supplies credentials and endpoints; it does not establish a tunnel or
+change the full node's listener settings.
 
 ## Import on the Timelord Mac
 
 Transfer the completed folder, including both sets of credentials, to the Timelord
 Mac. It should contain `connection.toml`, `client.crt`, `client.key`, `ca.crt`,
-`rpc-client.crt`, `rpc-client.key`, and `private-ca.crt`.
+`rpc-client.crt`, `rpc-client.key`, `private-ca.crt`, `network.json`, and
+`README.txt`.
 
 1. Open the Full node connection settings and choose **Another computer**.
 2. Choose **Import connection bundle…** and select the folder or `connection.toml`.

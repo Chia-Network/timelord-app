@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export on the node using its existing Chia Python environment."""
+"""Export a Timelord connection bundle from a Chia full-node root."""
 
 import argparse
 import importlib.metadata
@@ -31,13 +31,73 @@ def port(value, name):
     return value
 
 
+def mapping(value, name, *, null_is_empty=False):
+    if value is None and null_is_empty:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"config.yaml {name} must be a mapping")
+    return value
+
+
+def section(config, name, *, required=False, null_is_empty=False):
+    if name not in config:
+        if required:
+            raise ValueError(f"config.yaml has no {name} section")
+        return {}
+    value = config[name]
+    if required and value is None:
+        raise ValueError(f"config.yaml has no {name} section")
+    return mapping(value, name, null_is_empty=null_is_empty)
+
+
+def path_value(config, name, key, default):
+    value = config.get(key, default)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"config.yaml {name}.{key} must be a nonempty path string")
+    return value
+
+
+def selected_overrides(node, config):
+    if "network_overrides" in node:
+        return section(node, "network_overrides", null_is_empty=True)
+    return section(config, "network_overrides", null_is_empty=True)
+
+
+def override_group(overrides, name, network):
+    group = mapping(
+        overrides.get(name, {}), f"network_overrides {name}", null_is_empty=True
+    )
+    return mapping(
+        group.get(network, {}),
+        f"network_overrides {name}.{network}",
+        null_is_empty=True,
+    )
+
+
+def chia_version():
+    try:
+        import chia
+    except ImportError:
+        pass
+    else:
+        version = getattr(chia, "__version__", None)
+        if isinstance(version, str) and version.strip():
+            return version
+    try:
+        return importlib.metadata.version("chia-blockchain")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
 def export(args, load_yaml, generate_cert):
     root_value = args.chia_root or os.environ.get("CHIA_ROOT")
     if not root_value:
         raise ValueError("Supply --chia-root or set CHIA_ROOT")
     root = Path(root_value).expanduser().resolve(strict=True)
     config = load_yaml((root / "config/config.yaml").read_text())
-    node = config["full_node"]
+    if not isinstance(config, dict):
+        raise ValueError("config.yaml must be a mapping")
+    node = section(config, "full_node", required=True)
     network = node.get("selected_network", config.get("selected_network"))
     if not isinstance(network, str) or not network.strip():
         raise ValueError("Chia configuration has no selected network")
@@ -60,12 +120,16 @@ def export(args, load_yaml, generate_cert):
     output = Path(args.output or f"fullnode-{slug}-connection").expanduser()
 
     # Respect this installation's CA paths, including custom peer CAs.
-    public_ca = config.get("chia_ssl_ca", {})
-    private_ca = config.get("private_ssl_ca", {})
-    peer_crt = (root / public_ca.get("crt", "config/ssl/ca/chia_ca.crt")).read_bytes()
-    peer_key = (root / public_ca.get("key", "config/ssl/ca/chia_ca.key")).read_bytes()
-    rpc_crt = (root / private_ca.get("crt", "config/ssl/ca/private_ca.crt")).read_bytes()
-    rpc_key = (root / private_ca.get("key", "config/ssl/ca/private_ca.key")).read_bytes()
+    public_ca = section(config, "chia_ssl_ca")
+    private_ca = section(config, "private_ssl_ca")
+    peer_crt = (root / path_value(public_ca, "chia_ssl_ca", "crt",
+                                  "config/ssl/ca/chia_ca.crt")).read_bytes()
+    peer_key = (root / path_value(public_ca, "chia_ssl_ca", "key",
+                                  "config/ssl/ca/chia_ca.key")).read_bytes()
+    rpc_crt = (root / path_value(private_ca, "private_ssl_ca", "crt",
+                                 "config/ssl/ca/private_ca.crt")).read_bytes()
+    rpc_key = (root / path_value(private_ca, "private_ssl_ca", "key",
+                                 "config/ssl/ca/private_ca.key")).read_bytes()
     q = lambda value: json.dumps(value, ensure_ascii=True)
     manifest = (
         'schema_version = 1\n\n[node]\n'
@@ -76,14 +140,14 @@ def export(args, load_yaml, generate_cert):
         'server_name = "chia.net"\ncertificate = "rpc-client.crt"\n'
         'private_key = "rpc-client.key"\nca_certificate = "private-ca.crt"\n'
     )
-    overrides = node.get("network_overrides", config.get("network_overrides", {}))
+    overrides = selected_overrides(node, config)
     provenance = {
         "schema_version": 1,
         "network_id": network,
         "exported_at": datetime.now(timezone.utc).isoformat(),
-        "chia_version": importlib.metadata.version("chia-blockchain"),
-        "constants": overrides.get("constants", {}).get(network, {}),
-        "config_overrides": overrides.get("config", {}).get(network, {}),
+        "chia_version": chia_version(),
+        "constants": override_group(overrides, "constants", network),
+        "config_overrides": override_group(overrides, "config", network),
     }
     # Do not remove an existing destination, including a symlink, on any failure.
     output.mkdir(mode=0o700, parents=False, exist_ok=False)
@@ -111,22 +175,23 @@ def export(args, load_yaml, generate_cert):
     return output
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--chia-root", help="Chia root (default: $CHIA_ROOT)")
     parser.add_argument("--node-host", help="Address reachable from Timelord (default: suggested local route address)")
     parser.add_argument("--rpc-host", help="RPC address reachable from Timelord (default: same as --node-host)")
     parser.add_argument("--rpc-port", type=int, help="RPC port (default: full_node.rpc_port from Chia configuration)")
     parser.add_argument("--output", help="New output folder (default: ./fullnode-NETWORK-connection)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     os.umask(0o077)
     try:
         import yaml
         from chia.ssl.create_ssl import generate_ca_signed_cert
-        output = export(args, yaml.safe_load, generate_ca_signed_cert)
     except ImportError:
         parser.exit(1, "Run this tool with the node's existing Chia Python environment.\n")
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    try:
+        output = export(args, yaml.safe_load, generate_ca_signed_cert)
+    except (OSError, ValueError, ImportError) as error:
         parser.exit(1, f"Export failed: {error}\n")
     print(f"Created {output.resolve()}")
 
