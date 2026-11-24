@@ -1,20 +1,24 @@
 use super::*;
+fn script_helper(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let helper = dir.join(name);
+    fs::write(&helper, body).unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    helper
+}
 #[tokio::test]
 async fn completed_validator_is_reaped_before_reporting_success_or_failure() {
     let dir = std::env::temp_dir().join(format!("tl-validator-completed-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     for code in [0, 7] {
-        let helper = dir.join(format!("validator-{code}"));
         let pid_file = dir.join(format!("pid-{code}"));
-        fs::write(
-            &helper,
-            format!(
+        let helper = script_helper(
+            &dir,
+            &format!("validator-{code}"),
+            &format!(
                 "#!/bin/sh\necho $$ > '{}'\nexit {code}\n",
                 pid_file.display()
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let result = validate_before_reload(&helper, &dir.join("config.toml")).await;
         if code == 0 {
             result.unwrap();
@@ -48,17 +52,15 @@ async fn completed_validator_is_reaped_before_reporting_success_or_failure() {
 async fn timed_out_validator_is_group_killed_and_reaped_before_reload_returns() {
     let dir = std::env::temp_dir().join(format!("tl-validator-timeout-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
-    let helper = dir.join("validator");
     let pid_file = dir.join("pid");
-    fs::write(
-        &helper,
-        format!(
+    let helper = script_helper(
+        &dir,
+        "validator",
+        &format!(
             "#!/bin/sh\necho $$ > '{}'\nexec /bin/sleep 30\n",
             pid_file.display()
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    );
     let error = validate_before_reload(&helper, &dir.join("config.toml"))
         .await
         .unwrap_err();
@@ -89,9 +91,7 @@ async fn timed_out_validator_is_group_killed_and_reaped_before_reload_returns() 
 async fn control_accept_errors_back_off_and_keep_listener_and_worker() {
     let dir = std::env::temp_dir().join(format!("tl-accept-retry-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
-    let helper = dir.join("worker");
-    fs::write(&helper, "#!/bin/sh\ncat >/dev/null\n").unwrap();
-    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    let helper = script_helper(&dir, "worker", "#!/bin/sh\ncat >/dev/null\n");
     let log = timelord_supervisor::logging::Writer::stderr();
     let worker = Worker::spawn(
         &helper,
@@ -152,9 +152,7 @@ async fn control_accept_errors_back_off_and_keep_listener_and_worker() {
 async fn interrupted_wait_retains_worker_identity_and_graceful_cleanup() {
     let dir = std::env::temp_dir().join(format!("tl-wait-interrupted-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
-    let helper = dir.join("worker");
-    fs::write(&helper, "#!/bin/sh\ncat >/dev/null\n").unwrap();
-    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    let helper = script_helper(&dir, "worker", "#!/bin/sh\ncat >/dev/null\n");
     let log = timelord_supervisor::logging::Writer::stderr();
     let worker = Worker::spawn(
         &helper,
@@ -221,9 +219,7 @@ async fn interrupted_wait_retains_worker_identity_and_graceful_cleanup() {
 async fn failed_pause_retains_owner_and_power_until_confirmed_cleanup() {
     let dir = std::env::temp_dir().join(format!("tl-pause-owner-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
-    let helper = dir.join("worker");
-    fs::write(&helper, "#!/bin/sh\ncat >/dev/null\n").unwrap();
-    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    let helper = script_helper(&dir, "worker", "#!/bin/sh\ncat >/dev/null\n");
     let paths = Paths::for_config(&dir.join("config.toml")).unwrap();
     for resume in [false, true] {
         let log = timelord_supervisor::logging::Writer::stderr();
@@ -252,6 +248,7 @@ async fn failed_pause_retains_owner_and_power_until_confirmed_cleanup() {
         assert_eq!(state.snapshot().worker_pid, Some(pid as u32));
         assert!(state.snapshot().error.unwrap().contains("cleanup failed"));
         assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+        assert!(matches!(state.cleanup_cause(), Cause::Requested));
         // No replacement is admitted while the cleanup retry is pending.
         state
             .tick(
@@ -424,11 +421,11 @@ fn stable_worker_resets_crash_streak_but_short_crashes_keep_backoff() {
 /// starts while an earlier family is still alive. Validation passes unless
 /// `<helper>.reject` exists.
 fn slow_exit_helper(dir: &Path, exit_delay: &str) -> PathBuf {
-    let helper = dir.join("worker");
     let d = dir.display();
-    fs::write(
-        &helper,
-        format!(
+    script_helper(
+        dir,
+        "worker",
+        &format!(
             "#!/bin/sh\n\
              if [ \"$1\" = validate ]; then [ ! -e \"$0.reject\" ]; exit $?; fi\n\
              for f in '{d}'/alive.*; do [ -e \"$f\" ] && touch '{d}/overlap'; done\n\
@@ -437,9 +434,6 @@ fn slow_exit_helper(dir: &Path, exit_delay: &str) -> PathBuf {
              while :; do sleep 0.05; done\n"
         ),
     )
-    .unwrap();
-    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
-    helper
 }
 fn alive_families(dir: &Path) -> usize {
     fs::read_dir(dir)
@@ -626,6 +620,203 @@ async fn resume_and_reload_during_stopping_start_exactly_one_replacement_after_r
     .unwrap();
     assert!(!dir.join("overlap").exists());
     state.retire_now(&snapshots).await.unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn retirement_grace_depends_on_watchdog_classification() {
+    use timelord_supervisor::progress::Failure;
+    let unresponsive = Failure::unresponsive("heartbeat");
+    let reported = Failure::reported("essential");
+    let normal = timelord_supervisor::NORMAL_GRACEFUL_STOP;
+    assert_eq!(
+        Cause::Failed {
+            watchdog: Some(unresponsive)
+        }
+        .grace(),
+        timelord_supervisor::WATCHDOG_GRACEFUL_STOP
+    );
+    assert_eq!(
+        Cause::Failed {
+            watchdog: Some(reported)
+        }
+        .grace(),
+        normal
+    );
+    assert_eq!(Cause::Requested.grace(), normal);
+    assert_eq!(Cause::CleanupRetry.grace(), Duration::ZERO);
+    assert_eq!(Cause::Failed { watchdog: None }.grace(), normal);
+}
+
+#[tokio::test]
+async fn unresponsive_watchdog_failure_reaps_under_the_short_grace() {
+    use timelord_supervisor::progress::Failure;
+    let dir = std::env::temp_dir().join(format!("tl-unresponsive-grace-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let d = dir.display();
+    let helper = script_helper(
+        &dir,
+        "worker",
+        &format!("#!/bin/sh\ntouch '{d}/alive.'$$\ntrap '' TERM\nwhile :; do sleep 0.1; done\n"),
+    );
+    let (mut state, pid) = running_state(&dir, &helper).await;
+    let (snapshots, _) = watch::channel(state.published());
+    let started = Instant::now();
+    state.begin_retirement(Cause::Failed {
+        watchdog: Some(Failure::unresponsive("fixture heartbeat expiry")),
+    });
+    tokio::time::timeout(
+        Duration::from_secs(6),
+        state.poll_retirement(&snapshots, true),
+    )
+    .await
+    .expect("unresponsive retirement exceeded 6 s; it must not use the normal 25 s wait");
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "unresponsive retirement took {:?}",
+        started.elapsed()
+    );
+    assert!(reaped(pid));
+    assert!(matches!(state.lifecycle, Lifecycle::Backoff { .. }));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn cleanup_retry_skips_the_graceful_wait() {
+    use timelord_supervisor::progress::Failure;
+    let dir = std::env::temp_dir().join(format!("tl-cleanup-retry-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let d = dir.display();
+    let helper = script_helper(
+        &dir,
+        "worker",
+        &format!("#!/bin/sh\ntouch '{d}/alive.'$$\ntrap '' TERM\nwhile :; do sleep 0.1; done\n"),
+    );
+    let paths = Paths::for_config(&dir.join("config.toml")).unwrap();
+    let (mut state, pid) = running_state(&dir, &helper).await;
+    let (snapshots, _) = watch::channel(state.published());
+    state.lifecycle.worker_mut().unwrap().stop_fail_after_kill = 1;
+    state.begin_retirement(Cause::Failed {
+        watchdog: Some(Failure::unresponsive("fixture cleanup retry")),
+    });
+    state.poll_retirement(&snapshots, true).await;
+    assert!(matches!(state.lifecycle, Lifecycle::CleanupFailed { .. }));
+    assert!(
+        state.lifecycle.worker().unwrap().killed,
+        "a stop that reached the group SIGKILL must be marked"
+    );
+    assert_eq!(state.snapshot().worker_pid, Some(pid as u32));
+    let started = Instant::now();
+    state
+        .control(&paths, &helper, command(Control::Pause), &snapshots)
+        .await
+        .unwrap();
+    state.poll_retirement(&snapshots, true).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "CleanupRetry waited for the graceful budget: {:?}",
+        started.elapsed()
+    );
+    assert!(matches!(state.lifecycle, Lifecycle::Paused));
+    assert!(reaped(pid));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn worker_stop_bounds_group_kill_and_log_drain() {
+    let dir = std::env::temp_dir().join(format!("tl-stop-bound-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let d = dir.display();
+    let helper = script_helper(
+        &dir,
+        "worker",
+        &format!(
+            "#!/bin/sh\ntrap '' TERM\n\
+             /usr/bin/perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' /bin/sh -c 'echo $$ > {d}/grandchild; exec /bin/sleep 15' &\n\
+             while :; do sleep 0.1; done\n"
+        ),
+    );
+    let log = timelord_supervisor::logging::Writer::stderr();
+    let mut worker = Worker::spawn(
+        &helper,
+        &dir.join("config.toml"),
+        &dir.join("progress.sock"),
+        1,
+        &log,
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !dir.join("grandchild").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("detached grandchild did not start");
+    let grandchild: i32 = fs::read_to_string(dir.join("grandchild"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let started = Instant::now();
+    let status = worker.stop(Duration::ZERO).await.unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= LOG_DRAIN,
+        "Worker::stop did not wait for the aborted log drain: {elapsed:?}"
+    );
+    assert!(
+        elapsed < LOG_DRAIN + Duration::from_secs(1),
+        "Worker::stop took {elapsed:?}"
+    );
+    assert!(!status.success());
+    unsafe {
+        libc::kill(grandchild, libc::SIGKILL);
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_validation_reaps_the_validator_group() {
+    let dir = std::env::temp_dir().join(format!("tl-validator-cancel-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let pid_file = dir.join("pid");
+    let helper = script_helper(
+        &dir,
+        "validator",
+        &format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec /bin/sleep 30\n",
+            pid_file.display()
+        ),
+    );
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        validate_before_reload(&helper, &dir.join("config.toml")),
+    )
+    .await
+    .expect_err("validation should be cancelled");
+    let pid: i32 = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 

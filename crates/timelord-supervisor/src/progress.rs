@@ -263,6 +263,32 @@ impl Drop for Guard {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureKind {
+    /// Startup silence or heartbeat expiry: the worker stopped reporting.
+    Unresponsive,
+    /// A live worker reported an essential failure or exceeded a work deadline.
+    Reported,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Failure {
+    pub kind: FailureKind,
+    pub reason: String,
+}
+impl Failure {
+    pub fn reported(reason: impl Into<String>) -> Self {
+        Self {
+            kind: FailureKind::Reported,
+            reason: reason.into(),
+        }
+    }
+    pub fn unresponsive(reason: impl Into<String>) -> Self {
+        Self {
+            kind: FailureKind::Unresponsive,
+            reason: reason.into(),
+        }
+    }
+}
 pub struct Watchdog {
     started: Instant,
     last: Option<Instant>,
@@ -307,20 +333,24 @@ impl Watchdog {
         self.last
             .map(|last| now.saturating_duration_since(last).as_secs())
     }
-    pub fn failure(&self, now: Instant) -> Option<String> {
+    pub fn failure(&self, now: Instant) -> Option<Failure> {
         if self.failed {
-            return Some("Worker reported an essential task failure".into());
+            return Some(Failure::reported(
+                "Worker reported an essential task failure",
+            ));
         }
         if self.last.is_none()
             && now.saturating_duration_since(self.started) > Duration::from_secs(120)
         {
-            return Some("Worker did not report startup progress within 120 seconds".into());
+            return Some(Failure::unresponsive(
+                "Worker did not report startup progress within 120 seconds",
+            ));
         }
         if self
             .last
             .is_some_and(|last| now.saturating_duration_since(last) > Duration::from_secs(30))
         {
-            return Some("Worker progress heartbeat expired".into());
+            return Some(Failure::unresponsive("Worker progress heartbeat expired"));
         }
         for (lane, work) in self.stages.iter().enumerate() {
             if let Some((work, since)) = work
@@ -328,10 +358,10 @@ impl Watchdog {
                     .allowance()
                     .is_some_and(|limit| now.saturating_duration_since(*since) > limit)
             {
-                return Some(format!(
+                return Some(Failure::reported(format!(
                     "Work deadline exceeded: lane={lane} request={} generation={} stage={:?} target={}",
                     work.id, work.generation, work.stage, work.iterations
-                ));
+                )));
             }
         }
         None
@@ -495,6 +525,7 @@ mod tests {
             watch
                 .failure(now + Duration::from_secs(61))
                 .unwrap()
+                .reason
                 .contains("Verifying")
         );
         watch.observe(
@@ -505,6 +536,7 @@ mod tests {
             watch
                 .failure(now + Duration::from_secs(92))
                 .unwrap()
+                .reason
                 .contains("heartbeat")
         );
     }
@@ -529,6 +561,7 @@ mod tests {
             watch
                 .failure(now + Duration::from_secs(361))
                 .unwrap()
+                .reason
                 .contains("Eligibility")
         );
         watch.observe(
@@ -543,6 +576,7 @@ mod tests {
             watch
                 .failure(now + Duration::from_secs(378))
                 .unwrap()
+                .reason
                 .contains("Discovery")
         );
     }
@@ -642,6 +676,53 @@ mod tests {
                 .iter()
                 .all(Option::is_none)
         );
+    }
+
+    #[test]
+    fn watchdog_classifies_liveness_silence_and_reported_work_failures() {
+        let now = Instant::now();
+        let mut watch = Watchdog::new(now);
+        let startup = watch.failure(now + Duration::from_secs(121)).unwrap();
+        assert_eq!(startup.kind, FailureKind::Unresponsive);
+        assert!(startup.reason.contains("startup progress"));
+
+        let mut report = snapshot(1, Stage::WaitingForClient, 1);
+        watch.observe(report.clone(), now);
+        let heartbeat = watch.failure(now + Duration::from_secs(31)).unwrap();
+        assert_eq!(heartbeat.kind, FailureKind::Unresponsive);
+        assert!(heartbeat.reason.contains("heartbeat"));
+
+        report.sequence = 2;
+        report.failed = true;
+        watch.observe(report, now + Duration::from_secs(29));
+        let essential = watch.failure(now + Duration::from_secs(29)).unwrap();
+        assert_eq!(essential.kind, FailureKind::Reported);
+        assert!(essential.reason.contains("essential"));
+
+        let mut watch = Watchdog::new(now);
+        watch.observe(snapshot(1, Stage::Verifying, 1), now);
+        watch.observe(
+            snapshot(2, Stage::Verifying, 1),
+            now + Duration::from_secs(61),
+        );
+        let deadline = watch.failure(now + Duration::from_secs(61)).unwrap();
+        assert_eq!(deadline.kind, FailureKind::Reported);
+        assert!(deadline.reason.contains("deadline"));
+
+        // A reported failure is sticky and wins over an expired heartbeat.
+        let mut watch = Watchdog::new(now);
+        let mut report = snapshot(1, Stage::WaitingForClient, 1);
+        report.failed = true;
+        watch.observe(report, now);
+        let sticky = watch.failure(now + Duration::from_secs(31)).unwrap();
+        assert_eq!(sticky.kind, FailureKind::Reported);
+
+        // An expired heartbeat wins over a work deadline when no report arrived.
+        let mut watch = Watchdog::new(now);
+        watch.observe(snapshot(1, Stage::Verifying, 1), now);
+        let silent = watch.failure(now + Duration::from_secs(61)).unwrap();
+        assert_eq!(silent.kind, FailureKind::Unresponsive);
+        assert!(silent.reason.contains("heartbeat"));
     }
 
     #[test]

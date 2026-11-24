@@ -13,6 +13,8 @@ pub(super) struct OwnedProcess {
     pid: i32,
     #[cfg(test)]
     pub(super) wait_errors: std::sync::Mutex<std::collections::VecDeque<i32>>,
+    #[cfg(test)]
+    drop_reap_stall: bool,
 }
 impl OwnedProcess {
     pub(super) fn spawn(command: &mut Command) -> Result<Self> {
@@ -23,6 +25,8 @@ impl OwnedProcess {
             pid,
             #[cfg(test)]
             wait_errors: Default::default(),
+            #[cfg(test)]
+            drop_reap_stall: false,
         })
     }
     pub(super) fn take_output(
@@ -127,7 +131,27 @@ impl OwnedProcess {
 }
 impl Drop for OwnedProcess {
     fn drop(&mut self) {
+        // Signal the group before taking the Child; signal_group is a no-op
+        // once the handle is gone.
         self.signal_group(libc::SIGKILL);
+        if let Some(mut child) = self.child.take() {
+            // The leader may have left its group, so kill it directly as well.
+            let _ = child.start_kill();
+            // Reap through the owned Child so std records the wait status; a
+            // later kill_on_drop is then a no-op instead of a stale-PID ESRCH.
+            // Bound the wait so a failed retirement cannot hold the lock past
+            // ExitTimeOut or occupy a runtime worker indefinitely.
+            let deadline = std::time::Instant::now() + timelord_supervisor::KILL_AND_REAP;
+            loop {
+                let reaped = matches!(child.try_wait(), Ok(Some(_)) | Err(_));
+                #[cfg(test)]
+                let reaped = reaped && !self.drop_reap_stall;
+                if reaped || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
 }
 
@@ -154,6 +178,24 @@ mod tests {
         );
         assert!(owner.child.is_none());
         assert!(owner.exited().unwrap());
+    }
+    #[tokio::test]
+    async fn drop_reap_is_bounded_when_the_wait_status_never_settles() {
+        let mut owner =
+            OwnedProcess::spawn(Command::new("/bin/sh").arg("-c").arg("exec sleep 30")).unwrap();
+        let pid = owner.pid() as i32;
+        owner.drop_reap_stall = true;
+        let started = std::time::Instant::now();
+        drop(owner);
+        let elapsed = started.elapsed();
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        assert!(elapsed >= timelord_supervisor::KILL_AND_REAP);
+        assert!(
+            elapsed < timelord_supervisor::KILL_AND_REAP + Duration::from_secs(1),
+            "Drop took {elapsed:?}"
+        );
     }
     #[tokio::test]
     async fn observer_timeout_keeps_owner_armed_and_reaping_is_single_use() {

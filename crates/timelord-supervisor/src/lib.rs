@@ -17,7 +17,55 @@ use std::{
         io::AsRawFd,
     },
     path::{Path, PathBuf},
+    time::Duration,
 };
+
+/// Graceful SIGTERM wait for a healthy worker. Native ASIC retirement escalates
+/// over about 28 seconds (1 s TLSTOP, 5 s soft, 10 s SIGTERM, 10 s SIGKILL and
+/// two 1 s drains), and node stop, history flush or checkpointing can extend a
+/// worker to about 32 seconds. The 25 s wait therefore covers a normal native
+/// shutdown and intentionally truncates any forced-cleanup tail.
+pub const NORMAL_GRACEFUL_STOP: Duration = Duration::from_secs(25);
+/// Graceful SIGTERM wait for an unresponsive worker that sent no startup progress
+/// or let its heartbeat expire. A live worker that reported a failure keeps the
+/// normal native retirement budget.
+pub const WATCHDOG_GRACEFUL_STOP: Duration = Duration::from_secs(2);
+/// Bound on reaping the whole worker process group after the graceful wait.
+pub const KILL_AND_REAP: Duration = Duration::from_secs(3);
+/// Bound on draining the worker's concurrent log pumps under one deadline.
+pub const LOG_DRAIN: Duration = Duration::from_secs(1);
+
+/// Worst-case time to retire a worker: normal graceful wait, group kill/reap,
+/// then one shared log-drain deadline for both pumps.
+pub const WORST_CASE_STOP: Duration = Duration::from_secs(
+    NORMAL_GRACEFUL_STOP.as_secs() + KILL_AND_REAP.as_secs() + LOG_DRAIN.as_secs(),
+);
+
+/// Worst-case time for shutdown to settle a worker when a stop fails at the
+/// group kill: the first attempt is NORMAL_GRACEFUL_STOP + KILL_AND_REAP
+/// without reaching the log drain, then a CleanupRetry adds Duration::ZERO +
+/// KILL_AND_REAP + LOG_DRAIN. That equals WORST_CASE_STOP + KILL_AND_REAP,
+/// because the first attempt's unused drain is exactly the retry's drain. This
+/// is the shutdown worst case for that path; the rare waitid-error path can
+/// exceed it.
+pub const SHUTDOWN_WORST_CASE: Duration =
+    Duration::from_secs(WORST_CASE_STOP.as_secs() + KILL_AND_REAP.as_secs());
+
+const EXIT_TIME_OUT_MARGIN: Duration = Duration::from_secs(3);
+
+/// launchd's deadline for the supervisor to exit, with margin over the shutdown
+/// worst case.
+pub const EXIT_TIME_OUT: Duration =
+    Duration::from_secs(SHUTDOWN_WORST_CASE.as_secs() + EXIT_TIME_OUT_MARGIN.as_secs());
+/// Server-side bound on a control-loop reply, including reload validation. It
+/// does not wait for worker retirement, so it is independent of the stop budget.
+pub const CONTROL_SERVER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Client-side bound on a control transaction; must exceed the server bound.
+pub const CONTROL_CLIENT_TIMEOUT: Duration = Duration::from_secs(35);
+
+const _: () = assert!(CONTROL_CLIENT_TIMEOUT.as_secs() > CONTROL_SERVER_TIMEOUT.as_secs());
+const _: () = assert!(EXIT_TIME_OUT.as_secs() > SHUTDOWN_WORST_CASE.as_secs());
+const _: () = assert!(WATCHDOG_GRACEFUL_STOP.as_secs() < NORMAL_GRACEFUL_STOP.as_secs());
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -229,7 +277,7 @@ pub async fn request(
         net::UnixStream,
     };
     let paths = Paths::for_config(config)?;
-    let result = tokio::time::timeout(std::time::Duration::from_secs(35), async {
+    let result = tokio::time::timeout(CONTROL_CLIENT_TIMEOUT, async {
         let mut socket = UnixStream::connect(&paths.socket)
             .await
             .context("Connecting to installed supervisor")?;
@@ -368,6 +416,7 @@ pub fn launchd_plist_with_monitor(
     // Worker diagnostics have their own bounded rotating sink. Do not retain
     // unlimited launchd stdout/stderr across repeated supervisor failures.
     let log = "/dev/null";
+    let exit_time_out = EXIT_TIME_OUT.as_secs();
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -380,7 +429,7 @@ pub fn launchd_plist_with_monitor(
 <key>RunAtLoad</key><true/>
 <key>KeepAlive</key><true/>
 <key>ThrottleInterval</key><integer>10</integer>
-<key>ExitTimeOut</key><integer>20</integer>
+<key>ExitTimeOut</key><integer>{exit_time_out}</integer>
 <key>AbandonProcessGroup</key><false/>
 <key>ProcessType</key><string>Interactive</string>
 <key>StandardOutPath</key><string>{log}</string>
@@ -411,5 +460,25 @@ mod phase_tests {
         );
         assert_eq!(serde_json::to_value(phases).unwrap(), wire);
         assert!(serde_json::from_str::<SupervisorPhase>("\"unknown_phase\"").is_err());
+    }
+}
+
+#[cfg(test)]
+mod stop_budget_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn launchd_exit_timeout_covers_the_stop_budget() {
+        let xml = launchd_plist(
+            Path::new("/Applications/Timelord.app"),
+            Path::new("/config"),
+            "operator",
+        )
+        .unwrap();
+        assert!(xml.contains(&format!(
+            "<key>ExitTimeOut</key><integer>{}</integer>",
+            EXIT_TIME_OUT.as_secs()
+        )));
     }
 }
