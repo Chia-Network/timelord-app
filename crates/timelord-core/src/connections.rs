@@ -124,22 +124,35 @@ impl ConnectionProfiles {
     }
 }
 impl Config {
-    /// Fold the runtime node into its profile. Persistence then writes only
-    /// `[connections]`; a single-node configuration becomes a profile here.
-    pub fn remember_connection(&mut self) -> Result<(), String> {
-        match self.connections.active_mut()? {
-            Some(profile) => profile.node = self.node.clone(),
-            None if self.node.certificate.is_some() => {
-                self.node.validate()?;
-                self.connections.active_id = Some(self.connections.insert(self.node.clone()));
-            }
-            None => {}
+    /// Persist a credentialed single-node runtime as its first profile.
+    fn migrate_single_node(&mut self) -> Result<(), String> {
+        if self.connections.profiles.is_empty() && self.node.certificate.is_some() {
+            self.node.validate()?;
+            self.connections.active_id = Some(self.connections.insert(self.node.clone()));
         }
+        Ok(())
+    }
+    /// Switching or adding a connection commits the runtime node to the profile
+    /// that currently owns it; the runtime node is never copied between profiles.
+    fn commit_node(&mut self) -> Result<(), String> {
+        if let Some(profile) = self.connections.active_mut()? {
+            profile.node = self.node.clone();
+        }
+        Ok(())
+    }
+    /// Validate the selection and migrate a single-node configuration. Profiles
+    /// own their node, so saving never folds it into a different profile.
+    pub fn remember_connection(&mut self) -> Result<(), String> {
+        if self.connections.profiles.is_empty() {
+            return self.migrate_single_node();
+        }
+        self.connections.selected()?;
         Ok(())
     }
     pub fn add_connection(&mut self, node: NodeConfig) -> Result<(), String> {
         node.validate()?;
-        self.remember_connection()?;
+        self.migrate_single_node()?;
+        self.commit_node()?;
         self.connections.active_id = Some(self.connections.insert(node.clone()));
         self.node = node;
         Ok(())
@@ -156,7 +169,7 @@ impl Config {
             .ok_or("Connection profile does not exist")?
             .node
             .clone();
-        self.remember_connection()?;
+        self.commit_node()?;
         self.node = node;
         self.connections.active_id = Some(id.into());
         Ok(())
@@ -348,8 +361,10 @@ mod tests {
             .unwrap();
         config.node.host = "unsaved.fixture".into();
         assert!(config.validate().is_err());
+        // Saving without going through add/select must not quietly fold the
+        // runtime node into a different profile.
         config.remember_connection().unwrap();
-        config.validate().unwrap();
+        assert!(config.validate().is_err());
     }
 
     #[test]
