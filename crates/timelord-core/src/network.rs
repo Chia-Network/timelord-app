@@ -1,4 +1,10 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// Exactly 32 bytes of hexadecimal text, as Chia writes hashes.
+pub fn is_hex_32(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
 
 /// Integers use an explicit decimal representation across JSON, TOML and Swift.
 /// Unlike floating point or TOML integers, this covers the full u128 range.
@@ -22,8 +28,7 @@ pub enum NetworkValue {
     String(String),
     Bool(bool),
     Array(Vec<NetworkValue>),
-    Object(std::collections::BTreeMap<String, NetworkValue>),
-    Null,
+    Object(BTreeMap<String, NetworkValue>),
 }
 impl NetworkValue {
     pub fn as_str(&self) -> Option<&str> {
@@ -63,6 +68,8 @@ impl<'de> Deserialize<'de> for NetworkValue {
         fn convert(value: serde_json::Value) -> Result<NetworkValue, String> {
             use serde_json::Value;
             Ok(match value {
+                // TOML cannot represent null, and Chia never exports it in constants.
+                Value::Null => return Err("Network constant values cannot be null".into()),
                 Value::Number(v) => {
                     let integer = v.to_string();
                     if integer.parse::<u128>().is_err() && integer.parse::<i128>().is_err() {
@@ -72,7 +79,6 @@ impl<'de> Deserialize<'de> for NetworkValue {
                 }
                 Value::String(v) => NetworkValue::String(v),
                 Value::Bool(v) => NetworkValue::Bool(v),
-                Value::Null => NetworkValue::Null,
                 Value::Array(v) => {
                     NetworkValue::Array(v.into_iter().map(convert).collect::<Result<_, _>>()?)
                 }
@@ -115,7 +121,7 @@ impl<'de> Deserialize<'de> for NetworkValue {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ChainIdentity {
     network: Network,
-    constants: Option<std::collections::BTreeMap<String, NetworkValue>>,
+    constants: Option<BTreeMap<String, NetworkValue>>,
 }
 impl ChainIdentity {
     pub fn new(network: &Network, definition: Option<&NetworkDefinition>) -> Result<Self, String> {
@@ -124,14 +130,61 @@ impl ChainIdentity {
                 definition.validate(network)?;
                 Some(definition.constants.clone())
             }
-            (Network::Custom(_), None) => return Err("Missing custom chain definition".into()),
-            (_, Some(_)) => return Err("Built-in network cannot use a custom definition".into()),
+            (Network::Custom(_), None) => {
+                return Err("Custom networks require an imported network definition".into());
+            }
+            (_, Some(_)) => {
+                return Err("Built-in networks cannot use a custom definition".into());
+            }
             (_, None) => None,
         };
         Ok(Self {
             network: network.clone(),
             constants,
         })
+    }
+    /// The validated constants of a custom chain; `None` for built-in networks.
+    pub fn constants(&self) -> Option<&BTreeMap<String, NetworkValue>> {
+        self.constants.as_ref()
+    }
+}
+
+/// A validated Chia `selected_network` ID for a chain without a built-in definition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "String", into = "String")]
+pub struct CustomNetworkId(String);
+impl CustomNetworkId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl TryFrom<String> for CustomNetworkId {
+    type Error = String;
+    fn try_from(id: String) -> Result<Self, Self::Error> {
+        if id.is_empty()
+            || id.len() > 64
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err("Network ID must be 1–64 lowercase letters, digits or hyphens".into());
+        }
+        if matches!(id.as_str(), "mainnet" | "testnet11") {
+            return Err(format!(
+                "Network ID {id} is reserved for a built-in network"
+            ));
+        }
+        Ok(Self(id))
+    }
+}
+impl std::fmt::Display for CustomNetworkId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+impl From<CustomNetworkId> for String {
+    fn from(id: CustomNetworkId) -> Self {
+        id.0
     }
 }
 
@@ -142,32 +195,24 @@ pub enum Network {
     #[default]
     Mainnet,
     Testnet11,
-    Custom(String),
+    Custom(CustomNetworkId),
 }
 impl Network {
     pub fn label(&self) -> &str {
         match self {
             Self::Mainnet => "mainnet",
             Self::Testnet11 => "testnet11",
-            Self::Custom(name) => name,
+            Self::Custom(id) => id.as_str(),
         }
     }
 }
 impl TryFrom<String> for Network {
     type Error = String;
     fn try_from(name: String) -> Result<Self, Self::Error> {
-        if name.is_empty()
-            || name.len() > 64
-            || !name
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        {
-            return Err("Network ID must be 1–64 lowercase letters, digits or hyphens".into());
-        }
         Ok(match name.as_str() {
             "mainnet" => Self::Mainnet,
             "testnet11" => Self::Testnet11,
-            _ => Self::Custom(name),
+            _ => Self::Custom(name.try_into()?),
         })
     }
 }
@@ -196,9 +241,9 @@ pub struct NetworkDefinition {
     pub network_id: String,
     pub exported_at: String,
     pub chia_version: String,
-    pub constants: std::collections::BTreeMap<String, NetworkValue>,
+    pub constants: BTreeMap<String, NetworkValue>,
     #[serde(default)]
-    pub config_overrides: std::collections::BTreeMap<String, NetworkValue>,
+    pub config_overrides: BTreeMap<String, NetworkValue>,
 }
 impl NetworkDefinition {
     pub fn validate(&self, network: &Network) -> Result<(), String> {
@@ -215,15 +260,118 @@ impl NetworkDefinition {
                 "Network constant names must use uppercase letters, digits or underscores".into(),
             );
         }
-        let genesis = self
+        if !self
             .constants
             .get("GENESIS_CHALLENGE")
-            .and_then(|v| v.as_str());
-        if !genesis
-            .is_some_and(|value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+            .and_then(NetworkValue::as_str)
+            .is_some_and(is_hex_32)
         {
             return Err("Custom network requires a 32-byte hex GENESIS_CHALLENGE".into());
         }
         Ok(())
+    }
+}
+
+/// The single custom-network/definition rule: a custom chain needs one, and a
+/// built-in chain must not carry one.
+impl crate::NodeConfig {
+    pub fn chain_identity(&self) -> Result<ChainIdentity, String> {
+        ChainIdentity::new(&self.network, self.network_definition.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_ids_are_validated_and_never_shadow_built_in_networks() {
+        for name in ["ephemeral-fixture", "testnet0", "a", &"n".repeat(64)] {
+            let network: Network = name.parse().unwrap();
+            assert_eq!(network.label(), name);
+            assert_eq!(String::from(network.clone()), name);
+            assert_eq!(
+                serde_json::to_string(&network).unwrap(),
+                format!("\"{name}\"")
+            );
+            let Network::Custom(id) = network else {
+                panic!("{name} must stay custom");
+            };
+            assert_eq!(id.as_str(), name);
+        }
+        for name in ["", "Mainnet", "test net", "test.net", &"n".repeat(65)] {
+            assert!(name.parse::<Network>().is_err(), "{name}");
+        }
+        // Built-in names still resolve to built-ins, not custom IDs.
+        assert_eq!("mainnet".parse::<Network>().unwrap(), Network::Mainnet);
+        assert_eq!("testnet11".parse::<Network>().unwrap(), Network::Testnet11);
+        assert!(CustomNetworkId::try_from("mainnet".to_owned()).is_err());
+        assert!(CustomNetworkId::try_from("testnet11".to_owned()).is_err());
+    }
+
+    #[test]
+    fn network_values_round_trip_exactly_and_reject_null() {
+        let value: NetworkValue = serde_json::from_str(
+            r#"{"FACTOR":147573952589676412928,"FLAG":true,"NAME":"xch","LIST":[1,2],"NESTED":{"a":"b"}}"#,
+        )
+        .unwrap();
+        let text = serde_json::to_string(&value).unwrap();
+        let restored: NetworkValue = serde_json::from_str(&text).unwrap();
+        assert_eq!(restored, value);
+        for invalid in ["null", r#"{"A":null}"#, r#"{"A":[1,null]}"#] {
+            assert!(
+                serde_json::from_str::<NetworkValue>(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<NetworkValue>("184467440737095516160000")
+                .unwrap()
+                .unsigned::<u128>()
+                .unwrap(),
+            184467440737095516160000
+        );
+    }
+
+    #[test]
+    fn chain_identity_is_the_one_custom_definition_rule() {
+        let mut node = crate::NodeConfig::default();
+        node.chain_identity().unwrap();
+        node.network = "ephemeral-fixture".parse().unwrap();
+        assert!(node.chain_identity().is_err());
+        node.network_definition = Some(definition("ephemeral-fixture"));
+        node.chain_identity().unwrap();
+        node.network = Network::Mainnet;
+        assert!(node.chain_identity().is_err());
+    }
+
+    #[test]
+    fn definition_requires_a_32_byte_hex_genesis_challenge() {
+        let network: Network = "ephemeral-fixture".parse().unwrap();
+        let mut definition = definition("ephemeral-fixture");
+        definition
+            .constants
+            .insert("GENESIS_CHALLENGE".into(), "ab".repeat(32).into());
+        definition.validate(&network).unwrap();
+        for invalid in ["", "ab", &"zz".repeat(32), &format!("{}0", "ab".repeat(32))] {
+            definition
+                .constants
+                .insert("GENESIS_CHALLENGE".into(), invalid.to_owned().into());
+            assert!(definition.validate(&network).is_err(), "{invalid}");
+        }
+        definition
+            .constants
+            .insert("GENESIS_CHALLENGE".into(), "ab".repeat(32).into());
+        definition.constants.insert("bad name".into(), 1.into());
+        assert!(definition.validate(&network).is_err());
+    }
+
+    fn definition(network_id: &str) -> NetworkDefinition {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 1, "network_id": network_id,
+            "exported_at": "fixture", "chia_version": "fixture",
+            "constants": {"GENESIS_CHALLENGE": "ab".repeat(32)},
+        }))
+        .unwrap()
     }
 }

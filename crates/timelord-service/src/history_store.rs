@@ -49,11 +49,7 @@ pub fn scope(config: &Config) -> Result<String> {
     let mut bytes =
         serde_json::to_vec(&(&config.node.network, &config.node.host, config.node.port))?;
     if config.node.network_definition.is_some() {
-        let identity = timelord_core::ChainIdentity::new(
-            &config.node.network,
-            config.node.network_definition.as_ref(),
-        )
-        .map_err(anyhow::Error::msg)?;
+        let identity = config.node.chain_identity().map_err(anyhow::Error::msg)?;
         bytes.extend(serde_json::to_vec(&identity)?);
     }
     Ok(dg_xch_core::utils::hash_256(bytes)

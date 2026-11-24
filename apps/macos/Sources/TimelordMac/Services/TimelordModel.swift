@@ -450,9 +450,8 @@ final class TimelordModel: ObservableObject {
         guard !operationInProgress, var connections = configuration.connections,
               let selected = connections.profiles.first(where: { $0.id == id }),
               connections.activeId != id else { return }
-        if let current = connections.profiles.firstIndex(where: { $0.id == connections.activeId }) {
-            connections.profiles[current].node = configuration.node
-        }
+        // The active profile is the persisted source of truth; unsaved node
+        // edits are runtime-only and are discarded when the selection changes.
         connections.activeId = id
         configuration.connections = connections
         configuration.node = selected.node

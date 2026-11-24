@@ -149,10 +149,15 @@ Mainnet and Testnet11 continue using their pinned built-in definitions.
 
 Saved connection profiles live in `[connections]` with `active_id` and
 `[[connections.profiles]]` entries containing `id`, `name` and a complete `node`
-table. Existing single-node configurations migrate in memory when read and are persisted
-on the next save or import. The
-top-level `[node]` is the selected profile's runtime projection; saving synchronizes
-its edits into that profile. Imported profiles retain independent credential paths
+table. When profiles are used, `[connections]` is the single persisted source of
+truth: saving writes no `[node]` block, and the runtime node is derived from the
+active profile. A single-node configuration keeps only a plain `[node]` table and
+migrates in memory when read; the next save or import persists it as a profile.
+Files that already contain both tables are accepted: their `[node]` table was the
+legacy runtime projection, so it is folded into the active profile on read and
+omitted from the next save. A hand edit of `[node]` therefore still takes effect
+without falling back to the last-good checkpoint; edit the selected profile
+afterwards. Imported profiles retain independent credential paths
 and RPC settings. UI selection is staged until saved; a running worker needs
 Save & Restart to change connections. For CLI administration,
 `select-node --config FILE --profile ID` selects and saves an existing profile
@@ -164,6 +169,16 @@ helper JSON represent integers as `{ integer = "decimal digits" }`, preserving
 the full supported `u128` range through TOML and macOS settings edits. This also
 keeps numeric constants distinct from quoted strings. The resolver checks the
 pinned scheduler's parameter invariants before accepting imports or settings.
+
+Custom constants are strict. Unknown or misspelled names, `null` values (TOML
+cannot represent them), and legacy/current alias pairs supplied together (for
+example `MIN_PLOT_SIZE` with `MIN_PLOT_SIZE_V1`, or `NETWORK_TYPE` with
+`TESTNET`) are rejected instead of silently keeping a mainnet value. A real
+exported Chia `DEFAULT_CONSTANTS` file may also carry consensus keys the timelord
+does not consume: the derived `AGG_SIG_*` values other than
+`AGG_SIG_ME_ADDITIONAL_DATA`, and the presentation key `BECH32M_PREFIX`. These are
+type-checked and deliberately ignored. Every other key must be one the pinned
+scheduler can apply.
 
 Custom chain constants also form part of the saved-history scope and last-good
 fallback identity. Reusing a network name with another genesis or different

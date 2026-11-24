@@ -7,6 +7,21 @@ public struct AppConfiguration: Codable, Sendable, Equatable {
     public var service = ServiceConfiguration()
     public var hardware = HardwareConfiguration()
     public init() {}
+    private enum CodingKeys: String, CodingKey { case schemaVersion, node, connections, service, hardware }
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
+        connections = try container.decodeIfPresent(ConnectionProfiles.self, forKey: .connections)
+        // Profiles are the persisted source of truth; the service omits the
+        // duplicate node projection, so the active profile supplies the node.
+        node = try container.decodeIfPresent(NodeConfiguration.self, forKey: .node)
+            ?? connections.flatMap { profiles in
+                profiles.profiles.first { $0.id == profiles.activeId }?.node
+            }
+            ?? NodeConfiguration()
+        service = try container.decodeIfPresent(ServiceConfiguration.self, forKey: .service) ?? ServiceConfiguration()
+        hardware = try container.decodeIfPresent(HardwareConfiguration.self, forKey: .hardware) ?? HardwareConfiguration()
+    }
 }
 public struct ConnectionProfiles: Codable, Sendable, Equatable {
     public var activeId: String?
@@ -44,13 +59,17 @@ public struct NetworkDefinition: Codable, Sendable, Equatable {
 }
 
 /// Preserve nested overrides through settings edits. The helper normalizes
-/// integers to {"integer": "decimal digits"} so even u128 stays exact.
+/// integers to {"integer": "decimal digits"} so even u128 stays exact. TOML
+/// cannot represent null, so neither configuration nor definitions accept it.
 public indirect enum NetworkValue: Codable, Sendable, Equatable {
-    case string(String), number(Decimal), bool(Bool), array([NetworkValue]), object([String: NetworkValue]), null
+    case string(String), number(Decimal), bool(Bool), array([NetworkValue]), object([String: NetworkValue])
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
-        if container.decodeNil() { self = .null }
-        else if let value = try? container.decode(Bool.self) { self = .bool(value) }
+        guard !container.decodeNil() else {
+            throw DecodingError.dataCorruptedError(in: container,
+                debugDescription: "Network constant values cannot be null")
+        }
+        if let value = try? container.decode(Bool.self) { self = .bool(value) }
         else if let value = try? container.decode(String.self) { self = .string(value) }
         else if let value = try? container.decode(Decimal.self) { self = .number(value) }
         else if let value = try? container.decode([NetworkValue].self) { self = .array(value) }
@@ -64,7 +83,6 @@ public indirect enum NetworkValue: Codable, Sendable, Equatable {
         case .bool(let value): try container.encode(value)
         case .array(let value): try container.encode(value)
         case .object(let value): try container.encode(value)
-        case .null: try container.encodeNil()
         }
     }
 }

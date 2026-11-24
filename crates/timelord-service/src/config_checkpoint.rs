@@ -1,7 +1,7 @@
 //! Preserve the configuration that actually submitted verified work. Invalid
 //! operator edits remain untouched; a fallback is explicit in status/progress.
 use crate::{Shared, observability};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use std::{
     fs::OpenOptions,
     io::Read,
@@ -13,41 +13,92 @@ use std::{
 use timelord_core::Config;
 use tokio::sync::watch;
 const LIMIT: u64 = 1024 * 1024;
-pub fn bounded_text(path: &Path, private: bool) -> Result<String> {
+
+/// Configuration text failures. Only an unreadable file may fall back to the
+/// last-good checkpoint; malformed or oversized content must be reported.
+#[derive(Debug)]
+pub enum ConfigTextError {
+    Unreadable(std::io::Error),
+    Invalid(String),
+}
+impl std::fmt::Display for ConfigTextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreadable(error) => error.fmt(f),
+            Self::Invalid(message) => f.write_str(message),
+        }
+    }
+}
+impl std::error::Error for ConfigTextError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Unreadable(error) => Some(error),
+            Self::Invalid(_) => None,
+        }
+    }
+}
+
+pub fn bounded_text(path: &Path, private: bool) -> Result<String, ConfigTextError> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(
             libc::O_CLOEXEC | libc::O_NONBLOCK | if private { libc::O_NOFOLLOW } else { 0 },
         )
-        .open(path)?;
-    let meta = file.metadata()?;
-    ensure!(
-        meta.is_file() && meta.len() <= LIMIT,
-        "Configuration must be a regular file no larger than 1 MiB"
-    );
-    if private {
-        ensure!(
-            meta.uid() == unsafe { libc::geteuid() }
-                && meta.nlink() == 1
-                && meta.mode() & 0o077 == 0,
-            "Saved configuration must be private and owned"
-        );
+        .open(path)
+        .map_err(ConfigTextError::Unreadable)?;
+    let meta = file.metadata().map_err(ConfigTextError::Unreadable)?;
+    if !meta.is_file() || meta.len() > LIMIT {
+        return Err(ConfigTextError::Invalid(
+            "Configuration must be a regular file no larger than 1 MiB".into(),
+        ));
     }
-    let mut text = String::new();
-    file.take(LIMIT + 1).read_to_string(&mut text)?;
-    ensure!(
-        text.len() as u64 <= LIMIT,
-        "Configuration exceeds size limit"
-    );
-    Ok(text)
+    if private
+        && !(meta.uid() == unsafe { libc::geteuid() }
+            && meta.nlink() == 1
+            && meta.mode() & 0o077 == 0)
+    {
+        return Err(ConfigTextError::Invalid(
+            "Saved configuration must be private and owned".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(ConfigTextError::Unreadable)?;
+    if bytes.len() as u64 > LIMIT {
+        return Err(ConfigTextError::Invalid(
+            "Configuration exceeds the 1 MiB size limit".into(),
+        ));
+    }
+    // Decode directly: `read_to_string` would hide malformed content behind the
+    // same I/O error kind that justifies a last-good fallback.
+    String::from_utf8(bytes).map_err(|error| {
+        ConfigTextError::Invalid(format!("Configuration is not valid UTF-8: {error}"))
+    })
 }
 fn saved_path(path: &Path) -> Result<PathBuf> {
     Ok(timelord_supervisor::Paths::for_config(path)?
         .directory
         .join("last-good.toml"))
 }
+/// Network intent only, so other invalid fields cannot hide the requested chain.
 #[derive(Default, serde::Deserialize)]
 struct RequestedNetwork {
+    #[serde(default)]
+    node: Option<NetworkOnly>,
+    #[serde(default)]
+    connections: Option<RequestedConnections>,
+}
+#[derive(Default, serde::Deserialize)]
+struct RequestedConnections {
+    #[serde(default)]
+    active_id: Option<String>,
+    #[serde(default)]
+    profiles: Vec<RequestedProfile>,
+}
+#[derive(serde::Deserialize)]
+struct RequestedProfile {
+    id: String,
     #[serde(default)]
     node: NetworkOnly,
 }
@@ -57,6 +108,33 @@ struct NetworkOnly {
     network: timelord_core::Network,
     #[serde(default)]
     network_definition: Option<timelord_core::NetworkDefinition>,
+}
+impl RequestedNetwork {
+    /// A legacy `[node]` table wins; profiles-only files carry their intent in
+    /// the active profile. An unresolvable active profile is not mainnet.
+    fn network(self) -> Result<NetworkOnly> {
+        if let Some(node) = self.node {
+            return Ok(node);
+        }
+        let Some(connections) = self.connections else {
+            return Ok(NetworkOnly::default());
+        };
+        if connections.profiles.is_empty() {
+            return match connections.active_id {
+                None => Ok(NetworkOnly::default()),
+                Some(_) => bail!("Connection profiles have no profiles"),
+            };
+        }
+        let active = connections
+            .active_id
+            .context("Connection profiles have no active profile")?;
+        connections
+            .profiles
+            .into_iter()
+            .find(|profile| profile.id == active)
+            .map(|profile| profile.node)
+            .context("Active connection profile does not exist")
+    }
 }
 pub fn load_running(path: &Path) -> Result<(Config, bool)> {
     match bounded_text(path, false) {
@@ -68,18 +146,14 @@ pub fn load_running(path: &Path) -> Result<(Config, bool)> {
                 let intent: RequestedNetwork = toml::from_str(&text).with_context(|| {
                     format!("Cannot establish requested network; fallback refused: {requested}")
                 })?;
-                load_saved(path, Some(intent.node), requested)
+                let intent = intent.network().with_context(|| {
+                    format!("Cannot establish requested network; fallback refused: {requested}")
+                })?;
+                load_saved(path, Some(intent), requested)
             }
         },
-        // Text that is not UTF-8 was read, so it is malformed, not unreadable.
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|e| e.kind() != std::io::ErrorKind::InvalidData) =>
-        {
-            load_saved(path, None, error)
-        }
-        Err(error) => Err(error),
+        Err(ConfigTextError::Unreadable(error)) => load_saved(path, None, error.into()),
+        Err(error @ ConfigTextError::Invalid(_)) => Err(error.into()),
     }
 }
 fn load_saved(
@@ -159,8 +233,7 @@ pub async fn record(
         if !eligible(&shared) {
             continue;
         }
-        let process = shared.process.clone();
-        let permit = tokio::select! {p=process.progress.arithmetic(timelord_supervisor::progress::Resource::OptionalCheckpoint).acquire_owned()=>p?,_=shutdown.changed()=>return Ok(())};
+        let permit = tokio::select! {p=shared.process.progress.arithmetic(timelord_supervisor::progress::Resource::OptionalCheckpoint).acquire_owned()=>p?,_=shutdown.changed()=>return Ok(())};
         if !eligible_for_write(&shared, &current, &shutdown) {
             continue;
         }
@@ -168,7 +241,6 @@ pub async fn record(
         let path = path.clone();
         let writer_current = current.clone();
         let writer_shutdown = shutdown.clone();
-        let writer_process = process.clone();
         let writing = shared.clone();
         match write_until_shutdown(
             move || {
@@ -179,7 +251,7 @@ pub async fn record(
                 if !eligible_for_write(&writing, &writer_current, &writer_shutdown) {
                     return Ok(false);
                 }
-                let _stage = writer_process.progress.begin(
+                let _stage = writing.process.progress.begin(
                     timelord_supervisor::progress::Resource::OptionalCheckpoint,
                     0,
                     0,
@@ -193,7 +265,7 @@ pub async fn record(
         {
             Ok(Some(true)) => {
                 if eligible_for_write(&shared, &current, &shutdown) {
-                    process.progress.checkpointed();
+                    shared.process.progress.checkpointed();
                 }
                 return Ok(());
             }
@@ -292,6 +364,115 @@ mod tests {
         assert!(load_running(&path).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn fallback_uses_the_active_profile_network_and_refuses_unknown_intent() {
+        use timelord_core::{ConnectionProfile, NodeConfig};
+        let directory = std::env::temp_dir().join(format!("tl-lkg-profile-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("config.toml");
+        let profile_config = |network: &str| {
+            let node = NodeConfig {
+                network: network.parse().unwrap(),
+                ..Default::default()
+            };
+            let mut config = Config {
+                node: node.clone(),
+                ..Default::default()
+            };
+            config.connections.profiles = vec![ConnectionProfile {
+                id: "active".into(),
+                name: "Active".into(),
+                node,
+            }];
+            config.connections.active_id = Some("active".into());
+            config
+        };
+        crate::save(&saved_path(&path).unwrap(), &profile_config("testnet11")).unwrap();
+        // The runtime projection is gone from saved files and intent comes from
+        // the active profile.
+        let mut requested = profile_config("testnet11");
+        requested.schema_version = 999;
+        let text = toml::to_string(&requested).unwrap();
+        assert!(!text.contains("[node]"));
+        std::fs::write(&path, &text).unwrap();
+        assert!(load_running(&path).unwrap().1);
+
+        let mut mainnet = profile_config("mainnet");
+        mainnet.schema_version = 999;
+        std::fs::write(&path, toml::to_string(&mainnet).unwrap()).unwrap();
+        assert!(load_running(&path).is_err());
+
+        // A legacy [node] table still supplies the intent and wins over profiles.
+        std::fs::write(
+            &path,
+            "schema_version = 999\n\n[node]\nnetwork = \"mainnet\"\n\n[connections]\n\
+             active_id = \"active\"\n\n[[connections.profiles]]\nid = \"active\"\nname = \"Active\"\n\
+             [connections.profiles.node]\nnetwork = \"testnet11\"\n",
+        )
+        .unwrap();
+        assert!(load_running(&path).is_err());
+
+        // Profiles with no resolvable active profile are not mainnet.
+        for connections in ["active_id = \"missing\"\n", ""] {
+            std::fs::write(
+                &path,
+                format!(
+                    "schema_version = 999\n[connections]\n{connections}\
+                     [[connections.profiles]]\nid = \"active\"\nname = \"Active\"\n\
+                     [connections.profiles.node]\nnetwork = \"mainnet\"\n"
+                ),
+            )
+            .unwrap();
+            assert!(load_running(&path).is_err(), "{connections}");
+        }
+        // Even a mainnet last-good checkpoint cannot rescue unknown intent: the
+        // requested profile list has no selected profile.
+        crate::save(&saved_path(&path).unwrap(), &profile_config("mainnet")).unwrap();
+        for text in [
+            "schema_version = 999\n[connections]\n\
+             [[connections.profiles]]\nid = \"active\"\nname = \"Active\"\n\
+             [connections.profiles.node]\nnetwork = \"mainnet\"\n",
+            "schema_version = 999\n[connections]\nactive_id = \"active\"\nprofiles = []\n",
+        ] {
+            std::fs::write(&path, text).unwrap();
+            assert!(load_running(&path).is_err(), "{text}");
+        }
+        // A single-node request keeps working without profiles.
+        std::fs::write(
+            &path,
+            "schema_version = 999\n[node]\nnetwork = \"mainnet\"\n",
+        )
+        .unwrap();
+        assert!(load_running(&path).unwrap().1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn unreadable_files_fall_back_but_malformed_or_oversized_content_does_not() {
+        let directory = std::env::temp_dir().join(format!("tl-lkg-text-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("config.toml");
+        crate::save(&saved_path(&path).unwrap(), &Config::default()).unwrap();
+        assert!(matches!(
+            bounded_text(&path, false),
+            Err(ConfigTextError::Unreadable(_))
+        ));
+        assert!(load_running(&path).unwrap().1);
+        std::fs::write(&path, b"\xff[node]\n").unwrap();
+        assert!(matches!(
+            bounded_text(&path, false),
+            Err(ConfigTextError::Invalid(_))
+        ));
+        assert!(load_running(&path).is_err());
+        std::fs::write(&path, "x".repeat(LIMIT as usize + 1)).unwrap();
+        assert!(matches!(
+            bounded_text(&path, false),
+            Err(ConfigTextError::Invalid(_))
+        ));
+        assert!(load_running(&path).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn stalled_optional_disk_work_does_not_hold_runtime_shutdown_or_release_capacity_early() {
         let permit = Arc::new(tokio::sync::Semaphore::new(1));

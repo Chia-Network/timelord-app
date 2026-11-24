@@ -5,7 +5,7 @@ import TimelordPresentation
 
 @MainActor
 final class ConnectionProfileTests: XCTestCase {
-    func testSwitchingProfilesRestoresCompleteNodesAndPreservesEdits() throws {
+    func testSwitchingProfilesAdoptsStoredProfilesWithoutCopyingStagedEdits() throws {
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
         let mainnet = try decoder.decode(NodeConfiguration.self, from: Data("""
         {"host":"mainnet.fixture","port":8444,"network":"mainnet","server_name":"chia.net",
@@ -31,19 +31,38 @@ final class ConnectionProfileTests: XCTestCase {
         XCTAssertEqual(model.configuration.node, custom)
         XCTAssertNil(model.configuration.node.rpc)
         XCTAssertEqual(model.configuration.connections?.profiles.count, 2)
+        // Unsaved node edits stay in the selected profile's runtime projection;
+        // switching profiles adopts the stored profile instead of copying them.
+        XCTAssertEqual(model.configuration.connections?.profiles[0].node, mainnet)
         XCTAssertTrue(model.hasUnsavedSettings)
         model.selectConnectionProfile("main")
-        var expected = mainnet; expected.host = "edited-mainnet.fixture"
-        expected.rpc?.host = "corrected-rpc.fixture"; expected.rpc?.port = 58555
-        XCTAssertEqual(model.configuration.node, expected)
+        XCTAssertEqual(model.configuration.node, mainnet)
         XCTAssertNotNil(model.configuration.node.rpc)
         XCTAssertNil(model.configuration.node.networkDefinition)
         let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
         let restored = try decoder.decode(AppConfiguration.self, from: encoder.encode(model.configuration))
         XCTAssertEqual(restored.connections?.profiles[1].node, custom)
-        XCTAssertEqual(restored.node, expected)
+        XCTAssertEqual(restored.node, mainnet)
         model.selectConnectionProfile("unknown")
-        XCTAssertEqual(model.configuration.node, expected)
+        XCTAssertEqual(model.configuration.node, mainnet)
+    }
+
+    func testHelperConfigurationWithoutNodeDerivesItFromTheActiveProfile() throws {
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let config = try decoder.decode(AppConfiguration.self, from: Data("""
+        {"schema_version":1,"connections":{"active_id":"custom","profiles":[
+         {"id":"custom","name":"Custom","node":{"host":"custom.fixture","port":58445,"network":"ephemeral-fixture",
+          "certificate":"/fixture/custom.crt","private_key":"/fixture/custom.key","ca_certificate":"/fixture/custom-ca.crt"}},
+         {"id":"other","name":"Other","node":{"host":"other.fixture","port":8444,"network":"mainnet"}}]}}
+        """.utf8))
+        XCTAssertEqual(config.node.host, "custom.fixture")
+        XCTAssertEqual(config.node.network, "ephemeral-fixture")
+        XCTAssertEqual(config.connections?.activeId, "custom")
+        XCTAssertEqual(config.service, ServiceConfiguration())
+        XCTAssertEqual(config.hardware, HardwareConfiguration())
+
+        let withoutProfiles = try decoder.decode(AppConfiguration.self, from: Data("{}".utf8))
+        XCTAssertEqual(withoutProfiles.node, NodeConfiguration())
     }
     func testSaveReloadsProfilesCreatedByHelper() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("timelord-save-\(UUID().uuidString)")
