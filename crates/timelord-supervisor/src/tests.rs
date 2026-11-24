@@ -661,7 +661,7 @@ async fn unresponsive_watchdog_failure_reaps_under_the_short_grace() {
     let helper = script_helper(
         &dir,
         "worker",
-        &format!("#!/bin/sh\ntouch '{d}/alive.'$$\ntrap '' TERM\nwhile :; do sleep 0.1; done\n"),
+        &format!("#!/bin/sh\ntrap '' TERM\ntouch '{d}/alive.'$$\nwhile :; do sleep 0.1; done\n"),
     );
     let (mut state, pid) = running_state(&dir, &helper).await;
     let (snapshots, _) = watch::channel(state.published());
@@ -695,7 +695,7 @@ async fn cleanup_retry_skips_the_graceful_wait() {
     let helper = script_helper(
         &dir,
         "worker",
-        &format!("#!/bin/sh\ntouch '{d}/alive.'$$\ntrap '' TERM\nwhile :; do sleep 0.1; done\n"),
+        &format!("#!/bin/sh\ntrap '' TERM\ntouch '{d}/alive.'$$\nwhile :; do sleep 0.1; done\n"),
     );
     let paths = Paths::for_config(&dir.join("config.toml")).unwrap();
     let (mut state, pid) = running_state(&dir, &helper).await;

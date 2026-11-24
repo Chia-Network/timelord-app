@@ -330,15 +330,18 @@ mod tests {
 
     #[tokio::test]
     async fn startup_diagnostics_do_not_garble_a_split_character() {
-        // Two bytes, then 10000 bytes of two-byte characters: the kept window
-        // begins inside a character, so its continuation bytes are skipped.
-        let captured =
-            captured("{ printf 'XY'; yes 'é' | tr -d '\\n' | head -c 10000; } >&2; exit 7").await;
+        // One byte, 10000 bytes of two-byte characters, then one byte: the kept
+        // window begins on a continuation byte, which must be skipped.
+        let captured = captured(
+            "{ printf 'X'; yes 'é' | tr -d '\\n' | head -c 10000; printf 'Z'; } >&2; exit 7",
+        )
+        .await;
         assert!(captured.truncated);
+        assert!(captured.text.ends_with('Z'));
         assert!(
-            captured.text.chars().all(|character| character == 'é'),
+            !captured.text.contains('\u{FFFD}'),
             "{:?}",
-            captured.text.chars().take(4).collect::<String>()
+            captured.text.chars().take(2).collect::<String>()
         );
     }
 
