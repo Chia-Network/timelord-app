@@ -16,8 +16,10 @@ pub(crate) type Retirement =
 pub(crate) enum Cause {
     /// Pause, Reload, or Resume of a running worker.
     Requested,
-    /// The group was already SIGKILLed but did not reap; still send SIGTERM to
-    /// the leader, skip the SIGTERM wait, then group-SIGKILL and reap.
+    /// A stop with no SIGTERM grace. The group may already have been SIGKILLed
+    /// without reaping (CleanupFailed), or shutdown interrupted an attempt that
+    /// already spent its grace. Still send SIGTERM to the leader, skip the
+    /// wait, then group-SIGKILL and reap.
     CleanupRetry,
     /// Crash or watchdog failure: recorded as a recovery and backed off.
     Failed { watchdog: Option<Failure> },
@@ -166,7 +168,15 @@ impl SupervisorState {
     pub(crate) async fn retire_now(&mut self, snapshots: &watch::Sender<Published>) -> Result<()> {
         self.poll_retirement(snapshots, true).await;
         if self.lifecycle.worker().is_some() {
-            let cause = self.cleanup_cause();
+            // A worker still running gets the normal grace. One that already
+            // stopped once has spent its grace, even when that attempt failed
+            // before the group kill (a waitid error), so shutdown retries
+            // without another SIGTERM wait and cannot exceed the stop budget.
+            let cause = if matches!(self.lifecycle, Lifecycle::Running(_)) {
+                Cause::Requested
+            } else {
+                Cause::CleanupRetry
+            };
             self.begin_retirement(cause);
             self.publish(snapshots);
             self.poll_retirement(snapshots, true).await;
@@ -176,8 +186,10 @@ impl SupervisorState {
         }
         Ok(())
     }
-    /// A failed cleanup only skips the SIGTERM wait when the group was already
-    /// SIGKILLed; otherwise the worker may still be retiring natively.
+    /// Retry policy for an interactive Pause or Reload: skip the SIGTERM wait
+    /// only when the group was already SIGKILLed, otherwise the worker may
+    /// still be retiring natively. Shutdown retries without a wait instead, so
+    /// it never grants a second grace.
     pub(crate) fn cleanup_cause(&self) -> Cause {
         match &self.lifecycle {
             Lifecycle::CleanupFailed { worker, .. } if worker.killed => Cause::CleanupRetry,

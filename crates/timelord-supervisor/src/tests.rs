@@ -1,42 +1,6 @@
 use super::*;
-/// Write an executable fixture and return its path. The write runs in a child
-/// because Linux refuses to exec a file while any process holds it open for
-/// writing: a descriptor opened here can be inherited by an unrelated test's
-/// `fork` until that child execs, which makes the fixture's own exec fail with
-/// ETXTBSY. The child owns the only writable descriptor, and waiting for it
-/// closes that descriptor before the fixture is ever exec'd.
-pub(crate) fn script_helper(dir: &Path, name: &str, body: &str) -> PathBuf {
-    let helper = dir.join(name);
-    let mut writer = std::process::Command::new("/bin/sh")
-        .args(["-c", "cat > \"$1\" && chmod 700 \"$1\"", "fixture"])
-        .arg(&helper)
-        .stdin(Stdio::piped())
-        .spawn()
-        .expect("fixture writer");
-    writer
-        .stdin
-        .take()
-        .expect("fixture stdin")
-        .write_all(body.as_bytes())
-        .expect("fixture body");
-    assert!(writer.wait().expect("fixture writer").success());
-    helper
-}
+use crate::test_support::{reaped, script_helper};
 
-#[test]
-fn script_helper_writes_the_whole_executable() {
-    let dir = std::env::temp_dir().join(format!("tl-script-helper-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    let helper = script_helper(&dir, "worker", "#!/bin/sh\nexit 3\n");
-    assert_eq!(fs::read_to_string(&helper).unwrap(), "#!/bin/sh\nexit 3\n");
-    assert_eq!(fs::symlink_metadata(&helper).unwrap().mode() & 0o777, 0o700);
-    assert_eq!(
-        std::process::Command::new(&helper).status().unwrap().code(),
-        Some(3)
-    );
-    fs::remove_dir_all(dir).unwrap();
-}
 #[tokio::test]
 async fn completed_validator_is_reaped_before_reporting_success_or_failure() {
     let dir = std::env::temp_dir().join(format!("tl-validator-completed-{}", std::process::id()));
@@ -477,11 +441,6 @@ fn alive_families(dir: &Path) -> usize {
         })
         .count()
 }
-fn reaped(pid: i32) -> bool {
-    let mut status = 0;
-    let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-    result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
-}
 async fn running_state(dir: &Path, helper: &Path) -> (SupervisorState, i32) {
     let log = timelord_supervisor::logging::Writer::stderr();
     let mut state = SupervisorState::new(Ok(Intent::default()), log);
@@ -752,6 +711,41 @@ async fn cleanup_retry_skips_the_graceful_wait() {
         started.elapsed()
     );
     assert!(matches!(state.lifecycle, Lifecycle::Paused));
+    assert!(reaped(pid));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_retry_never_waits_out_a_second_grace() {
+    let dir = std::env::temp_dir().join(format!("tl-shutdown-retry-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let helper = script_helper(
+        &dir,
+        "worker",
+        "#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 0.1; done\n",
+    );
+    let paths = Paths::for_config(&dir.join("config.toml")).unwrap();
+    let log = timelord_supervisor::logging::Writer::stderr();
+    let mut worker =
+        Worker::spawn(&helper, &paths.config, &dir.join("progress.sock"), 1, &log).unwrap();
+    let pid = worker.process.pid() as i32;
+    // Fail before SIGTERM, so the failed attempt never reached the group kill.
+    worker.stop_failures = 1;
+    let mut state = SupervisorState::new(Ok(Intent::default()), log);
+    state.lifecycle = Lifecycle::Running(Box::new(worker));
+    let (snapshots, _) = watch::channel(state.published());
+    state.begin_retirement(Cause::Failed { watchdog: None });
+    state.poll_retirement(&snapshots, true).await;
+    assert!(matches!(state.lifecycle, Lifecycle::CleanupFailed { .. }));
+    assert!(!state.lifecycle.worker().unwrap().killed);
+    let started = Instant::now();
+    state.retire_now(&snapshots).await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "shutdown granted a second 25 s grace: {:?}",
+        started.elapsed()
+    );
     assert!(reaped(pid));
     fs::remove_dir_all(dir).unwrap();
 }

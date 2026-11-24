@@ -35,27 +35,44 @@ pub const KILL_AND_REAP: Duration = Duration::from_secs(3);
 /// Bound on draining the worker's concurrent log pumps under one deadline.
 pub const LOG_DRAIN: Duration = Duration::from_secs(1);
 
+/// Const `Duration` arithmetic for the shutdown budget: a budget that would
+/// overflow `Duration` is a compile error rather than a silent truncation.
+const fn sum(left: Duration, right: Duration) -> Duration {
+    match left.checked_add(right) {
+        Some(total) => total,
+        None => panic!("shutdown budget overflow"),
+    }
+}
+const fn times(value: Duration, factor: u32) -> Duration {
+    match value.checked_mul(factor) {
+        Some(total) => total,
+        None => panic!("shutdown budget overflow"),
+    }
+}
+
 /// Worst-case time to retire a worker: normal graceful wait, group kill/reap,
 /// then one shared log-drain deadline for both pumps.
-pub const WORST_CASE_STOP: Duration = Duration::from_secs(
-    NORMAL_GRACEFUL_STOP.as_secs() + KILL_AND_REAP.as_secs() + LOG_DRAIN.as_secs(),
-);
+pub const WORST_CASE_STOP: Duration = sum(sum(NORMAL_GRACEFUL_STOP, KILL_AND_REAP), LOG_DRAIN);
 
 /// Scheduling allowance for the bounded waits, which poll on 10-20 ms sleeps.
 const WAIT_SLOP: Duration = Duration::from_millis(100);
 /// Reap bounds a failing shutdown can spend: the first stop, the CleanupRetry
 /// and the final `OwnedProcess::Drop`.
-const SHUTDOWN_REAP_BOUNDS: u128 = 3;
+const SHUTDOWN_REAP_BOUNDS: u32 = 3;
 
 /// Worst-case time for shutdown to settle a worker. A stop that fails at the
 /// group kill waits out NORMAL_GRACEFUL_STOP and then its own KILL_AND_REAP,
 /// never reaching the log drain; the CleanupRetry spends another KILL_AND_REAP
 /// and fails the same way; the unreaped owner left behind then spends a final
-/// KILL_AND_REAP in `OwnedProcess::Drop` before the supervisor can exit.
-pub const SHUTDOWN_WORST_CASE: Duration = Duration::from_millis(
-    (NORMAL_GRACEFUL_STOP.as_millis()
-        + KILL_AND_REAP.as_millis() * SHUTDOWN_REAP_BOUNDS
-        + WAIT_SLOP.as_millis()) as u64,
+/// KILL_AND_REAP in `OwnedProcess::Drop` before the supervisor can exit. A
+/// failed attempt never re-grants the graceful wait, so every shutdown path
+/// stays inside this budget.
+pub const SHUTDOWN_WORST_CASE: Duration = sum(
+    sum(
+        NORMAL_GRACEFUL_STOP,
+        times(KILL_AND_REAP, SHUTDOWN_REAP_BOUNDS),
+    ),
+    WAIT_SLOP,
 );
 
 /// launchd's deadline for the supervisor to exit. This is the external ceiling
@@ -72,7 +89,6 @@ pub const CONTROL_SERVER_TIMEOUT: Duration = Duration::from_secs(30);
 pub const CONTROL_CLIENT_TIMEOUT: Duration = Duration::from_secs(35);
 
 const _: () = assert!(CONTROL_CLIENT_TIMEOUT.as_secs() > CONTROL_SERVER_TIMEOUT.as_secs());
-const _: () = assert!(EXIT_TIME_OUT.as_millis() > SHUTDOWN_WORST_CASE.as_millis());
 const _: () = assert!(
     EXIT_TIME_OUT.as_millis() >= SHUTDOWN_WORST_CASE.as_millis() + EXIT_TIME_OUT_MARGIN.as_millis()
 );
@@ -494,11 +510,16 @@ mod stop_budget_tests {
     }
 
     #[test]
-    fn shutdown_budget_counts_the_grace_three_reap_bounds_and_slack() {
-        // 25 s graceful + 3 s first reap + 3 s retry reap + 3 s drop reap + 0.1 s.
+    fn documented_shutdown_budget_is_the_grace_the_three_reap_bounds_and_slack() {
+        // No test can afford to drive a 34 s shutdown, so the arithmetic is
+        // pinned to the numbers docs/deployment.md quotes. The compile-time
+        // asserts above keep the launchd deadline over it.
         assert_eq!(WORST_CASE_STOP, Duration::from_secs(29));
         assert_eq!(SHUTDOWN_WORST_CASE, Duration::from_millis(34_100));
-        assert_eq!(EXIT_TIME_OUT, Duration::from_secs(35));
-        assert!(EXIT_TIME_OUT > SHUTDOWN_WORST_CASE);
+        assert!(SHUTDOWN_WORST_CASE < Duration::from_secs(35));
+        assert!(
+            EXIT_TIME_OUT <= Duration::from_secs(35),
+            "launchd deadline grew"
+        );
     }
 }

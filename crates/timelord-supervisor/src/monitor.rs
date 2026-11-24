@@ -149,7 +149,8 @@ mod tests {
     async fn monitor_listener_failure_preserves_the_live_worker_and_controls() {
         let dir = std::env::temp_dir().join(format!("tl-monitor-failure-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let helper = crate::tests::script_helper(&dir, "worker", "#!/bin/sh\nexec /bin/sleep 60\n");
+        let helper =
+            crate::test_support::script_helper(&dir, "worker", "#!/bin/sh\nexec /bin/sleep 60\n");
         let config = dir.join("config.toml");
         let progress = dir.join("progress.sock");
         let log = timelord_supervisor::logging::Writer::stderr();

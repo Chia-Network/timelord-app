@@ -2,6 +2,8 @@ mod monitor;
 mod process;
 mod retirement;
 mod startup;
+#[cfg(test)]
+mod test_support;
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use process::OwnedProcess;
@@ -9,7 +11,10 @@ use retirement::{Cause, Retiring};
 use std::{
     fs,
     io::Write,
-    os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
+    os::unix::{
+        fs::{FileTypeExt, MetadataExt, PermissionsExt},
+        io::AsRawFd,
+    },
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -786,13 +791,7 @@ async fn monitoring_exit(
             .take(512)
             .collect(),
     );
-    // A closed startup pipe (the CLI has exited) must not panic the supervisor
-    // through eprintln's write-failure panic.
-    let _ = writeln!(
-        std::io::stderr(),
-        "{}",
-        state.monitor_error.as_deref().expect("monitor error")
-    );
+    eprintln!("{}", state.monitor_error.as_deref().expect("monitor error"));
     state.publish(snapshots);
 }
 
@@ -858,6 +857,15 @@ async fn run(
     let mut controls = tokio::spawn(accept_controls(listener, current, tx, state.log.clone()));
     let mut timer = tokio::time::interval(Duration::from_millis(100));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Every fallible startup step is done, so stop reporting diagnostics on the
+    // caller's stderr pipe. Replacing fd 2 closes that pipe for the short-lived
+    // CLI and keeps any later child that inherits stderr from holding the
+    // CLI's descriptor open. Best effort: the CLI's read is bounded anyway.
+    if let Ok(null) = fs::OpenOptions::new().write(true).open("/dev/null") {
+        unsafe {
+            libc::dup2(null.as_raw_fd(), libc::STDERR_FILENO);
+        }
+    }
     let stop = signal();
     tokio::pin!(stop);
     let result: Result<()> = async {

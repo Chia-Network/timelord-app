@@ -1,6 +1,6 @@
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    io::Write,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -32,16 +32,33 @@ impl Fixture {
         self.0.join("config.toml")
     }
     pub(crate) fn helper(&self, body: &str) -> PathBuf {
-        let path = self.0.join("worker");
-        fs::write(
-            &path,
-            format!(
+        self.script(
+            "worker",
+            &format!(
                 "#!/bin/sh\nif [ \"$1\" = validate ]; then [ ! -e \"$0.reject\" ]; exit $?; fi\necho $$ >> '{}'\n{body}\n",
                 self.0.join("pids").display()
             ),
         )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    /// Write an executable fixture script. The write runs in a child process:
+    /// Linux refuses to exec a file while any process holds it open for
+    /// writing, and a descriptor opened here can be inherited by another
+    /// test's `fork` until that child execs (rust-lang/rust#114554).
+    pub(crate) fn script(&self, name: &str, body: &str) -> PathBuf {
+        let path = self.0.join(name);
+        let mut writer = std::process::Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\" && chmod 700 \"$1\"", "fixture"])
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("fixture writer");
+        writer
+            .stdin
+            .take()
+            .expect("fixture stdin")
+            .write_all(body.as_bytes())
+            .expect("fixture body");
+        assert!(writer.wait().expect("fixture writer").success());
         path
     }
     pub(crate) fn supervisor(&self, helper: &Path) -> Child {

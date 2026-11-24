@@ -188,13 +188,12 @@ mod tests {
         let started = std::time::Instant::now();
         drop(owner);
         let elapsed = started.elapsed();
-        // Drop killed and reaped the leader itself. Probe the PID instead of
-        // sending SIGKILL to a number that may already belong to another
-        // process once the wait status is consumed.
-        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
+        // Drop must not leave a waitable child behind. Probed with waitpid, not
+        // kill(pid, 0): waitpid only reports on this process's own children, so
+        // a reused PID cannot be touched or misreported.
+        assert!(
+            crate::test_support::reaped(pid),
+            "Drop left the leader unreaped"
         );
         assert!(elapsed >= timelord_supervisor::KILL_AND_REAP);
         assert!(
