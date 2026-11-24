@@ -70,7 +70,12 @@ jobs:
           build-mode: ${{ matrix.build-mode }}
       - name: Build Swift for analysis
         if: matrix.language == 'swift'
-        run: swift build --package-path apps/macos --scratch-path build/codeql-swift
+        env:
+          # Trace only swiftc; see scripts/codeql-swift-build.sh. Letting the
+          # tracer cover the whole SwiftPM build makes this step roughly an
+          # order of magnitude slower.
+          DYLD_INSERT_LIBRARIES: ''
+        run: bash scripts/codeql-swift-build.sh
       - name: Analyze
         uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
         with:
