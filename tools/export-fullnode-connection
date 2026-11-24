@@ -31,23 +31,10 @@ def port(value, name):
     return value
 
 
-def mapping(value, name, *, null_is_empty=False):
-    if value is None and null_is_empty:
-        return {}
+def as_mapping(value, label):
     if not isinstance(value, dict):
-        raise ValueError(f"config.yaml {name} must be a mapping")
+        raise ValueError(f"config.yaml {label} must be a mapping")
     return value
-
-
-def section(config, name, *, required=False, null_is_empty=False):
-    if name not in config:
-        if required:
-            raise ValueError(f"config.yaml has no {name} section")
-        return {}
-    value = config[name]
-    if required and value is None:
-        raise ValueError(f"config.yaml has no {name} section")
-    return mapping(value, name, null_is_empty=null_is_empty)
 
 
 def path_value(config, name, key, default):
@@ -58,19 +45,22 @@ def path_value(config, name, key, default):
 
 
 def selected_overrides(node, config):
-    if "network_overrides" in node:
-        return section(node, "network_overrides", null_is_empty=True)
-    return section(config, "network_overrides", null_is_empty=True)
+    overrides = (
+        node["network_overrides"]
+        if "network_overrides" in node
+        else config.get("network_overrides")
+    )
+    return {} if overrides is None else as_mapping(overrides, "network_overrides")
 
 
 def override_group(overrides, name, network):
-    group = mapping(
-        overrides.get(name, {}), f"network_overrides {name}", null_is_empty=True
-    )
-    return mapping(
-        group.get(network, {}),
-        f"network_overrides {name}.{network}",
-        null_is_empty=True,
+    group = overrides.get(name)
+    group = {} if group is None else as_mapping(group, f"network_overrides {name}")
+    selected = group.get(network)
+    return (
+        {}
+        if selected is None
+        else as_mapping(selected, f"network_overrides {name}.{network}")
     )
 
 
@@ -97,7 +87,10 @@ def export(args, load_yaml, generate_cert):
     config = load_yaml((root / "config/config.yaml").read_text())
     if not isinstance(config, dict):
         raise ValueError("config.yaml must be a mapping")
-    node = section(config, "full_node", required=True)
+    node = config.get("full_node")
+    if node is None:
+        raise ValueError("config.yaml has no full_node section")
+    node = as_mapping(node, "full_node")
     network = node.get("selected_network", config.get("selected_network"))
     if not isinstance(network, str) or not network.strip():
         raise ValueError("Chia configuration has no selected network")
@@ -120,8 +113,16 @@ def export(args, load_yaml, generate_cert):
     output = Path(args.output or f"fullnode-{slug}-connection").expanduser()
 
     # Respect this installation's CA paths, including custom peer CAs.
-    public_ca = section(config, "chia_ssl_ca")
-    private_ca = section(config, "private_ssl_ca")
+    public_ca = (
+        as_mapping(config["chia_ssl_ca"], "chia_ssl_ca")
+        if "chia_ssl_ca" in config
+        else {}
+    )
+    private_ca = (
+        as_mapping(config["private_ssl_ca"], "private_ssl_ca")
+        if "private_ssl_ca" in config
+        else {}
+    )
     peer_crt = (root / path_value(public_ca, "chia_ssl_ca", "crt",
                                   "config/ssl/ca/chia_ca.crt")).read_bytes()
     peer_key = (root / path_value(public_ca, "chia_ssl_ca", "key",
@@ -191,7 +192,7 @@ def main(argv=None):
         parser.exit(1, "Run this tool with the node's existing Chia Python environment.\n")
     try:
         output = export(args, yaml.safe_load, generate_ca_signed_cert)
-    except (OSError, ValueError, ImportError) as error:
+    except (OSError, ValueError, TypeError, ImportError, yaml.YAMLError) as error:
         parser.exit(1, f"Export failed: {error}\n")
     print(f"Created {output.resolve()}")
 

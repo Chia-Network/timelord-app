@@ -28,8 +28,12 @@ def fake_cert(ca, key, crt_path, key_path):
 
 
 def stub_modules(generate_cert, version=None):
+    class YAMLError(Exception):
+        pass
+
     yaml_module = types.ModuleType("yaml")
     yaml_module.safe_load = json.loads
+    yaml_module.YAMLError = YAMLError
     chia = types.ModuleType("chia")
     if version is not None:
         chia.__version__ = version
@@ -82,7 +86,9 @@ class ExportTests(unittest.TestCase):
             exporter, "detect_host", return_value="192.168.1.25"
         ), patch.object(
             exporter.importlib.metadata, "version", side_effect=metadata_version
-        ), patch.dict(sys.modules, {"chia": None}):
+        ), patch.dict(sys.modules, {"chia": None}), contextlib.redirect_stdout(
+            io.StringIO()
+        ), contextlib.redirect_stderr(io.StringIO()):
             return exporter.export(self.args, json.loads, generate or fake_cert).resolve()
 
     def run_main(self, modules, argv, version="test-version"):
@@ -94,7 +100,9 @@ class ExportTests(unittest.TestCase):
         stderr = io.StringIO()
         with patch.object(
             exporter.importlib.metadata, "version", side_effect=metadata_version
-        ), patch.dict(sys.modules, modules), contextlib.redirect_stderr(stderr):
+        ), patch.dict(sys.modules, modules), contextlib.redirect_stdout(
+            io.StringIO()
+        ), contextlib.redirect_stderr(stderr):
             try:
                 exporter.main(argv)
                 code = None
@@ -305,6 +313,65 @@ class ExportTests(unittest.TestCase):
         self.assertNotIn("Chia Python environment", error)
         self.assertNotIn("Traceback", error)
         self.assertFalse(self.output.exists())
+
+    def test_encrypted_ca_key_type_error_is_reported_as_export_failure(self):
+        def encrypted(*args):
+            raise TypeError("Password was not given but private key is encrypted")
+
+        self.write_config()
+        code, error = self.run_main(stub_modules(encrypted), self.argv())
+        self.assertEqual(code, 1)
+        self.assertIn("Export failed", error)
+        self.assertIn("Password was not given", error)
+        self.assertNotIn("Traceback", error)
+        self.assertNotIn("Chia Python environment", error)
+        self.assertFalse(self.output.exists())
+
+    def test_non_json_serializable_override_is_reported_as_export_failure(self):
+        from datetime import date
+
+        self.write_config()
+        self.config["network_overrides"]["constants"]["ephemeral-test"]["EXPORTED_AT"] = (
+            date(2026, 1, 1)
+        )
+        modules = stub_modules(fake_cert)
+        modules["yaml"].safe_load = lambda text: self.config
+        code, error = self.run_main(modules, self.argv())
+        self.assertEqual(code, 1)
+        self.assertIn("Export failed", error)
+        self.assertNotIn("Traceback", error)
+        self.assertFalse(self.output.exists())
+
+    def test_malformed_yaml_is_reported_as_export_failure(self):
+        modules = stub_modules(fake_cert)
+
+        def broken(text):
+            raise modules["yaml"].YAMLError("fixture malformed yaml")
+
+        modules["yaml"].safe_load = broken
+        self.write_config()
+        code, error = self.run_main(modules, self.argv())
+        self.assertEqual(code, 1)
+        self.assertIn("Export failed", error)
+        self.assertIn("fixture malformed yaml", error)
+        self.assertNotIn("Traceback", error)
+        self.assertNotIn("Chia Python environment", error)
+        self.assertFalse(self.output.exists())
+
+    def test_empty_or_non_mapping_config_is_rejected(self):
+        self.args.chia_root = str(self.root)
+        config_path = self.root / "config/config.yaml"
+        for text in ("null", "[]"):
+            with self.subTest(text=text):
+                config_path.write_text(text)
+                with contextlib.redirect_stdout(
+                    io.StringIO()
+                ), contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaisesRegex(
+                        ValueError, "config.yaml must be a mapping"
+                    ):
+                        exporter.export(self.args, json.loads, fake_cert)
+                self.assertFalse(self.output.exists())
 
 
 if __name__ == "__main__":

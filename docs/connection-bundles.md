@@ -7,8 +7,9 @@ runs its own timelord service. No Python installation is needed on the Timelord 
 For the complete dashboard, prepare **both** connections before importing: the
 timelord peer identity for proof production and the private RPC identity for sync
 status and height. The importer configures both from the same `connection.toml`.
-Follow all sections below in order. A peer-only bundle is a deliberate reduced
-setup: it can produce proofs but cannot report whether the full node is synced.
+Follow all sections below in order. A peer-only bundle is made by removing
+`[node.rpc]` from an exported manifest: it can produce proofs but cannot report
+whether the full node is synced.
 
 ## Allow the remote timelord on the node
 
@@ -56,8 +57,9 @@ the tool exits with an error. The remaining options have defaults:
 
 The exporter reads the configured peer/RPC ports and CA paths, generates separate
 peer and RPC leaf identities, and writes an owner-only bundle without changing
-the node configuration. No CA signing keys are exported. `network.json` preserves
-the selected network's consensus/config overrides, Chia version and export time.
+the node configuration. No CA signing keys are exported. `network.json` is always
+written; it records `schema_version`, the network ID, genesis challenge, exported
+constants and `config_overrides`, Chia version and export time.
 The root itself is not needed on the receiving Mac.
 
 RPC defaults to the same node address as the peer connection and the node's
@@ -140,9 +142,10 @@ private_key = "rpc-client.key"
 ca_certificate = "private-ca.crt"
 ```
 
-`[node.rpc]` is omitted only for a deliberate peer-only bundle. For a custom
-network, `network.json` records the network ID, genesis challenge, exported
-constants, Chia version and export time; the importer reads it. Credential paths
+Remove `[node.rpc]` from the manifest to make a peer-only bundle. `network.json`
+is always written and is used for custom networks: it records `schema_version`,
+the network ID, genesis challenge, exported constants and `config_overrides`,
+Chia version and export time; the importer reads it. Credential paths
 must be relative and stay inside the folder, including through symlinks. Keep
 private keys mode 0600, transfer the folder privately, for example with `scp -r`,
 and never include a CA signing key (`chia_ca.key` or `private_ca.key`). Create a
