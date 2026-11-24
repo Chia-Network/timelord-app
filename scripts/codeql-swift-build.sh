@@ -20,7 +20,6 @@ if [[ -n "${DYLD_INSERT_LIBRARIES:-}" ]]; then
     echo "note: clearing DYLD_INSERT_LIBRARIES so the build runs outside the tracer" >&2
 fi
 unset DYLD_INSERT_LIBRARIES
-: "${CODEQL_RUNNER:?CodeQL tracing is not initialized}"
 : "${SEMMLE_PRELOAD_libtrace:?CodeQL tracing is not initialized}"
 
 scratch="build/codeql-swift"
@@ -32,10 +31,12 @@ case "$swiftc" in
         exit 1
         ;;
 esac
+mkdir -p "$scratch"
+scratch="$(cd "$scratch" && pwd)"
 toolchain="$scratch/toolchain"
 shadow_swiftc="$toolchain/usr/bin/swiftc"
+wrapper_calls="$scratch/wrapper-calls"
 real_toolchain="$(dirname "$(dirname "$(dirname "$swiftc")")")"
-mkdir -p "$scratch"
 
 # The shadow toolchain is a symlink farm around the active Xcode toolchain with
 # one difference: usr/bin/swiftc is the tracing wrapper. Keeping the wrapper's
@@ -59,16 +60,21 @@ for entry in "$real_toolchain"/usr/bin/*; do
 done
 
 # Keep every CodeQL/SEMMLE setting on the compiler wrapper, including the
-# extractor's trap and source-archive directories.
+# extractor's trap and source-archive directories. Exec the compiler directly
+# with the tracer preloaded: routing every compile through the separate
+# CODEQL_RUNNER process made each compiler invocation start a fresh extractor
+# and was slower than tracing the whole build.
 {
     echo '#!/bin/bash'
+    printf 'printf x >> %q\n' "$wrapper_calls"
     while IFS= read -r name; do
         printf 'export %s=%q\n' "$name" "${!name}"
     done < <(compgen -e | grep -E '^(CODEQL|SEMMLE)_' || true)
     printf 'export DYLD_INSERT_LIBRARIES=%q\n' "$SEMMLE_PRELOAD_libtrace"
-    printf 'exec %q %q "$@"\n' "$CODEQL_RUNNER" "$swiftc"
+    printf 'exec %q "$@"\n' "$swiftc"
 } > "$shadow_swiftc"
 chmod +x "$shadow_swiftc"
+: > "$wrapper_calls"
 
 # The native build system honours --toolchain for compilation. The default
 # Swift Build engine registers the Xcode toolchain with its build service and
@@ -88,4 +94,6 @@ if [[ "$trap_count" -eq 0 ]]; then
     echo "error: the traced Swift build produced no CodeQL trap files" >&2
     exit 1
 fi
+calls="$(wc -c < "$wrapper_calls" | tr -d ' ')"
+echo "compiler wrapper invocations: $calls"
 echo "CodeQL Swift extraction produced $trap_count trap file(s)"
