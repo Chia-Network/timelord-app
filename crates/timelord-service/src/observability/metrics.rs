@@ -355,6 +355,31 @@ impl Metrics {
             .with_label_values(&[chain(c)])
             .inc();
     }
+    #[cfg(test)]
+    pub fn histogram_count(&self, name: &'static str, labels: &[&str]) -> u64 {
+        match name {
+            "proof_duration_seconds" => self
+                .proof_duration
+                .with_label_values(labels)
+                .get_sample_count(),
+            "submission_duration_seconds" => self
+                .submission_duration
+                .with_label_values(labels)
+                .get_sample_count(),
+            _ => panic!("Unknown test histogram: {name}"),
+        }
+    }
+    #[cfg(test)]
+    pub fn session_starts(&self, c: Chain) -> u64 {
+        SessionReason::ALL
+            .iter()
+            .map(|reason| {
+                self.vdf_sessions_started_total
+                    .with_label_values(&[chain(c), reason.label()])
+                    .get()
+            })
+            .sum()
+    }
     pub fn topology_changed(&self) {
         self.topology_changes_total
             .with_label_values(&[] as &[&str])

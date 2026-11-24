@@ -542,7 +542,7 @@ impl Shared {
 
 impl Shared {
     pub(crate) fn metrics(&self) -> Option<&Arc<observability::Metrics>> {
-        (self.scope == runtime::RuntimeScope::Production).then_some(&self.process.metrics)
+        self.scope.metrics(&self.process)
     }
 }
 

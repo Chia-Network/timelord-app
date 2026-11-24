@@ -1,33 +1,29 @@
 //! Scheduled request lifetime, independent of retry attempt lifetimes.
 use super::{ProofStage, index};
-use std::{
-    sync::{Arc, Mutex},
-    time::Instant,
-};
+use std::{sync::Mutex, time::Instant};
 use timelord_core::Chain;
 
 /// A request remains pending while its board recovers. Dropping it records cancellation.
 pub struct Activity<'a> {
-    runtime: Arc<Mutex<crate::runtime::RuntimeState>>,
+    runtime: &'a Mutex<crate::runtime::RuntimeState>,
     chain: Chain,
-    // Production owners lend their handle; admission work observes nothing.
     metrics: Option<&'a super::Metrics>,
     started: Instant,
     finished: bool,
 }
 impl<'a> Activity<'a> {
     pub fn new(
-        runtime: Arc<Mutex<crate::runtime::RuntimeState>>,
-        c: Chain,
+        runtime: &'a Mutex<crate::runtime::RuntimeState>,
+        chain: Chain,
         metrics: Option<&'a super::Metrics>,
     ) -> Self {
         {
             let mut state = runtime.lock().expect("runtime");
-            state.pending[index(c)] += 1;
+            state.pending[index(chain)] += 1;
         }
         Self {
             runtime,
-            chain: c,
+            chain,
             metrics,
             started: Instant::now(),
             finished: false,

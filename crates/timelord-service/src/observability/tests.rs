@@ -533,10 +533,10 @@ fn process_totals_survive_history_pruning_and_runtime_replacement() {
 #[test]
 fn pending_activity_counts_cancellation_but_not_completed_work() {
     let (shared, metrics, _) = fixture();
-    let activity = Activity::new(shared.runtime.clone(), Chain::Challenge, Some(&metrics));
+    let activity = Activity::new(&shared.runtime, Chain::Challenge, Some(&metrics));
     assert_eq!(shared.runtime.lock().unwrap().pending[0], 1);
     drop(activity);
-    let mut completed = Activity::new(shared.runtime.clone(), Chain::Challenge, Some(&metrics));
+    let mut completed = Activity::new(&shared.runtime, Chain::Challenge, Some(&metrics));
     completed.finish();
     drop(completed);
     assert_eq!(shared.runtime.lock().unwrap().pending[0], 0);
@@ -567,7 +567,7 @@ async fn exposition_isolated_routes_and_concurrent_scrapes_are_consistent() {
         let metrics = metrics.clone();
         let runtime = shared.runtime.clone();
         async move {
-            let mut activity = Activity::new(runtime, Chain::Challenge, Some(&metrics));
+            let mut activity = Activity::new(&runtime, Chain::Challenge, Some(&metrics));
             for _ in 0..50 {
                 metrics.verified(epoch, Chain::Challenge, 999_999.9);
                 tokio::task::yield_now().await;
@@ -670,14 +670,12 @@ fn productive_work_survives_observer_failure_but_not_essential_failure() {
     assert_eq!(state.epoch, None);
 }
 #[test]
-fn admission_activity_does_not_emit_production_telemetry() {
-    let metrics = Metrics::new(Network::Mainnet).unwrap();
-    let runtime = Arc::new(Mutex::new(RuntimeState::admission()));
-    let mut completed = Activity::new(runtime.clone(), Chain::Challenge, None);
+fn admission_activity_counts_pending_work_without_telemetry() {
+    let runtime = Mutex::new(RuntimeState::admission());
+    let mut completed = Activity::new(&runtime, Chain::Challenge, None);
     assert_eq!(runtime.lock().unwrap().pending[0], 1);
     completed.finish();
     drop(completed);
-    drop(Activity::new(runtime.clone(), Chain::Challenge, None));
+    drop(Activity::new(&runtime, Chain::Challenge, None));
     assert_eq!(runtime.lock().unwrap().pending[0], 0);
-    assert_eq!(metrics.counter("work_cancelled_total", &["challenge"]), 0);
 }
