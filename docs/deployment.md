@@ -60,7 +60,8 @@ commands support `--expected-revision` for concurrent administration. They retur
 promptly and never wait for a worker to exit: the supervisor acknowledges once
 the intent change is durable and retirement of the old worker family has
 *started*, and the returned status may show `"phase":"stopping"` while the worker
-drains (up to about 15 seconds before a group-wide kill). Pause is persisted
+drains (a 25-second SIGTERM wait, then a 3-second group-wide kill and reap;
+worst case about 30 seconds). Pause is persisted
 before acknowledgment; poll `status` until `phase` is `paused` and `worker_pid`
 is null to confirm the family has retired. Reload first validates the requested
 file (a rejected file keeps the running worker and returns an error), then starts

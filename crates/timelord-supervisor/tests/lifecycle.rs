@@ -624,6 +624,7 @@ async fn independent_watchdog_reaps_and_replaces_a_stopped_worker_without_gui() 
     unsafe {
         assert_eq!(libc::kill(pid, libc::SIGSTOP), 0);
     }
+    let stopped_at = std::time::Instant::now();
     let replacement = tokio::time::timeout(Duration::from_secs(55), async {
         loop {
             let status = request(&fixture.config(), Control::Status, None)
@@ -637,6 +638,11 @@ async fn independent_watchdog_reaps_and_replaces_a_stopped_worker_without_gui() 
     })
     .await
     .expect("watchdog did not replace its stopped worker");
+    assert!(
+        stopped_at.elapsed() < Duration::from_secs(50),
+        "watchdog replacement took {:?}; the normal 25s graceful wait must not be used",
+        stopped_at.elapsed()
+    );
     assert!(replacement.worker_generation > first.worker_generation);
     assert!(replacement.restarts >= 1);
     assert!(

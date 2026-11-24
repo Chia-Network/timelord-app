@@ -13,8 +13,9 @@ use std::{
     time::Duration,
 };
 use timelord_supervisor::{
-    AcceptBackoff, Control, InstanceLock, Intent, Mode, Network, Paths, Request, Response, Status,
-    SupervisorPhase, peer_is_owner,
+    AcceptBackoff, CONTROL_SERVER_TIMEOUT, Control, InstanceLock, Intent, KILL_AND_REAP, LOG_DRAIN,
+    Mode, Network, Paths, Request, Response, Status, SupervisorPhase, graceful_stop_wait,
+    peer_is_owner,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -284,22 +285,17 @@ impl Worker {
             stop_failures: 0,
         })
     }
-    async fn stop(&mut self) -> Result<std::process::ExitStatus> {
+    async fn stop(&mut self, graceful: Duration) -> Result<std::process::ExitStatus> {
         #[cfg(test)]
         if self.stop_failures > 0 {
             self.stop_failures -= 1;
             anyhow::bail!("Injected worker cleanup failure");
         }
-        // Let the coordinator close native control channels and drain proof
-        // work first. The group-wide hard stop remains the bounded fallback.
         self.process.signal_leader(libc::SIGTERM);
-        self.process.wait_for_exit(Duration::from_secs(25)).await?;
-        let result = self.process.kill_and_reap(Duration::from_secs(3)).await?;
+        self.process.wait_for_exit(graceful).await?;
+        let result = self.process.kill_and_reap(KILL_AND_REAP).await?;
         for task in &mut self.log_tasks {
-            if tokio::time::timeout(Duration::from_secs(1), &mut *task)
-                .await
-                .is_err()
-            {
+            if tokio::time::timeout(LOG_DRAIN, &mut *task).await.is_err() {
                 task.abort();
             }
         }
@@ -329,7 +325,7 @@ async fn validate_before_reload(helper: &Path, config: &Path) -> Result<()> {
     // identity before reporting either a timeout, observation error, or result.
     let completed = owner.wait_for_exit(Duration::from_secs(5)).await;
     let status = owner
-        .kill_and_reap(Duration::from_secs(3))
+        .kill_and_reap(KILL_AND_REAP)
         .await
         .context("Configuration validator did not retire")?;
     ensure!(
@@ -402,7 +398,7 @@ async fn handle(mut socket: UnixStream, state: Snapshot, tx: mpsc::Sender<Envelo
         let (reply, rx) = oneshot::channel();
         tx.try_send(Envelope { request, reply })
             .context("Supervisor control queue is full")?;
-        tokio::time::timeout(Duration::from_secs(30), rx).await??
+        tokio::time::timeout(CONTROL_SERVER_TIMEOUT, rx).await??
     };
     socket.write_all(&serde_json::to_vec(&response)?).await?;
     socket.write_all(b"\n").await?;
@@ -639,8 +635,9 @@ impl SupervisorState {
         };
         let pid = worker.process.pid();
         let uptime = worker.started.elapsed();
+        let graceful = graceful_stop_wait(matches!(&cause, Cause::Failed { watchdog: Some(_) }));
         let task = tokio::spawn(async move {
-            let result = worker.stop().await;
+            let result = worker.stop(graceful).await;
             (worker, result)
         });
         self.lifecycle = Lifecycle::Stopping(Box::new(Retiring {

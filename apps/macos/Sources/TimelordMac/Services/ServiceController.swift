@@ -70,7 +70,7 @@ final class ServiceController {
         case replaced
     }
     /// Bounds the wait after acknowledgment. Graceful retirement is bounded by
-    /// the supervisor (about 15 s); the rest covers starting the replacement.
+    /// the supervisor (about 30 s worst case); the rest covers starting the replacement.
     static let completionTimeout: TimeInterval = 90
 
     /// Fresh revision protects a remote administrator's concurrent Pause/Run.

@@ -17,7 +17,51 @@ use std::{
         io::AsRawFd,
     },
     path::{Path, PathBuf},
+    time::Duration,
 };
+
+/// Graceful SIGTERM wait for a healthy worker; native ASIC retirement can take
+/// up to about 25 seconds.
+pub const NORMAL_GRACEFUL_STOP: Duration = Duration::from_secs(25);
+/// Graceful SIGTERM wait after a watchdog failure: the worker is already hung,
+/// so do not spend the normal ASIC drain budget.
+pub const WATCHDOG_GRACEFUL_STOP: Duration = Duration::from_secs(2);
+/// Bound on reaping the whole worker process group after the graceful wait.
+pub const KILL_AND_REAP: Duration = Duration::from_secs(3);
+/// Bound on draining one worker log pump.
+pub const LOG_DRAIN: Duration = Duration::from_secs(1);
+/// Worker stdout and stderr each have one log pump.
+pub const LOG_TASK_COUNT: u64 = 2;
+
+// Each outer deadline leaves margin so it cannot race the stop budget.
+const EXIT_TIME_OUT_MARGIN: Duration = Duration::from_secs(5);
+const CONTROL_SERVER_MARGIN: Duration = Duration::from_secs(10);
+const CONTROL_CLIENT_MARGIN: Duration = Duration::from_secs(5);
+
+/// Worst-case time to retire a worker: normal graceful wait, group kill/reap,
+/// then draining both log pumps.
+pub const WORST_CASE_STOP: Duration = Duration::from_secs(
+    NORMAL_GRACEFUL_STOP.as_secs() + KILL_AND_REAP.as_secs() + LOG_TASK_COUNT * LOG_DRAIN.as_secs(),
+);
+/// launchd's deadline for the supervisor to exit, with margin over the stop budget.
+pub const EXIT_TIME_OUT: Duration =
+    Duration::from_secs(WORST_CASE_STOP.as_secs() + EXIT_TIME_OUT_MARGIN.as_secs());
+/// Server-side bound on a control request awaiting the lifecycle loop.
+pub const CONTROL_SERVER_TIMEOUT: Duration =
+    Duration::from_secs(WORST_CASE_STOP.as_secs() + CONTROL_SERVER_MARGIN.as_secs());
+/// Client-side bound on a control transaction; must exceed the server bound.
+pub const CONTROL_CLIENT_TIMEOUT: Duration =
+    Duration::from_secs(CONTROL_SERVER_TIMEOUT.as_secs() + CONTROL_CLIENT_MARGIN.as_secs());
+
+/// Graceful SIGTERM wait for a retirement: a watchdog failure means the worker
+/// is already hung, so use the short wait instead of the normal ASIC drain.
+pub fn graceful_stop_wait(watchdog_failure: bool) -> Duration {
+    if watchdog_failure {
+        WATCHDOG_GRACEFUL_STOP
+    } else {
+        NORMAL_GRACEFUL_STOP
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -229,7 +273,7 @@ pub async fn request(
         net::UnixStream,
     };
     let paths = Paths::for_config(config)?;
-    let result = tokio::time::timeout(std::time::Duration::from_secs(35), async {
+    let result = tokio::time::timeout(CONTROL_CLIENT_TIMEOUT, async {
         let mut socket = UnixStream::connect(&paths.socket)
             .await
             .context("Connecting to installed supervisor")?;
@@ -368,6 +412,7 @@ pub fn launchd_plist_with_monitor(
     // Worker diagnostics have their own bounded rotating sink. Do not retain
     // unlimited launchd stdout/stderr across repeated supervisor failures.
     let log = "/dev/null";
+    let exit_time_out = EXIT_TIME_OUT.as_secs();
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -380,7 +425,7 @@ pub fn launchd_plist_with_monitor(
 <key>RunAtLoad</key><true/>
 <key>KeepAlive</key><true/>
 <key>ThrottleInterval</key><integer>10</integer>
-<key>ExitTimeOut</key><integer>20</integer>
+<key>ExitTimeOut</key><integer>{exit_time_out}</integer>
 <key>AbandonProcessGroup</key><false/>
 <key>ProcessType</key><string>Interactive</string>
 <key>StandardOutPath</key><string>{log}</string>
@@ -411,5 +456,46 @@ mod phase_tests {
         );
         assert_eq!(serde_json::to_value(phases).unwrap(), wire);
         assert!(serde_json::from_str::<SupervisorPhase>("\"unknown_phase\"").is_err());
+    }
+}
+
+#[cfg(test)]
+mod stop_budget_tests {
+    use super::*;
+    use std::path::Path;
+    use std::time::Duration;
+
+    #[test]
+    fn stop_budget_components_and_derived_bounds_are_exact() {
+        assert_eq!(NORMAL_GRACEFUL_STOP, Duration::from_secs(25));
+        assert_eq!(WATCHDOG_GRACEFUL_STOP, Duration::from_secs(2));
+        assert_eq!(KILL_AND_REAP, Duration::from_secs(3));
+        assert_eq!(LOG_DRAIN, Duration::from_secs(1));
+        assert_eq!(WORST_CASE_STOP, Duration::from_secs(30));
+        assert_eq!(EXIT_TIME_OUT, Duration::from_secs(35));
+        assert_eq!(CONTROL_SERVER_TIMEOUT, Duration::from_secs(40));
+        assert_eq!(CONTROL_CLIENT_TIMEOUT, Duration::from_secs(45));
+        assert_eq!(graceful_stop_wait(true), Duration::from_secs(2));
+        assert_eq!(graceful_stop_wait(false), Duration::from_secs(25));
+    }
+
+    #[test]
+    fn stop_budget_deadlines_are_ordered() {
+        assert!(EXIT_TIME_OUT > WORST_CASE_STOP);
+        assert!(CONTROL_SERVER_TIMEOUT > WORST_CASE_STOP);
+        assert!(CONTROL_SERVER_TIMEOUT > EXIT_TIME_OUT);
+        assert!(CONTROL_CLIENT_TIMEOUT > CONTROL_SERVER_TIMEOUT);
+        assert!(WATCHDOG_GRACEFUL_STOP < NORMAL_GRACEFUL_STOP);
+    }
+
+    #[test]
+    fn launchd_exit_timeout_covers_the_stop_budget() {
+        let xml = launchd_plist(
+            Path::new("/Applications/Timelord.app"),
+            Path::new("/config"),
+            "operator",
+        )
+        .unwrap();
+        assert!(xml.contains("<key>ExitTimeOut</key><integer>35</integer>"));
     }
 }
