@@ -1,5 +1,11 @@
 import Foundation
 
+public struct PersistenceResolution: Sendable, Equatable {
+    public let configuration: AppConfiguration
+    /// At least one incomplete RPC draft was replaced by its last saved value.
+    public let droppedIncompleteRPCDrafts: Bool
+}
+
 public struct AppConfiguration: Codable, Sendable, Equatable {
     public var schemaVersion = 1
     public var connections: ConnectionProfiles?
@@ -28,23 +34,29 @@ public struct AppConfiguration: Codable, Sendable, Equatable {
     /// Resolve incomplete RPC drafts for saving. A draft is UI state, but it
     /// must not erase RPC settings that are already saved: an incomplete draft
     /// falls back to the last saved RPC settings for the same profile. Only an
-    /// explicit `rpc = nil` (toggle off) persists no RPC settings.
-    public func resolvedForPersistence(against saved: Self) -> Self {
+    /// explicit `rpc = nil` (toggle off) persists no RPC settings. The result
+    /// records whether any draft was replaced so Done can report what it drops.
+    public func resolvedForPersistence(against saved: Self) -> PersistenceResolution {
         var resolved = self
+        var droppedIncompleteRPCDrafts = false
         if var profiles = resolved.connections, !profiles.profiles.isEmpty {
             for index in profiles.profiles.indices {
                 let id = profiles.profiles[index].id
                 let savedRPC = saved.connections?.profiles.first { $0.id == id }?.node.rpc
-                profiles.profiles[index].node.resolveIncompleteRPC(using: savedRPC)
+                let dropped = profiles.profiles[index].node.resolveIncompleteRPC(using: savedRPC)
+                droppedIncompleteRPCDrafts = droppedIncompleteRPCDrafts || dropped
             }
             resolved.connections = profiles
         } else {
-            resolved.node.resolveIncompleteRPC(using: saved.node.rpc)
+            droppedIncompleteRPCDrafts = resolved.node.resolveIncompleteRPC(using: saved.node.rpc)
         }
-        return resolved
+        return PersistenceResolution(
+            configuration: resolved, droppedIncompleteRPCDrafts: droppedIncompleteRPCDrafts)
     }
-    /// Saving strips incomplete RPC drafts. Put the user's still-editable
-    /// drafts back so a connection test or board refresh does not clear the form.
+    /// `saveConfiguration()` reloads the helper's copy, which has no
+    /// incomplete RPC drafts. Put the user's still-editable drafts back into
+    /// the in-memory form so implicit saves (connection test, board refresh)
+    /// do not clear it. The saved copy stays stripped.
     public func restoringIncompleteRPCDrafts(from draft: Self) -> Self {
         var restored = self
         if var profiles = restored.connections, !profiles.profiles.isEmpty {
@@ -137,9 +149,12 @@ public struct NodeConfiguration: Codable, Sendable, Equatable {
     public init() {}
     public var hasIdentity: Bool { certificate != nil && privateKey != nil && caCertificate != nil }
     /// The service accepts RPC only when every endpoint and credential is set.
-    public mutating func resolveIncompleteRPC(using saved: NodeRPCConfiguration?) {
-        guard let rpc, !rpc.isComplete else { return }
+    /// Returns true when an incomplete draft was replaced by `saved`.
+    @discardableResult
+    public mutating func resolveIncompleteRPC(using saved: NodeRPCConfiguration?) -> Bool {
+        guard let rpc, !rpc.isComplete else { return false }
         self.rpc = saved
+        return true
     }
 }
 public struct NetworkDefinition: Codable, Sendable, Equatable {

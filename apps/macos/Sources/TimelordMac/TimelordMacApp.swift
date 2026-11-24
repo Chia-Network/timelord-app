@@ -12,7 +12,7 @@ private struct TimelordScenes: Scene {
     @ObservedObject var model: TimelordModel
     var body: some Scene {
         // Menu-bar open requests should focus the single dashboard window.
-        Window("Timelord", id: "main") { Overview(model: model) }
+        Window("Timelord", id: DashboardWindow.id) { Overview(model: model) }
             .defaultSize(width: 1180, height: 820)
             .windowResizability(.contentMinSize)
             .commands {

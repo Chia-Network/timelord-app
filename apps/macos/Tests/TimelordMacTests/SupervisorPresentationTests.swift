@@ -330,6 +330,7 @@ final class SupervisorPresentationTests: XCTestCase {
         XCTAssertEqual(model.connectionResult, "Authenticated fixture node.")
         XCTAssertEqual(model.configuration.node.rpc, draft,
             "Saving for a connection test must not clear the half-filled RPC form")
+        XCTAssertNil(model.errorMessage, "An implicit save must not report dropping the draft")
         XCTAssertTrue(model.hasUnsavedSettings)
 
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -340,6 +341,7 @@ final class SupervisorPresentationTests: XCTestCase {
         await model.discoverBoards()
         XCTAssertEqual(model.configuration.node.rpc, draft,
             "Saving for a board refresh must not clear the half-filled RPC form")
+        XCTAssertNil(model.errorMessage, "A board refresh must not report dropping the draft")
     }
 
     func testIncompleteRPCDraftKeepsLastSavedRPCInSingleNodeMode() async throws {
@@ -433,6 +435,74 @@ final class SupervisorPresentationTests: XCTestCase {
         XCTAssertFalse(model.hasUnsavedSettings)
         let persisted = try decode(fixture.configurationURL)
         XCTAssertEqual(persisted.node.rpc, rpc)
+    }
+
+    func testFinishingSettingsReportsDiscardedIncompleteRPCDraft() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        let configuration = runnableConfiguration(host: "done.fixture")
+        try fixture.writeConfiguration(configuration)
+        let model = fixture.model(configuration)
+        model.configuration.node.rpc = NodeRPCConfiguration(host: "rpc.draft.fixture")
+
+        let finished = await model.finishSettings()
+
+        XCTAssertTrue(finished)
+        XCTAssertEqual(model.errorMessage,
+            "RPC changes not saved: the RPC settings are incomplete.")
+        XCTAssertNil(model.configuration.node.rpc)
+        XCTAssertFalse(model.hasUnsavedSettings)
+        let persisted = try decode(fixture.configurationURL)
+        XCTAssertNil(persisted.node.rpc, "Done must not persist the incomplete draft")
+    }
+
+    func testFinishingSettingsWithOnlyCompleteRPCProfilesReportsNoNotice() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        var configuration = runnableConfiguration(host: "done.fixture")
+        configuration.node.rpc = completeRPC(host: "rpc.saved.fixture")
+        try fixture.writeConfiguration(configuration)
+        let model = fixture.model(configuration)
+        let edited = completeRPC(host: "rpc.edited.fixture")
+        model.configuration.node.rpc = edited
+
+        let finished = await model.finishSettings()
+
+        XCTAssertTrue(finished)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.configuration.node.rpc, edited)
+        let persisted = try decode(fixture.configurationURL)
+        XCTAssertEqual(persisted.node.rpc, edited)
+    }
+
+    func testFinishingSettingsReportsDiscardedIncompleteProfileRPCDraft() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        let savedRPC = completeRPC(host: "rpc.first.fixture")
+        var first = runnableConfiguration(host: "first.fixture").node
+        first.rpc = savedRPC
+        var second = runnableConfiguration(host: "second.fixture").node
+        second.certificate = "/fixture/second.crt"
+        var profiles = ConnectionProfiles(); profiles.activeId = "first"
+        profiles.profiles = [
+            ConnectionProfile(id: "first", name: "First", node: first),
+            ConnectionProfile(id: "second", name: "Second", node: second),
+        ]
+        var configuration = AppConfiguration(); configuration.connections = profiles
+        try fixture.writeConfiguration(configuration)
+        let model = fixture.model(configuration)
+        var node = model.configuration.node
+        node.rpc?.host = ""
+        model.configuration.node = node
+
+        let finished = await model.finishSettings()
+
+        XCTAssertTrue(finished)
+        XCTAssertEqual(model.errorMessage,
+            "RPC changes not saved: the RPC settings are incomplete.")
+        XCTAssertEqual(model.configuration.node.rpc, savedRPC)
+        let persisted = try decode(fixture.configurationURL)
+        XCTAssertEqual(persisted.connections?.profiles[0].node.rpc, savedRPC)
     }
 
     private func completeRPC(host: String) -> NodeRPCConfiguration {

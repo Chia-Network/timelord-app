@@ -39,7 +39,7 @@ final class TimelordModel: ObservableObject {
     /// What the next save would persist: incomplete RPC drafts fall back to
     /// their last saved settings and do not look like runtime changes.
     private var resolvedConfiguration: AppConfiguration {
-        configuration.resolvedForPersistence(against: savedConfiguration)
+        configuration.resolvedForPersistence(against: savedConfiguration).configuration
     }
     private var liveStatus: ServiceStatus?
     private var workerStatus = WorkerStatusObservation.absent
@@ -395,9 +395,14 @@ final class TimelordModel: ObservableObject {
         return finishSettingsSuccessfully()
     }
     /// A completed settings sheet must not leave an invalid RPC draft dirty for
-    /// the rest of the session. Implicit saves still keep it for editing.
+    /// the rest of the session; tell the user when Done discards one. Implicit
+    /// saves still keep it for editing.
     private func finishSettingsSuccessfully() -> Bool {
-        configuration = resolvedConfiguration
+        let resolved = configuration.resolvedForPersistence(against: savedConfiguration)
+        configuration = resolved.configuration
+        if resolved.droppedIncompleteRPCDrafts {
+            reportActionError("RPC changes not saved: the RPC settings are incomplete.")
+        }
         updateSnapshot()
         return true
     }
