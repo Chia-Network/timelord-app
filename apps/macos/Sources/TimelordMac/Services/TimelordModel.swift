@@ -311,7 +311,10 @@ final class TimelordModel: ObservableObject {
         var runtimeConfiguration = configuration
         runtimeConfiguration.service.startAutomatically = savedConfiguration.service.startAutomatically
         runtimeConfiguration.connections = savedConfiguration.connections
+        // The active node is derived from connections now, so compare it too:
+        // a profile switch or node edit still requires restart/reload.
         return runtimeConfiguration != savedConfiguration
+            || configuration.node != savedConfiguration.node
     }
     var settingsDoneTitle: String {
         guard canControlService && (hasRuntimeSettingsChanges || configurationNeedsRestart) else { return "Done" }
