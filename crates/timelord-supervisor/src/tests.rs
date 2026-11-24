@@ -723,13 +723,25 @@ async fn shutdown_retry_never_waits_out_a_second_grace() {
     let helper = script_helper(
         &dir,
         "worker",
-        "#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 0.1; done\n",
+        &format!(
+            "#!/bin/sh\ntrap '' TERM\ntouch '{}/ready'\nwhile :; do sleep 0.1; done\n",
+            dir.display()
+        ),
     );
     let paths = Paths::for_config(&dir.join("config.toml")).unwrap();
     let log = timelord_supervisor::logging::Writer::stderr();
     let mut worker =
         Worker::spawn(&helper, &paths.config, &dir.join("progress.sock"), 1, &log).unwrap();
     let pid = worker.process.pid() as i32;
+    // Let the worker install its TERM trap, or the retry's SIGTERM would end it
+    // before the grace it must not wait out could be observed.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !dir.join("ready").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fixture worker did not start");
     // Fail before SIGTERM, so the failed attempt never reached the group kill.
     worker.stop_failures = 1;
     let mut state = SupervisorState::new(Ok(Intent::default()), log);
