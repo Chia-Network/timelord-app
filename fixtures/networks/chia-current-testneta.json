@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "network_id": "testneta",
+  "exported_at": "2026-01-01T00:00:00+00:00",
+  "chia_version": "main",
+  "constants": {
+    "AGG_SIG_ME_ADDITIONAL_DATA": "b0a306abe27407130586c8e13d06dc057d4538c201dbd36c8f8c481f5e51af5c",
+    "DIFFICULTY_CONSTANT_FACTOR": 10052721566054,
+    "DIFFICULTY_STARTING": 30,
+    "EPOCH_BLOCKS": 768,
+    "GENESIS_CHALLENGE": "b0a306abe27407130586c8e13d06dc057d4538c201dbd36c8f8c481f5e51af5c",
+    "GENESIS_PRE_FARM_FARMER_PUZZLE_HASH": "08296fc227decd043aee855741444538e4cc9a31772c4d1a9e6242d1e777e42a",
+    "GENESIS_PRE_FARM_POOL_PUZZLE_HASH": "08296fc227decd043aee855741444538e4cc9a31772c4d1a9e6242d1e777e42a",
+    "HARD_FORK_HEIGHT": 3693395,
+    "MEMPOOL_BLOCK_BUFFER": 10,
+    "MIN_PLOT_SIZE_V1": 18,
+    "NETWORK_TYPE": 1,
+    "SUB_SLOT_ITERS_STARTING": 67108864
+  },
+  "config_overrides": {
+    "address_prefix": "txch",
+    "default_full_node_port": 58444
+  }
+}

@@ -14,10 +14,46 @@ pub struct ConnectionProfile {
     pub name: String,
     pub node: NodeConfig,
 }
+/// A `[node]` table is no longer a second owner once profiles are configured.
+pub const STRAY_NODE: &str = "[node] is not used when [[connections.profiles]] are configured; edit the active profile instead";
+
+/// An entry addressable by connection-profile ID.
+pub trait ProfileId {
+    fn profile_id(&self) -> &str;
+}
+impl ProfileId for ConnectionProfile {
+    fn profile_id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// One selection rule shared by persisted profiles and fallback network intent:
+/// a missing `active_id` is only valid when there are no profiles at all.
+fn select_index<T: ProfileId>(
+    active_id: Option<&str>,
+    profiles: &[T],
+) -> Result<Option<usize>, String> {
+    match active_id {
+        Some(active) => profiles
+            .iter()
+            .position(|profile| profile.profile_id() == active)
+            .map(Some)
+            .ok_or_else(|| "Selected connection profile does not exist".into()),
+        None if profiles.is_empty() => Ok(None),
+        None => Err("Connection profiles require one selected profile".into()),
+    }
+}
+pub fn select_profile<'a, T: ProfileId>(
+    active_id: Option<&str>,
+    profiles: &'a [T],
+) -> Result<Option<&'a T>, String> {
+    Ok(select_index(active_id, profiles)?.map(|index| &profiles[index]))
+}
+
 impl ConnectionProfiles {
     /// Structural validation plus the runtime projection invariant. The runtime
-    /// node is derived from the active profile, so a legacy `[node]` table never
-    /// fails here and can never clobber a profile.
+    /// node is derived from the active profile, so a legacy `[node]` table either
+    /// matches it or is rejected during deserialization.
     pub fn validate(&self, active_node: &NodeConfig) -> Result<(), String> {
         let mut ids = std::collections::HashSet::new();
         for profile in &self.profiles {
@@ -28,30 +64,39 @@ impl ConnectionProfiles {
             }
             profile.node.validate()?;
         }
-        match self.active() {
-            None if self.active_id.is_none() && self.profiles.is_empty() => Ok(()),
+        match self.selected()? {
             Some(profile) if profile.node == *active_node => Ok(()),
+            None => Ok(()),
             Some(_) => Err("The active connection profile must match [node]".into()),
-            None => Err("Connection profiles require one existing active profile".into()),
         }
     }
+    /// The selected profile, or `Ok(None)` for a single-node configuration.
+    pub fn selected(&self) -> Result<Option<&ConnectionProfile>, String> {
+        select_profile(self.active_id.as_deref(), &self.profiles)
+    }
     pub fn active(&self) -> Option<&ConnectionProfile> {
-        let id = self.active_id.as_deref()?;
-        self.profiles.iter().find(|p| p.id == id)
+        self.selected().ok().flatten()
     }
-    fn active_mut(&mut self) -> Option<&mut ConnectionProfile> {
-        let id = self.active_id.as_deref()?;
-        self.profiles.iter_mut().find(|p| p.id == id)
+    fn active_mut(&mut self) -> Result<Option<&mut ConnectionProfile>, String> {
+        let index = select_index(self.active_id.as_deref(), &self.profiles)?;
+        Ok(index.map(|index| &mut self.profiles[index]))
     }
-    /// `[connections]` is the persisted source of truth. A `[node]` table is
-    /// accepted for compatibility but ignored whenever profiles are used, so a
-    /// partial legacy table cannot wipe credentials or reset the chain. Without
-    /// profiles, `[node]` is the runtime node.
-    pub fn resolve_node(&self, node: Option<NodeConfig>) -> NodeConfig {
-        self.active()
-            .map(|profile| profile.node.clone())
-            .or(node)
-            .unwrap_or_default()
+    /// `[connections]` is the persisted source of truth. A `[node]` table that
+    /// equals the active profile is accepted as legacy input; a diverging one is
+    /// rejected instead of silently overriding or dropping operator edits. With
+    /// no profiles, `[node]` is the runtime node.
+    pub fn resolve_node(&self, node: Option<NodeConfig>) -> Result<NodeConfig, String> {
+        match self.selected()? {
+            Some(profile) => {
+                if let Some(node) = node
+                    && node != profile.node
+                {
+                    return Err(STRAY_NODE.into());
+                }
+                Ok(profile.node.clone())
+            }
+            None => Ok(node.unwrap_or_default()),
+        }
     }
     fn insert(&mut self, node: NodeConfig) -> String {
         let id = (1..)
@@ -82,16 +127,13 @@ impl Config {
     /// Fold the runtime node into its profile. Persistence then writes only
     /// `[connections]`; a single-node configuration becomes a profile here.
     pub fn remember_connection(&mut self) -> Result<(), String> {
-        if let Some(profile) = self.connections.active_mut() {
-            profile.node = self.node.clone();
-            return Ok(());
-        }
-        if !self.connections.profiles.is_empty() {
-            return Err("Select an existing connection profile".into());
-        }
-        if self.node.certificate.is_some() {
-            self.node.validate()?;
-            self.connections.active_id = Some(self.connections.insert(self.node.clone()));
+        match self.connections.active_mut()? {
+            Some(profile) => profile.node = self.node.clone(),
+            None if self.node.certificate.is_some() => {
+                self.node.validate()?;
+                self.connections.active_id = Some(self.connections.insert(self.node.clone()));
+            }
+            None => {}
         }
         Ok(())
     }
@@ -247,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn profiles_win_over_a_legacy_node_table() {
+    fn matching_legacy_node_table_migrates_and_is_omitted_on_save() {
         let mut config = Config {
             node: complete("mainnet.fixture", Network::Mainnet),
             ..Default::default()
@@ -255,13 +297,11 @@ mod tests {
         config
             .add_connection(complete("testnet.fixture", Network::Testnet11))
             .unwrap();
-        let expected = config.node.clone();
-        config.node.host = "edited.fixture".into();
         let text = legacy_text(&config);
         assert!(text.contains("[node]") && text.contains("[connections]"));
         let restored: Config = toml::from_str(&text).unwrap();
-        assert_eq!(restored.node, expected);
-        assert_eq!(restored.connections.active().unwrap().node, expected);
+        assert_eq!(restored.node, config.node);
+        assert_eq!(restored.connections.active().unwrap().node, config.node);
         restored.validate().unwrap();
         let saved = toml::to_string(&restored).unwrap();
         assert!(!saved.contains("[node]"));
@@ -272,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn a_partial_node_table_cannot_clobber_the_active_profile() {
+    fn diverging_stray_node_tables_are_rejected_loudly() {
         let mut config = Config {
             node: complete("mainnet.fixture", Network::Mainnet),
             ..Default::default()
@@ -280,19 +320,21 @@ mod tests {
         config
             .add_connection(complete("testnet.fixture", Network::Testnet11))
             .unwrap();
-        let expected = config.node.clone();
+        config.node.host = "edited.fixture".into();
+        let error = toml::from_str::<Config>(&legacy_text(&config))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("edit the active profile"), "{error}");
         // `NodeConfig` fills omitted fields with defaults, so a partial table
         // would otherwise wipe credentials and reset the network to mainnet.
         let partial = NodeConfig {
             host: "partial.fixture".into(),
             ..Default::default()
         };
-        let text = legacy_text_with(&config, &partial);
-        assert!(text.contains("partial.fixture"));
-        let restored: Config = toml::from_str(&text).unwrap();
-        assert_eq!(restored.node, expected);
-        assert_eq!(restored.connections.active().unwrap().node, expected);
-        restored.validate().unwrap();
+        let error = toml::from_str::<Config>(&legacy_text_with(&config, &partial))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("edit the active profile"), "{error}");
     }
 
     #[test]

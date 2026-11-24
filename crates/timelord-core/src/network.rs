@@ -272,8 +272,9 @@ impl NetworkDefinition {
     }
 }
 
-/// The single custom-network/definition rule: a custom chain needs one, and a
-/// built-in chain must not carry one.
+/// Node-level entry to the shared chain identity rule: a custom chain needs a
+/// definition and a built-in chain must not carry one. Partial network intent
+/// (last-good fallback) uses [`ChainIdentity::new`] directly.
 impl crate::NodeConfig {
     pub fn chain_identity(&self) -> Result<ChainIdentity, String> {
         ChainIdentity::new(&self.network, self.network_definition.as_ref())

@@ -5,7 +5,7 @@ import TimelordPresentation
 
 @MainActor
 final class ConnectionProfileTests: XCTestCase {
-    func testSwitchingProfilesAdoptsStoredProfilesWithoutCopyingStagedEdits() throws {
+    func testSwitchingProfilesKeepsEditsWithTheProfileThatOwnsThem() throws {
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
         let mainnet = try decoder.decode(NodeConfiguration.self, from: Data("""
         {"host":"mainnet.fixture","port":8444,"network":"mainnet","server_name":"chia.net",
@@ -27,42 +27,69 @@ final class ConnectionProfileTests: XCTestCase {
         model.configuration.node.host = "edited-mainnet.fixture"
         model.configuration.node.rpc?.host = "corrected-rpc.fixture"
         model.configuration.node.rpc?.port = 58555
+        var expected = mainnet; expected.host = "edited-mainnet.fixture"
+        expected.rpc?.host = "corrected-rpc.fixture"; expected.rpc?.port = 58555
         model.selectConnectionProfile("custom")
         XCTAssertEqual(model.configuration.node, custom)
         XCTAssertNil(model.configuration.node.rpc)
         XCTAssertEqual(model.configuration.connections?.profiles.count, 2)
-        // Unsaved node edits stay in the selected profile's runtime projection;
-        // switching profiles adopts the stored profile instead of copying them.
-        XCTAssertEqual(model.configuration.connections?.profiles[0].node, mainnet)
+        // Edits live on the active profile, so switching away does not discard them.
+        XCTAssertEqual(model.configuration.connections?.profiles[0].node, expected)
         XCTAssertTrue(model.hasUnsavedSettings)
         model.selectConnectionProfile("main")
-        XCTAssertEqual(model.configuration.node, mainnet)
+        XCTAssertEqual(model.configuration.node, expected)
         XCTAssertNotNil(model.configuration.node.rpc)
         XCTAssertNil(model.configuration.node.networkDefinition)
         let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
         let restored = try decoder.decode(AppConfiguration.self, from: encoder.encode(model.configuration))
         XCTAssertEqual(restored.connections?.profiles[1].node, custom)
-        XCTAssertEqual(restored.node, mainnet)
+        XCTAssertEqual(restored.node, expected)
         model.selectConnectionProfile("unknown")
-        XCTAssertEqual(model.configuration.node, mainnet)
+        XCTAssertEqual(model.configuration.node, expected)
     }
 
-    func testHelperConfigurationWithoutNodeDerivesItFromTheActiveProfile() throws {
+    func testConfigurationDerivesNodeFromTheActiveProfileAndRejectsDivergence() throws {
+        let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
-        let config = try decoder.decode(AppConfiguration.self, from: Data("""
-        {"schema_version":1,"connections":{"active_id":"custom","profiles":[
-         {"id":"custom","name":"Custom","node":{"host":"custom.fixture","port":58445,"network":"ephemeral-fixture",
-          "certificate":"/fixture/custom.crt","private_key":"/fixture/custom.key","ca_certificate":"/fixture/custom-ca.crt"}},
-         {"id":"other","name":"Other","node":{"host":"other.fixture","port":8444,"network":"mainnet"}}]}}
-        """.utf8))
-        XCTAssertEqual(config.node.host, "custom.fixture")
-        XCTAssertEqual(config.node.network, "ephemeral-fixture")
-        XCTAssertEqual(config.connections?.activeId, "custom")
-        XCTAssertEqual(config.service, ServiceConfiguration())
-        XCTAssertEqual(config.hardware, HardwareConfiguration())
+        var custom = NodeConfiguration(); custom.host = "custom.fixture"; custom.port = 58445
+        custom.network = "ephemeral-fixture"
+        var other = NodeConfiguration(); other.host = "other.fixture"
+        var config = AppConfiguration()
+        var profiles = ConnectionProfiles(); profiles.activeId = "custom"
+        profiles.profiles = [
+            ConnectionProfile(id: "custom", name: "Custom", node: custom),
+            ConnectionProfile(id: "other", name: "Other", node: other),
+        ]
+        config.connections = profiles
+        let data = try encoder.encode(config)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertNil(object["node"])
+        let restored = try decoder.decode(AppConfiguration.self, from: data)
+        XCTAssertEqual(restored.node, custom)
+        XCTAssertEqual(restored.connections?.activeId, "custom")
 
-        let withoutProfiles = try decoder.decode(AppConfiguration.self, from: Data("{}".utf8))
-        XCTAssertEqual(withoutProfiles.node, NodeConfiguration())
+        var matching = object
+        matching["node"] = try JSONSerialization.jsonObject(with: encoder.encode(custom))
+        let migrated = try decoder.decode(
+            AppConfiguration.self, from: JSONSerialization.data(withJSONObject: matching))
+        XCTAssertEqual(migrated.node, custom)
+
+        var diverging = matching
+        var edited = custom; edited.host = "ignored.fixture"
+        diverging["node"] = try JSONSerialization.jsonObject(with: encoder.encode(edited))
+        XCTAssertThrowsError(
+            try decoder.decode(
+                AppConfiguration.self, from: JSONSerialization.data(withJSONObject: diverging)))
+
+        var single = AppConfiguration(); single.node.host = "single.fixture"
+        let restoredSingle = try decoder.decode(AppConfiguration.self, from: encoder.encode(single))
+        XCTAssertEqual(restoredSingle.node, single.node)
+        let singleObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoder.encode(single)) as? [String: Any])
+        var missingService = singleObject; missingService.removeValue(forKey: "service")
+        XCTAssertThrowsError(
+            try decoder.decode(
+                AppConfiguration.self, from: JSONSerialization.data(withJSONObject: missingService)))
     }
     func testSaveReloadsProfilesCreatedByHelper() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("timelord-save-\(UUID().uuidString)")
@@ -118,8 +145,11 @@ final class ConnectionProfileTests: XCTestCase {
         await model.saveConfiguration()
         XCTAssertNil(model.errorMessage)
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
-        let submitted = try decoder.decode(
-            AppConfiguration.self, from: Data(contentsOf: captured))
+        let submittedData = try Data(contentsOf: captured)
+        let submitted = try decoder.decode(AppConfiguration.self, from: submittedData)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: submittedData) as? [String: Any])
+        XCTAssertNil(object["node"])
         XCTAssertEqual(submitted.connections?.profiles[0].node.host, "edited.fixture")
         XCTAssertEqual(submitted.connections?.profiles[1].node.host, "other.fixture")
         XCTAssertEqual(model.configuration.connections?.profiles[0].node.host, "edited.fixture")

@@ -301,11 +301,11 @@ final class TimelordModel: ObservableObject {
     var hasUnsavedSettings: Bool { configuration != savedConfiguration }
     /// Only the node profile differs between two configurations.
     private static func onlyNodeDiffers(_ old: AppConfiguration, _ new: AppConfiguration) -> Bool {
-        var adjusted = old
-        adjusted.node = new.node
-        adjusted.connections = new.connections
-        adjusted.service.startAutomatically = new.service.startAutomatically
-        return adjusted == new
+        var adjusted = new
+        adjusted.connections = old.connections
+        adjusted.node = old.node
+        adjusted.service.startAutomatically = old.service.startAutomatically
+        return adjusted == old
     }
     private var hasRuntimeSettingsChanges: Bool {
         var runtimeConfiguration = configuration
@@ -368,13 +368,6 @@ final class TimelordModel: ObservableObject {
     }
     func saveConfiguration() async {
         guard !operationInProgress else { return }; operationInProgress = true; defer { operationInProgress = false }
-        // Profiles are the persisted source of truth; fold the staged runtime
-        // node into its profile before submitting so the reload is not stale.
-        if var connections = configuration.connections,
-           let index = connections.profiles.firstIndex(where: { $0.id == connections.activeId }) {
-            connections.profiles[index].node = configuration.node
-            configuration.connections = connections
-        }
         do {
             let runtimeChanged = hasRuntimeSettingsChanges
             let nodeOnly = Self.onlyNodeDiffers(savedConfiguration, configuration)
@@ -455,13 +448,12 @@ final class TimelordModel: ObservableObject {
     }
     func selectConnectionProfile(_ id: String) {
         guard !operationInProgress, var connections = configuration.connections,
-              let selected = connections.profiles.first(where: { $0.id == id }),
-              connections.activeId != id else { return }
-        // The active profile is the persisted source of truth; unsaved node
-        // edits are runtime-only and are discarded when the selection changes.
+              connections.activeId != id,
+              connections.profiles.contains(where: { $0.id == id }) else { return }
+        // Nodes are stored in the profiles themselves, so edits made before the
+        // switch remain with the profile that is still selected.
         connections.activeId = id
         configuration.connections = connections
-        configuration.node = selected.node
         nodeSync = nil; lastNodeSyncFetch = .distantPast
     }
     /// Removing a profile edits configuration only; imported identity files can
@@ -470,13 +462,12 @@ final class TimelordModel: ObservableObject {
         guard !operationInProgress, !isBusy, var connections = configuration.connections,
               connections.profiles.contains(where: { $0.id == id }) else { return }
         connections.profiles.removeAll { $0.id == id }
-        if connections.activeId == id {
-            let next = connections.profiles.first
-            connections.activeId = next?.id
-            configuration.node = next?.node ?? NodeConfiguration()
-            nodeSync = nil; lastNodeSyncFetch = .distantPast
-        }
+        if connections.activeId == id { connections.activeId = connections.profiles.first?.id }
         configuration.connections = connections
+        if connections.profiles.isEmpty {
+            configuration.node = NodeConfiguration()
+        }
+        nodeSync = nil; lastNodeSyncFetch = .distantPast
     }
     func chooseFile() -> String? {
         let panel = NSOpenPanel(); panel.canChooseFiles = true; panel.canChooseDirectories = false; panel.allowsMultipleSelection = false

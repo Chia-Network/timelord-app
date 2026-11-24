@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "network_id": "testnet10",
+  "exported_at": "2024-01-01T00:00:00+00:00",
+  "chia_version": "2.3.0",
+  "constants": {
+    "AGG_SIG_ME_ADDITIONAL_DATA": "ae83525ba8d1dd3f09b277de18ca3e43fc0af20d20c4b3e92ef2a48bd291ccb2",
+    "DIFFICULTY_CONSTANT_FACTOR": 10052721566054,
+    "DIFFICULTY_STARTING": 30,
+    "EPOCH_BLOCKS": 768,
+    "GENESIS_CHALLENGE": "ae83525ba8d1dd3f09b277de18ca3e43fc0af20d20c4b3e92ef2a48bd291ccb2",
+    "GENESIS_PRE_FARM_FARMER_PUZZLE_HASH": "3d8765d3a597ec1d99663f6c9816d915b9f68613ac94009884c4addaefcce6af",
+    "GENESIS_PRE_FARM_POOL_PUZZLE_HASH": "d23da14695a188ae5708dd152263c4db883eb27edeb936178d4d988b8f3ce5fc",
+    "MEMPOOL_BLOCK_BUFFER": 10,
+    "MIN_PLOT_SIZE": 18,
+    "SOFT_FORK2_HEIGHT": 3000000,
+    "SOFT_FORK4_HEIGHT": 4465000,
+    "HARD_FORK_HEIGHT": 2997292,
+    "HARD_FORK_FIX_HEIGHT": 3426000,
+    "PLOT_FILTER_128_HEIGHT": 3061804,
+    "PLOT_FILTER_64_HEIGHT": 8010796,
+    "PLOT_FILTER_32_HEIGHT": 13056556
+  },
+  "config_overrides": {
+    "address_prefix": "txch",
+    "default_full_node_port": 58444
+  }
+}

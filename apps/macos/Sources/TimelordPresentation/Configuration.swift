@@ -2,25 +2,78 @@ import Foundation
 
 public struct AppConfiguration: Codable, Sendable, Equatable {
     public var schemaVersion = 1
-    public var node = NodeConfiguration()
     public var connections: ConnectionProfiles?
     public var service = ServiceConfiguration()
     public var hardware = HardwareConfiguration()
+    /// Single-node storage; ignored while `connections.profiles` is non-empty.
+    private var singleNode = NodeConfiguration()
+
+    /// The active node is derived from the active profile. Only a single-node
+    /// configuration stores it directly, so there is no second mutable owner.
+    public var node: NodeConfiguration {
+        get {
+            guard let connections,
+                  let active = connections.profiles.first(where: { $0.id == connections.activeId })
+            else { return singleNode }
+            return active.node
+        }
+        set {
+            if let index = activeProfileIndex {
+                connections?.profiles[index].node = newValue
+            } else {
+                singleNode = newValue
+            }
+        }
+    }
+    private var activeProfileIndex: Int? {
+        guard let connections else { return nil }
+        return connections.profiles.firstIndex { $0.id == connections.activeId }
+    }
+    private var profileConnections: ConnectionProfiles? {
+        guard let connections, !connections.profiles.isEmpty else { return nil }
+        return connections
+    }
+
     public init() {}
     private enum CodingKeys: String, CodingKey { case schemaVersion, node, connections, service, hardware }
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
+        schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        service = try container.decode(ServiceConfiguration.self, forKey: .service)
+        hardware = try container.decode(HardwareConfiguration.self, forKey: .hardware)
         connections = try container.decodeIfPresent(ConnectionProfiles.self, forKey: .connections)
-        // Profiles are the persisted source of truth; the service omits the
-        // duplicate node projection, so the active profile supplies the node.
-        node = try container.decodeIfPresent(NodeConfiguration.self, forKey: .node)
-            ?? connections.flatMap { profiles in
-                profiles.profiles.first { $0.id == profiles.activeId }?.node
+        let supplied = try container.decodeIfPresent(NodeConfiguration.self, forKey: .node)
+        if profileConnections != nil {
+            guard activeProfileIndex != nil else {
+                throw DecodingError.dataCorruptedError(forKey: .connections, in: container,
+                    debugDescription: "Connection profiles require one existing active profile")
             }
-            ?? NodeConfiguration()
-        service = try container.decodeIfPresent(ServiceConfiguration.self, forKey: .service) ?? ServiceConfiguration()
-        hardware = try container.decodeIfPresent(HardwareConfiguration.self, forKey: .hardware) ?? HardwareConfiguration()
+            if let supplied, supplied != node {
+                throw DecodingError.dataCorruptedError(forKey: .node, in: container,
+                    debugDescription: "[node] is not used when [[connections.profiles]] are configured; edit the active profile instead")
+            }
+        } else {
+            singleNode = supplied ?? NodeConfiguration()
+        }
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(schemaVersion, forKey: .schemaVersion)
+        try container.encode(service, forKey: .service)
+        try container.encode(hardware, forKey: .hardware)
+        if let profileConnections {
+            try container.encode(profileConnections, forKey: .connections)
+        } else {
+            if let connections { try container.encode(connections, forKey: .connections) }
+            try container.encode(singleNode, forKey: .node)
+        }
+    }
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.schemaVersion == rhs.schemaVersion
+            && lhs.service == rhs.service
+            && lhs.hardware == rhs.hardware
+            && lhs.node == rhs.node
+            && lhs.profileConnections == rhs.profileConnections
     }
 }
 public struct ConnectionProfiles: Codable, Sendable, Equatable {

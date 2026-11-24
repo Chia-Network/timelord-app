@@ -1,0 +1,542 @@
+use super::*;
+#[test]
+fn invalid_edits_use_only_private_validated_saved_configuration_and_do_not_overwrite_intent() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("tl-lkg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.toml");
+    let mut config = Config::default();
+    config.node.host = "saved.example".into();
+    crate::save(&path, &config).unwrap();
+    let saved = saved_path(&path).unwrap();
+    crate::save(&saved, &config).unwrap();
+    std::fs::write(&path, "schema_version = 999").unwrap();
+    let (loaded, fallback) = load_running(&path).unwrap();
+    assert!(fallback);
+    assert_eq!(loaded.node.host, "saved.example");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "schema_version = 999"
+    );
+    std::fs::set_permissions(&saved, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(load_running(&path).is_err());
+    std::fs::set_permissions(&saved, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(&saved, "also broken").unwrap();
+    assert!(load_running(&path).is_err());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[test]
+fn fallback_requires_known_matching_network_unless_requested_file_is_unreadable() {
+    let dir = std::env::temp_dir().join(format!("tl-lkg-network-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.toml");
+    crate::save(&saved_path(&path).unwrap(), &Config::default()).unwrap();
+    for text in [
+        "schema_version=999\n[node]\nnetwork='testnet11'",
+        "schema_version=999\n[node]\nnetwork='unknown'",
+        "invalid TOML",
+    ] {
+        std::fs::write(&path, text).unwrap();
+        assert!(load_running(&path).is_err(), "{text}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+    std::fs::write(&path, b"[node]\nnetwork='mainnet'\n\xff").unwrap();
+    assert!(load_running(&path).is_err());
+    std::fs::write(&path, "schema_version=999\n[node]\nnetwork='mainnet'").unwrap();
+    assert!(load_running(&path).unwrap().1);
+    std::fs::remove_file(&path).unwrap();
+    assert!(load_running(&path).unwrap().1);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn fallback_never_crosses_custom_chain_definitions_with_the_same_name() {
+    let dir = std::env::temp_dir().join(format!("tl-lkg-custom-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.toml");
+    let mut config = Config {
+        node: crate::network::tests::node(),
+        ..Default::default()
+    };
+    crate::save(&saved_path(&path).unwrap(), &config).unwrap();
+    config.schema_version = 999;
+    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    assert!(load_running(&path).unwrap().1);
+    let definition = config.node.network_definition.as_mut().unwrap();
+    definition.exported_at = "re-exported later".into();
+    definition.chia_version = "another version".into();
+    definition.config_overrides.insert(
+        "address_prefix".into(),
+        "different-prefix".to_owned().into(),
+    );
+    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    assert!(load_running(&path).unwrap().1);
+    config
+        .node
+        .network_definition
+        .as_mut()
+        .unwrap()
+        .constants
+        .insert("GENESIS_CHALLENGE".into(), "cd".repeat(32).into());
+    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    assert!(load_running(&path).is_err());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[test]
+fn fallback_uses_the_active_profile_network_and_refuses_unknown_intent() {
+    use timelord_core::{ConnectionProfile, NodeConfig};
+    let directory = std::env::temp_dir().join(format!("tl-lkg-profile-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("config.toml");
+    let profile_config = |network: &str| {
+        let node = NodeConfig {
+            network: network.parse().unwrap(),
+            ..Default::default()
+        };
+        let mut config = Config {
+            node: node.clone(),
+            ..Default::default()
+        };
+        config.connections.profiles = vec![ConnectionProfile {
+            id: "active".into(),
+            name: "Active".into(),
+            node,
+        }];
+        config.connections.active_id = Some("active".into());
+        config
+    };
+    crate::save(&saved_path(&path).unwrap(), &profile_config("testnet11")).unwrap();
+    // The runtime projection is gone from saved files and intent comes from
+    // the active profile.
+    let mut requested = profile_config("testnet11");
+    requested.schema_version = 999;
+    let text = toml::to_string(&requested).unwrap();
+    assert!(!text.contains("[node]"));
+    std::fs::write(&path, &text).unwrap();
+    assert!(load_running(&path).unwrap().1);
+
+    let mut mainnet = profile_config("mainnet");
+    mainnet.schema_version = 999;
+    std::fs::write(&path, toml::to_string(&mainnet).unwrap()).unwrap();
+    assert!(load_running(&path).is_err());
+
+    // A matching legacy [node] table is accepted, so genuine two-table files
+    // migrate even when the rest of the file is invalid.
+    std::fs::write(
+            &path,
+            "schema_version = 999\n\n[node]\nnetwork = \"testnet11\"\n\n[connections]\n\
+             active_id = \"active\"\n\n[[connections.profiles]]\nid = \"active\"\nname = \"Active\"\n\
+             [connections.profiles.node]\nnetwork = \"testnet11\"\n",
+        )
+        .unwrap();
+    let (loaded, fallback) = load_running(&path).unwrap();
+    assert!(fallback);
+    assert_eq!(loaded.node.network, "testnet11".parse().unwrap());
+
+    // A diverging (including empty or partial) [node] table fails loudly and
+    // cannot silently select mainnet.
+    for node in [
+        "network = \"mainnet\"\n",
+        "",
+        "host = \"partial.fixture\"\nnetwork = \"testnet11\"\n",
+    ] {
+        std::fs::write(
+            &path,
+            format!(
+                "schema_version = 999\n\n[node]\n{node}\n[connections]\n\
+                     active_id = \"active\"\n\n[[connections.profiles]]\nid = \"active\"\n\
+                     name = \"Active\"\n[connections.profiles.node]\nnetwork = \"testnet11\"\n"
+            ),
+        )
+        .unwrap();
+        let error = load_running(&path).unwrap_err().to_string();
+        assert!(error.contains("edit the active profile"), "{node}: {error}");
+    }
+
+    // Profiles with no resolvable active profile are not mainnet.
+    for connections in ["active_id = \"missing\"\n", ""] {
+        std::fs::write(
+            &path,
+            format!(
+                "schema_version = 999\n[connections]\n{connections}\
+                     [[connections.profiles]]\nid = \"active\"\nname = \"Active\"\n\
+                     [connections.profiles.node]\nnetwork = \"mainnet\"\n"
+            ),
+        )
+        .unwrap();
+        assert!(load_running(&path).is_err(), "{connections}");
+    }
+    // Even a mainnet last-good checkpoint cannot rescue unknown intent: the
+    // requested profile list has no selected profile.
+    crate::save(&saved_path(&path).unwrap(), &profile_config("mainnet")).unwrap();
+    for text in [
+        "schema_version = 999\n[connections]\n\
+             [[connections.profiles]]\nid = \"active\"\nname = \"Active\"\n\
+             [connections.profiles.node]\nnetwork = \"mainnet\"\n",
+        "schema_version = 999\n[connections]\nactive_id = \"active\"\nprofiles = []\n",
+        // Unknown active_id against a mainnet checkpoint must still refuse;
+        // a buggy mainnet default would accept this checkpoint.
+        "schema_version = 999\n[connections]\nactive_id = \"missing\"\n\
+             [[connections.profiles]]\nid = \"active\"\nname = \"Active\"\n\
+             [connections.profiles.node]\nnetwork = \"mainnet\"\n",
+        // An empty [node] table must not report mainnet intent either.
+        "schema_version = 999\n[node]\n\n[connections]\n\
+             [[connections.profiles]]\nid = \"active\"\nname = \"Active\"\n\
+             [connections.profiles.node]\nnetwork = \"testnet11\"\n",
+    ] {
+        std::fs::write(&path, text).unwrap();
+        assert!(load_running(&path).is_err(), "{text}");
+    }
+    // A single-node request keeps working without profiles.
+    std::fs::write(
+        &path,
+        "schema_version = 999\n[node]\nnetwork = \"mainnet\"\n",
+    )
+    .unwrap();
+    assert!(load_running(&path).unwrap().1);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn unreadable_files_fall_back_but_malformed_or_oversized_content_does_not() {
+    let directory = std::env::temp_dir().join(format!("tl-lkg-text-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("config.toml");
+    crate::save(&saved_path(&path).unwrap(), &Config::default()).unwrap();
+    assert!(matches!(
+        bounded_text(&path, false),
+        Err(ConfigTextError::Unreadable(_))
+    ));
+    assert!(load_running(&path).unwrap().1);
+    std::fs::write(&path, b"\xff[node]\n").unwrap();
+    assert!(matches!(
+        bounded_text(&path, false),
+        Err(ConfigTextError::Invalid(_))
+    ));
+    assert!(load_running(&path).is_err());
+    std::fs::write(&path, "x".repeat(LIMIT as usize + 1)).unwrap();
+    assert!(matches!(
+        bounded_text(&path, false),
+        Err(ConfigTextError::Invalid(_))
+    ));
+    assert!(load_running(&path).is_err());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn stalled_optional_disk_work_does_not_hold_runtime_shutdown_or_release_capacity_early() {
+    let permit = Arc::new(tokio::sync::Semaphore::new(1));
+    let held = permit.clone().try_acquire_owned().unwrap();
+    let (entered, waiting) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let (finished, done) = std::sync::mpsc::channel();
+    let (stop, mut shutdown) = watch::channel(false);
+    let runtime_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            assert_eq!(
+                write_until_shutdown(
+                    move || {
+                        let _permit = held;
+                        entered.send(()).unwrap();
+                        let _ = released.recv();
+                        Ok(true)
+                    },
+                    &mut shutdown
+                )
+                .await
+                .unwrap(),
+                None
+            );
+        });
+        drop(runtime);
+        finished.send(()).unwrap();
+    });
+    waiting.recv_timeout(Duration::from_secs(3)).unwrap();
+    stop.send(true).unwrap();
+    let stopped = done.recv_timeout(Duration::from_secs(2));
+    assert_eq!(permit.available_permits(), 0);
+    release.send(()).unwrap();
+    stopped.expect("runtime drop waited for optional disk work");
+    runtime_thread.join().unwrap();
+}
+#[test]
+fn relative_config_checkpoint_keeps_original_profile_and_credential_paths() {
+    let root = PathBuf::from(format!(".tl-lkg-paths-{}", std::process::id()));
+    for directory in [root.clone(), root.join("nested")] {
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("config.toml");
+        crate::save(&path, &Config::default()).unwrap();
+        let mut candidate = crate::load(&path).unwrap();
+        crate::set_default_automatic_state(&mut candidate, &path).unwrap();
+        let parent = directory.canonicalize().unwrap();
+        let expected = parent.join("automatic-profiles.json");
+        assert_eq!(candidate.hardware.automatic_state.as_ref(), Some(&expected));
+        let saved = saved_path(&path).unwrap();
+        crate::save(&saved, &candidate).unwrap();
+        std::fs::write(&path, "schema_version = 999").unwrap();
+        let (fallback, used_saved) = load_running(&path).unwrap();
+        assert!(used_saved);
+        assert_eq!(fallback.hardware.automatic_state, Some(expected));
+
+        // Relative checkpoint fields also belong to the original config,
+        // including when the operator has removed that file altogether.
+        candidate.hardware.automatic_state = Some("learned/profiles.json".into());
+        candidate.node.certificate = Some("credentials/node.crt".into());
+        candidate.node.private_key = Some("credentials/node.key".into());
+        candidate.node.ca_certificate = Some("credentials/ca.crt".into());
+        crate::save(&saved, &candidate).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let (fallback, used_saved) = load_running(&path).unwrap();
+        assert!(used_saved);
+        assert_eq!(
+            fallback.hardware.automatic_state,
+            Some(parent.join("learned/profiles.json"))
+        );
+        assert_eq!(
+            fallback.node.certificate,
+            Some(parent.join("credentials/node.crt"))
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+#[tokio::test]
+async fn checkpoint_preserves_proven_work_despite_observer_failure_but_rejects_production_failure()
+{
+    let dir = std::env::temp_dir().join(format!("tl-lkg-work-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.toml");
+    let mut config = Config::default();
+    config.node.certificate = Some(dir.join("fixture.crt"));
+    config.node.private_key = Some(dir.join("fixture.key"));
+    config.node.ca_certificate = Some(dir.join("fixture-ca.crt"));
+    config.hardware.boards = vec![toml::from_str("id='a'\nname='A'\nclient_port=18110").unwrap()];
+    let shared = Arc::new(
+        crate::Shared::new(
+            None,
+            config.clone(),
+            std::sync::Arc::new(std::sync::Mutex::new(crate::runtime::RuntimeState::new(
+                false,
+            ))),
+            crate::operational::State::fixture(),
+            crate::unix_now(),
+            crate::unix_now(),
+        )
+        .routed_by_config(),
+    );
+    let process = shared.process.clone();
+    process.fail(); // A failed scrape listener leaves proof production running.
+    let (current_tx, current) = watch::channel(shared.clone());
+    let (stop, rx) = watch::channel(false);
+    let task = tokio::spawn(record(config.clone(), path.clone(), current, rx));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(!saved_path(&path).unwrap().exists());
+    {
+        let mut state = shared.runtime.lock().unwrap();
+        state.node = "authenticated".into();
+        state.scheduler_initialized = true;
+        state.proofs_delivered = 1;
+        state.boards.insert(
+            "a".into(),
+            crate::runtime::HardwareState {
+                lifecycle: {
+                    let mut owner = crate::board_lifecycle::BoardLifecycle::fixture(
+                        crate::board_lifecycle::Phase::Connected,
+                        true,
+                        None,
+                        1,
+                    );
+                    owner.verified(1, 0, 1);
+                    owner.verified(1, 1, 1);
+                    owner
+                },
+                ..Default::default()
+            },
+        );
+    }
+    shared
+        .clients
+        .lock()
+        .unwrap()
+        .extend([("a".into(), 0), ("a".into(), 1)]);
+    assert!(!observability::ready(&shared));
+    assert!(eligible(&shared));
+    tokio::time::timeout(Duration::from_secs(4), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        process
+            .progress
+            .snapshot(1, 1)
+            .unwrap()
+            .configuration_checkpointed
+    );
+    std::fs::write(&path, "schema_version = 999").unwrap();
+    assert!(load_running(&path).unwrap().1);
+    assert!(
+        !observability::ready(&shared),
+        "promotion cannot clear observer failure"
+    );
+    for essential in [false, true] {
+        let waiting_process = crate::operational::State::fixture();
+        waiting_process.fail(); // Observer failure alone must remain acceptable.
+        let mut waiting_state = crate::runtime::RuntimeState::new(false);
+        {
+            let proven = shared.runtime.lock().unwrap();
+            waiting_state.node = proven.node.clone();
+            waiting_state.scheduler_initialized = proven.scheduler_initialized;
+            waiting_state.proofs_delivered = proven.proofs_delivered;
+            waiting_state.boards = proven.boards.clone();
+        }
+        let waiting = Arc::new(
+            crate::Shared::new(
+                None,
+                shared.config.clone(),
+                Arc::new(std::sync::Mutex::new(waiting_state)),
+                waiting_process.clone(),
+                shared.started_unix,
+                shared.service_started_unix,
+            )
+            .with_clients(shared.clients.clone())
+            .routed(shared.assignments()),
+        );
+        current_tx.send_replace(waiting.clone());
+        assert!(eligible(&waiting));
+        let capacity = waiting_process
+            .progress
+            .arithmetic(timelord_supervisor::progress::Resource::OptionalCheckpoint);
+        let held = capacity.acquire_owned().await.unwrap();
+        let rejected = dir.join(format!("failed-during-permit-wait-{essential}.toml"));
+        let (reject_stop, rx) = watch::channel(false);
+        let recording = record(config.clone(), rejected.clone(), current_tx.subscribe(), rx);
+        tokio::pin!(recording);
+        // First tick passes eligibility and blocks on the held capacity.
+        tokio::select! {
+            biased;
+            result = &mut recording => panic!("record exited before capacity became available: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+        }
+        if essential {
+            waiting_process.essential_failure();
+        } else {
+            waiting.runtime.lock().unwrap().failed_proofs = 1;
+        }
+        drop(held);
+        tokio::select! {
+            result = &mut recording => panic!("ineligible checkpoint was promoted: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+        }
+        reject_stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), &mut recording)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!saved_path(&rejected).unwrap().exists());
+        assert!(
+            !waiting_process
+                .progress
+                .snapshot(1, 1)
+                .unwrap()
+                .configuration_checkpointed
+        );
+        current_tx.send_replace(shared.clone());
+    }
+    shared.runtime.lock().unwrap().failed_proofs = 1;
+    assert!(!eligible(&shared), "sent work cannot hide a failed proof");
+    let rejected = dir.join("proof-failed.toml");
+    let (reject_stop, rx) = watch::channel(false);
+    let rejecting = tokio::spawn(record(
+        config.clone(),
+        rejected.clone(),
+        current_tx.subscribe(),
+        rx,
+    ));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    reject_stop.send(true).unwrap();
+    rejecting.await.unwrap().unwrap();
+    assert!(!saved_path(&rejected).unwrap().exists());
+    // Even with a clean proof counter, an essential task exit must reject
+    // promotion before the serve loop changes the process to Stopping.
+    shared.runtime.lock().unwrap().failed_proofs = 0;
+    process.essential_failure();
+    assert_eq!(process.snapshot().phase, crate::operational::Phase::Running);
+    assert!(!eligible(&shared));
+    process.fail();
+    assert!(
+        !eligible(&shared),
+        "observer failure cannot downgrade essential failure"
+    );
+    let rejected = dir.join("essential-failed.toml");
+    let (reject_stop, rx) = watch::channel(false);
+    let rejecting = tokio::spawn(record(config, rejected.clone(), current_tx.subscribe(), rx));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    reject_stop.send(true).unwrap();
+    rejecting.await.unwrap().unwrap();
+    assert!(!saved_path(&rejected).unwrap().exists());
+    let _ = stop.send(true);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[test]
+fn oversized_and_non_regular_configuration_is_rejected_without_unbounded_reads() {
+    let dir = std::env::temp_dir().join(format!("tl-config-size-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    assert!(bounded_text(&dir, false).is_err());
+    let path = dir.join("large");
+    std::fs::write(&path, vec![b'x'; LIMIT as usize + 1]).unwrap();
+    assert!(bounded_text(&path, false).is_err());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn exact_size_and_read_boundaries_are_enforced() {
+    let dir = std::env::temp_dir().join(format!("tl-config-limit-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.toml");
+    std::fs::write(&path, vec![b'x'; LIMIT as usize]).unwrap();
+    assert_eq!(bounded_text(&path, false).unwrap().len() as u64, LIMIT);
+    std::fs::write(&path, vec![b'x'; LIMIT as usize + 1]).unwrap();
+    assert!(matches!(
+        bounded_text(&path, false),
+        Err(ConfigTextError::Invalid(_))
+    ));
+    // The read-side bound is enforced even without filesystem metadata.
+    assert_eq!(
+        read_bounded(std::io::repeat(b'x').take(LIMIT))
+            .unwrap()
+            .len() as u64,
+        LIMIT
+    );
+    assert!(matches!(
+        read_bounded(std::io::repeat(b'x').take(LIMIT + 1)),
+        Err(ConfigTextError::Invalid(_))
+    ));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn private_reads_reject_symlinks_and_shared_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("tl-config-private-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.toml");
+    std::fs::write(&path, "schema_version = 1\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(bounded_text(&path, true).is_ok());
+    let link = dir.join("link");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    assert!(matches!(
+        bounded_text(&link, true),
+        Err(ConfigTextError::Unreadable(_))
+    ));
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    assert!(matches!(
+        bounded_text(&path, true),
+        Err(ConfigTextError::Invalid(_))
+    ));
+    std::fs::remove_dir_all(dir).unwrap();
+}
