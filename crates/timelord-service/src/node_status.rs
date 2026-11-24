@@ -118,7 +118,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_requires_the_configured_ca_and_valid_server_name() {
-        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
         use std::sync::Arc;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -129,10 +129,11 @@ mod tests {
         let mut params = CertificateParams::new(vec!["fixture-ca".into()]).unwrap();
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         let ca = params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::from_params(&params, &ca_key);
         let key = KeyPair::generate().unwrap();
         let leaf = CertificateParams::new(vec!["node.fixture".into()])
             .unwrap()
-            .signed_by(&key, &ca, &ca_key)
+            .signed_by(&key, &issuer)
             .unwrap();
         std::fs::write(directory.join("ca.crt"), ca.pem()).unwrap();
         std::fs::write(directory.join("leaf.crt"), leaf.pem()).unwrap();

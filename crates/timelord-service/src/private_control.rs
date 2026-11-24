@@ -1,4 +1,6 @@
-//! Same-user, owner-only Unix IPC. It can only pause/resume tuning, not set hardware.
+//! Same-user, owner-only Unix IPC. It can hold/resume tuning, apply a saved
+//! node-profile change and retry or disable a board. It cannot set hardware
+//! operating points or control arbitrary processes.
 use crate::Shared;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -11,18 +13,54 @@ use timelord_supervisor::AcceptBackoff;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
-    sync::watch,
+    sync::{Semaphore, watch},
 };
+/// Private-control transactions allowed at once. This matches the node-reload
+/// channel capacity in service.rs (`tokio::sync::mpsc::channel(4)`). Excess
+/// same-user requests deliberately queue by waiting for a permit rather than
+/// being shed, so a local client cannot spawn unbounded handlers ahead of the
+/// service.
+const MAX_IN_FLIGHT: usize = 4;
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Request {
+struct TuningRequest {
     paused: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum BoardAction {
+    /// End probation now and retry a waiting owner immediately.
+    Retry,
+    /// Keep the board out of rotation (optionally for a bounded time).
+    Disable,
+    Enable,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Command {
+    ReloadNode,
+    Board {
+        serial: String,
+        action: BoardAction,
+        #[serde(default)]
+        seconds: Option<u64>,
+    },
+}
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum Request {
+    Tuning(TuningRequest),
+    Command(Command),
 }
 #[derive(Serialize, Deserialize)]
 pub struct Response {
     pub paused: bool,
     pub service_pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
+/// A node-profile change request handed to the service owner loop.
+pub type NodeReload = tokio::sync::oneshot::Sender<std::result::Result<(), String>>;
 pub struct Listener {
     listener: UnixListener,
     path: PathBuf,
@@ -66,7 +104,11 @@ pub fn bind(path: &Path) -> Result<Listener> {
         inode: std::fs::symlink_metadata(path)?.ino(),
     })
 }
-async fn handle(mut socket: UnixStream, shared: Arc<Shared>) -> Result<()> {
+async fn handle(
+    mut socket: UnixStream,
+    shared: Arc<Shared>,
+    node: tokio::sync::mpsc::Sender<NodeReload>,
+) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         use std::os::fd::AsRawFd;
@@ -92,21 +134,86 @@ async fn handle(mut socket: UnixStream, shared: Arc<Shared>) -> Result<()> {
         bail!("Invalid private control request");
     }
     let request: Request = serde_json::from_str(&line)?;
-    shared.runtime.lock().expect("runtime").tuning_paused = request.paused;
+    let error = match request {
+        Request::Tuning(request) => {
+            shared.runtime.lock().expect("runtime").tuning_paused = request.paused;
+            None
+        }
+        Request::Command(Command::ReloadNode) => {
+            let (reply, outcome) = tokio::sync::oneshot::channel();
+            node.send(reply)
+                .await
+                .map_err(|_| anyhow::anyhow!("Service is stopping"))?;
+            outcome.await.context("Service is stopping")?.err()
+        }
+        Request::Command(Command::Board {
+            serial,
+            action,
+            seconds,
+        }) => board_action(&shared, &serial, action, seconds)
+            .err()
+            .map(|e| format!("{e:#}")),
+    };
     let response = Response {
-        paused: request.paused,
+        paused: shared.runtime.lock().expect("runtime").tuning_paused,
         service_pid: std::process::id(),
+        error,
     };
     socket.write_all(&serde_json::to_vec(&response)?).await?;
     socket.write_all(b"\n").await?;
+    Ok(())
+}
+fn board_action(
+    shared: &Shared,
+    serial: &str,
+    action: BoardAction,
+    seconds: Option<u64>,
+) -> Result<()> {
+    let id = shared
+        .config
+        .hardware
+        .boards
+        .iter()
+        .find(|b| b.serial.as_deref() == Some(serial))
+        .map(|b| b.id.clone())
+        .context("No configured board has that serial")?;
+    let store = shared
+        .runtime
+        .lock()
+        .expect("runtime")
+        .safety
+        .clone()
+        .context("Board journal unavailable")?;
+    let now = crate::unix_now();
+    match action {
+        BoardAction::Retry => {
+            store.update_health(serial, true, |h| h.retry_now(now))?;
+            if let Some(hardware) = shared.runtime.lock().expect("runtime").boards.get_mut(&id) {
+                hardware.retry_requested = true;
+            }
+        }
+        BoardAction::Disable => {
+            store.update_health(serial, false, |h| {
+                h.disable(seconds.map(|s| now.saturating_add(s)))
+            })?;
+        }
+        BoardAction::Enable => {
+            store.update_health(serial, true, |h| h.enable())?;
+            if let Some(hardware) = shared.runtime.lock().expect("runtime").boards.get_mut(&id) {
+                hardware.retry_requested = true;
+            }
+        }
+    }
+    tracing::info!(serial, ?action, ?seconds, "Operator board action applied");
     Ok(())
 }
 pub async fn run(
     control: Listener,
     shared: Arc<Shared>,
     shutdown: watch::Receiver<bool>,
+    node: tokio::sync::mpsc::Sender<NodeReload>,
 ) -> Result<()> {
-    run_with(AcceptBackoff::new(), control, shared, shutdown).await
+    run_with(AcceptBackoff::new(), control, shared, shutdown, node).await
 }
 
 async fn run_with(
@@ -114,7 +221,9 @@ async fn run_with(
     control: Listener,
     shared: Arc<Shared>,
     mut shutdown: watch::Receiver<bool>,
+    node: tokio::sync::mpsc::Sender<NodeReload>,
 ) -> Result<()> {
+    let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
     loop {
         tokio::select! {
             _=shutdown.changed()=>break,
@@ -122,28 +231,48 @@ async fn run_with(
                 tracing::warn!(%error,failures=failures,?delay,"Private control accept failed; retrying");
             })=> {
                 let Some((socket,_))=accepted else { continue; };
+                // Reserve a slot before spawning so waiting tasks stay bounded.
+                // Excess requests queue here for a permit by design.
+                let permit = tokio::select! {
+                    _=shutdown.changed()=>break,
+                    permit=in_flight.clone().acquire_owned()=>permit.expect("private-control semaphore is never closed"),
+                };
                 // Bounded same-user transaction; no unauthenticated public HTTP mutation.
-                if let Err(error)=tokio::time::timeout(Duration::from_secs(2),handle(socket,shared.clone())).await {tracing::debug!(%error,"Private control timed out");}
+                // A node-profile switch drains the old session; allow it longer.
+                let shared = shared.clone();
+                let node = node.clone();
+                tokio::spawn(async move {
+                    let _permit=permit;
+                    if let Err(error)=tokio::time::timeout(Duration::from_secs(30),handle(socket,shared,node)).await {tracing::debug!(%error,"Private control timed out");}
+                });
             }
         }
     }
     Ok(())
 }
 pub async fn request(path: &Path, paused: bool) -> Result<Response> {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    send(path, Request::Tuning(TuningRequest { paused }), 3).await
+}
+pub async fn command(path: &Path, command: Command) -> Result<Response> {
+    let response = send(path, Request::Command(command), 35).await?;
+    if let Some(error) = &response.error {
+        bail!("{error}");
+    }
+    Ok(response)
+}
+async fn send(path: &Path, request: Request, seconds: u64) -> Result<Response> {
+    tokio::time::timeout(Duration::from_secs(seconds), async {
         let mut socket = UnixStream::connect(path)
             .await
-            .context("The running service does not support live tuning control")?;
-        socket
-            .write_all(&serde_json::to_vec(&Request { paused })?)
-            .await?;
+            .context("The running service does not support live control")?;
+        socket.write_all(&serde_json::to_vec(&request)?).await?;
         socket.write_all(b"\n").await?;
         let mut line = String::new();
         use tokio::io::AsyncReadExt;
-        BufReader::new(socket.take(257))
+        BufReader::new(socket.take(1025))
             .read_line(&mut line)
             .await?;
-        if line.len() > 256 || !line.ends_with('\n') {
+        if line.len() > 1024 || !line.ends_with('\n') {
             bail!("Invalid private control response");
         }
         Ok(serde_json::from_str(&line)?)
@@ -165,20 +294,20 @@ mod tests {
             0o600
         );
         assert!(bind(&path).is_err());
-        let shared = Arc::new(Shared {
-            native: None,
-            config: timelord_core::Config::default(),
-            assignments: vec![],
-            clients: Default::default(),
-            process: crate::operational::State::fixture(),
-            scope: crate::runtime::RuntimeScope::Production,
-            runtime: Default::default(),
-            started_unix: crate::unix_now(),
-            service_started_unix: crate::unix_now(),
-        });
+        let shared = Arc::new(crate::Shared::new(
+            None,
+            timelord_core::Config::default(),
+            std::sync::Arc::new(std::sync::Mutex::new(crate::runtime::RuntimeState::new(
+                false,
+            ))),
+            crate::operational::State::fixture(),
+            crate::unix_now(),
+            crate::unix_now(),
+        ));
         shared.runtime.lock().unwrap().phase = "running".into();
         let (stop, shutdown) = watch::channel(false);
-        let server = tokio::spawn(run(control, shared.clone(), shutdown));
+        let (node, _node_requests) = tokio::sync::mpsc::channel(1);
+        let server = tokio::spawn(run(control, shared.clone(), shutdown, node));
         let response = request(&path, true).await.unwrap();
         assert!(response.paused);
         assert_eq!(response.service_pid, std::process::id());
@@ -202,19 +331,19 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("tl-control-backoff-{}.sock", std::process::id()));
         let control = bind(&path).unwrap();
-        let shared = Arc::new(Shared {
-            native: None,
-            config: timelord_core::Config::default(),
-            assignments: vec![],
-            clients: Default::default(),
-            process: crate::operational::State::fixture(),
-            runtime: Default::default(),
-            started_unix: crate::unix_now(),
-            service_started_unix: crate::unix_now(),
-            scope: crate::runtime::RuntimeScope::Production,
-        });
+        let shared = Arc::new(crate::Shared::new(
+            None,
+            timelord_core::Config::default(),
+            std::sync::Arc::new(std::sync::Mutex::new(crate::runtime::RuntimeState::new(
+                false,
+            ))),
+            crate::operational::State::fixture(),
+            crate::unix_now(),
+            crate::unix_now(),
+        ));
         let (stop, shutdown) = watch::channel(false);
         let started = std::time::Instant::now();
+        let (node, _node_requests) = tokio::sync::mpsc::channel(1);
         let server = tokio::spawn(run_with(
             AcceptBackoff::with_injected([
                 std::io::Error::from_raw_os_error(libc::ECONNABORTED),
@@ -223,6 +352,7 @@ mod tests {
             control,
             shared,
             shutdown,
+            node,
         ));
         assert!(request(&path, true).await.unwrap().paused);
         assert!(started.elapsed() >= Duration::from_millis(140));

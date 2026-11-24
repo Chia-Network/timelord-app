@@ -1,13 +1,24 @@
 # Rust timelord integration
 
-Pinned dependency: [dg_xch_utils](https://github.com/GalactechsLLC/dg_xch_utils/tree/ca437be562cec5f0514f6edd4c794adfe382dd8a),
-revision `ca437be562cec5f0514f6edd4c794adfe382dd8a`, Apache-2.0.
-See upstream.toml, LICENSE, NOTICE and Cargo.lock. No upstream source is patched.
+The app uses dg_xch as Git dependencies on the Chia-Network fork
+https://github.com/Chia-Network/dg_xch_utils, pinned to one revision for every
+dg_xch crate. The fork carries upstream `ca437be562cec5f0514f6edd4c794adfe382dd8a`,
+the HF2 compatibility commits through `3b50863ee641c67e4c46b9a18640001e0c94833f`,
+and our signed patches. Apache-2.0.
+See [VENDORING.md](VENDORING.md), upstream.toml, LICENSE, NOTICE and Cargo.lock for
+maintenance instructions and exact provenance.
 
 The app links the public regular Scheduler, protocol/consensus types, TLS/framing
 helpers and VDF verifier. Our `runtime.rs` owns the node session and injects our
 `asic.rs` backend directly when executing scheduler plans. Upstream's regular
 service/CLI is not used: it constructs a CpuBackend and recomputes each request.
+
+Custom Chia network imports resolve the exact exported network ID and supported
+constant overrides in our `network.rs` adapter, using pinned Mainnet constants as
+the baseline. They do not use upstream's DGX seed-derived chain format. Current HF2 filter schedules and strength parameters are applied explicitly.
+The fork's maintained core and timelord supply PoS2 witness verification, consensus hashing and
+message codecs. Offline custom import/handshake tests alone do not establish
+transition support or live consensus acceptance.
 
 The adapter keeps one logical-chain session per assigned board, retains squaring
 across requests with identical generation/challenge/input, primes the validated infused-chain input as soon as
@@ -20,16 +31,20 @@ request identity and consensus proof validity before sending a node message.
 Normal resets drain proofs through STOP/ACK and close the old connection; timeout
 or cancellation closes the lease. Cancellation cannot leave a partial native frame
 in a reused socket. Node disconnects cancel workers and drain retained sessions.
-Invalid ASIC results latch a hardware fault and stop owned clients.
+Invalid ASIC results stop the affected owner's work, not other owners or the
+node session. Managed owners recover indefinitely with cooldowns, fresh hardware
+initialization and private verification after invalid proofs. Unknown retirement
+evidence requests conservative recovery rather than a permanent admission gate.
+Every production proof still requires native verification and scheduler checks.
 
 The offline checkpoint fixture is generated and independently verified by canonical
 C++ chiavdf. The adapter has tests for persistent successive requests, partial-frame
 cancellation, cryptographic corruption, strict TLS identity and native log guards.
 Initial local ASIC/mainnet smoke testing verified real proofs and a stored signage
 proof pair. Wider consensus and timing still require replay and sustained acceptance.
-Current Chia adds an optional header MMR root to unfinished-block messages; our
-adapter accepts only the absent-root extension or legacy framing, with captured
-message regression coverage. Active MMR roots require upstream consensus support.
+Current header MMR roots and packed sub-epoch challenge roots are supported,
+with captured Chia message and consensus-hash regression coverage. Exact legacy
+absent-root unfinished-message framing remains supported.
 The existing live Python coordinator has not been replaced or used as a test fixture.
 
 ## ARM SHA and six-worker trial
@@ -118,3 +133,38 @@ restarts, with healthy native sessions and the full-node peer connection retaine
 during an isolated hardware outage. Offline socket/process/TLS fixtures exercise
 recovery, exhaustion and safety latches. The live check verifies deployment health
 only; it does not inject a physical board fault or establish an IPS improvement.
+
+`continuous-recovery-deployment.json` records the user-authorized November 13
+custom-testnet deployment. The injected native SIGTERM recovered automatically
+while retaining the supervisor, worker, healthy owner PIDs and the exact node TCP
+connection through the recovery check. Other chains delivered verified proofs
+during recovery. A separate ASIC 2 native timeout also recurred and recovered;
+a process sample locates the stall in FTDI `BulkOutRequest` during engine enable.
+The other two owners delivered 88 additional proofs in a subsequent 50-second
+capture, with zero verification failures. The USB stall remains unresolved; this
+is not an all-board stability result or a PoS transition test.
+
+## HF2 development deployment (November 15)
+
+The original compatibility branch `fix/chia-hf2-timelord`, revision
+`3b50863`, adds current Chia PoS2 verification via `chia-pos2 = 1.0.0`,
+quality-commitment consensus hashing, packed header/sub-epoch MMR roots,
+height/strength-aware iteration calculation and timelord-only HF2 capability.
+Chia-derived wire/hash/quality vectors and a captured peer sequence cover these
+changes. The app adapter accepts current envelopes and retains exact legacy
+absent-root compatibility; custom relative filter schedules retain their length.
+
+`hf2-testnet-deployment.json` records actual m6mini submissions and full-node
+acceptance of PoS2 blocks, beginning at height 10554. It does not establish an
+activation replay or sustained hardware stability. That historical deployment used the compatibility fork. Current builds use
+the Chia-Network fork with the review fixes described in VENDORING.md.
+Standard builds require no local checkout or Cargo override.
+
+## Maintained vendor deployment (November 15)
+
+`vendor-hf2-deployment.json` records the signed vendor build and full-node
+acceptance of its PoS2 infusion at height 11052, including the source peer,
+submission time and accepted header hash. All three boards delivered verified
+proofs; configuration and Running intent were preserved. The 885 workspace tests,
+feature matrix, Swift build and fresh-archive checks passed. This short trial
+does not establish sustained hardware stability or activation replay coverage.

@@ -1,0 +1,126 @@
+{
+  "date": "2026-11-18",
+  "machine": "m6mini",
+  "network": "testnet11",
+  "purpose": "User-authorized testnet deployment of the board reliability overhaul (availability-first routing, transient vs safety recovery, unplug detection, disturbance hold, node-profile switch without USB restart)",
+  "authorization": "User request in session: deploy to m6mini (not production) for testing",
+  "native_revision": "7c47cf07e575cee38c5ad56c67d391b4f131ad6b",
+  "native_client_sha256": "9bd618b6d781b6d0d034cc74e5dbbe51275621cd0e5717b5edd97345e9110789",
+  "native_client_unchanged_from_previous_deployment": true,
+  "before": {
+    "supervisor_pid": 726,
+    "worker_pid": 55819,
+    "mode": "running",
+    "node_state": "ready",
+    "proofs_delivered": 2664,
+    "boards": [
+      {
+        "name": "ASIC 2",
+        "serial": "CHIA0000000032",
+        "chains": [
+          "challenge"
+        ],
+        "frequency_mhz": 1480.0
+      },
+      {
+        "name": "ASIC 3",
+        "serial": "CHIA0000000063",
+        "chains": [
+          "reward"
+        ],
+        "frequency_mhz": 1740.0
+      },
+      {
+        "name": "ASIC 1",
+        "serial": "CHIA0000000116",
+        "chains": [
+          "infused_challenge"
+        ],
+        "frequency_mhz": 1660.0
+      }
+    ]
+  },
+  "deployments": [
+    {
+      "stage": "~/timelord-reliability-20261118",
+      "base_commit": "86c09ce73eb56a4cdf691e40081ed05731e83cce",
+      "working_tree": "uncommitted reliability overhaul (items 1-35)",
+      "source_patch_sha256": "5017cb673b3f063c5c4001ad08499fee01d43226e4dc25767e857c21369581b8",
+      "untracked_source_sha256": "16c4903cd9be74fa6984d61e6a6552c859d44143a138b7f67db1266593edab33",
+      "supervisor_pid": 63114,
+      "worker_pid": 63115,
+      "mode": "running",
+      "configuration_unchanged": true,
+      "verified_both_app_copies": true,
+      "state_backup": "~/timelord-reliability-20261118/state-before (schema 1 board journal; use for a rollback to the previous build)"
+    },
+    {
+      "stage": "~/timelord-reliability-20261118b",
+      "base_commit": "86c09ce73eb56a4cdf691e40081ed05731e83cce",
+      "working_tree": "as above plus busy-device and cautious-canary fixes found during the first deployment",
+      "source_patch_sha256": "61a7adced7b3f6a79d99a7c0ece1571c1ccf6c56a287b87cd95b9b48aa8cf6e9",
+      "untracked_source_sha256": "89c275a65f658880ff5f4045437b339673474e84bc0510ae2a9114c14eafdc70",
+      "supervisor_pid": 63463,
+      "worker_pid": 63464,
+      "mode": "running",
+      "configuration_unchanged": true,
+      "verified_both_app_copies": true
+    },
+    {
+      "stage": "~/timelord-reliability-20261118c",
+      "base_commit": "86c09ce73eb56a4cdf691e40081ed05731e83cce",
+      "working_tree": "as above plus availability-first routing (benching removed; every serving board carries work) and a USB inventory check after an owner dies, so an unplug is not a failure",
+      "source_patch_sha256": "4524dacb460bdd7d181cd3ab70407dc1f81d5fe0bf082f80ba6786cba0111729",
+      "untracked_source_sha256": "2a52c1440e7c47d9afb5f9dcae48cc5ed26a536cd1a9deeb9a281f15929bf3ba",
+      "supervisor_pid": 66063,
+      "worker_pid": 66064,
+      "mode": "running",
+      "configuration_unchanged": true,
+      "reason": "User feedback after the first unplug: a working board that was only unplugged must not be counted or taken out of rotation."
+    },
+    {
+      "stage": "~/timelord-reliability-20261118d",
+      "base_commit": "86c09ce73eb56a4cdf691e40081ed05731e83cce",
+      "working_tree": "build C plus late unplug forgiveness (a counted transport failure is taken back when the restart finds the board missing within 120 s) and USB-check logging",
+      "source_patch_sha256": "f5e424b51a901d69c571958e93eaeb5e5b0faaf05d798d3cf4d49580bff5b3f1",
+      "untracked_source_sha256": "17acfd46777603021a26ca1a3e93ddaeb7707afb323d6e5f8a3b0d1ae9e94d3b",
+      "previous_supervisor_pid": 66063,
+      "supervisor_pid": 70061,
+      "worker_pid": 70062,
+      "mode": "running",
+      "configuration_unchanged": true,
+      "verified_both_app_copies": true,
+      "authorization": "User request in session: deploy it",
+      "result": "19:20:16Z worker restarted; all three boards serving by 19:20:22Z at their learned points (no cautious starts): challenge ASIC 3, reward ASIC 1, infused-challenge ASIC 2 (probation). Verified proofs submitted from 19:21Z."
+    }
+  ],
+  "observations": {
+    "learned_profiles_resumed": "ASIC 2 at 1480 MHz and ASIC 3 at 1740 MHz resumed their learned points without a cautious start (identical native client hash).",
+    "schema_upgrade": "board-safety.json upgraded from schema 1 to 2 on first start; unclean_owner journal state became cautious starts, not restrictions.",
+    "stall_detection": "18:26:48Z ASIC 2 stopped reporting for 15 s (its known blocked USB write) and was retired; its challenge chain moved to ASIC 3 without restarting other owners.",
+    "lane_escalation": "18:27:39Z ASIC 1's routed engine never connected (Waiting for ASIC client timed out); only that owner was retired.",
+    "cautious_return": "18:28:14Z ASIC 2 and 18:28:29Z ASIC 1 returned from cautious starts to their saved settings (1480 / 1650 MHz) after verified work.",
+    "persistence_across_restart": "The second deployment restarted the worker; failure streaks (ASIC 2: 1, ASIC 1: 2) and probation carried over.",
+    "routing_after_restart": "Challenge on ASIC 3 (no failures), reward on ASIC 2, infused-challenge on ASIC 1 (probation). Proofs delivered.",
+    "issues_found_and_fixed": [
+      "A native client launched while the previous owner's USB handle was still being released failed FT_OpenEx (error 3) and was counted as a reliability failure. Fixed in the second build: an open failure is treated as busy/absent (no penalty, 5 s retry).",
+      "A board in a cautious start that carries only the infused-challenge chain could wait a long time for verified work on testnet. Fixed in the second build: it runs a private canary proof on an idle engine."
+    ],
+    "unplug_experiment": {
+      "first_unplug": "Before build C, pulling one cable produced FT_IO_ERROR (error 10) and 'Native control rejected request 3: temperature_unavailable'; it was counted as a failure and, under the old benching rule, kept a working board out of rotation for 30 minutes. That rule was removed in build C.",
+      "18:52:43Z": "ASIC 2 (CHIA0000000032) stalled for 15 s and was counted (streak 2); the other boards kept their native PIDs.",
+      "18:55:35Z": "ASIC 2 (CHIA0000000032) stopped with FT_IO_ERROR (error 10) and temperature_unavailable while its cable was untouched: a genuine fault, correctly counted (streak 3). The build C USB check saw the board attached. Routes moved to ASIC 3 and ASIC 1 within 0.3 s; the restart 30 s later succeeded and ASIC 2 carried the infused-challenge chain from 18:56:18Z.",
+      "finding": "An unplug produces the same native signature as ASIC 2's genuine faults (FT_IO_ERROR then temperature_unavailable), so only USB inventory can tell them apart. A single check right after the error may run before macOS removes the device; build D therefore also takes a counted failure back when the restart finds the board missing within 120 s. Build D's unplug path has not yet been exercised on hardware.",
+      "operator_actions": "The operator pulled ASIC 1's cable once (18:42:38Z, recorded as a failure under build B: 'Native control rejected request 3: temperature_unavailable' after FT_IO_ERROR) and later replugged it. No other cable was changed.",
+      "19:02:40Z": "ASIC 2 stalled again (15 s of native silence; streak 4). It kept carrying the infused-challenge chain between failures while ASIC 3 and ASIC 1 kept the challenge and reward chains with unchanged native PIDs."
+    },
+    "node_profile_switch": {
+      "time": "2026-11-18T22:30:07Z",
+      "action": "Operator switched the connection profile from testnet11 to mainnet in the app while running build D.",
+      "result": "No warnings or errors. Worker PID 70062 and all three native PIDs (70069, 70078, 82694) unchanged; routes unchanged. Status was waiting_for_clients for about 2 s; the first mainnet unfinished block was scheduled at 22:30:21Z and verified signage points were submitted from 22:31Z.",
+      "issue_found": "Session proof counters carried over across the switch (4673 to 4676), so the configuration checkpoint could treat testnet proofs as evidence for the mainnet profile. Fixed after this observation by resetting the counters on a node switch (not deployed)."
+    },
+    "asic2_failures_after_build_d": "ASIC 2 reached a streak of 7 by 20:48:27Z, all native stalls with the board still attached (logged 'ASIC still attached after its owner stopped'); it kept returning to the infused-challenge chain."
+  },
+  "validation_boundary": "A short testnet observation and one live node-profile switch to mainnet. One physical unplug (ASIC 1, under build B) was observed; build C/D unplug detection, hub power-cycle and the 24-hour flaky-board soak have not been exercised on hardware; see docs/hardware-qualification.md."
+}

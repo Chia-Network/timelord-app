@@ -1,13 +1,18 @@
 //! Supervise only explicitly configured native clients. Initialization is sequential.
-mod admission;
 mod board;
 mod failure;
 pub(crate) mod lifecycle;
 use failure::classify;
 pub use failure::{NativeFailure, NativeFailureKind};
-pub use prepared::{Facts, Prepared, prepare_for};
+pub use prepared::{Facts, prepare};
+pub(crate) mod continuous;
+pub(crate) mod health;
 mod native;
 mod prepared;
+mod recovery;
+mod recovery_point;
+mod retirement;
+pub(crate) mod routing;
 mod tuning;
 use crate::{
     Shared,
@@ -18,13 +23,14 @@ use anyhow::{Context, Result, bail};
 use board::*;
 pub(crate) use native::INITIALIZATION;
 use native::*;
+pub(crate) use recovery_point::CAUTIOUS_CEILING_MHZ;
+use recovery_point::recovery_point;
 use std::{process::Stdio, sync::Arc, time::Duration};
 use timelord_core::{BoardConfig, Config, ProfileMode};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncWriteExt, BufReader},
     process::{Child, Command},
-    sync::{oneshot, watch},
-    task::JoinSet,
+    sync::watch,
 };
 use tuning::*;
 
@@ -104,118 +110,39 @@ fn decode_frequencies(bytes: &[u8]) -> Result<Vec<f64>> {
 }
 
 pub(crate) const TEMPERATURE_TIMEOUT_SECONDS: u64 = 60;
+/// The pinned native client writes raw-speed records every second and
+/// temperatures every few seconds. Silence this long means its event loop is
+/// stuck (for example inside a blocked USB write), not merely idle.
+pub(crate) const LIVENESS_TIMEOUT_SECONDS: u64 = 15;
 
-pub(crate) fn unavailable(shared: &Shared) -> std::collections::HashSet<String> {
-    let (boards, safety) = {
-        let state = shared.runtime.lock().expect("runtime");
-        (state.boards.clone(), state.safety.clone())
-    };
-    unavailable_for(&shared.config, &boards, safety.as_deref())
+/// A proof backend for owner fixtures; it is also the runtime's recovery prover.
+#[cfg(test)]
+pub(crate) fn fixture_backend(shared: &Shared) -> Arc<crate::asic::AsicBackend> {
+    let backend = Arc::new(crate::asic::AsicBackend::new(
+        shared.runtime.clone(),
+        shared.process.clone(),
+    ));
+    for board in &shared.config.hardware.boards {
+        let _ = backend.add_board(&board.id);
+    }
+    shared.runtime.lock().expect("runtime").prover = Arc::downgrade(&backend);
+    backend
 }
-pub(crate) fn unavailable_for(
-    config: &Config,
-    boards: &std::collections::HashMap<String, HardwareState>,
-    safety: Option<&crate::safety::Store>,
-) -> std::collections::HashSet<String> {
-    let managed = safety.is_some();
-    config
-        .hardware
-        .boards
-        .iter()
-        .filter(|board| {
-            let policy = safety.map(|store| store.policy(board)).unwrap_or_default();
-            policy.restriction.is_some()
-                || boards.get(&board.id).map_or(managed, |state| {
-                    (managed && !state.lifecycle.matches_serial(board.serial.as_deref()))
-                        || !state.lifecycle.capacity(crate::unix_now(), managed).usable
-                })
-        })
-        .map(|b| b.id.clone())
-        .collect()
-}
+
+/// Bind runtime board state to configured serials and their saved policy.
 pub(crate) fn restore_lifecycles(
     config: &Config,
     boards: &mut std::collections::HashMap<String, HardwareState>,
-    safety: Option<&crate::safety::Store>,
+    safety: &crate::safety::Store,
 ) {
     for board in &config.hardware.boards {
         let lifecycle = &mut boards.entry(board.id.clone()).or_default().lifecycle;
         lifecycle.bind(board.serial.as_deref());
-        lifecycle.restore_policy(
-            safety.map(|store| store.policy(board)).unwrap_or_default(),
-            crate::unix_now(),
-        );
+        lifecycle.restore_policy(safety.policy(board));
     }
-}
-pub async fn run(
-    shared: Arc<Shared>,
-    backend: Arc<crate::asic::AsicBackend>,
-    mut shutdown: watch::Receiver<bool>,
-) -> Result<()> {
-    let mut children = JoinSet::new();
-    let (stop, child_shutdown) = watch::channel(false);
-    let managed = shared.runtime.lock().expect("runtime").safety.is_some();
-    for board in &shared.config.hardware.boards {
-        if !shared.assignments.iter().any(|a| a.board_id == board.id) && !managed {
-            continue;
-        }
-        if shared
-            .runtime
-            .lock()
-            .expect("runtime")
-            .boards
-            .get(&board.id)
-            .is_some_and(|b| b.lifecycle.status().latched_fault)
-            && !managed
-        {
-            continue;
-        }
-        let (tx, rx) = oneshot::channel();
-        children.spawn(supervise_board(
-            shared.clone(),
-            backend.clone(),
-            board.clone(),
-            tx,
-            child_shutdown.clone(),
-            RestartBackoff::default(),
-        ));
-        // Keep USB initialization sequential. Ordinary board startup failures
-        // must not prevent the next board from starting or stop existing owners.
-        tokio::select! {
-            _ = shutdown.changed() => break,
-            initialized = tokio::time::timeout(Duration::from_secs(30), rx) => {
-                if !matches!(initialized, Ok(Ok(()))) {
-                    tracing::warn!(board=%board.name, "ASIC not ready yet; continuing other boards");
-                }
-            }
-        }
-    }
-    loop {
-        if *shutdown.borrow() {
-            break;
-        }
-        tokio::select! {
-            _ = shutdown.changed() => break,
-            Some(result) = children.join_next(), if !children.is_empty() => {
-                if let Err(error) = result {
-                    shared.process.essential_failure();
-                    // A panic loses trusted native-owner cleanup (and may poison
-                    // shared state). Replace the worker rather than reopening USB
-                    // while the failed owner's retirement remains unconfirmed.
-                    tracing::error!(%error, "ASIC supervisor task failed");
-                    return Err(error.into());
-                }
-            }
-        }
-    }
-    let _ = stop.send(true);
-    while let Some(result) = children.join_next().await {
-        if let Err(error) = result {
-            tracing::warn!(%error, "ASIC shutdown failed");
-        }
-    }
-    Ok(())
 }
 
+#[cfg(test)]
+pub(crate) mod testing;
 #[cfg(test)]
 mod tests;

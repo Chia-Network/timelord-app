@@ -137,8 +137,7 @@ A retry can replace assets on an existing draft. It refuses to modify a publishe
 release. Move no existing release tags; use a new version for different source.
 Notarization failures retain their submission JSON in a diagnostic Actions
 artifact, and do not create a draft release. Cargo audit remains a separate
-Security check. Its reviewed upstream RSA advisory exception is documented in
-`.cargo/audit.toml`; signing does not remove that dependency.
+Security check.
 
 ## Local packaging check
 

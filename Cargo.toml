@@ -15,18 +15,20 @@ libc = "0.2"
 axum = "0.8"
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "sync", "time", "process"] }
-toml = "0.9"
+toml = "1.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-dg_xch_core = { git = "https://github.com/GalactechsLLC/dg_xch_utils", rev = "ca437be562cec5f0514f6edd4c794adfe382dd8a", default-features = false, features = ["bls"] }
-dg_xch_timelord = { git = "https://github.com/GalactechsLLC/dg_xch_utils", rev = "ca437be562cec5f0514f6edd4c794adfe382dd8a" }
-dg_xch_servers = { git = "https://github.com/GalactechsLLC/dg_xch_utils", rev = "ca437be562cec5f0514f6edd4c794adfe382dd8a" }
-dg_xch_vdf = { git = "https://github.com/GalactechsLLC/dg_xch_utils", rev = "ca437be562cec5f0514f6edd4c794adfe382dd8a" }
-dg_xch_serialize = { git = "https://github.com/GalactechsLLC/dg_xch_utils", rev = "ca437be562cec5f0514f6edd4c794adfe382dd8a" }
-x509-cert = "0.2"
-num-bigint = "0.4"
+# dg_xch crates come from the Chia-Network fork branch chia/timelord-app-deps;
+# see integrations/dg-xch/VENDORING.md. Keep all five on the same rev.
+dg_xch_core = { git = "https://github.com/Chia-Network/dg_xch_utils", rev = "7c3e1f3c52b16e95dc8de113fd2713f80d18c179", default-features = false, features = ["bls"] }
+dg_xch_timelord = { git = "https://github.com/Chia-Network/dg_xch_utils", rev = "7c3e1f3c52b16e95dc8de113fd2713f80d18c179" }
+dg_xch_servers = { git = "https://github.com/Chia-Network/dg_xch_utils", rev = "7c3e1f3c52b16e95dc8de113fd2713f80d18c179" }
+dg_xch_vdf = { git = "https://github.com/Chia-Network/dg_xch_utils", rev = "7c3e1f3c52b16e95dc8de113fd2713f80d18c179" }
+dg_xch_serialize = { git = "https://github.com/Chia-Network/dg_xch_utils", rev = "7c3e1f3c52b16e95dc8de113fd2713f80d18c179" }
+x509-cert = "0.3"
+num-bigint = "0.5"
 futures-util = "0.3"
 rustls = "0.23"
 tokio-rustls = "0.26"

@@ -40,17 +40,22 @@ pub struct Snapshot {
 
 pub struct Store {
     path: PathBuf,
-    scope: String,
+    scope: std::sync::Mutex<String>,
 }
 
-pub fn scope(config: &Config, assignments: &[timelord_core::Assignment]) -> Result<String> {
-    // Changing a node/assignment must not attribute another session's measurements.
-    let bytes = serde_json::to_vec(&(
-        config.node.network,
-        &config.node.host,
-        config.node.port,
-        assignments,
-    ))?;
+/// The node context of a chart. Observations carry their board and engine, so
+/// routing changes stay within one history; a different node does not.
+pub fn scope(config: &Config) -> Result<String> {
+    let mut bytes =
+        serde_json::to_vec(&(&config.node.network, &config.node.host, config.node.port))?;
+    if config.node.network_definition.is_some() {
+        let identity = timelord_core::ChainIdentity::new(
+            &config.node.network,
+            config.node.network_definition.as_ref(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        bytes.extend(serde_json::to_vec(&identity)?);
+    }
     Ok(dg_xch_core::utils::hash_256(bytes)
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -58,15 +63,20 @@ pub fn scope(config: &Config, assignments: &[timelord_core::Assignment]) -> Resu
 }
 
 impl Store {
-    pub fn new(
-        path: PathBuf,
-        config: &Config,
-        assignments: &[timelord_core::Assignment],
-    ) -> Result<Self> {
+    pub fn new(path: PathBuf, config: &Config) -> Result<Self> {
         Ok(Self {
             path,
-            scope: scope(config, assignments)?,
+            scope: std::sync::Mutex::new(scope(config)?),
         })
+    }
+    /// Point future checkpoints at a new node context. Returns whether the
+    /// context changed.
+    pub fn retarget(&self, config: &Config) -> Result<bool> {
+        let next = scope(config)?;
+        let mut current = self.scope.lock().expect("history scope");
+        let changed = *current != next;
+        *current = next;
+        Ok(changed)
     }
 
     pub fn restore(&self, state: &mut RuntimeState, started: u64) -> Result<()> {
@@ -86,7 +96,7 @@ impl Store {
             saved.schema_version == 1,
             "Unsupported history checkpoint version"
         );
-        if saved.scope != self.scope {
+        if saved.scope != *self.scope.lock().expect("history scope") {
             return Ok(());
         }
         saved.prune(started);
@@ -116,7 +126,12 @@ impl Store {
     }
 
     pub fn capture(&self, state: &RuntimeState, started: u64, now: u64) -> Snapshot {
-        Snapshot::capture(self.scope.clone(), state, started, now)
+        Snapshot::capture(
+            self.scope.lock().expect("history scope").clone(),
+            state,
+            started,
+            now,
+        )
     }
 
     pub fn checkpoint(
@@ -305,12 +320,7 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("timelord-history-{}-{unique}", std::process::id()));
         fs::create_dir(&directory).unwrap();
-        let store = Store::new(
-            directory.join("config.history.json"),
-            &Config::default(),
-            &[],
-        )
-        .unwrap();
+        let store = Store::new(directory.join("config.history.json"), &Config::default()).unwrap();
         (directory, store)
     }
 
@@ -321,6 +331,8 @@ mod tests {
             timestamp_unix: timestamp,
             work_started_unix: timestamp - 1,
             ips,
+            board_id: None,
+            engine: None,
         }
     }
 
@@ -336,7 +348,7 @@ mod tests {
             .arithmetic(timelord_supervisor::progress::Resource::OptionalCheckpoint)
             .try_acquire_owned()
             .unwrap();
-        let store = Arc::new(Store::new(path.clone(), &Config::default(), &[]).unwrap());
+        let store = Arc::new(Store::new(path.clone(), &Config::default()).unwrap());
         let started = tokio::time::Instant::now();
         assert!(
             store
@@ -358,8 +370,8 @@ mod tests {
         let config = Config::default();
         let state = RuntimeState::default();
         let progress = crate::operational::State::fixture().progress.clone();
-        let old = Arc::new(Store::new(dir.join("history.json"), &config, &[]).unwrap());
-        let replacement = Arc::new(Store::new(dir.join("history.json"), &config, &[]).unwrap());
+        let old = Arc::new(Store::new(dir.join("history.json"), &config).unwrap());
+        let replacement = Arc::new(Store::new(dir.join("history.json"), &config).unwrap());
         let permit = progress
             .arithmetic(timelord_supervisor::progress::Resource::OptionalCheckpoint)
             .try_acquire_owned()
@@ -479,14 +491,13 @@ mod tests {
             .unwrap();
         let mut config = Config::default();
         config.node.host = "other-node".into();
-        let other =
-            Store::new(store.path.clone(), &config, &config.assignments().unwrap()).unwrap();
+        let other = Store::new(store.path.clone(), &config).unwrap();
         let mut state = RuntimeState::default();
         other.restore(&mut state, 1100).unwrap();
         assert!(state.archive.is_none());
         config.node.host = "localhost".into();
         config.node.network = timelord_core::Network::Testnet11;
-        Store::new(store.path.clone(), &config, &config.assignments().unwrap())
+        Store::new(store.path.clone(), &config)
             .unwrap()
             .restore(&mut state, 1100)
             .unwrap();
@@ -495,42 +506,38 @@ mod tests {
     }
 
     #[test]
-    fn history_scope_uses_the_resolved_plan_instead_of_recomputing_config_order() {
-        let (directory, _) = fixture();
-        let mut config = Config::default();
-        config.hardware.boards = (0..3)
-            .map(|i| {
-                toml::from_str(&format!(
-                    "id='b{i}'\nname='B{i}'\nclient_port={}",
-                    18110 + i
-                ))
-                .unwrap()
-            })
-            .collect();
-        let configured = config.assignments().unwrap();
-        let mut resolved = configured.clone();
-        resolved[0].board_id = "b2".into();
-        resolved[2].board_id = "b0".into();
-        let path = directory.join("ranked.json");
-        let store = Store::new(path.clone(), &config, &resolved).unwrap();
-        let mut state = RuntimeState::default();
-        state.observations.push(proof(1, 1002, 900_000.));
-        store
-            .save(&store.capture(&state, 1000, 1050).pruned(1050))
-            .unwrap();
-        let mut restored = RuntimeState::default();
-        Store::new(path.clone(), &config, &configured)
+    fn custom_genesis_or_constants_changes_start_a_new_history_scope() {
+        let mut config = Config {
+            node: crate::network::tests::node(),
+            ..Default::default()
+        };
+        let original = scope(&config).unwrap();
+        let definition = config.node.network_definition.as_mut().unwrap();
+        definition.exported_at = "another export".into();
+        definition.chia_version = "another version".into();
+        definition
+            .config_overrides
+            .insert("address_prefix".into(), "another-prefix".to_owned().into());
+        assert_eq!(scope(&config).unwrap(), original);
+        config
+            .node
+            .network_definition
+            .as_mut()
             .unwrap()
-            .restore(&mut restored, 1100)
-            .unwrap();
-        assert!(restored.archive.is_none());
-        Store::new(path, &config, &resolved)
+            .constants
+            .insert("GENESIS_CHALLENGE".into(), "cd".repeat(32).into());
+        assert_ne!(scope(&config).unwrap(), original);
+        config.node = crate::network::tests::node();
+        config
+            .node
+            .network_definition
+            .as_mut()
             .unwrap()
-            .restore(&mut restored, 1100)
-            .unwrap();
-        assert!(restored.archive.is_some());
-        fs::remove_dir_all(directory).unwrap();
+            .constants
+            .insert("SUB_SLOT_ITERS_STARTING".into(), 67108864.into());
+        assert_ne!(scope(&config).unwrap(), original);
     }
+
     #[test]
     fn failed_write_and_corrupt_read_preserve_the_existing_file() {
         let (directory, store) = fixture();

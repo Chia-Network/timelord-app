@@ -1,15 +1,16 @@
 //! Process-owned metric handles and Prometheus encoding.
 use super::{
     OperatingPointReason, PeakResult, ProofStage, RestartReason, SessionReason, SubmissionKind,
-    board, chain, index, snapshot,
+    UnfinishedOutcome, UnfinishedSource, board, chain, index, snapshot,
 };
 use crate::Shared;
+use crate::safety::JournalReset;
 use anyhow::Result;
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::BTreeSet,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -30,6 +31,7 @@ pub struct Metrics {
     proofs_verified_total: IntCounterVec,
     proof_verification_failures_total: IntCounterVec,
     submissions_total: IntCounterVec,
+    unfinished_candidates_total: IntCounterVec,
     topology_changes_total: IntCounterVec,
     asic_recoveries_total: IntCounterVec,
     client_restarts_total: IntCounterVec,
@@ -48,14 +50,48 @@ pub struct Metrics {
     last: Mutex<Last>,
     ever_connected: AtomicBool,
     clients_started: Mutex<BTreeSet<String>>,
+    board_failures_total: IntCounterVec,
+    safety_journal_resets_total: IntCounterVec,
+    chain_moves_total: IntCounterVec,
+    delayed_bundles_total: IntCounterVec,
+    /// Applied to every family at encode time, so a live node-profile switch
+    /// relabels the exposition without rebuilding counters.
+    network: Mutex<String>,
 }
 impl Metrics {
     pub fn new(network: Network) -> Result<Arc<Self>> {
-        let network = network.label();
-        let registry = Registry::new_custom(
-            Some("chia_timelord".into()),
-            Some(HashMap::from([("network".into(), network.into())])),
+        let network = network.label().to_owned();
+        let registry = Registry::new_custom(Some("chia_timelord".into()), None)?;
+        let board_failures_total = IntCounterVec::new(
+            Opts::new(
+                "board_failures_total",
+                "Native owner failures counted against board reliability",
+            ),
+            &["board"],
         )?;
+        registry.register(Box::new(board_failures_total.clone()))?;
+        let safety_journal_resets_total = IntCounterVec::new(
+            Opts::new(
+                "safety_journal_resets_total",
+                "Processes that found a previously written but now absent or unreadable board safety journal and started from cautious defaults; at most 1 per process, exported only by the process that reported the reset, so use the raw value, not increase()",
+            ),
+            &["reason"],
+        )?;
+        registry.register(Box::new(safety_journal_resets_total.clone()))?;
+        let chain_moves_total = IntCounterVec::new(
+            Opts::new("chain_moves_total", "Chains moved between boards"),
+            &[],
+        )?;
+        registry.register(Box::new(chain_moves_total.clone()))?;
+        chain_moves_total.with_label_values(&[] as &[&str]);
+        let delayed_bundles_total = IntCounterVec::new(
+            Opts::new(
+                "delayed_bundles_total",
+                "Verified chain proofs that waited over 10 seconds for their bundle partner",
+            ),
+            &["chain"],
+        )?;
+        registry.register(Box::new(delayed_bundles_total.clone()))?;
         let proofs_verified_total = IntCounterVec::new(
             Opts::new("proofs_verified_total", "proofs verified total"),
             &["chain"],
@@ -74,12 +110,20 @@ impl Metrics {
             &["kind"],
         )?;
         registry.register(Box::new(submissions_total.clone()))?;
+        let unfinished_candidates_total = IntCounterVec::new(
+            Opts::new(
+                "unfinished_candidates_total",
+                "unfinished candidate admission outcomes total",
+            ),
+            &["outcome", "source"],
+        )?;
+        registry.register(Box::new(unfinished_candidates_total.clone()))?;
         let topology_changes_total = IntCounterVec::new(
             Opts::new("topology_changes_total", "topology changes total"),
             &[],
         )?;
         registry.register(Box::new(topology_changes_total.clone()))?;
-        topology_changes_total.with_label_values(&[]);
+        topology_changes_total.with_label_values(&[] as &[&str]);
         let asic_recoveries_total = IntCounterVec::new(
             Opts::new("asic_recoveries_total", "asic recoveries total"),
             &["board", "engine"],
@@ -100,7 +144,7 @@ impl Metrics {
             &[],
         )?;
         registry.register(Box::new(node_reconnects_total.clone()))?;
-        node_reconnects_total.with_label_values(&[]);
+        node_reconnects_total.with_label_values(&[] as &[&str]);
         let peak_updates_total = IntCounterVec::new(
             Opts::new("peak_updates_total", "peak updates total"),
             &["result"],
@@ -202,6 +246,7 @@ impl Metrics {
             proofs_verified_total,
             proof_verification_failures_total,
             submissions_total,
+            unfinished_candidates_total,
             topology_changes_total,
             asic_recoveries_total,
             client_restarts_total,
@@ -220,8 +265,14 @@ impl Metrics {
             last: Mutex::new(Last::default()),
             ever_connected: AtomicBool::new(false),
             clients_started: Mutex::new(BTreeSet::new()),
+            board_failures_total,
+            safety_journal_resets_total,
+            chain_moves_total,
+            delayed_bundles_total,
+            network: Mutex::new(network),
         });
         for c in Chain::ALL {
+            metrics.delayed_bundles_total.with_label_values(&[chain(c)]);
             metrics.proofs_verified_total.with_label_values(&[chain(c)]);
             metrics
                 .proof_verification_failures_total
@@ -241,6 +292,13 @@ impl Metrics {
         for kind in SubmissionKind::ALL {
             metrics.submissions_total.with_label_values(&[kind.label()]);
         }
+        for outcome in UnfinishedOutcome::ALL {
+            for source in UnfinishedSource::ALL {
+                metrics
+                    .unfinished_candidates_total
+                    .with_label_values(&[outcome.label(), source.label()]);
+            }
+        }
         Ok(metrics)
     }
     #[cfg(test)]
@@ -252,6 +310,10 @@ impl Metrics {
                 .with_label_values(labels)
                 .get(),
             "submissions_total" => self.submissions_total.with_label_values(labels).get(),
+            "unfinished_candidates_total" => self
+                .unfinished_candidates_total
+                .with_label_values(labels)
+                .get(),
             "topology_changes_total" => self.topology_changes_total.with_label_values(labels).get(),
             "asic_recoveries_total" => self.asic_recoveries_total.with_label_values(labels).get(),
             "client_restarts_total" => self.client_restarts_total.with_label_values(labels).get(),
@@ -263,6 +325,8 @@ impl Metrics {
                 .vdf_sessions_started_total
                 .with_label_values(labels)
                 .get(),
+            "board_failures_total" => self.board_failures_total.with_label_values(labels).get(),
+            "chain_moves_total" => self.chain_moves_total.with_label_values(labels).get(),
             "operating_point_changes_total" => self
                 .operating_point_changes_total
                 .with_label_values(labels)
@@ -270,8 +334,31 @@ impl Metrics {
             _ => panic!("Unknown test counter: {name}"),
         }
     }
+    pub fn set_network(&self, network: &Network) {
+        *self.network.lock().expect("metrics") = network.label().to_owned();
+    }
+    pub fn board_failed(&self, board: &str) {
+        self.board_failures_total.with_label_values(&[board]).inc();
+    }
+    pub fn safety_journal_reset(&self, reset: JournalReset) {
+        self.safety_journal_resets_total
+            .with_label_values(&[reset.label()])
+            .inc();
+    }
+    pub fn chains_moved(&self, count: u64) {
+        self.chain_moves_total
+            .with_label_values(&[] as &[&str])
+            .inc_by(count);
+    }
+    pub fn bundle_delayed(&self, c: Chain) {
+        self.delayed_bundles_total
+            .with_label_values(&[chain(c)])
+            .inc();
+    }
     pub fn topology_changed(&self) {
-        self.topology_changes_total.with_label_values(&[]).inc();
+        self.topology_changes_total
+            .with_label_values(&[] as &[&str])
+            .inc();
     }
     pub fn verification_failed(&self, c: Chain) {
         self.proof_verification_failures_total
@@ -313,12 +400,12 @@ impl Metrics {
     }
     pub fn node_message_received(&self) {
         self.last_node_message_timestamp_seconds
-            .with_label_values(&[])
+            .with_label_values(&[] as &[&str])
             .set(crate::unix_now() as i64);
     }
     pub fn peak_received(&self) {
         self.last_peak_received_timestamp_seconds
-            .with_label_values(&[])
+            .with_label_values(&[] as &[&str])
             .set(crate::unix_now() as i64);
     }
     pub fn begin_session(&self) -> u64 {
@@ -337,7 +424,9 @@ impl Metrics {
     }
     pub fn connected(&self) {
         if self.ever_connected.swap(true, Ordering::Relaxed) {
-            self.node_reconnects_total.with_label_values(&[]).inc();
+            self.node_reconnects_total
+                .with_label_values(&[] as &[&str])
+                .inc();
         }
     }
     pub fn verified(&self, epoch: u64, c: Chain, ips: f64) {
@@ -357,6 +446,11 @@ impl Metrics {
         self.proof_duration
             .with_label_values(&[chain(c), stage.label()])
             .observe(elapsed.as_secs_f64());
+    }
+    pub fn unfinished_candidate(&self, outcome: UnfinishedOutcome, source: UnfinishedSource) {
+        self.unfinished_candidates_total
+            .with_label_values(&[outcome.label(), source.label()])
+            .inc();
     }
     pub fn submitted(&self, kind: SubmissionKind, elapsed: Duration) {
         self.submissions_total
@@ -385,6 +479,7 @@ impl Metrics {
         for b in &config.hardware.boards {
             let label = board(config, &b.id);
             self.thermal_stops_total.with_label_values(&[&label]);
+            self.board_failures_total.with_label_values(&[&label]);
             for engine in ["0", "1", "2", "unknown"] {
                 self.asic_recoveries_total
                     .with_label_values(&[&label, engine]);
@@ -402,7 +497,7 @@ impl Metrics {
     pub fn render(&self, shared: &Shared, now: u64) -> Result<String> {
         let snapshot = snapshot(shared, now);
         let mut samples = snapshot.samples;
-        let network = shared.config.node.network.label();
+        let network = self.network.lock().expect("metrics").clone();
         let last = self.last.lock().expect("metrics");
         if snapshot.epoch == Some(last.epoch) {
             if let Some(ips) = last.ips {
@@ -418,7 +513,17 @@ impl Metrics {
         samples.add("ready", &[], &[], f64::from(snapshot.readiness.ready));
         samples.add("healthy", &[], &[], f64::from(snapshot.healthy));
         let mut families = self.registry.gather();
-        families.extend(self.current.collect(samples, network)?);
+        for family in &mut families {
+            for metric in family.mut_metric() {
+                let mut label = prometheus::proto::LabelPair::default();
+                label.set_name("network".into());
+                label.set_value(network.clone());
+                let mut labels = metric.take_label();
+                labels.insert(0, label);
+                metric.set_label(labels);
+            }
+        }
+        families.extend(self.current.collect(samples, &network)?);
         let mut encoded = Vec::new();
         TextEncoder::new().encode(&families, &mut encoded)?;
         Ok(String::from_utf8(encoded)?)

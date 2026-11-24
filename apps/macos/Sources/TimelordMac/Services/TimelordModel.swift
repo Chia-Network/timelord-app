@@ -16,6 +16,9 @@ final class TimelordModel: ObservableObject {
     @Published var configuration = AppConfiguration()
     @Published private(set) var configurationLoaded = false
     @Published private(set) var configurationNeedsRestart = false
+    /// The pending change touches only the full-node profile, which the running
+    /// service applies without restarting ASIC boards.
+    private var pendingChangeIsNodeOnly = true
     @Published private(set) var operationInProgress = false
     @Published var connectionResult: String?
     @Published private(set) var discoveredDevices: [DiscoveredDevice] = []
@@ -36,6 +39,8 @@ final class TimelordModel: ObservableObject {
         controller.supervisor?.mode == .paused && controller.supervisor?.phase == .paused
     }
     private var quitting = false
+    private var lastStartupAttempt = Date.distantPast
+    private var startupError: String?
     private var monitoring: Task<Void, Never>?
     private let monitoringEnabled: Bool
 
@@ -45,7 +50,10 @@ final class TimelordModel: ObservableObject {
     var logsURL: URL { controller.logsURL }
     var statusURL: URL { liveClient.endpoint }
     var quitLabel: String { "Quit interface" }
-    var canStartService: Bool { !quitting && canControlService && !controller.desiredRunning && presentationOperation != .pause && !isBusy }
+    private var hasRunnableConfiguration: Bool {
+        configurationLoaded && savedConfiguration.node.hasIdentity && !savedConfiguration.hardware.boards.isEmpty && savedConfiguration.hardware.clientBinary != nil
+    }
+    var canStartService: Bool { !quitting && (canControlService || hasRunnableConfiguration) && !controller.desiredRunning && presentationOperation != .pause && !isBusy }
     var canInspectConnections: Bool { !controller.desiredRunning && controller.processID == nil && liveStatus == nil && !isBusy }
 
     init(controller suppliedController: ServiceController? = nil, initialConfiguration: AppConfiguration? = nil, monitoringEnabled: Bool = true) {
@@ -104,6 +112,11 @@ final class TimelordModel: ObservableObject {
             } catch { errorMessage = error.localizedDescription }
         }
         await controller.refresh()
+        if canControlService, let startupError {
+            if errorMessage == startupError { errorMessage = nil }
+            self.startupError = nil
+        }
+        if monitoringEnabled { await restoreStartupIntent() }
         await refreshNodeSync()
         let expectedPID = controller.processID
         workerStatus.observe(supervisor: controller.supervisor)
@@ -133,12 +146,36 @@ final class TimelordModel: ObservableObject {
         if !operationInProgress && !isBusy && Date().timeIntervalSince(lastDiscovery)>15 { await refreshDevices() }
     }
 
+    /// Starting the control plane never overrides a deliberately saved Pause.
+    func restoreStartupIntent(now: Date = Date()) async {
+        guard configurationLoaded, !quitting, !canControlService, !isBusy,
+              savedConfiguration.service.startAutomatically, hasRunnableConfiguration,
+              now.timeIntervalSince(lastStartupAttempt) >= 30 else { return }
+        lastStartupAttempt = now
+        controlOperation = .start; updateSnapshot()
+        defer { controlOperation = nil; updateSnapshot() }
+        do {
+            try await ensureSupervisor()
+            if errorMessage == startupError { errorMessage = nil }
+            startupError = nil
+        } catch {
+            startupError = error.localizedDescription
+            errorMessage = startupError
+        }
+    }
+    private func ensureSupervisor() async throws {
+        try await controller.ensureStarted(network: savedConfiguration.node.network,
+            monitorListen: savedConfiguration.service.supervisorObservabilityListen,
+            statusListen: savedConfiguration.service.statusListen)
+    }
+
     private func refreshNodeSync() async {
+        guard configuration.node == savedConfiguration.node, !configurationNeedsRestart else { nodeSync = nil; return }
         if configurationLoaded && Date().timeIntervalSince(lastNodeSyncFetch) >= 15 {
             lastNodeSyncFetch = Date()
             let expectedNode = savedConfiguration.node
             let result = expectedNode.rpc == nil ? nil : try? await configurationClient.nodeState()
-            if savedConfiguration.node == expectedNode { nodeSync = result }
+            if savedConfiguration.node == expectedNode && configuration.node == expectedNode && !configurationNeedsRestart { nodeSync = result }
         }
     }
 
@@ -167,7 +204,7 @@ final class TimelordModel: ObservableObject {
         case .setupRequired:
             if !savedConfiguration.node.hasIdentity { return "Connect node" }
             if savedConfiguration.hardware.boards.isEmpty || savedConfiguration.hardware.clientBinary == nil { return "Set up boards" }
-            return canControlService ? "Start Timelord" : "Enable background service"
+            return "Start Timelord"
         }
     }
     func primaryAction() {
@@ -181,8 +218,7 @@ final class TimelordModel: ObservableObject {
         case .setupRequired:
             if !savedConfiguration.node.hasIdentity { sheet = .node }
             else if savedConfiguration.hardware.boards.isEmpty || savedConfiguration.hardware.clientBinary == nil { sheet = .boards }
-            else if canControlService { startService() }
-            else { sheet = .settings }
+            else { startService() }
         default: sheet = .node
         }
     }
@@ -192,6 +228,17 @@ final class TimelordModel: ObservableObject {
             configuration.hardware.clientBinary = path
             configuration.hardware.driverLibrary = Bundle.main.bundleURL.appendingPathComponent("Contents/Frameworks/libftd2xx.dylib").path
         }
+    }
+    /// Operator board controls. They act on one board; the others keep running.
+    func boardAction(_ id: String, _ action: BoardAction, minutes: Int? = nil) async {
+        guard canControlService, !operationInProgress,
+              let serial = snapshot.boards.first(where: { $0.id == id })?.serial else { return }
+        operationInProgress = true; defer { operationInProgress = false }
+        do {
+            try await configurationClient.board(serial: serial, action: action, minutes: minutes)
+            errorMessage = nil
+            await refresh()
+        } catch { errorMessage = error.localizedDescription }
     }
     func toggleTuning() async {
         guard canControlService, !operationInProgress, let pid = controller.processID else { return }
@@ -207,6 +254,7 @@ final class TimelordModel: ObservableObject {
         do {
             switch operation {
             case .start:
+                if !controller.canControlService { try await ensureSupervisor() }
                 if try await controller.start() {
                     // Only a fresh Resume applies the saved configuration.
                     configurationNeedsRestart = false; useSavedStatusEndpoint()
@@ -251,9 +299,18 @@ final class TimelordModel: ObservableObject {
         catch { errorMessage = error.localizedDescription }
     }
     var hasUnsavedSettings: Bool { configuration != savedConfiguration }
+    /// Only the node profile differs between two configurations.
+    private static func onlyNodeDiffers(_ old: AppConfiguration, _ new: AppConfiguration) -> Bool {
+        var adjusted = old
+        adjusted.node = new.node
+        adjusted.connections = new.connections
+        adjusted.service.startAutomatically = new.service.startAutomatically
+        return adjusted == new
+    }
     private var hasRuntimeSettingsChanges: Bool {
         var runtimeConfiguration = configuration
         runtimeConfiguration.service.startAutomatically = savedConfiguration.service.startAutomatically
+        runtimeConfiguration.connections = savedConfiguration.connections
         return runtimeConfiguration != savedConfiguration
     }
     var settingsDoneTitle: String {
@@ -270,8 +327,10 @@ final class TimelordModel: ObservableObject {
                 : "Your settings are saved. Timelord is paused."
         }
         if canControlService {
-            return hasRuntimeSettingsChanges || configurationNeedsRestart
-                ? "Save & Restart applies your changes and briefly restarts Timelord."
+            let pending = hasRuntimeSettingsChanges || configurationNeedsRestart
+            let nodeOnly = pendingChangeIsNodeOnly && Self.onlyNodeDiffers(savedConfiguration, configuration)
+            return pending
+                ? (nodeOnly ? "Save & Restart switches the full-node connection. ASIC boards keep running." : "Save & Restart applies your changes and briefly restarts Timelord.")
                 : "Your settings are saved. Timelord keeps running."
         }
         if liveStatus != nil { return "Done saves your changes. Restart the externally managed service to apply them." }
@@ -285,8 +344,25 @@ final class TimelordModel: ObservableObject {
             guard errorMessage == nil else { return false }
         }
         if configurationNeedsRestart && canControlService {
+            if pendingChangeIsNodeOnly && controller.desiredRunning && liveStatus != nil {
+                // Switch networks without touching USB: boards keep their owners,
+                // tuning and reliability history. Fall back to a restart if the
+                // service refuses (for example, a board setting also changed).
+                operationInProgress = true
+                do {
+                    try await configurationClient.reloadNode()
+                    configurationNeedsRestart = false; pendingChangeIsNodeOnly = true
+                    useSavedStatusEndpoint(); errorMessage = nil
+                    connectionResult = "Switched the full-node connection. ASIC boards kept running."
+                } catch {
+                    connectionResult = nil
+                }
+                operationInProgress = false
+                if !configurationNeedsRestart { updateSnapshot(); return true }
+            }
             await restartService()
             guard !configurationNeedsRestart else { return false }
+            pendingChangeIsNodeOnly = true
         }
         return true
     }
@@ -294,11 +370,18 @@ final class TimelordModel: ObservableObject {
         guard !operationInProgress else { return }; operationInProgress = true; defer { operationInProgress = false }
         do {
             let runtimeChanged = hasRuntimeSettingsChanges
+            let nodeOnly = Self.onlyNodeDiffers(savedConfiguration, configuration)
             let updated = configuration
             try await configurationClient.save(updated)
-            savedConfiguration = updated
+            let persisted = try await configurationClient.load()
+            // Keep edits made while the helper was saving, but adopt its profile
+            // migration whenever the submitted configuration is still current.
+            if configuration == updated { configuration = persisted }
+            savedConfiguration = persisted
             nodeSync = nil; lastNodeSyncFetch = .distantPast
-            configurationNeedsRestart = configurationNeedsRestart || ((canControlService || liveStatus != nil) && runtimeChanged)
+            let needsRestart = (canControlService || liveStatus != nil) && runtimeChanged
+            if needsRestart { pendingChangeIsNodeOnly = (configurationNeedsRestart ? pendingChangeIsNodeOnly : true) && nodeOnly }
+            configurationNeedsRestart = configurationNeedsRestart || needsRestart
             errorMessage = nil; configurationLoaded = true
             connectionResult = configurationNeedsRestart ? "Saved. Restart Timelord to apply these settings." : "Settings saved."
             if !configurationNeedsRestart { useSavedStatusEndpoint() }
@@ -345,6 +428,10 @@ final class TimelordModel: ObservableObject {
         let panel = NSOpenPanel(); panel.canChooseFiles = !local; panel.canChooseDirectories = true; panel.allowsMultipleSelection = false
         panel.message = local ? "Choose your Chia root folder." : "Choose connection.toml or its connection bundle folder."
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        if hasUnsavedSettings {
+            await saveConfiguration()
+            guard errorMessage == nil else { return }
+        }
         operationInProgress = true; defer { operationInProgress = false }
         do {
             if local { try await configurationClient.localNode(root: url.path) }
@@ -355,9 +442,35 @@ final class TimelordModel: ObservableObject {
             configuration = try await configurationClient.load(); savedConfiguration = configuration; configurationLoaded = true; errorMessage = nil
             nodeSync = nil; lastNodeSyncFetch = .distantPast
             configurationNeedsRestart = canControlService || liveStatus != nil
-            connectionResult = "Connection imported. Test the connection when you’re ready."
+            connectionResult = "Connection profile imported. Save & Restart applies it to a running Timelord."
             updateSnapshot()
         } catch { errorMessage = error.localizedDescription }
+    }
+    func selectConnectionProfile(_ id: String) {
+        guard !operationInProgress, var connections = configuration.connections,
+              let selected = connections.profiles.first(where: { $0.id == id }),
+              connections.activeId != id else { return }
+        if let current = connections.profiles.firstIndex(where: { $0.id == connections.activeId }) {
+            connections.profiles[current].node = configuration.node
+        }
+        connections.activeId = id
+        configuration.connections = connections
+        configuration.node = selected.node
+        nodeSync = nil; lastNodeSyncFetch = .distantPast
+    }
+    /// Removing a profile edits configuration only; imported identity files can
+    /// still be referenced by other profiles and remain on disk.
+    func removeConnectionProfile(_ id: String) {
+        guard !operationInProgress, !isBusy, var connections = configuration.connections,
+              connections.profiles.contains(where: { $0.id == id }) else { return }
+        connections.profiles.removeAll { $0.id == id }
+        if connections.activeId == id {
+            let next = connections.profiles.first
+            connections.activeId = next?.id
+            configuration.node = next?.node ?? NodeConfiguration()
+            nodeSync = nil; lastNodeSyncFetch = .distantPast
+        }
+        configuration.connections = connections
     }
     func chooseFile() -> String? {
         let panel = NSOpenPanel(); panel.canChooseFiles = true; panel.canChooseDirectories = false; panel.allowsMultipleSelection = false

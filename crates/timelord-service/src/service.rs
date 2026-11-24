@@ -1,24 +1,20 @@
-//! Service generation ownership, listeners and topology replacement.
+//! Service ownership: status listeners, the node session and persistent
+//! per-board native owners. USB changes update routes, never the process.
 use crate::{
-    Shared, asic, assignment, config_checkpoint, hardware, history_store, inventory, observability,
+    Shared, asic, config_checkpoint, hardware, history_store, inventory, observability,
     operational, private_control, runtime, safety, status_api, unix_now,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
-    net::SocketAddr,
-    path::{Path, PathBuf},
+    collections::HashMap,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
 use timelord_core::Config;
 use timelord_supervisor::AcceptBackoff;
-use tokio::{
-    net::{TcpListener, TcpStream},
-    sync::watch,
-    task::JoinSet,
-};
-use vdf_client_protocol::{ClientMessage, acknowledge_stop, read_message};
+use tokio::io::AsyncReadExt;
+use tokio::{net::TcpListener, sync::watch, task::JoinSet};
 
 struct Run {
     shared: Arc<Shared>,
@@ -26,42 +22,44 @@ struct Run {
     tasks: JoinSet<Result<()>>,
     store: Arc<history_store::Store>,
     history_enabled: bool,
+    owner_updates: watch::Sender<Arc<Shared>>,
+    node: NodeSession,
+}
+
+/// The node session has its own stop signal so a node-profile change can
+/// replace it without touching native owners, routes or USB.
+struct NodeSession {
+    stop: watch::Sender<bool>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+impl NodeSession {
+    fn start(shared: &Arc<Shared>, backend: &Arc<asic::AsicBackend>) -> Self {
+        let (stop, receiver) = watch::channel(false);
+        let task = shared.config.node.certificate.is_some().then(|| {
+            let shared = shared.clone();
+            let backend = backend.clone();
+            tokio::spawn(async move { crate::runtime::run(shared, backend, receiver).await })
+        });
+        Self { stop, task }
+    }
+    async fn stop(&mut self) {
+        let _ = self.stop.send(true);
+        if let Some(task) = self.task.take()
+            && let Err(error) = task.await
+        {
+            tracing::warn!(%error, "Node session task failed during shutdown");
+        }
+    }
 }
 
 impl Run {
-    async fn replace(
-        self,
-        config: Config,
-        mut prepared: hardware::Prepared,
-        history_path: PathBuf,
-        safety: Option<Arc<safety::Store>>,
-    ) -> Result<Self> {
-        let previous = self.shared.clone();
-        let process = previous.process.clone();
-        self.stop().await?;
-        // Verification and retirement can change admission while old tasks drain.
-        // Reuse provenance, but never reuse capacity from before retirement.
-        let boards = previous.runtime.lock().expect("runtime").boards.clone();
-        let unavailable = hardware::unavailable_for(&config, &boards, safety.as_deref());
-        prepared.reconcile(&config, &unavailable).await?;
-        start_run(
-            config,
-            prepared,
-            history_path,
-            &boards,
-            previous.service_started_unix,
-            process,
-            safety,
-        )
-        .await
-    }
-
     async fn stop(mut self) -> Result<()> {
+        self.node.stop().await;
         let _ = self.stop.send(true);
         let mut failure = None;
         while let Some(task) = self.tasks.join_next().await {
             if let Err(error) = task
-                .context("Client listener stopped unexpectedly")
+                .context("Service task stopped unexpectedly")
                 .and_then(|r| r)
             {
                 failure = Some(error);
@@ -81,47 +79,86 @@ impl Run {
         }
         failure.map_or(Ok(()), Err)
     }
+
+    /// Publish a configuration whose hardware section is unchanged in meaning
+    /// (new locations, remembered boards) or whose node section changed.
+    fn publish(&mut self, config: Config, current: &watch::Sender<Arc<Shared>>) {
+        let previous = &self.shared;
+        let updated = Arc::new(Shared {
+            config,
+            native: previous.native.clone(),
+            clients: previous.clients.clone(),
+            runtime: previous.runtime.clone(),
+            process: previous.process.clone(),
+            scope: previous.scope,
+            started_unix: previous.started_unix,
+            service_started_unix: previous.service_started_unix,
+        });
+        self.owner_updates.send_replace(updated.clone());
+        self.shared = updated.clone();
+        current.send_replace(updated);
+    }
+
+    /// Replace only the node session. Native owners, routes, learned tuning and
+    /// board health stay in place: no board depends on the selected network.
+    async fn replace_node(
+        &mut self,
+        config: Config,
+        current: &watch::Sender<Arc<Shared>>,
+    ) -> Result<()> {
+        let backend = self
+            .shared
+            .runtime
+            .lock()
+            .expect("runtime")
+            .prover
+            .upgrade()
+            .context("Proof backend unavailable")?;
+        self.node.stop().await;
+        backend.stop_all().await;
+        let new_context = self.store.retarget(&config)?;
+        {
+            let mut state = self.shared.runtime.lock().expect("runtime");
+            state.reset_node_context();
+            if new_context {
+                // Restored history belongs to the previous node context.
+                state.archive = None;
+                // Chain measurements from another node never join this chart.
+                state.observations = Default::default();
+                state.estimated_observations = Default::default();
+            }
+            state.event(None, "node_profile_change");
+        }
+        self.shared
+            .process
+            .metrics
+            .set_network(&config.node.network);
+        self.publish(config, current);
+        self.node = NodeSession::start(&self.shared, &backend);
+        Ok(())
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_run(
     config: Config,
-    prepared: hardware::Prepared,
+    native: Option<Arc<hardware::Facts>>,
     history_path: PathBuf,
     board_states: &HashMap<String, runtime::HardwareState>,
     service_started_unix: u64,
     process: Arc<operational::State>,
-    safety: Option<Arc<safety::Store>>,
+    safety: Arc<safety::Store>,
+    node_requests: tokio::sync::mpsc::Sender<private_control::NodeReload>,
 ) -> Result<Run> {
-    let hardware::Prepared {
-        assignments,
-        native,
-    } = prepared;
-    tracing::info!(plan=?assignments, "Resolved chain assignments for this run");
     let control = config
         .service
         .control_socket
         .as_ref()
         .map(|p| private_control::bind(p))
         .transpose()?;
-    let mut listeners = vec![];
-    for b in &config.hardware.boards {
-        let capacity = assignments.iter().filter(|a| a.board_id == b.id).count() as u8;
-        if capacity == 0 {
-            continue;
-        }
-        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], b.client_port)))
-            .await
-            .with_context(|| format!("Binding client listener for {}", b.id))?;
-        listeners.push((b.id.clone(), capacity, listener));
-    }
-    let active = config.node.certificate.is_some() && !assignments.is_empty();
     let tuning_paused = config.service.tuning_paused;
     let started_unix = unix_now();
-    let store = Arc::new(history_store::Store::new(
-        history_path,
-        &config,
-        &assignments,
-    )?);
+    let store = Arc::new(history_store::Store::new(history_path, &config)?);
     let mut runtime = runtime::RuntimeState::new(tuning_paused);
     // Leave unreadable/corrupt checkpoints untouched and keep proof production
     // available. A bad history file must not silently be replaced with empty data.
@@ -133,31 +170,32 @@ async fn start_run(
         }
     };
     runtime.boards = board_states.clone();
-    hardware::restore_lifecycles(&config, &mut runtime.boards, safety.as_deref());
-    runtime.safety = safety;
-    process.metrics.register_boards(&config);
-    if assignments.is_empty() {
-        runtime.transition(
-            "waiting_for_clients",
-            "disconnected",
-            "Connect an ASIC board to resume.",
-        );
+    hardware::restore_lifecycles(&config, &mut runtime.boards, &safety);
+    if let Some(reset) = safety.journal_reset() {
+        process.metrics.safety_journal_reset(reset);
     }
+    runtime.safety = Some(safety);
+    process.metrics.register_boards(&config);
+    runtime.transition(
+        "waiting_for_clients",
+        "waiting_for_hardware",
+        if config.hardware.boards.is_empty() {
+            "Connect an ASIC board to resume."
+        } else {
+            "Starting ASIC boards before connecting to the full node."
+        },
+    );
     let runtime = Arc::new(Mutex::new(runtime));
-    let (backend, offers) =
-        asic::AsicBackend::new(&config, &assignments, runtime.clone(), process.clone())?;
-    let backend = Arc::new(backend);
-    let shared = Arc::new(Shared {
+    let backend = Arc::new(asic::AsicBackend::new(runtime.clone(), process.clone()));
+    let shared = Arc::new(Shared::new(
         native,
         config,
-        assignments,
-        clients: Arc::new(Mutex::new(BTreeSet::new())),
-        process,
-        scope: crate::runtime::RuntimeScope::Production,
         runtime,
+        process,
         started_unix,
         service_started_unix,
-    });
+    ));
+    shared.runtime.lock().expect("runtime").prover = Arc::downgrade(&backend);
     let (shutdown, receiver) = watch::channel(false);
     let mut tasks = JoinSet::new();
     if history_enabled {
@@ -167,43 +205,20 @@ async fn start_run(
             receiver.clone(),
         ));
     }
-    for (id, capacity, listener) in listeners {
-        tasks.spawn(client_listener(
-            listener,
-            id.clone(),
-            capacity,
-            shared.clone(),
-            receiver.clone(),
-            if active {
-                offers.get(&id).cloned()
-            } else {
-                None
-            },
-        ));
-    }
-    if active {
-        let shared = shared.clone();
-        let backend = backend.clone();
-        let shutdown = receiver.clone();
-        tasks.spawn(async move {
-            runtime::run(shared, backend, shutdown).await;
-            Ok(())
-        });
-    }
-    if shared.config.hardware.client_binary.is_some() {
-        let backend = backend.clone();
-        let shared = shared.clone();
-        let shutdown = receiver.clone();
-        tasks.spawn(async move {
-            hardware::run(shared, backend, shutdown)
-                .await
-                .context("ASIC supervision stopped")
-        });
-    }
+    let node = NodeSession::start(&shared, &backend);
+    let (owner_updates, receiver_updates) = watch::channel(shared.clone());
+    tasks.spawn(hardware::continuous::run(
+        shared.clone(),
+        backend,
+        receiver_updates,
+        receiver.clone(),
+    ));
     if let Some(control) = control {
         let shared = shared.clone();
         let shutdown = receiver.clone();
-        tasks.spawn(async move { private_control::run(control, shared, shutdown).await });
+        tasks.spawn(
+            async move { private_control::run(control, shared, shutdown, node_requests).await },
+        );
     }
     Ok(Run {
         shared,
@@ -211,6 +226,8 @@ async fn start_run(
         tasks,
         store,
         history_enabled,
+        owner_updates,
+        node,
     })
 }
 
@@ -250,55 +267,6 @@ fn spawn_http(
     })
 }
 
-/// Replace the current run for a changed topology or capacity. A replacement
-/// that fails validation keeps the current run.
-async fn replace(
-    run: Run,
-    mut config: Config,
-    unavailable: &HashSet<String>,
-    history_path: &Path,
-    safety: &Option<Arc<safety::Store>>,
-    current: &watch::Sender<Arc<Shared>>,
-) -> Result<Run> {
-    let process = run.shared.process.clone();
-    // Validate the replacement before interrupting healthy work.
-    let prepared = match hardware::prepare_for(&config, unavailable).await {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            tracing::warn!(%error, "Topology replacement rejected; retaining current owners");
-            return Ok(run);
-        }
-    };
-    let _topology = process.progress.begin(
-        timelord_supervisor::progress::Resource::Topology,
-        0,
-        0,
-        timelord_supervisor::progress::Stage::TopologyChange,
-    );
-    {
-        let mut runtime = run.shared.runtime.lock().expect("runtime");
-        config.service.tuning_paused = runtime.tuning_paused;
-        runtime.transition(
-            "reconfiguring",
-            "disconnected",
-            "Updating engines for connected ASIC boards.",
-        );
-        runtime.event(None, "topology_change");
-        for board in runtime.boards.values_mut() {
-            board.raw_speeds.clear();
-        }
-    }
-    process.reconfigure();
-    process.metrics.topology_changed();
-    tracing::info!(plan=?prepared.assignments, "USB topology changed; replacing chain owners");
-    let run = run
-        .replace(config, prepared, history_path.to_path_buf(), safety.clone())
-        .await?;
-    current.send_replace(run.shared.clone());
-    process.resume();
-    Ok(run)
-}
-
 pub(crate) async fn serve(
     config: Config,
     history_path: PathBuf,
@@ -309,31 +277,27 @@ pub(crate) async fn serve(
     tokio::pin!(signal);
     let requested_config = config.clone();
     let service_started_unix = unix_now();
-    let process = operational::State::new(observability::Metrics::new(config.node.network)?);
+    let process =
+        operational::State::new(observability::Metrics::new(config.node.network.clone())?);
     process.progress.configuration(fallback);
     // Start reporting before discovery or native initialization can wait.
-    let initial = Arc::new(Shared {
-        native: None,
-        config: config.clone(),
-        assignments: vec![],
-        clients: Default::default(),
-        process: process.clone(),
-        scope: crate::runtime::RuntimeScope::Production,
-        runtime: Arc::new(Mutex::new(runtime::RuntimeState::new(
+    let initial = Arc::new(Shared::new(
+        None,
+        config.clone(),
+        Arc::new(Mutex::new(runtime::RuntimeState::new(
             config.service.tuning_paused,
         ))),
-        started_unix: service_started_unix,
+        process.clone(),
         service_started_unix,
-    });
+        service_started_unix,
+    ));
     let (current, state) = watch::channel(initial);
     let report_state = state.clone();
     let _reporter = timelord_supervisor::progress::Reporter::with_readiness(
         process.progress.clone(),
         move || observability::ready(&report_state.borrow()),
     )?;
-    // The status listener outlives each topology. No UI or external supervisor
-    // is required to restart the service after a USB change.
-    let board_states = HashMap::new();
+    let (node_requests, mut node_reloads) = tokio::sync::mpsc::channel(4);
     let startup = async {
         let http = TcpListener::bind(config.service.status_listen)
             .await
@@ -347,43 +311,43 @@ pub(crate) async fn serve(
         } else {
             None
         };
-        let safety = if config.hardware.client_binary.is_some() {
-            Some(Arc::new(
-                safety::Store::open(&config_path)?.monitored(process.progress.clone()),
-            ))
-        } else {
-            None
-        };
-        let (config, prepared) = {
+        let safety =
+            Arc::new(safety::Store::open(&config_path)?.monitored(process.progress.clone()));
+        let (config, native) = {
             let _discovery = process.progress.begin(
                 timelord_supervisor::progress::Resource::Topology,
                 0,
                 0,
                 timelord_supervisor::progress::Stage::Discovery,
             );
-            let config = inventory::connected_configuration(config).await?;
-            let unavailable = hardware::unavailable_for(&config, &board_states, safety.as_deref());
-            let prepared = hardware::prepare_for(&config, &unavailable).await?;
-            (config, prepared)
+            let config = hardware::continuous::known_configuration(config);
+            let native = hardware::prepare(&config).await?;
+            (config, native)
         };
         let run = start_run(
             config,
-            prepared,
+            native,
             history_path.clone(),
-            &board_states,
+            &HashMap::new(),
             service_started_unix,
             process.clone(),
-            safety.clone(),
+            safety,
+            node_requests.clone(),
         )
         .await?;
-        Ok::<_, anyhow::Error>((http, observer, safety, run))
+        Ok::<_, anyhow::Error>((http, observer, run))
     };
-    let (http, observer, safety, mut run) = tokio::select! {
+    let (http, observer, mut run) = tokio::select! {
         biased;
         _ = &mut signal => return Ok(()),
         result = startup => result?,
     };
     current.send_replace(run.shared.clone());
+    if let Ok(paths) = timelord_supervisor::Paths::for_config(&config_path) {
+        process
+            .board_history
+            .attach(paths.directory.join("board-history.json"));
+    }
     let app = status_api::router(observability::HttpState {
         current: state.clone(),
         process: process.clone(),
@@ -391,7 +355,7 @@ pub(crate) async fn serve(
     let (http_stop, stopped) = watch::channel(false);
     let mut checkpoint = Some(tokio::spawn(config_checkpoint::record(
         requested_config,
-        config_path,
+        config_path.clone(),
         state.clone(),
         stopped.clone(),
     )));
@@ -409,8 +373,6 @@ pub(crate) async fn serve(
     });
     let mut poll = tokio::time::interval(Duration::from_secs(5));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut topology = inventory::TopologyChange::default();
-    let mut capacity = assignment::CapacityChange::default();
     let mut inventory_task: Option<tokio::task::JoinHandle<Result<Config>>> = None;
     let result = loop {
         let candidate = tokio::select! {
@@ -422,6 +384,28 @@ pub(crate) async fn serve(
             error = essential_exit(&mut run.tasks, &process), if !run.tasks.is_empty() => break Err(error),
             _ = observation_exit(&mut observation_server, &process), if observation_server.is_some() => continue,
             result = &mut server => break result.context("Status task failed")?.context("Status server failed"),
+            Some(request) = node_reloads.recv() => {
+                let outcome = node_reload(&mut run, &config_path, &current).await;
+                match &outcome {
+                    Err(error) => tracing::warn!(error=%format!("{error:#}"), "Node profile change rejected; current session retained"),
+                    // Promote the new configuration as last-good only once it
+                    // proves itself, like a configuration loaded at startup.
+                    Ok(Some(requested)) => {
+                        if let Some(old) = checkpoint.take() {
+                            old.abort();
+                        }
+                        checkpoint = Some(tokio::spawn(config_checkpoint::record(
+                            requested.clone(),
+                            config_path.clone(),
+                            current.subscribe(),
+                            http_stop.subscribe(),
+                        )));
+                    }
+                    Ok(None) => {}
+                }
+                let _ = request.send(outcome.map(|_| ()).map_err(|error| format!("{error:#}")));
+                continue;
+            }
             result=async{inventory_task.as_mut().expect("inventory").await}, if inventory_task.is_some()=>{
                 inventory_task.take();
                 result.context("USB reconciliation task failed")?
@@ -430,20 +414,19 @@ pub(crate) async fn serve(
                 if inventory_task.is_none() {
                     let shared=run.shared.clone();
                     inventory_task=Some(tokio::spawn(async move{inventory::live_configuration(&shared).await}));
-
                 }
                 continue;
             }
         };
-        let next = topology.observe(&run.shared.config, candidate);
-        let unavailable = hardware::unavailable(&run.shared);
-        let capacity_changed =
-            capacity.observe(&run.shared.assignments, &run.shared.config, &unavailable);
-        if next.is_none() && !capacity_changed {
-            continue;
+        // Inventory failures are never interpreted as unplugged boards.
+        if let Ok(candidate) = candidate {
+            let config = hardware::continuous::known_configuration(candidate);
+            if serde_json::to_value(&config.hardware.boards)?
+                != serde_json::to_value(&run.shared.config.hardware.boards)?
+            {
+                run.publish(config, &current);
+            }
         }
-        let config = next.unwrap_or_else(|| run.shared.config.clone());
-        run = replace(run, config, &unavailable, &history_path, &safety, &current).await?;
     };
     process.stop();
     if result.is_err() {
@@ -451,6 +434,9 @@ pub(crate) async fn serve(
     }
     run.stop().await?;
     if let Some(inventory) = inventory_task {
+        // Cancelling the isolated probe drops its kill-on-drop child. Do not
+        // wait for a blocked driver enumeration when stopping the service.
+        inventory.abort();
         let _ = inventory.await;
     }
     let _ = http_stop.send(true);
@@ -472,85 +458,100 @@ pub(crate) async fn serve(
     result
 }
 
+/// Apply a saved node-profile change without restarting USB owners. Any change
+/// outside the node/connection sections still requires a supervised restart.
+async fn node_reload(
+    run: &mut Run,
+    config_path: &std::path::Path,
+    current: &watch::Sender<Arc<Shared>>,
+) -> Result<Option<Config>> {
+    let requested = crate::load(config_path)?;
+    // Mirror serve's normalization so only real edits differ.
+    let mut saved = requested.clone();
+    saved.service.control_socket = Some(crate::automatic::socket_path(config_path, &saved));
+    crate::set_default_automatic_state(&mut saved, config_path)?;
+    saved.service.tuning_paused = run.shared.config.service.tuning_paused;
+    // A legacy app-launch preference with no runtime effect (README); the app
+    // also treats it as node-only, so it must not force a board restart.
+    saved.service.start_automatically = run.shared.config.service.start_automatically;
+    let candidate = hardware::continuous::known_configuration(saved);
+    let running = &run.shared.config;
+    // USB locations are resolved at runtime and remembered boards are a
+    // registry, not operator edits. Every other board setting must match.
+    let settings = |config: &Config| -> Result<serde_json::Value> {
+        let mut hardware = config.hardware.clone();
+        hardware.boards.sort_by(|a, b| a.id.cmp(&b.id));
+        for board in &mut hardware.boards {
+            board.device_location = None;
+        }
+        hardware.remembered_boards = vec![];
+        Ok(serde_json::to_value((&hardware, &config.service))?)
+    };
+    anyhow::ensure!(
+        settings(&candidate)? == settings(running)?,
+        "Board or service settings changed; use Save & Restart"
+    );
+    crate::network::resolve(&candidate.node)?;
+    if serde_json::to_value(&candidate.node)? == serde_json::to_value(&running.node)? {
+        return Ok(None);
+    }
+    tracing::info!(network=%candidate.node.network, host=%candidate.node.host, "Switching full-node profile; native owners retained");
+    run.replace_node(candidate, current).await?;
+    Ok(Some(requested))
+}
+
+/// Accept identified native engine sockets for one board. Each lease names its
+/// physical engine; the backend routes work only to currently routed engines.
 pub(crate) async fn client_listener(
     listener: TcpListener,
     id: String,
-    capacity: u8,
     shared: Arc<Shared>,
     shutdown: watch::Receiver<bool>,
-    offers: Option<tokio::sync::mpsc::Sender<asic::Lease>>,
+    offers: tokio::sync::mpsc::Sender<asic::Lease>,
 ) -> Result<()> {
-    client_listener_with(
-        AcceptBackoff::new(),
-        listener,
-        id,
-        capacity,
-        shared,
-        shutdown,
-        offers,
-    )
-    .await
+    client_listener_with(AcceptBackoff::new(), listener, id, shared, shutdown, offers).await
 }
 
 async fn client_listener_with(
     mut backoff: AcceptBackoff,
     listener: TcpListener,
     id: String,
-    capacity: u8,
     shared: Arc<Shared>,
     mut shutdown: watch::Receiver<bool>,
-    offers: Option<tokio::sync::mpsc::Sender<asic::Lease>>,
+    offers: tokio::sync::mpsc::Sender<asic::Lease>,
 ) -> Result<()> {
-    let mut clients = JoinSet::new();
     loop {
         tokio::select! {
             _=shutdown.changed()=>break,
-            Some(result)=clients.join_next(),if !clients.is_empty()=>{result.context("Client task failed")?;},
             accepted=backoff.accept(listener.accept(), |error, failures, delay| {
                 tracing::warn!(%error,failures=failures,?delay,"VDF accept failed; retrying");
             })=>{
-                let Some((socket,_))=accepted else { continue; };
-                let slot={let mut connected=shared.clients.lock().expect("client state lock");let slot=(0..capacity).find(|slot|!connected.contains(&(id.clone(),*slot)));if let Some(slot)=slot {connected.insert((id.clone(),slot));}slot};
-                if let Some(slot)=slot {
-                    if let Some(offers) = &offers {
-                        let generation = {
-                            let mut runtime = shared.runtime.lock().expect("runtime");
-                            let hardware = runtime.boards.entry(id.clone()).or_default();
-                            // Reusing a slot must never reuse its predecessor's verified readiness.
-                            hardware.lifecycle.forget_slot(slot);
-                            hardware.lifecycle.status().generation
-                        };
-                        let lease = asic::Lease { socket, board: id.clone(), slot, generation, clients: shared.clients.clone() };
-                        if offers.try_send(lease).is_err() { tracing::warn!(board=%id, "ASIC socket queue full"); }
-                        continue;
-                    }
-                    let shared=shared.clone();let id=id.clone();let mut shutdown=shutdown.clone();
-                    clients.spawn(async move {
-                        tracing::info!(board=%id,slot,"VDF socket connected; configure the full node to begin work");
-                        let result=tokio::select! {_=shutdown.changed()=>Ok(()),result=idle_client(socket)=>result};
-                        shared.clients.lock().expect("client state lock").remove(&(id.clone(),slot));
-                        if let Err(error)=result {tracing::debug!(board=%id,slot,%error,"VDF socket closed");}
-                    });
-                } else {tracing::warn!(board=%id,"Rejected excess VDF socket");}
+                let Some((mut socket,_))=accepted else { continue; };
+                let mut identity = [0u8;13];
+                if !matches!(tokio::time::timeout(Duration::from_secs(2), socket.read_exact(&mut identity)).await, Ok(Ok(_)))
+                    || &identity[..11] != b"TLENGINE 1 " || identity[12] != b'\n' || !(b'0'..=b'2').contains(&identity[11]) {
+                    tracing::warn!(board=%id, "Rejected VDF socket without an engine identity");
+                    continue;
+                }
+                let slot = identity[11] - b'0';
+                let claimed = shared.clients.lock().expect("client state lock").insert((id.clone(), slot));
+                if !claimed {
+                    tracing::warn!(board=%id, slot, "Rejected duplicate VDF engine socket");
+                    continue;
+                }
+                let generation = {
+                    let mut runtime = shared.runtime.lock().expect("runtime");
+                    let hardware = runtime.boards.entry(id.clone()).or_default();
+                    // Reusing a slot must never reuse its predecessor's verified readiness.
+                    hardware.lifecycle.forget_slot(slot);
+                    hardware.lifecycle.status().generation
+                };
+                let lease = asic::Lease { socket, board: id.clone(), slot, generation, clients: shared.clients.clone() };
+                if offers.try_send(lease).is_err() { tracing::warn!(board=%id, "ASIC socket queue full"); }
             }
         }
     }
-    while let Some(result) = clients.join_next().await {
-        result.context("Client shutdown failed")?;
-    }
     Ok(())
-}
-
-async fn idle_client(mut socket: TcpStream) -> Result<()> {
-    match read_message(&mut socket).await? {
-        ClientMessage::Stop => {
-            acknowledge_stop(&mut socket).await?;
-            Ok(())
-        }
-        ClientMessage::Proof(_) => {
-            bail!("Unsolicited proof received without an active challenge; not accepted")
-        }
-    }
 }
 
 pub(crate) async fn shutdown_signal() {

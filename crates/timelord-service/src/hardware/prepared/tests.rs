@@ -1,8 +1,6 @@
 use super::*;
-use crate::Shared;
 use crate::hardware::native::{ClientLog, NativeOwner, startup};
 use std::{os::unix::fs::PermissionsExt, process::Stdio};
-use tokio::sync::oneshot;
 
 #[tokio::test]
 async fn owners_reuse_the_validated_capabilities_and_running_binary_identity() {
@@ -29,19 +27,18 @@ done
     config.hardware.client_binary = Some(binary.clone());
     config.hardware.boards = (0..3).map(|index| toml::from_str(&format!(
         "id='b{index}'\nname='Board {index}'\nserial='s{index}'\nclient_port={}\ndevice_location={}\nprofile='automatic'",18110 + index,index + 1)).unwrap()).collect();
-    let mut prepared = prepare_for(&config, &Default::default()).await.unwrap();
-    assert_eq!(prepared.assignments.len(), 3);
-    let shared = Shared {
-        config: config.clone(),
-        assignments: prepared.assignments.clone(),
-        native: prepared.native.clone(),
-        clients: Default::default(),
-        process: crate::operational::State::fixture(),
-        scope: crate::runtime::RuntimeScope::Production,
-        runtime: Default::default(),
-        started_unix: crate::unix_now(),
-        service_started_unix: crate::unix_now(),
-    };
+    let native = prepare(&config).await.unwrap();
+    let shared = crate::Shared::new(
+        native.clone(),
+        config.clone(),
+        std::sync::Arc::new(std::sync::Mutex::new(crate::runtime::RuntimeState::new(
+            false,
+        ))),
+        crate::operational::State::fixture(),
+        crate::unix_now(),
+        crate::unix_now(),
+    )
+    .routed_by_config();
     let mut child = Command::new(&binary)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -59,32 +56,11 @@ done
     // This live child already owns the validated binary; creating its control
     // owner must not probe or fingerprint the pathname again.
     std::fs::remove_file(&binary).unwrap();
-    let identity = prepared.native.clone().unwrap();
-    let original = prepared.assignments.clone();
-    prepared
-        .reconcile(&config, &std::collections::HashSet::from(["b0".into()]))
-        .await
-        .unwrap();
-    assert!(
-        prepared
-            .assignments
-            .iter()
-            .all(|assignment| assignment.board_id != "b0")
-    );
-    assert_eq!(prepared.assignments.len(), 3);
-    assert!(Arc::ptr_eq(prepared.native.as_ref().unwrap(), &identity));
-    prepared
-        .reconcile(&config, &Default::default())
-        .await
-        .unwrap();
-    assert_eq!(prepared.assignments, original);
-
     let mut owner = NativeOwner::attach(&config.hardware.boards[0], &mut child).unwrap();
     let startup = startup(&shared, &config.hardware.boards[0]).await.unwrap();
-    let (ready, _rx) = oneshot::channel();
-    let mut log = ClientLog::new(child.stderr.take().unwrap(), ready);
+    let mut log = ClientLog::new(child.stderr.take().unwrap());
     owner
-        .initialize(&shared, &config.hardware.boards[0], &mut log, startup)
+        .initialize(&shared, &config.hardware.boards[0], &mut log, &startup)
         .await
         .unwrap();
     assert_eq!(
@@ -100,29 +76,6 @@ done
             .success()
     );
     std::fs::remove_dir_all(directory).unwrap();
-}
-
-#[tokio::test]
-async fn reconcile_resolves_assignments_without_revalidating_automatic_boards() {
-    let mut config = Config::default();
-    config.hardware.boards.push(
-        toml::from_str(
-            "id='b0'\nname='Board 0'\nserial='s0'\nclient_port=18110\ndevice_location=1\nprofile='automatic'",
-        )
-        .unwrap(),
-    );
-    config.hardware.boards[0].automatic.start_frequency_mhz = 1455.;
-    let mut prepared = Prepared {
-        assignments: vec![],
-        native: Some(Arc::new(Facts {
-            hash: "hash".into(),
-            host: "host".into(),
-            frequencies: vec![1450.],
-        })),
-    };
-    let unavailable = std::collections::HashSet::from(["b0".into()]);
-    prepared.reconcile(&config, &unavailable).await.unwrap();
-    assert!(prepared.assignments.is_empty());
 }
 
 #[tokio::test]
@@ -151,7 +104,7 @@ esac
         .unwrap(),
     );
     config.hardware.boards[0].automatic.start_frequency_mhz = 1455.;
-    let error = prepare_for(&config, &Default::default())
+    let error = prepare(&config)
         .await
         .err()
         .expect("unsupported Automatic start frequency was accepted");

@@ -43,9 +43,18 @@ final class SupervisorClientTests: XCTestCase {
         let running = try XCTUnwrap(current)
         XCTAssertEqual(running.mode, .running)
         XCTAssertNotEqual(running.workerPid, running.supervisorPid)
-        let paused = try await client.send(.pause, expectedRevision: running.revision)
-        XCTAssertEqual(paused.mode, .paused)
-        XCTAssertNil(paused.workerPid, "Pause acknowledgment must follow worker cleanup")
+        let acknowledged = try await client.send(.pause, expectedRevision: running.revision)
+        XCTAssertEqual(acknowledged.mode, .paused, "Pause is durable when acknowledged")
+        // Retirement continues in the background; status reports its completion.
+        var settled: SupervisorStatus?
+        let pauseDeadline = Date().addingTimeInterval(20)
+        while Date() < pauseDeadline {
+            let status = try await client.send(.status)
+            if status.phase == .paused { settled = status; break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let paused = try XCTUnwrap(settled)
+        XCTAssertNil(paused.workerPid, "Paused phase follows worker cleanup")
         do {
             _ = try await client.send(.resume, expectedRevision: running.revision)
             XCTFail("Stale control revision resumed production")
@@ -53,5 +62,26 @@ final class SupervisorClientTests: XCTestCase {
         let resumed = try await client.send(.resume, expectedRevision: paused.revision)
         XCTAssertEqual(resumed.mode, .running)
         _ = try await client.send(.pause)
+    }
+
+    @MainActor
+    func testReloadWaitsForTheReplacementWorkerAfterSlowRetirement() async throws {
+        let fixture = try SupervisedFixture(workerBody: """
+        trap 'sleep 3; exit 0' TERM
+        while :; do sleep 0.1; done
+        """)
+        defer { fixture.close() }
+        try await fixture.launch()
+        let before = try XCTUnwrap(fixture.controller.supervisor)
+        let oldPID = try XCTUnwrap(before.workerPid)
+        try await fixture.controller.reload()
+        let after = try XCTUnwrap(fixture.controller.supervisor)
+        XCTAssertEqual(after.phase, .workerStarted)
+        XCTAssertEqual(after.workerGeneration, before.workerGeneration + 1)
+        XCTAssertNotEqual(after.workerPid, oldPID)
+        XCTAssertNotEqual(kill(oldPID, 0), 0, "The old worker family was retired before its replacement")
+        try await fixture.controller.stop()
+        XCTAssertEqual(fixture.controller.supervisor?.phase, .paused)
+        XCTAssertNil(fixture.controller.processID)
     }
 }

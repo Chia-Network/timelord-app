@@ -12,7 +12,7 @@ schema_version = 1
 [node]
 host = "localhost"
 port = 8444
-network = "mainnet" # or testnet11
+network = "mainnet" # or testnet11; import a bundle for a custom network
 server_name = "chia.net"
 certificate = "identity/client.crt"
 private_key = "identity/client.key"
@@ -25,7 +25,7 @@ status_listen = "127.0.0.1:9257"
 # allow_remote_observability = true # Explicit opt-in: no built-in authentication/TLS.
 # Persistent supervisor listener; re-register after changing it.
 supervisor_observability_listen = "127.0.0.1:9259"
-# Legacy app-launch preference; durable supervisor Run/Pause is authoritative.
+# Start session supervision when the app opens; saved Run/Pause is authoritative.
 start_automatically = true
 tuning_paused = false
 
@@ -51,17 +51,13 @@ locations are discovered afresh; serials preserve settings across port changes.
 `remembered_boards` retains disconnected board settings. The number of detected
 boards determines capacity: one board runs three engines, two boards run two plus
 one, and three boards run one each. Automatic layouts rebalance while the service
-runs, after three agreeing five-second discovery polls. This briefly stops proof
-work and reconnects the node with the new layout; it does not restart the app or
-status endpoint. No boards leaves the service waiting for hardware. USB discovery
-errors do not trigger redistribution. Idle chains with supervised native owners
-remain in the layout even when open FTDI metadata and proof sockets are absent;
-the native owner's sensor/exit watchdog determines when that evidence expires.
-A changed layout uses its separately learned
-engine-count/mask profile, or its configured Automatic starting frequency/voltage
-if no matching profile exists. A high single-engine clock is never reused as a
-three-engine learned setting. Thermal and invalid-proof faults stay latched.
-Changed assignments start fresh chart scopes and run counters, preserving correct
+runs, retaining healthy native owners and the node session while routing affected
+chains to spare engines. No boards leaves the service waiting and retrying for
+hardware. Discovery failures do not remove healthy owners. Known disconnected
+boards retain their settings and recovery supervisors. Each layout selects its
+own learned tuning profile; reserved idle engines are not counted as active work.
+
+Changed assignments start fresh chart scopes, preserving correct
 board attribution; ordinary same-layout client reconnects retain the charts.
 
 ### Chain assignments
@@ -119,7 +115,7 @@ the packaged D2XX library relative to the helper inside the app bundle. Explicit
 ## Node identities
 
 Select a local Chia root in the app, or run `local-node --chia-root FOLDER`. This
-uses its public timelord leaf identity for the full-node peer port and imports the
+reads its selected network and peer port, uses its public timelord leaf identity for the full-node peer port and imports the
 private RPC leaf identity for read-only sync status/height. It neither edits Chia's
 configuration nor imports CA signing keys. Peer connectivity does not establish
 sync status. RPC is polled every 15 seconds; stale observations show no height.
@@ -142,6 +138,38 @@ certificate = "rpc-client.crt"
 private_key = "rpc-client.key"
 ca_certificate = "private-ca.crt"
 ```
+
+Custom bundles additionally include `network.json` (schema 1): the exact
+`network_id`, `GENESIS_CHALLENGE` and selected constant overrides, export time,
+Chia version and selected configuration overrides. The importer validates the
+network ID/genesis and stores this under `[node.network_definition]`; it does not
+keep a reference to the transfer folder. Network IDs use 1–64 lowercase letters,
+digits or hyphens. Missing or mismatched definitions are rejected before saving.
+Mainnet and Testnet11 continue using their pinned built-in definitions.
+
+Saved connection profiles live in `[connections]` with `active_id` and
+`[[connections.profiles]]` entries containing `id`, `name` and a complete `node`
+table. Existing single-node configurations migrate in memory when read and are persisted
+on the next save or import. The
+top-level `[node]` is the selected profile's runtime projection; saving synchronizes
+its edits into that profile. Imported profiles retain independent credential paths
+and RPC settings. UI selection is staged until saved; a running worker needs
+Save & Restart to change connections. For CLI administration,
+`select-node --config FILE --profile ID` selects and saves an existing profile
+without connecting to a node or touching hardware. Reload the running worker to
+apply it. Unknown IDs or invalid profiles leave the saved file intact.
+
+Raw exported numeric constants are normalized on import. Saved configuration and
+helper JSON represent integers as `{ integer = "decimal digits" }`, preserving
+the full supported `u128` range through TOML and macOS settings edits. This also
+keeps numeric constants distinct from quoted strings. The resolver checks the
+pinned scheduler's parameter invariants before accepting imports or settings.
+
+Custom chain constants also form part of the saved-history scope and last-good
+fallback identity. Reusing a network name with another genesis or different
+constants cannot silently reuse the earlier chain's history or fallback config.
+Export timestamps, Chia versions and presentation overrides are provenance, not
+chain identity; re-exporting the same chain does not invalidate fallback/history.
 
 ## Automatic tuning
 
@@ -280,19 +308,37 @@ timelord-service node-state --config FILE
 timelord-service serve --config FILE
 timelord-service status --config FILE
 timelord-service tuning --config FILE --paused true
+timelord-service board --config FILE --serial SERIAL --action retry
+timelord-service board --config FILE --serial SERIAL --action disable [--minutes 60]
+timelord-service board --config FILE --serial SERIAL --action enable
+timelord-service select-node --config FILE --profile ID
+timelord-service reload-node --config FILE
 ```
+
+`board` acts on one board in the running service: `retry` ends its probation,
+clears its failure streak and retries a waiting owner now, `disable` keeps it out of rotation (for the
+given minutes, or until `enable`), and `enable` returns it. The other boards and
+the node session keep running. `reload-node` applies a saved full-node profile
+change (for example after `select-node`) without restarting ASIC boards; it is
+refused, with the reason, when board or service settings also changed, which
+still need a supervised restart.
 
 `configuration` prints JSON; `configure --input JSON_FILE` validates before
 replacement. `check-hardware --config FILE` explicitly starts the configured
 clients for a bounded synthetic three-chain proof check without a full node.
 Never point it at boards in use. It applies the configured operating point and
 thermal guard, verifies retained sessions and a reset, then stops its own clients.
-It does not train Automatic tuning or change saved settings.
+It does not train Automatic tuning or change saved settings. It refuses to run
+when the board safety journal is missing or unreadable after a prior write, and
+stays refused until the worker has saved board state (not merely run once) so the
+reset is recorded and an unreadable journal is archived; then rerun the check.
+It takes the worker lock, so it does not run at the same time as the serving
+worker and fails clearly when that lock is held.
 
 The status/history HTTP API is read-only and bound to loopback. Same-user,
 mode-0600 Unix IPC handles Pause/Resume tuning. `service.control_socket` optionally
-overrides its derived path. Fault and thermal stops require an explicit restart;
-startup never becomes an automatic restart loop.
+overrides its derived path. Automatic faults retry without a terminal hold;
+only an explicit Pause durably disables requested work.
 
 App administrator overrides: `TIMELORD_CONFIG`, `TIMELORD_SERVICE_BINARY`, and
 `TIMELORD_STATUS_URL`. Run only one owner of a board. The app can observe an external
@@ -308,35 +354,65 @@ Native readback retries are separate from client recovery: three reads per stage
 20 ms apart, with engines paused and no repeated voltage/PLL writes. Persistent
 unexpected state still stops that native client.
 
-The service supervises each physical board independently. After a transient
-client/control/socket failure it restarts only that board, with delays of 1, 5,
-and 30 seconds. Initialization must reapply and verify the saved operating point;
-verified proofs are required before the board appears productive again.
+Each physical board has one persistent supervisor and native owner. Failures
+are handled by the smallest part first:
 
-Capabilities, binary identity and host provenance are prepared once per configuration
-generation, outside the async executor. Automatic owner setup has a 45-second
+- A dropped proof session is retried on the same owner. A second lane error
+  within 120 seconds, or a routed engine whose socket never arrives, retires
+  that board's owner.
+- A native client that stops reporting telemetry for 15 seconds is treated as
+  stuck (typically a blocked USB write) and retired with bounded waits.
+- Only overheating and invalid proofs are safety restrictions. Overheating waits
+  30 seconds, probes at 200 MHz / 0.7 V and needs fresh cool telemetry; an invalid
+  proof waits 10 seconds and needs a private verified proof. The first fault at a
+  point lowers the recovery clock limit 50 MHz below it; six hours of fault-free
+  serving raise it 50 MHz again until it reaches the normal 1450 MHz cap.
+- An unconfirmed shutdown (crash, kill, unplug) is not a restriction. The next
+  owner starts cautiously at the recovery point and returns to the board's
+  best-known setting (learned for Automatic, configured for Manual) after its
+  first verified work. A cautious start never overwrites a learned profile.
+- An unplugged or busy board is looked for again every 5 seconds and does not
+  count as a failure. When a running owner dies, the service checks USB before
+  counting it: a board that is no longer attached was unplugged, not broken.
+
+Availability comes first: every serving board carries work, and nothing but
+hardware evidence or an operator disable takes a working board out. Reliability
+is saved per serial, survives worker restarts and node-profile switches, and
+only decides which chain a board carries. Restart delays follow the failure
+streak: 1, 5, then 30 seconds. After a failure a board is on probation (1 min,
+5 min, then 30 min, and 2 h after six consecutive failures). On probation it
+prefers the infused-challenge chain while more reliable boards carry the
+challenge and reward chains; with no more reliable board it carries whatever is
+needed. Thirty minutes of stable serving after probation clears the streak, and
+so does an operator retry. Retries never exhaust. A serving board with no chains
+(for example a spare) runs a private canary proof every minute, as does a board
+finishing a cautious start whose chain has no work yet.
+
+Routing keeps every chain on its current board while that board stays eligible,
+uses a fixed board order (serial, then identifier), and moves chains back to a
+returning board only at the next peak, so improvements never cancel in-flight
+work. Any board starting, stopping or being rerouted holds Automatic tuning on
+every board for 20 seconds, and live operating-point changes are serialized
+across boards. When a route changes a board's active engine count, the board
+applies the setting learned for that count; without one it never keeps a clock
+above the configured start for more active engines. A new native build starts
+50 MHz below the previous build's stable point when that is above the start.
+
+Capabilities, binary identity and host provenance are prepared once per service
+process, outside the async executor. Automatic owner setup has a 45-second
 limit, including the control exchange's own 30-second acknowledgement limit.
 After setup succeeds, the native network-ready message has a separate 30-second
 allowance. The USB initialization mutex is released earlier: on acknowledged
-Automatic control, or on the first valid Manual temperature sample. Both are
-emitted by the pinned native event loop after USB, clocks, voltage and PVT setup
-have completed. A socket connection is not used as physical presence evidence;
-a timeout still retires and reaps its owner.
+Automatic control, or on the first valid Manual temperature sample. A board
+serves only once all engine sockets connected and fresh telemetry is cool.
 
-Restart attempts never raise its saved voltage or frequency. An unaccepted Automatic
-trial returns to the last saved point. The retry budget can renew after at least
-ten minutes of operation, three verified outputs for each assigned chain from
-that run, and fresh proof/temperature telemetry.
-
-Exhausted retries, failed proof verification, thermal stops and missing temperature
-telemetry require attention; these are not retried indefinitely. Pause/Run starts
-a new supervision session. Pausing or quitting cancels pending restarts.
-
-Other boards keep their processes, settings and chain sessions during a board
-outage. The full-node connection remains open to receive progress from other
-timelords. The service never submits an incomplete combined proof or treats an
-unavailable board as productive. History gaps apply to the affected board; healthy
-boards' verified samples remain available.
+Other native owners and the full-node session survive a board outage. Automatic
+layouts move only affected chains; explicit serial mappings keep their assignments.
+Every submitted proof must still pass the native verifier. Route changes reset
+chart scope to avoid attributing old samples to a different board. Status reports
+`recovery_reason`, `retry_after_unix` and the actual `native_pid`; socket connection
+counts alone are never evidence of verified productivity. Pause cancels retries;
+quitting the GUI preserves the saved Run intent.
 
 See [deployment health and metrics](observability.md) for optional Prometheus,
 liveness/readiness endpoints and deployment examples.

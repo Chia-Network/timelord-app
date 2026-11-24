@@ -4,7 +4,34 @@ The build consumes public Chia-Network/chiavdf at the exact commit in
 [upstream.env](upstream.env), without source overlays or copied prover/control
 headers. That revision includes upstream performance, live-control and telemetry
 work plus [opened-handle serial validation](https://github.com/Chia-Network/chiavdf/pull/474).
-The serial PR is pending; the pin refers to its immutable public branch commit.
+The pin is `7c47cf07e575cee38c5ad56c67d391b4f131ad6b`, the merged main commit combining
+[PR 497](https://github.com/Chia-Network/chiavdf/pull/497) for bounded readback and
+checked shutdown with [PR 498](https://github.com/Chia-Network/chiavdf/pull/498)
+for physical engine identities. Its source tree is identical to the previously
+validated PR head `005fe3c357341dfd0c5aa9a8244f8fbc31e957b6`. It includes the merged serial and
+initialization changes. Requested operating points retain strict limits; measured
+values use the existing bounded readback tolerance, including a regulator reading
+one 6.25 mV VID step below a 0.700 V target. The request itself is exactly
+representable. `TLACK` measurements must not be reused as commands outside strict
+limits. Offline regression coverage does not establish hardware/testnet acceptance.
+
+Managed owners send `TLSTOP 1 ID` and retain complete positive `TLSTOPACK` or
+legacy shutdown evidence through soft deadlines and TERM fallback. Process reaping
+is independently required. The supervisor allows 25 seconds for worker cleanup,
+covering the native 5-second soft deadline, 10-second TERM allowance and bounded
+pipe drains. Unknown evidence forces conservative reinitialization, not a
+permanent stop. Native exit status is 70 for exceptions or unconfirmed hardware
+shutdown, including TLSTOP and SIGTERM; successful exit alone never replaces the
+positive acknowledgement plus reaping requirement. The native emulator models
+regulator VID writes and can force zero readback; offline main-loop fixtures cover
+confirmed exit 0, unconfirmed exit 70, stale stop IDs and unterminated control
+frames at EOF. These checks do not establish physical shutdown timing. The version probe does not
+advertise these extensions, so consumers must pin a supporting revision.
+`--engine-identity` sends `TLENGINE 1 N` on every engine socket
+connection; the adapter consumes it before the usual VDF protocol. Incomplete or
+failed identity writes and peer resets close and retry only that engine
+connection; STOP replies are best effort on a broken socket. Failed
+connects release their socket descriptors.
 
 ```sh
 bash scripts/build-native.sh

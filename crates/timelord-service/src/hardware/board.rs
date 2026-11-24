@@ -1,5 +1,7 @@
-//! One board orchestration: discovery, admission, production lifetime and retry.
+//! One board's persistent supervision: locate, launch, check, serve, retire
+//! and retry. Retries never exhaust; reliability decides routing, not retries.
 use super::*;
+use timelord_supervisor::progress::{BoardSlot, Resource, Stage};
 
 async fn acquire_initialization(
     shutdown: &mut watch::Receiver<bool>,
@@ -14,68 +16,65 @@ async fn acquire_initialization(
     }
 }
 
-const RESTART_DELAYS: [u64; 3] = [1, 5, 30];
-pub(super) struct RestartBackoff {
-    pub(super) used: usize,
-    pub(super) delays: [Duration; 3],
+/// The board is not attached (or not uniquely identifiable). Absence is not a
+/// reliability failure: the board did nothing wrong by being unplugged.
+#[derive(Debug)]
+pub(crate) struct BoardAbsent(pub String);
+impl std::fmt::Display for BoardAbsent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is disconnected, busy, or has an ambiguous USB identity",
+            self.0
+        )
+    }
 }
-impl Default for RestartBackoff {
+impl std::error::Error for BoardAbsent {}
+/// The operator disabled or held this board; retiring it is not a failure.
+#[derive(Debug)]
+pub(crate) struct OperatorHold;
+impl std::fmt::Display for OperatorHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Board disabled by the operator")
+    }
+}
+impl std::error::Error for OperatorHold {}
+/// Supervision timing. Production uses the defaults; fixtures scale them down.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Timing {
+    /// Restart delays after the first, second and later consecutive failures.
+    pub restart: [Duration; 3],
+    /// How often an absent board is looked for.
+    pub absent: Duration,
+    /// Native silence that means its event loop is stuck.
+    pub liveness: Duration,
+    /// Interval between private canary proofs on an unrouted serving board.
+    pub canary: Duration,
+}
+impl Default for Timing {
     fn default() -> Self {
         Self {
-            used: 0,
-            delays: RESTART_DELAYS.map(Duration::from_secs),
+            restart: [1, 5, 30].map(Duration::from_secs),
+            absent: Duration::from_secs(5),
+            liveness: Duration::from_secs(crate::hardware::LIVENESS_TIMEOUT_SECONDS),
+            canary: Duration::from_secs(native::CANARY_SECONDS),
         }
     }
 }
-impl RestartBackoff {
-    pub(super) fn next(&mut self, established: bool) -> Duration {
-        if established {
-            self.used = 0;
-        }
-        let delay = self.delays[self.used.min(self.delays.len() - 1)];
-        self.used = self.used.saturating_add(1);
-        delay
+impl Timing {
+    fn restart_delay(&self, health: &crate::hardware::health::Health) -> Duration {
+        let index = (health.consecutive_failures.max(1) - 1) as usize;
+        self.restart[index.min(self.restart.len() - 1)]
     }
 }
-pub(super) fn established(
-    shared: &Shared,
-    board: &BoardConfig,
-    started: u64,
-    elapsed: Duration,
-) -> bool {
-    if elapsed < Duration::from_secs(600) {
-        return false;
-    }
-    let now = crate::unix_now();
-    let state = shared.runtime.lock().expect("runtime");
-    let telemetry_fresh = state
-        .boards
-        .get(&board.id)
-        .is_some_and(|b| now.saturating_sub(b.temperature_unix) <= 30);
-    telemetry_fresh
-        && shared
-            .assignments
-            .iter()
-            .filter(|a| a.board_id == board.id)
-            .all(|a| {
-                let proofs: Vec<_> = state
-                    .observations
-                    .iter()
-                    .filter(|o| o.chain == a.chain && o.work_started_unix >= started)
-                    .collect();
-                proofs.len() >= 3
-                    && proofs
-                        .last()
-                        .is_some_and(|o| now.saturating_sub(o.timestamp_unix) <= 30)
-            })
-}
+
 pub(super) fn checkpoint_retired(
     shared: &Shared,
     board: &BoardConfig,
     store: &crate::safety::Store,
     serial: &str,
 ) -> Result<()> {
-    let (quiesced, fault, failed) = {
+    let (quiesced, fault) = {
         let state = shared.runtime.lock().expect("runtime");
         let status = state
             .boards
@@ -83,116 +82,113 @@ pub(super) fn checkpoint_retired(
             .context("Retired board missing")?
             .lifecycle
             .status();
-        (
-            status.quiesced,
-            status.fault,
-            status.phase == crate::board_lifecycle::Phase::Fault,
-        )
+        (status.quiesced, status.fault)
     };
-    if let Some(fault) = fault {
-        store.quarantine(serial, fault.into())?;
-    } else if failed || !quiesced {
-        // Confirmed retirement proves the hardware stopped; it cannot validate a
-        // failed control exchange. Transport failures require fresh admission.
-        store.quarantine(serial, crate::safety::Reason::UncleanOwner)?;
-    }
-    if quiesced {
-        store.closed(serial)?;
-    }
-    Ok(())
-}
-
-// The journal must be armed before spawning an owner. Only a failed spawn can
-// roll that intent back without a native shutdown confirmation: no child exists.
-pub(super) async fn launch_prepared(
-    shared: &Shared,
-    board: &BoardConfig,
-    startup: &native::Startup,
-) -> Result<Child> {
-    match launch(shared, board, startup).await {
-        Ok(child) => Ok(child),
-        Err(error) => {
-            let safety = shared.runtime.lock().expect("runtime").safety.clone();
-            if let (Some(store), Some(serial)) = (safety, &board.serial) {
-                store
-                    .closed(serial)
-                    .context("Closing journal after native spawn failed")?;
-            }
-            shared
-                .runtime
-                .lock()
-                .expect("runtime")
-                .boards
-                .entry(board.id.clone())
-                .or_default()
-                .lifecycle
-                .retired(true, None, crate::unix_now());
-            Err(error)
+    match fault {
+        Some(crate::board_lifecycle::Fault::Thermal) => {
+            store.restrict(serial, crate::safety::Reason::Thermal)?
         }
+        Some(crate::board_lifecycle::Fault::InvalidProof) => {
+            store.restrict(serial, crate::safety::Reason::InvalidProof)?
+        }
+        _ => {}
     }
+    if !quiesced {
+        // Without confirmation the physical operating point is unknown: start
+        // the next owner cautiously. This is not a safety restriction.
+        store.mark_cautious(serial)?;
+    }
+    store.closed(serial)
 }
 
 /// Closed-owner discovery is the only observation allowed to declare this
-/// serial absent. Both initial preparation and post-admission use this path.
+/// serial absent.
 async fn locate(shared: &Shared, board: &mut BoardConfig) -> Result<()> {
-    if board.serial.is_some() {
-        let devices = crate::inventory::discover(&shared.config).await?;
-        let observed = crate::inventory::board_observation(board, &devices);
-        shared
-            .runtime
-            .lock()
-            .expect("runtime")
-            .boards
-            .get_mut(&board.id)
-            .expect("board")
-            .lifecycle
-            .inventory(None, observed);
-        board.device_location = Some(crate::inventory::board_location(board, &devices)?);
-    }
+    let devices = crate::inventory::discover(&shared.config).await?;
+    let present = crate::inventory::board_observation(board, &devices)
+        == crate::inventory::Observation::Present;
     shared
         .runtime
         .lock()
         .expect("runtime")
         .boards
-        .get_mut(&board.id)
-        .expect("board")
-        .device_location = board.device_location;
+        .entry(board.id.clone())
+        .or_default()
+        .lifecycle
+        .inventory(present);
+    let location = crate::inventory::board_location(board, &devices)
+        .map_err(|_| anyhow::Error::new(BoardAbsent(board.name.clone())))?;
+    board.device_location = Some(location);
+    shared
+        .runtime
+        .lock()
+        .expect("runtime")
+        .boards
+        .entry(board.id.clone())
+        .or_default()
+        .device_location = Some(location);
     Ok(())
 }
 
-mod attempt;
-use attempt::PreparedAttempt;
-
-/// The unique task for this configured serial. Each prepared attempt owns the
-/// serial lease and initialization guards until its native owner retires.
+/// The unique task for this configured serial.
 struct BoardSupervisor {
     shared: Arc<Shared>,
     backend: Arc<crate::asic::AsicBackend>,
     board: BoardConfig,
-    ready: Option<oneshot::Sender<()>>,
     shutdown: watch::Receiver<bool>,
-    budget: RestartBackoff,
-    safety: Option<Arc<crate::safety::Store>>,
+    safety: Arc<crate::safety::Store>,
     previous_failure: crate::observability::RestartReason,
+    timing: Timing,
+    /// Health from before the last counted transport failure, the live health
+    /// right after it, and when it happened. If the board is then found
+    /// unplugged within `FORGIVE_WINDOW` and nobody else changed that health,
+    /// the failure was the unplug (USB enumeration can outlive the I/O error)
+    /// and is taken back.
+    forgivable: Option<(
+        crate::hardware::health::Health,
+        crate::hardware::health::Health,
+        tokio::time::Instant,
+    )>,
+}
+/// How long after a counted failure a board found missing proves the failure
+/// was an unplug.
+const FORGIVE_WINDOW: Duration = Duration::from_secs(120);
+/// Classified once so recovery never reconstructs why the owner stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    Absent,
+    Held,
+    Unplugged,
+    Failed,
 }
 pub(super) async fn supervise_board(
     shared: Arc<Shared>,
     backend: Arc<crate::asic::AsicBackend>,
     board: BoardConfig,
-    ready: oneshot::Sender<()>,
     shutdown: watch::Receiver<bool>,
-    budget: RestartBackoff,
 ) {
-    let safety = shared.runtime.lock().expect("runtime").safety.clone();
+    supervise_board_with(shared, backend, board, shutdown, Timing::default()).await
+}
+pub(crate) async fn supervise_board_with(
+    shared: Arc<Shared>,
+    backend: Arc<crate::asic::AsicBackend>,
+    board: BoardConfig,
+    shutdown: watch::Receiver<bool>,
+    timing: Timing,
+) {
+    let Some(safety) = shared.runtime.lock().expect("runtime").safety.clone() else {
+        tracing::error!(board=%board.name, "Board supervision requires the safety journal");
+        return;
+    };
     BoardSupervisor {
         shared,
         backend,
         board,
-        ready: Some(ready),
         shutdown,
-        budget,
         safety,
         previous_failure: crate::observability::RestartReason::Topology,
+        timing,
+        forgivable: None,
     }
     .run()
     .await;
@@ -200,44 +196,58 @@ pub(super) async fn supervise_board(
 impl BoardSupervisor {
     async fn run(mut self) {
         while !*self.shutdown.borrow() {
-            if self.hold_for_policy() {
-                self.ready.take();
-                tokio::select! { _=self.shutdown.changed()=>return, _=tokio::time::sleep(Duration::from_secs(5))=>{} }
+            if let Some(reason) = self.hold() {
+                self.note_hold(reason);
+                if !self.wait(Duration::from_secs(1)).await {
+                    return;
+                }
                 continue;
             }
-            if self.safety.is_none()
-                && self
-                    .shared
-                    .runtime
-                    .lock()
-                    .expect("runtime")
-                    .boards
-                    .get(&self.board.id)
-                    .is_some_and(|board| board.lifecycle.status().latched_fault)
-            {
-                return;
-            }
-            let started = tokio::time::Instant::now();
-            let started_unix = crate::unix_now();
             let result = self.attempt().await;
-            if *self.shutdown.borrow() || result.is_ok() {
+            if *self.shutdown.borrow() {
                 return;
             }
-            let Some(delay) = self
-                .recover(result.unwrap_err(), started, started_unix)
-                .await
-            else {
-                return;
+            let delay = match result {
+                Ok(()) => Duration::from_secs(1),
+                Err(error) => self.recover(error).await,
             };
-            tokio::select! { _=self.shutdown.changed()=>return, _=tokio::time::sleep(delay)=>{} }
+            if !self.wait(delay).await {
+                return;
+            }
         }
     }
-    fn hold_for_policy(&self) -> bool {
-        let policy = self
-            .safety
-            .as_ref()
-            .map(|store| store.policy(&self.board))
-            .unwrap_or_default();
+    /// Sleep up to `delay`, ending early on an operator retry. Returns false on
+    /// shutdown.
+    async fn wait(&mut self, delay: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + delay;
+        loop {
+            {
+                let mut state = self.shared.runtime.lock().expect("runtime");
+                if let Some(hardware) = state.boards.get_mut(&self.board.id)
+                    && std::mem::take(&mut hardware.retry_requested)
+                {
+                    return true;
+                }
+            }
+            let step = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(Duration::from_secs(1));
+            if step.is_zero() {
+                return true;
+            }
+            tokio::select! {
+                _ = self.shutdown.changed() => return false,
+                _ = tokio::time::sleep(step) => {}
+            }
+        }
+    }
+    /// Reasons this board must not run a native owner right now.
+    fn hold(&self) -> Option<String> {
+        if self.shared.config.hardware.client_binary.is_none() {
+            return Some("Choose the bundled native ASIC client in Settings".into());
+        }
+        let policy = self.safety.policy(&self.board);
+        let now = crate::unix_now();
         self.shared
             .runtime
             .lock()
@@ -246,377 +256,310 @@ impl BoardSupervisor {
             .entry(self.board.id.clone())
             .or_default()
             .lifecycle
-            .restore_policy(policy, crate::unix_now());
-        policy.hold_reason(crate::unix_now()).is_some()
+            .restore_policy(policy.clone());
+        if policy.health.disabled(now) {
+            return Some(match policy.health.disabled_until_unix {
+                Some(u64::MAX) | None => "Disabled by the operator".into(),
+                Some(until) => format!(
+                    "Kept out of rotation by the operator for {} more seconds",
+                    until.saturating_sub(now)
+                ),
+            });
+        }
+        policy.hold_reason(now)
     }
+    fn note_hold(&self, reason: String) {
+        let policy = self.safety.policy(&self.board);
+        let mut state = self.shared.runtime.lock().expect("runtime");
+        let hardware = state.boards.entry(self.board.id.clone()).or_default();
+        hardware.recovery_reason = Some(reason);
+        hardware.retry_after_unix = policy
+            .restriction
+            .map(|_| policy.retry_after_unix)
+            .or(policy.health.disabled_until_unix.filter(|&u| u != u64::MAX));
+    }
+    fn progress(&self) -> timelord_supervisor::progress::Guard {
+        let index = self
+            .shared
+            .config
+            .hardware
+            .boards
+            .iter()
+            .position(|configured| configured.id == self.board.id)
+            .unwrap_or(0);
+        self.shared.process.progress.begin(
+            Resource::BoardPreparation(
+                BoardSlot::from_index(index).expect("at most three configured boards"),
+            ),
+            0,
+            0,
+            Stage::BoardPreparation,
+        )
+    }
+    /// One native lifetime: lease, locate, journal, launch, supervise, retire.
     async fn attempt(&mut self) -> Result<()> {
-        PreparedAttempt::start(self).await
+        let serial = self
+            .board
+            .serial
+            .clone()
+            .context("ASIC boards need a persistent serial identity")?;
+        // Another process owning this serial is "busy", not a board failure.
+        let lease = self
+            .safety
+            .lease(&serial)
+            .map_err(|_| anyhow::Error::new(BoardAbsent(self.board.name.clone())))?;
+        let Some(initialization) = acquire_initialization(&mut self.shutdown).await else {
+            return Ok(());
+        };
+        let preparing = self.progress();
+        tokio::select! {
+            result = locate(&self.shared, &mut self.board) => result?,
+            _ = self.shutdown.changed() => return Ok(()),
+        }
+        let startup = startup(&self.shared, &self.board).await?;
+        self.safety.begin_owner(&serial, startup.point)?;
+        {
+            let mut state = self.shared.runtime.lock().expect("runtime");
+            state.disturb(
+                crate::unix_now(),
+                crate::hardware::continuous::DISTURBANCE_SECONDS,
+            );
+            let hardware = state.boards.entry(self.board.id.clone()).or_default();
+            hardware.lifecycle.begin_attempt(crate::unix_now());
+            hardware.raw_speeds.clear();
+            hardware.temperature_unix = 0;
+            hardware.temperature_c = None;
+            hardware.recovery_reason = None;
+            hardware.retry_after_unix = None;
+            hardware.cautious = startup.cautious;
+        }
+        let child = match launch(&self.shared, &self.board, &startup).await {
+            Ok(child) => child,
+            Err(error) => {
+                // No child exists, so the journal can close without confirmation.
+                self.safety
+                    .closed(&serial)
+                    .context("Closing journal after native spawn failed")?;
+                self.shared
+                    .runtime
+                    .lock()
+                    .expect("runtime")
+                    .boards
+                    .entry(self.board.id.clone())
+                    .or_default()
+                    .lifecycle
+                    .retired(true, None, crate::unix_now());
+                return Err(error);
+            }
+        };
+        if let Some(metrics) = self.shared.metrics() {
+            metrics.client_started(
+                &crate::observability::board(&self.shared.config, &self.board.id),
+                self.previous_failure,
+            );
+        }
+        let result = supervise_with(
+            self.shared.clone(),
+            self.backend.clone(),
+            self.board.clone(),
+            child,
+            self.shutdown.clone(),
+            initialization,
+            Some(preparing),
+            startup,
+            self.timing,
+        )
+        .await;
+        let checkpoint = checkpoint_retired(&self.shared, &self.board, &self.safety, &serial);
+        if let (Err(error), Err(saved)) = (&result, &checkpoint) {
+            tracing::error!(error=%format!("{error:#}"), saved=%format!("{saved:#}"), "Native retirement could not be checkpointed");
+        }
+        drop(lease);
+        // The recovery path needs the typed native fault even if persistence failed.
+        result.and(checkpoint)
     }
-    async fn recover(
-        &mut self,
-        error: anyhow::Error,
-        started: tokio::time::Instant,
-        started_unix: u64,
-    ) -> Option<Duration> {
+    /// After a running owner dies, a closed-owner inventory tells an unplug
+    /// apart from a failure: an unplugged board did nothing wrong. Unknown
+    /// (discovery failed or ambiguous) still counts, conservatively.
+    async fn unplugged(&mut self) -> bool {
+        if self.board.serial.is_none() {
+            return false;
+        }
+        let Some(_initialization) = acquire_initialization(&mut self.shutdown).await else {
+            return false;
+        };
+        let devices = match tokio::time::timeout(
+            Duration::from_secs(15),
+            crate::inventory::discover(&self.shared.config),
+        )
+        .await
+        {
+            Ok(Ok(devices)) => devices,
+            Ok(Err(error)) => {
+                tracing::info!(board=%self.board.name, error=%format!("{error:#}"), "USB check after the owner stopped failed; counting the stop");
+                return false;
+            }
+            Err(_) => {
+                tracing::info!(board=%self.board.name, "USB check after the owner stopped timed out; counting the stop");
+                return false;
+            }
+        };
+        let observation = crate::inventory::board_observation(&self.board, &devices);
+        let missing = observation == crate::inventory::Observation::Missing;
+        if !missing {
+            tracing::info!(board=%self.board.name, ?observation, "ASIC still attached after its owner stopped");
+        }
+        if missing {
+            self.shared
+                .runtime
+                .lock()
+                .expect("runtime")
+                .boards
+                .entry(self.board.id.clone())
+                .or_default()
+                .lifecycle
+                .inventory(false);
+        }
+        missing
+    }
+    async fn recover(&mut self, error: anyhow::Error) -> Duration {
+        let fault = classify(&error);
+        let stop = if error.is::<BoardAbsent>() {
+            Stop::Absent
+        } else if error.is::<OperatorHold>() {
+            Stop::Held
+        } else if fault == crate::board_lifecycle::Fault::Transport && self.unplugged().await {
+            Stop::Unplugged
+        } else {
+            Stop::Failed
+        };
+        match stop {
+            Stop::Absent => self.forgive(),
+            Stop::Unplugged => {
+                tracing::info!(board=%self.board.name, error=%format!("{error:#}"), "ASIC was unplugged; not counted as a failure");
+                // This stop was the unplug; an earlier failure stays counted.
+                self.forgivable = None;
+            }
+            Stop::Held | Stop::Failed => {}
+        }
+        let absent = stop != Stop::Failed;
         let shared = &self.shared;
         let board = &self.board;
-        let safety = &self.safety;
-        let backend = &self.backend;
+        let reason = if stop == Stop::Unplugged {
+            format!("{} was unplugged", board.name)
+        } else {
+            format!("{error:#}")
+        };
         self.previous_failure = crate::observability::restart_reason(&error);
-        let fault = classify(&error);
         let thermal = fault == crate::board_lifecycle::Fault::Thermal;
-        let stable = established(&self.shared, &self.board, started_unix, started.elapsed());
-        let delay = self.budget.next(stable);
-        let stop = {
+        // Only failures of a board that was found count against its
+        // reliability. Unplugged boards are simply looked for again.
+        let delay = if absent {
+            self.timing.absent
+        } else {
+            match board
+                .serial
+                .as_deref()
+                .map(|serial| self.safety.record_failure(serial, &reason))
+            {
+                Some(Ok((before, after))) => {
+                    self.forgivable = if fault == crate::board_lifecycle::Fault::Transport {
+                        Some((before, after.clone(), tokio::time::Instant::now()))
+                    } else {
+                        None
+                    };
+                    if let Some(metrics) = shared.metrics() {
+                        metrics
+                            .board_failed(&crate::observability::board(&shared.config, &board.id));
+                    }
+                    crate::board_history::record(
+                        shared,
+                        board,
+                        "failure",
+                        Some(&reason),
+                        Some(&after),
+                    );
+                    self.timing.restart_delay(&after)
+                }
+                Some(Err(saved)) => {
+                    tracing::error!(error=%format!("{saved:#}"), "Board failure could not be recorded");
+                    Duration::from_secs(30)
+                }
+                None => Duration::from_secs(30),
+            }
+        };
+        {
             let mut state = shared.runtime.lock().expect("runtime");
             if thermal {
-                native::record_thermal_stop(&mut state, shared, board, error.to_string());
+                native::record_thermal_stop(&mut state, shared, board, reason.clone());
             }
             let hardware = state.boards.entry(board.id.clone()).or_default();
-            // Missing USB/sensor data is recoverable. Explicit overtemperature and
-            // invalid verified proofs remain latched. Old ambiguous guards fail closed.
             hardware
                 .lifecycle
-                .fault(fault, error.to_string(), crate::unix_now());
-            hardware.lifecycle.retry();
+                .fault(fault, reason.clone(), crate::unix_now());
             hardware.raw_speeds.clear();
             hardware.temperature_c = None;
             hardware.temperature_unix = 0;
             hardware.fault(&error);
-            let stop = hardware.lifecycle.status().latched_fault;
-            if !state.boards.iter().any(|(id, b)| {
-                id != &board.id
-                    && b.lifecycle.status().phase == crate::board_lifecycle::Phase::Connected
-            }) {
-                state.phase = "waiting_for_clients".into();
-                state.message = if stop {
-                    format!("{} needs attention: {error}", board.name)
-                } else {
-                    format!("Recovering {}: {error}", board.name)
-                };
-            }
-            if !state.events.iter().any(|e| {
-                e.board_id.as_ref() == Some(&board.id)
-                    && e.kind == "board_fault"
-                    && e.end_unix.is_none()
-            }) {
+            hardware.recovery_reason = Some(reason.clone());
+            hardware.retry_after_unix = Some(crate::unix_now().saturating_add(delay.as_secs()));
+            if !absent
+                && !state.events.iter().any(|e| {
+                    e.board_id.as_ref() == Some(&board.id)
+                        && e.kind == "board_fault"
+                        && e.end_unix.is_none()
+                })
+            {
                 state.event(Some(board.id.clone()), "board_fault");
             }
-            stop
-        };
-        backend.stop_board(&board.id).await;
-        tracing::warn!(board=%board.name, %error, attempt=self.budget.used, retry_seconds=delay.as_secs(), stop, "ASIC client stopped; other boards remain supervised");
+        }
+        self.backend.stop_board(&board.id).await;
+        if absent {
+            tracing::debug!(board=%board.name, error=%reason, "ASIC not attached; looking again shortly");
+        } else {
+            tracing::warn!(board=%board.name, error=%reason, retry_seconds=delay.as_secs(), "ASIC client stopped; other boards remain supervised");
+        }
         if thermal
-            && let (Some(store), Some(serial)) = (&safety, &board.serial)
-            && let Err(saved) = store.quarantine(serial, crate::safety::Reason::Thermal)
+            && let Some(serial) = &board.serial
+            && let Err(saved) = self.safety.restrict(serial, crate::safety::Reason::Thermal)
         {
-            tracing::error!(%saved,"Thermal fault could not be checkpointed");
+            tracing::error!(error=%format!("{saved:#}"), "Thermal fault could not be checkpointed");
         }
-        if stop && safety.is_none() {
-            return None;
+        delay
+    }
+    /// The board was found unplugged soon after a counted transport failure:
+    /// that failure was the unplug, so restore the health from before it.
+    fn forgive(&mut self) {
+        let Some((previous, post_failure, at)) = self.forgivable.take() else {
+            return;
+        };
+        let Some(serial) = self.board.serial.as_deref() else {
+            return;
+        };
+        if at.elapsed() > FORGIVE_WINDOW {
+            return;
         }
-        Some(delay)
+        match self.safety.forgive(serial, &post_failure, previous.clone()) {
+            Ok(true) => {
+                tracing::info!(board=%self.board.name, consecutive_failures=previous.consecutive_failures, "ASIC was unplugged; its last stop is no longer counted as a failure");
+                crate::board_history::record(
+                    &self.shared,
+                    &self.board,
+                    "failure_forgiven",
+                    Some(&format!("{} was unplugged", self.board.name)),
+                    Some(&previous),
+                );
+            }
+            Ok(false) => {
+                // An operator retry/disable/enable (or any other update) acted
+                // after the failure; never overwrite that decision.
+            }
+            Err(saved) => {
+                tracing::error!(error=%format!("{saved:#}"), "Unplugged board's failure could not be forgiven")
+            }
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn missing_sensor_data_is_not_a_thermal_rejection() {
-        for reason in [
-            "temperature_unavailable",
-            "initial_readback attempts=3",
-            "ASIC temperature telemetry stopped",
-            "USB open failed",
-        ] {
-            assert_eq!(
-                classify(&anyhow::anyhow!(
-                    "Native control rejected request 2: {reason}"
-                )),
-                crate::board_lifecycle::Fault::Transport
-            );
-        }
-        for reason in ["temperature_limit", "temperature_guard"] {
-            let error = anyhow::Error::new(crate::hardware::NativeFailure::rejection(2, reason))
-                .context("Board A: failed");
-            assert_eq!(classify(&error), crate::board_lifecycle::Fault::Thermal);
-            assert_eq!(
-                classify(&anyhow::anyhow!("unrelated text mentioning {reason}")),
-                crate::board_lifecycle::Fault::Transport
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn live_automatic_temperature_guard_records_one_thermal_stop() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("tl-live-thermal-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let binary = dir.join("client");
-        std::fs::write(
-            &binary,
-            r#"#!/bin/sh
-if [ "$1" = --control-frequencies ]; then echo '[1430,1450,1460]'; exit 0; fi
-while read command version id frequency voltage; do
-  if [ "$id" = 2 ]; then printf 'TLERR 1 %s temperature_guard temperature=58\n' "$id"; continue; fi
-  printf 'TLACK 1 %s %s %s\n' "$id" "$frequency" "$voltage"
-done
-"#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let board: BoardConfig = toml::from_str("id='thermal-live'\nname='Thermal live'\nserial='fixture'\nclient_port=18110\ndevice_location=1\nprofile='automatic'").unwrap();
-        let mut config = Config::default();
-        config.hardware.boards = vec![board.clone()];
-        config.hardware.client_binary = Some(binary);
-        let shared = Arc::new(Shared {
-            native: Some(Facts::load(&config).await.unwrap()),
-            assignments: config.assignments().unwrap(),
-            config,
-            clients: Default::default(),
-            process: crate::operational::State::fixture(),
-            scope: crate::runtime::RuntimeScope::Production,
-            runtime: Default::default(),
-            started_unix: crate::unix_now(),
-            service_started_unix: crate::unix_now(),
-        });
-        let mut child = Command::new(
-            shared
-                .config
-                .hardware
-                .client_binary
-                .as_ref()
-                .unwrap()
-                .clone(),
-        )
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-        let mut owner = NativeOwner::attach(&board, &mut child).unwrap();
-        let startup = startup(&shared, &board).await.unwrap();
-        let (ready, _ready) = oneshot::channel();
-        let mut log = ClientLog::new(child.stderr.take().unwrap(), ready);
-        owner
-            .initialize(&shared, &board, &mut log, startup)
-            .await
-            .unwrap();
-        let (_stop, mut shutdown) = watch::channel(false);
-        shared
-            .runtime
-            .lock()
-            .unwrap()
-            .boards
-            .entry(board.id.clone())
-            .or_default()
-            .recoveries = 80;
-        owner.tuning.as_mut().unwrap().policy.applied(
-            Point {
-                frequency_mhz: 1470.,
-                voltage_v: 1.,
-            },
-            crate::unix_now().saturating_sub(10),
-            "settled fixture point".into(),
-        );
-        let error = owner
-            .tick(&shared, &board, &mut log, &mut shutdown)
-            .await
-            .unwrap_err();
-        assert_eq!(classify(&error), crate::board_lifecycle::Fault::Thermal);
-        assert_eq!(
-            shared
-                .runtime
-                .lock()
-                .unwrap()
-                .events
-                .iter()
-                .filter(|event| {
-                    event.board_id.as_deref() == Some(board.id.as_str())
-                        && event.kind == "thermal_stop"
-                })
-                .count(),
-            0,
-            "the log reader saw no over-limit telemetry"
-        );
-        let (backend, _offers) = crate::asic::AsicBackend::new(
-            &shared.config,
-            &shared.assignments,
-            shared.runtime.clone(),
-            shared.process.clone(),
-        )
-        .unwrap();
-        let mut supervisor = BoardSupervisor {
-            shared: shared.clone(),
-            backend: Arc::new(backend),
-            board: board.clone(),
-            ready: None,
-            shutdown: watch::channel(false).1,
-            budget: RestartBackoff::default(),
-            safety: None,
-            previous_failure: crate::observability::RestartReason::Topology,
-        };
-        supervisor
-            .recover(error, tokio::time::Instant::now(), crate::unix_now())
-            .await;
-        {
-            let state = shared.runtime.lock().unwrap();
-            let status = state.boards[&board.id].lifecycle.status();
-            assert_eq!(status.fault, Some(crate::board_lifecycle::Fault::Thermal));
-            assert_eq!(status.phase, crate::board_lifecycle::Phase::ThermalStop);
-            assert_eq!(
-                state
-                    .events
-                    .iter()
-                    .filter(|event| {
-                        event.board_id.as_deref() == Some(board.id.as_str())
-                            && event.kind == "thermal_stop"
-                    })
-                    .count(),
-                1
-            );
-        }
-        crate::hardware::native::terminate(&mut child).await;
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn transferred_qualified_unassigned_board_keeps_ticket_without_opening_or_retesting() {
-        let dir = std::env::temp_dir().join(format!("tl-admitted-transfer-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let serial = format!("wait-{:x}", std::process::id());
-        let board: BoardConfig = toml::from_str(&format!("id='waiting'\nname='Waiting'\nserial='{serial}'\nclient_port=18110\ndevice_location=1\nprofile='manual'\nfrequency_mhz=1450.0\nvoltage_v=1.0")).unwrap();
-        let mut config = Config::default();
-        config.hardware.boards = vec![board.clone()];
-        // Readable fingerprint only: neither native launch nor D2XX discovery is
-        // possible in this fixture. Reuse must stay entirely on the closed path.
-        let client = dir.join("must-not-launch");
-        std::fs::write(&client, "fixture client identity").unwrap();
-        config.hardware.client_binary = Some(client);
-        let store = Arc::new(crate::safety::Store::open(&dir.join("config.toml")).unwrap());
-        let mut runtime = {
-            let mut state = crate::runtime::RuntimeState::new(false);
-            state.safety = Some(store.clone());
-            state
-        };
-        let hardware = runtime.boards.entry(board.id.clone()).or_default();
-        hardware.lifecycle.bind(Some(&serial));
-        hardware.lifecycle.admitted(0);
-        let seed = Shared {
-            native: if config
-                .hardware
-                .boards
-                .iter()
-                .any(|b| b.profile == ProfileMode::Automatic)
-            {
-                Some(Facts::load(&config).await.unwrap())
-            } else {
-                None
-            },
-            config: config.clone(),
-            assignments: vec![],
-            process: crate::operational::State::fixture(),
-            scope: crate::runtime::RuntimeScope::Production,
-            runtime: Arc::new(std::sync::Mutex::new(runtime)),
-            clients: Default::default(),
-            started_unix: 1,
-            service_started_unix: 1,
-        };
-        let q = admission::qualification(&seed, &board, 3).unwrap();
-        store.qualify(&serial, q.clone()).unwrap();
-        let mut transferred = seed.runtime.lock().unwrap().boards.clone();
-        for _ in 0..2 {
-            let mut runtime = {
-                let mut state = crate::runtime::RuntimeState::new(false);
-                state.safety = Some(store.clone());
-                state
-            };
-            runtime.boards = transferred;
-            restore_lifecycles(&config, &mut runtime.boards, Some(&store));
-            let runtime = Arc::new(std::sync::Mutex::new(runtime));
-            let shared = Arc::new(Shared {
-                native: if config
-                    .hardware
-                    .boards
-                    .iter()
-                    .any(|b| b.profile == ProfileMode::Automatic)
-                {
-                    Some(Facts::load(&config).await.unwrap())
-                } else {
-                    None
-                },
-                config: config.clone(),
-                assignments: vec![],
-                process: crate::operational::State::fixture(),
-                scope: crate::runtime::RuntimeScope::Production,
-                runtime: runtime.clone(),
-                clients: Default::default(),
-                started_unix: 1,
-                service_started_unix: 1,
-            });
-            let (backend, _) = crate::asic::AsicBackend::new(
-                &config,
-                &[],
-                runtime.clone(),
-                crate::operational::State::fixture(),
-            )
-            .unwrap();
-            let (stop, rx) = watch::channel(false);
-            let task = tokio::spawn(run(shared.clone(), Arc::new(backend), rx));
-            tokio::time::timeout(Duration::from_secs(3), async {
-                while store.lease(&serial).is_ok() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-            {
-                let mut state = runtime.lock().unwrap();
-                let lifecycle = &mut state.boards.get_mut(&board.id).unwrap().lifecycle;
-                assert_eq!(lifecycle.admitted_inventory_epoch(), Some(0));
-                assert_eq!(lifecycle.status().generation, 0);
-                lifecycle.observe_inventory(0, crate::board_lifecycle::Inventory::Missing);
-                assert!(!lifecycle.capacity(1, true).usable);
-                lifecycle.observe_inventory(0, crate::board_lifecycle::Inventory::Present);
-                assert!(lifecycle.capacity(1, true).usable);
-            }
-            let record = store.board(&serial).unwrap();
-            assert_eq!(record.owner_epoch, 0);
-            assert!(!record.owner_active);
-            assert_eq!(record.qualification, Some(q.clone()));
-            assert!(record.quarantine.is_none());
-            stop.send(true).unwrap();
-            tokio::time::timeout(Duration::from_secs(3), task)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-            assert!(store.lease(&serial).is_ok());
-            transferred = runtime.lock().unwrap().boards.clone();
-        }
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-    #[tokio::test]
-    async fn admission_reacquire_cancels_without_waiting_for_another_native_owner() {
-        let _held = INITIALIZATION.lock().await;
-        let (stop, mut shutdown) = watch::channel(false);
-        let wait = acquire_initialization(&mut shutdown);
-        tokio::pin!(wait);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut wait)
-                .await
-                .is_err()
-        );
-        stop.send(true).unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), wait)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        let mut already_stopped = stop.subscribe();
-        assert!(acquire_initialization(&mut already_stopped).await.is_none());
-    }
-}
+mod tests;

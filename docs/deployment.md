@@ -1,5 +1,18 @@
 # Unattended macOS deployment
 
+Opening an already configured app starts a user-session supervisor if none is
+available and `service.start_automatically` is enabled (the default). Run also
+starts it when needed, without administrator approval. This startup does not send
+Resume: saved Run/Pause intent remains authoritative. An explicit Pause survives
+app relaunch and reboot. With the app open, an unavailable session supervisor is
+retried at most once every 30 seconds. Quitting the interface leaves the supervisor
+and requested proof work running. The full-node RPC sync display is independent
+of supervisor availability and proof readiness.
+
+Session supervision starts when the app opens. Use the system registration below
+for boot operation without a GUI login or app launch; session startup reconnects
+to an existing registered supervisor rather than creating another owner.
+
 Install the signed app at `/Applications/Timelord.app`. Configure the node identity
 and native client using the interface, then choose **Enable background service…**
 in Settings. This is an explicit macOS administrator approval, not an automatic
@@ -43,9 +56,21 @@ sudo -u operator /Applications/Timelord.app/Contents/Helpers/timelord-supervisor
 ```
 
 Replace `status` with `pause`, `resume`, or `reload` as appropriate. Mutating
-commands support `--expected-revision` for concurrent administration. Pause is
-persisted before acknowledgment and stops the worker family. Reload preserves
-Run/Pause. A corrupt intent file keeps production stopped with `state_error` until
+commands support `--expected-revision` for concurrent administration. They return
+promptly and never wait for a worker to exit: the supervisor acknowledges once
+the intent change is durable and retirement of the old worker family has
+*started*, and the returned status may show `"phase":"stopping"` while the worker
+drains (up to about 15 seconds before a group-wide kill). Pause is persisted
+before acknowledgment; poll `status` until `phase` is `paused` and `worker_pid`
+is null to confirm the family has retired. Reload first validates the requested
+file (a rejected file keeps the running worker and returns an error), then starts
+retirement and returns; the replacement is running once `phase` is
+`worker_started` with a higher `worker_generation`. A Pause sent while stopping
+takes effect immediately and no replacement starts; repeated reloads while
+stopping coalesce into one replacement; a new worker never starts until the old
+process group has been reaped. Reload preserves Run/Pause. If cleanup fails, the
+status stays `stopping` with a `Worker cleanup failed` error while the supervisor
+keeps ownership and retries. A corrupt intent file keeps production stopped with `state_error` until
 an explicit administrator command repairs it; it is never treated as a fresh Run.
 The private supervisor directory beside config holds its socket, locks and intent.
 Do not delete lock files while processes may still be alive.
@@ -137,7 +162,7 @@ Validate the signed replacement and all bundled helpers first. Stage the app on
 the same volume before replacing the installed bundle, and keep the previous signed
 bundle for rollback. Use the installer's `remove` operation to unregister the old LaunchDaemon without
 changing Run/Pause intent, and confirm the old supervisor/worker family has retired
-before replacing files. Replace the app atomically, then use `install` to register
+(a `pause` acknowledgment alone does not confirm this) before replacing files. Replace the app atomically, then use `install` to register
 the new signed bundle with the same config/account and preserved intent. Do not use
 Pause as a temporary upgrade flag or assume reload holds the worker stopped.
 Confirm supervisor health, current readiness, native identities and new verified

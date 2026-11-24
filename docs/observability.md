@@ -27,7 +27,7 @@ health as failed on the local status endpoint while proof work continues.
 
 | Endpoint | Response |
 | --- | --- |
-| `/metrics` | Prometheus text format, available through node/board outages and topology replacement |
+| `/metrics` | Prometheus text format, available through node/board outages and node-profile switches |
 | `/healthz` | Plain `200 Ok` while essential supervision tasks function; `503` after an unexpected exit or during shutdown |
 | `/readyz` | JSON `{"ready":true,"reason":"ready"}` with 200; otherwise 503 and a fixed reason |
 
@@ -42,14 +42,16 @@ have socket capacity, and have temperature telemetry no older than 30 seconds.
 Unmanaged clients must verify work in their current connection generation.
 ICC is required only while the adapter has ICC work pending. An idle ICC engine
 and paused automatic tuning do not independently fail readiness. A node outage or
-recoverable board failure affects readiness, not liveness. Topology replacement
-is live but temporarily unready. Reasons are `setup_required`,
+recoverable board failure affects readiness, not liveness. A route change keeps
+the service live and ready while one board can serve each required chain. Reasons are `setup_required`,
 `waiting_for_node`, `waiting_for_chain_state`, `waiting_for_clients`,
-`reconfiguring`, `service_unavailable`, and `ready`.
+`stopping`, `service_unavailable`, and `ready`.
 
 ## Metric contract
 
-All application series carry `network` (`mainnet` or `testnet11`). Prometheus
+All application series carry `network` (`mainnet`, `testnet11` or a custom
+network name). It follows a live node-profile switch: counters continue under the
+new label, so compare rates per network rather than raw totals. Prometheus
 supplies region, instance, job and deployment labels. Board labels use configured
 serials, falling back to configured IDs. Physical engine numbers are `0`, `1`,
 `2`; recovery events without an engine use `unknown`. Socket slots are not
@@ -74,7 +76,11 @@ All names below have the prefix `chia_timelord_`:
 | `version`, `build_info` | gauge; `version`, plus `revision` on build info | Actual service package version / build revision, value 1 |
 | `process_start_time_seconds` | gauge | Start of this service process |
 | `healthy`, `ready` | gauge | Probe state, 0 or 1 |
-| `topology_changes_total` | counter | Applied topology replacement attempts |
+| `topology_changes_total` | counter | Applied chain-route changes |
+| `chain_moves_total` | counter | Chains moved between boards by route changes |
+| `board_failures_total{board}` | counter | Native owner failures counted against board reliability (absence is not counted) |
+| `safety_journal_resets_total{reason}` | counter; `reason` (`missing` or `unreadable`) | Processes that found a previously written but now absent or unreadable board safety journal and started from cautious defaults; at most 1 per process and exported only by the process that reported the reset, so use the raw value, not `increase()`; first-start journal creation is not counted |
+| `delayed_bundles_total{chain}` | counter | Verified chain proofs that waited over 10 seconds for their bundle partner |
 | `estimated_ips` | gauge | Latest validated completion from any chain in this node session |
 | `chain_estimated_ips` | gauge; `chain` | Latest validated completion for each chain in this session |
 | `proofs_verified_total`, `proof_verification_failures_total` | counter; `chain` | Native verifier outcomes for scheduled work; failures include priming checks |
@@ -91,6 +97,7 @@ All names below have the prefix `chia_timelord_`:
 | `node_connected`, `node_reconnects_total` | gauge / counter | Authenticated link and reconnections after the first authenticated connection |
 | `last_node_message_timestamp_seconds`, `last_peak_received_timestamp_seconds` | gauge | Last observed node frame / decoded peak |
 | `peak_updates_total` | counter; `result` | Scheduler accepted, ignored or rejected peak updates |
+| `unfinished_candidates_total` | counter; `outcome,source` | Unfinished-block admission outcomes from node frames or peak retries |
 | `scheduler_peak_height`, `deficit` | gauge | Accepted peak values, absent before a peak or after session replacement |
 | `work_pending` | gauge; `chain` | Adapter has an unfinished scheduled request, 0 or 1 |
 | `work_cancelled_total` | counter; `chain` | Adapter requests dropped without completion |
@@ -103,8 +110,36 @@ All names below have the prefix `chia_timelord_`:
 | `proof_duration_seconds` | histogram; `chain,stage` | Observed proof pipeline boundaries below |
 | `submission_duration_seconds` | histogram; `kind` | Successful bundle write duration |
 
+Alert on the raw `safety_journal_resets_total` value being greater than zero for
+either `reason="unreadable"` or `reason="missing"`; both are unexpected after a host
+has already written a journal. The value is at most 1 per process and is exported
+only by a process that reported a reset, so use the raw value, not `increase()`.
+The alert fires on the first scrape of a process that reported a previously
+written journal as missing or unreadable. A restart before any board-state save
+re-reports the reset, so the series is still exposed and the alert keeps firing;
+that is intended. `keep_firing_for: 5m` ignores short scrape failures so the
+alert does not flap. The series clears only once a start has saved board state and
+a later restart does not re-report, and the series has then been absent for that
+hold time (or the worker is stopped, paused, or crashed). `TimelordScrapeFailed`
+may then cover an outage. If the worker dies after the first board-state save but
+before the first scrape, the next start loads a valid journal and does not
+re-report, so the signal can be lost.
+`missing` means a journal whose
+write had been attempted on this host was absent; the write-lock sidecar remains
+after an attempted write, including a failed first persist. A first start (no
+journal and no write-lock sidecar) creates the journal and does not increment the
+metric. After a previously written journal is missing, the journal stays absent
+and every start reports `missing` until a real board-state save writes it.
+`unreadable` is a parse or validation failure that is archived; the journal is
+left absent, so later starts report `missing`. The `board-safety-corrupt-*`
+archive preserves the original reason. This signal
+catches accidental loss, not a same-UID adversary, who can remove the write-lock
+sidecar as well as the journal.
+
 Chains are `challenge`, `reward`, `infused_challenge`. Bundle kinds are `signage`,
-`infusion`, `end_of_sub_slot`. All reason/state labels use fixed enumerations;
+`infusion`, `end_of_sub_slot`. Unfinished candidate outcomes are `admitted`,
+`deferred`, `deferred_queue_full`, `duplicate`, `stale`, `ignored` and `rejected`;
+sources are `node` and `retry`. All reason/state labels use fixed enumerations;
 error text, paths, hashes, request IDs and heights are never labels.
 
 The legacy `estimated_ips` uses existing receipt-time elapsed work and truncation

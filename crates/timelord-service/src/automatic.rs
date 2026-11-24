@@ -5,7 +5,7 @@ use timelord_core::AutomaticConfig;
 
 mod profiles;
 pub use profiles::{
-    Learned, fingerprint, host, initial, initial_point, learned, save, socket_path,
+    Learned, fingerprint, host, inherited, initial_point, learned, save, socket_path,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -49,6 +49,9 @@ pub struct Input {
     pub temperature: Option<f64>,
     pub temperature_limit: f64,
     pub paused: bool,
+    /// Another board is starting, retiring or being rerouted. Hold the
+    /// current setting: shared-bus disturbances are not evidence about it.
+    pub disturbed: bool,
 }
 // A severe burst is independent of proof throughput: a storm can starve proofs.
 // Keep only the last 20 events, and allow five seconds after a clock write for
@@ -281,7 +284,7 @@ impl Policy {
             },
         ))
     }
-    /// Admission yields an experiment without changing its current hardware point.
+    /// Interrupt an experiment without changing its current hardware point.
     /// A fresh full observation is required before retaining learned evidence.
     pub fn interrupt_trial(&mut self, now: u64) {
         let Some(trial) = self.trial.take() else {
@@ -332,6 +335,17 @@ impl Policy {
             self.recovery_burst.reset(now);
             self.status.state = "paused".into();
             self.status.message = "Current settings held; proof production continues".into();
+            self.was_paused = true;
+            if !self.is_retest() {
+                self.trial = None;
+            }
+            return None;
+        }
+        if input.disturbed {
+            self.recovery_burst.reset(now);
+            self.status.state = "holding".into();
+            self.status.message =
+                "Holding settings while boards start, stop or change routes".into();
             self.was_paused = true;
             if !self.is_retest() {
                 self.trial = None;

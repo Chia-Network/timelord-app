@@ -144,7 +144,7 @@ async fn control_accept_errors_back_off_and_keep_listener_and_worker() {
     assert!(!acceptor.is_finished());
     acceptor.abort();
     let _ = acceptor.await;
-    state.retire(&snapshots).await.unwrap();
+    state.retire_now(&snapshots).await.unwrap();
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -212,7 +212,7 @@ async fn interrupted_wait_retains_worker_identity_and_graceful_cleanup() {
         .lock()
         .unwrap()
         .push_back(libc::EINTR);
-    state.retire(&snapshots).await.unwrap();
+    state.retire_now(&snapshots).await.unwrap();
     assert_eq!(state.snapshot().worker_pid, None);
     fs::remove_dir_all(dir).unwrap();
 }
@@ -238,13 +238,15 @@ async fn failed_pause_retains_owner_and_power_until_confirmed_cleanup() {
             command,
             expected_revision: None,
         };
-        assert!(
-            state
-                .control(&paths, &helper, request(Control::Pause), &snapshots)
-                .await
-                .is_err()
-        );
+        // Pause is acknowledged once durable; retirement continues in the
+        // background and its failure surfaces through status.
+        state
+            .control(&paths, &helper, request(Control::Pause), &snapshots)
+            .await
+            .unwrap();
         assert_eq!(paths.load_intent().unwrap().mode, Mode::Paused);
+        assert!(matches!(state.lifecycle, Lifecycle::Stopping(_)));
+        state.poll_retirement(&snapshots, true).await;
         assert!(state.needs_power());
         assert_eq!(state.snapshot().phase, SupervisorPhase::Stopping);
         assert_eq!(state.snapshot().worker_pid, Some(pid as u32));
@@ -263,19 +265,20 @@ async fn failed_pause_retains_owner_and_power_until_confirmed_cleanup() {
         assert_eq!(state.snapshot().worker_pid, Some(pid as u32));
         assert_eq!(state.generation, 0);
         if resume {
-            assert!(
-                state
-                    .control(&paths, &helper, request(Control::Resume), &snapshots)
-                    .await
-                    .is_err()
-            );
+            state
+                .control(&paths, &helper, request(Control::Resume), &snapshots)
+                .await
+                .unwrap();
+            state.poll_retirement(&snapshots, true).await;
             assert_eq!(state.intent.mode, Mode::Running);
             assert_eq!(state.snapshot().worker_pid, Some(pid as u32));
             assert!(matches!(state.lifecycle, Lifecycle::CleanupFailed { .. }));
+            assert_eq!(state.generation, 0);
             state
                 .control(&paths, &helper, request(Control::Pause), &snapshots)
                 .await
                 .unwrap();
+            state.poll_retirement(&snapshots, true).await;
         } else {
             let Lifecycle::CleanupFailed { next, .. } = &mut state.lifecycle else {
                 panic!("cleanup ownership lost")
@@ -290,6 +293,8 @@ async fn failed_pause_retains_owner_and_power_until_confirmed_cleanup() {
                 )
                 .await
                 .unwrap();
+            assert!(matches!(state.lifecycle, Lifecycle::Stopping(_)));
+            state.poll_retirement(&snapshots, true).await;
         }
         assert!(matches!(state.lifecycle, Lifecycle::Paused));
         assert!(!state.needs_power());
@@ -371,8 +376,8 @@ fn initial_status_projects_durable_pause_and_invalid_state() {
     assert!(invalid.snapshot().error.is_some());
     assert!(!invalid.needs_power());
 }
-#[test]
-fn power_follows_requested_run_through_recovery_and_actual_pause_cleanup() {
+#[tokio::test]
+async fn power_follows_requested_run_through_recovery_and_actual_pause_cleanup() {
     let mut state = SupervisorState::new(
         Ok(Intent::default()),
         timelord_supervisor::logging::Writer::stderr(),
@@ -385,7 +390,15 @@ fn power_follows_requested_run_through_recovery_and_actual_pause_cleanup() {
     assert!(state.needs_power());
     assert_eq!(state.snapshot().phase, SupervisorPhase::Recovering);
     state.intent.mode = Mode::Paused;
-    state.lifecycle = Lifecycle::Stopping { pid: 123 };
+    let task = tokio::spawn(std::future::pending());
+    task.abort();
+    state.lifecycle = Lifecycle::Stopping(Box::new(Retiring {
+        pid: 123,
+        uptime: Duration::ZERO,
+        cause: Cause::Requested,
+        restart: false,
+        task,
+    }));
     assert!(state.needs_power());
     assert_eq!(state.snapshot().worker_pid, Some(123));
     assert_eq!(state.snapshot().phase, SupervisorPhase::Stopping);
@@ -404,4 +417,238 @@ fn stable_worker_resets_crash_streak_but_short_crashes_keep_backoff() {
     }
     assert_eq!(retry_delay(&mut failures, Some(Duration::from_secs(60))), 1);
     assert_eq!(retry_delay(&mut failures, None), 5);
+}
+
+/// A worker that takes `exit_delay` seconds to honour SIGTERM. Each started
+/// family records `alive.<pid>` until it exits, and flags `overlap` if it
+/// starts while an earlier family is still alive. Validation passes unless
+/// `<helper>.reject` exists.
+fn slow_exit_helper(dir: &Path, exit_delay: &str) -> PathBuf {
+    let helper = dir.join("worker");
+    let d = dir.display();
+    fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = validate ]; then [ ! -e \"$0.reject\" ]; exit $?; fi\n\
+             for f in '{d}'/alive.*; do [ -e \"$f\" ] && touch '{d}/overlap'; done\n\
+             touch '{d}/alive.'$$\n\
+             trap \"sleep {exit_delay}; rm -f '{d}/alive.'$$; exit 0\" TERM\n\
+             while :; do sleep 0.05; done\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    helper
+}
+fn alive_families(dir: &Path) -> usize {
+    fs::read_dir(dir)
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .is_ok_and(|e| e.file_name().to_string_lossy().starts_with("alive."))
+        })
+        .count()
+}
+fn reaped(pid: i32) -> bool {
+    let mut status = 0;
+    let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+}
+async fn running_state(dir: &Path, helper: &Path) -> (SupervisorState, i32) {
+    let log = timelord_supervisor::logging::Writer::stderr();
+    let mut state = SupervisorState::new(Ok(Intent::default()), log);
+    let (snapshots, _) = watch::channel(state.published());
+    state
+        .tick(
+            helper,
+            &dir.join("config.toml"),
+            &dir.join("progress.sock"),
+            &snapshots,
+        )
+        .await
+        .unwrap();
+    let pid = state.snapshot().worker_pid.expect("worker started") as i32;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while alive_families(dir) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fixture worker did not start");
+    (state, pid)
+}
+fn command(command: Control) -> Request {
+    Request {
+        command,
+        expected_revision: None,
+    }
+}
+
+#[tokio::test]
+async fn reload_returns_while_slow_worker_retires_and_pause_during_stopping_ends_paused() {
+    let dir = std::env::temp_dir().join(format!("tl-reload-pause-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let helper = slow_exit_helper(&dir, "2");
+    let paths = Paths::for_config(&dir.join("config.toml")).unwrap();
+    let progress = dir.join("progress.sock");
+    let (mut state, pid) = running_state(&dir, &helper).await;
+    let (snapshots, _) = watch::channel(state.published());
+
+    let started = Instant::now();
+    state
+        .control(&paths, &helper, command(Control::Reload), &snapshots)
+        .await
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "Reload waited for worker retirement: {:?}",
+        started.elapsed()
+    );
+    let stopping = state.snapshot();
+    assert_eq!(stopping.phase, SupervisorPhase::Stopping);
+    assert_eq!(stopping.worker_pid, Some(pid as u32));
+    assert!(stopping.progress.is_none());
+
+    // Pause during retirement is durable at once and acknowledged promptly.
+    let started = Instant::now();
+    state
+        .control(&paths, &helper, command(Control::Pause), &snapshots)
+        .await
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert_eq!(paths.load_intent().unwrap().mode, Mode::Paused);
+    assert_eq!(state.snapshot().mode, Mode::Paused);
+    assert_eq!(state.snapshot().phase, SupervisorPhase::Stopping);
+    // A further Reload coalesces into the retirement in flight.
+    state
+        .control(&paths, &helper, command(Control::Reload), &snapshots)
+        .await
+        .unwrap();
+    assert_eq!(state.snapshot().worker_pid, Some(pid as u32));
+
+    // The loop keeps ticking; nothing starts while the old family is alive.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while matches!(state.lifecycle, Lifecycle::Stopping(_)) {
+            assert_eq!(state.generation, 1);
+            state
+                .tick(&helper, &paths.config, &progress, &snapshots)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("retirement did not complete");
+    for _ in 0..5 {
+        state
+            .tick(&helper, &paths.config, &progress, &snapshots)
+            .await
+            .unwrap();
+    }
+    assert!(matches!(state.lifecycle, Lifecycle::Paused));
+    assert_eq!(state.snapshot().phase, SupervisorPhase::Paused);
+    assert_eq!(state.snapshot().worker_pid, None);
+    assert_eq!(
+        state.generation, 1,
+        "Pause during stopping started a worker"
+    );
+    assert!(!state.needs_power());
+    assert!(reaped(pid));
+    assert_eq!(alive_families(&dir), 0);
+    assert!(!dir.join("overlap").exists());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn resume_and_reload_during_stopping_start_exactly_one_replacement_after_reap() {
+    let dir = std::env::temp_dir().join(format!("tl-reload-resume-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let helper = slow_exit_helper(&dir, "1");
+    let paths = Paths::for_config(&dir.join("config.toml")).unwrap();
+    let progress = dir.join("progress.sock");
+    let (mut state, pid) = running_state(&dir, &helper).await;
+    let (snapshots, _) = watch::channel(state.published());
+
+    state
+        .control(&paths, &helper, command(Control::Pause), &snapshots)
+        .await
+        .unwrap();
+    state
+        .control(&paths, &helper, command(Control::Resume), &snapshots)
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        state
+            .control(&paths, &helper, command(Control::Reload), &snapshots)
+            .await
+            .unwrap();
+    }
+    assert_eq!(state.intent.mode, Mode::Running);
+    assert_eq!(state.snapshot().phase, SupervisorPhase::Stopping);
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while state.generation == 1 {
+            assert_eq!(state.snapshot().worker_pid, Some(pid as u32));
+            state
+                .tick(&helper, &paths.config, &progress, &snapshots)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("replacement did not start");
+    // The old family was reaped before its replacement was spawned.
+    assert!(reaped(pid));
+    let replacement = state.snapshot();
+    assert_eq!(replacement.phase, SupervisorPhase::WorkerStarted);
+    assert_ne!(replacement.worker_pid, Some(pid as u32));
+    for _ in 0..5 {
+        state
+            .tick(&helper, &paths.config, &progress, &snapshots)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        state.generation, 2,
+        "coalesced reloads started extra workers"
+    );
+    assert_eq!(state.restarts, 0);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while alive_families(&dir) != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!dir.join("overlap").exists());
+    state.retire_now(&snapshots).await.unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn rejected_reload_retains_the_running_worker() {
+    let dir = std::env::temp_dir().join(format!("tl-reload-reject-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let helper = slow_exit_helper(&dir, "0");
+    let paths = Paths::for_config(&dir.join("config.toml")).unwrap();
+    let (mut state, pid) = running_state(&dir, &helper).await;
+    let (snapshots, _) = watch::channel(state.published());
+    fs::write(helper.with_extension("reject"), b"fixture").unwrap();
+    let error = state
+        .control(&paths, &helper, command(Control::Reload), &snapshots)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("validation failed"));
+    assert!(matches!(state.lifecycle, Lifecycle::Running(_)));
+    assert_eq!(state.snapshot().worker_pid, Some(pid as u32));
+    assert_eq!(state.generation, 1);
+    assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+    state.retire_now(&snapshots).await.unwrap();
+    assert!(reaped(pid));
+    fs::remove_dir_all(dir).unwrap();
 }

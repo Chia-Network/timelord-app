@@ -2,18 +2,15 @@
 use crate::{
     Shared,
     asic::{AsicBackend, ProofTiming},
-    observability::{PeakResult, ProofStage, SubmissionKind},
+    observability::{PeakResult, ProofStage, SubmissionKind, UnfinishedOutcome, UnfinishedSource},
 };
 use anyhow::{Context, Result, bail};
-use dg_xch_core::{
-    consensus::chain_definition::ChainSelection,
-    protocols::{ChiaMessage, NodeType, ProtocolMessageTypes, shared::Handshake},
-};
+use dg_xch_core::protocols::{ChiaMessage, NodeType, ProtocolMessageTypes, shared::Handshake};
 use dg_xch_serialize::{ChiaProtocolVersion, ChiaSerialize};
 use dg_xch_servers::transport::{
     SERVICE_MESSAGE_LIMIT, TlsIdentity, decode_exact, encode, handshake,
 };
-use dg_xch_timelord::scheduler::{Output, Scheduler, WorkPlan, WorkResult};
+use dg_xch_timelord::scheduler::{Admission, Output, Scheduler, WorkPlan, WorkResult};
 use futures_util::{SinkExt, StreamExt};
 use std::{
     sync::Arc,
@@ -32,13 +29,6 @@ mod state;
 pub(crate) use state::RuntimeScope;
 pub use state::{Event, HardwareState, Observation, RawSpeed, RawState, RuntimeState};
 
-pub fn chain(config: &Config) -> Result<ChainSelection> {
-    let name = match config.node.network {
-        timelord_core::Network::Mainnet => "mainnet",
-        timelord_core::Network::Testnet11 => "testnet11",
-    };
-    ChainSelection::from_config(name, None).map_err(anyhow::Error::msg)
-}
 pub async fn connect(config: &Config) -> Result<Socket> {
     crate::connection::validate_identity(&config.node)?;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -60,9 +50,7 @@ pub async fn connect(config: &Config) -> Result<Socket> {
             .context("Choose the node CA certificate")?,
     };
     let tls = identity.client().context("Loading node credentials")?;
-    let network = chain(config)?
-        .handshake_network_id()
-        .map_err(anyhow::Error::msg)?;
+    let network = crate::network::handshake_id(&config.node).to_owned();
     let server_name = config
         .node
         .server_name
@@ -94,7 +82,7 @@ pub async fn connect(config: &Config) -> Result<Socket> {
         &mut socket,
         encode(
             ProtocolMessageTypes::Handshake,
-            &handshake(&network, NodeType::Timelord, 0),
+            &timelord_handshake(&network),
             None,
         )?,
     )
@@ -111,6 +99,17 @@ pub async fn connect(config: &Config) -> Result<Socket> {
     validate_handshake(message.msg_type, &greeting, &network)?;
     Ok(socket)
 }
+fn timelord_handshake(network: &str) -> Handshake {
+    let mut greeting = handshake(network, NodeType::Timelord, 0);
+    if !greeting
+        .capabilities
+        .iter()
+        .any(|capability| capability.0 == 6)
+    {
+        greeting.capabilities.push((6, "1".to_owned()));
+    }
+    greeting
+}
 pub fn validate_handshake(
     kind: ProtocolMessageTypes,
     greeting: &Handshake,
@@ -124,27 +123,109 @@ pub fn validate_handshake(
     }
     Ok(())
 }
-// Current Chia appends an optional header MMR root to the legacy unfinished
-// block envelope. The pinned scheduler supports pre-MMR consensus only. Accept
-// the absent root, require exact framing, and fail closed on an active MMR root.
+// Current envelopes carry the MMR root. Retain exact legacy framing only when
+// appending the absent-root byte produces a complete, valid message.
 fn decode_unfinished(
     bytes: &[u8],
 ) -> Result<dg_xch_core::protocols::timelord::NewUnfinishedBlockTimelord> {
-    use dg_xch_core::protocols::timelord::NewUnfinishedBlockTimelord;
     if bytes.len() > SERVICE_MESSAGE_LIMIT {
         bail!("Unfinished block exceeds message limit");
     }
-    let mut cursor = std::io::Cursor::new(bytes);
-    let value =
-        NewUnfinishedBlockTimelord::from_bytes(&mut cursor, ChiaProtocolVersion::default())?;
-    match &bytes[cursor.position() as usize..] {
-        [] | [0] => Ok(value),
-        [1, root @ ..] if root.len() == 32 => {
-            bail!("The pinned scheduler does not support header MMR roots yet")
-        }
-        _ => bail!("Malformed unfinished-block extension"),
+    if let Ok(value) = decode_exact(bytes) {
+        return Ok(value);
+    }
+    let mut legacy = bytes.to_vec();
+    legacy.push(0);
+    let value: dg_xch_core::protocols::timelord::NewUnfinishedBlockTimelord =
+        decode_exact(&legacy).context("Malformed unfinished-block envelope")?;
+    if value.header_mmr_root.is_some() {
+        bail!("Truncated unfinished-block MMR root");
+    }
+    Ok(value)
+}
+
+fn admission_outcome(admission: Admission) -> UnfinishedOutcome {
+    match admission {
+        Admission::Admitted(_) => UnfinishedOutcome::Admitted,
+        Admission::Deferred => UnfinishedOutcome::Deferred,
+        Admission::DeferredQueueFull => UnfinishedOutcome::DeferredQueueFull,
+        Admission::Duplicate => UnfinishedOutcome::Duplicate,
+        Admission::Stale => UnfinishedOutcome::Stale,
+        Admission::Ignored => UnfinishedOutcome::Ignored,
     }
 }
+fn log_admission(admission: Admission, proof_version: Option<u8>, source: &'static str) {
+    match admission {
+        Admission::Admitted(hash) => match proof_version {
+            Some(proof_version) => {
+                tracing::info!(proof_version,%hash,source,"Scheduled validated unfinished block")
+            }
+            None => tracing::info!(%hash,source,"Scheduled validated unfinished block"),
+        },
+        Admission::Deferred => {
+            tracing::debug!(
+                source,
+                "Deferred unfinished block until chain context is known"
+            )
+        }
+        Admission::DeferredQueueFull => {
+            tracing::warn!(source, "Deferred unfinished block queue is full")
+        }
+        Admission::Duplicate => tracing::debug!(source, "Ignored duplicate unfinished block"),
+        Admission::Stale => tracing::debug!(source, "Ignored stale unfinished block"),
+        Admission::Ignored => {
+            tracing::debug!(
+                source,
+                "Ignored unfinished block without matching chain state"
+            )
+        }
+    }
+}
+fn handle_retry_outcome(
+    (hash, outcome): (
+        dg_xch_core::blockchain::sized_bytes::Bytes32,
+        Result<Admission, String>,
+    ),
+    metrics: &crate::observability::Metrics,
+) {
+    match outcome {
+        Ok(admission) => {
+            log_admission(admission, None, "retry");
+            metrics.unfinished_candidate(admission_outcome(admission), UnfinishedSource::Retry);
+        }
+        Err(error) => {
+            metrics.unfinished_candidate(UnfinishedOutcome::Rejected, UnfinishedSource::Retry);
+            tracing::warn!(%hash,%error,"Rejected unfinished block");
+        }
+    }
+}
+// Candidate decoding, commitment hashing and admission share a recoverable boundary.
+// Malformed node frames are deliberately non-fatal: they are logged and dropped
+// without resetting the scheduler or the authenticated node session.
+fn handle_unfinished(
+    scheduler: &mut dg_xch_timelord::scheduler::Scheduler,
+    bytes: &[u8],
+    metrics: &crate::observability::Metrics,
+) -> Result<Admission> {
+    let result = (|| -> Result<_> {
+        let candidate = decode_unfinished(bytes).context("Decoding unfinished block")?;
+        let version = candidate.reward_chain_block.proof_of_space.version;
+        Ok((version, scheduler.admit_unfinished(candidate)?))
+    })();
+    match result {
+        Ok((proof_version, admission)) => {
+            log_admission(admission, Some(proof_version), "node");
+            metrics.unfinished_candidate(admission_outcome(admission), UnfinishedSource::Node);
+            Ok(admission)
+        }
+        Err(error) => {
+            metrics.unfinished_candidate(UnfinishedOutcome::Rejected, UnfinishedSource::Node);
+            tracing::warn!(%error,"Rejected unfinished block");
+            Err(error)
+        }
+    }
+}
+
 async fn send(socket: &mut Socket, message: Message) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(5), socket.send(message))
         .await
@@ -253,15 +334,15 @@ async fn execute(backend: Arc<AsicBackend>, plan: WorkPlan) -> Result<Completed>
     let (cc, rc, icc) = tokio::try_join!(cc, rc, icc)?;
     let mut speeds = vec![(Chain::Challenge, cc.1), (Chain::Reward, rc.1)];
     if let Some((_, speed)) = &icc {
-        speeds.push((Chain::InfusedChallenge, *speed));
+        speeds.push((Chain::InfusedChallenge, speed.clone()));
     }
     let bundle_ready = Instant::now();
     for (chain, timing) in &speeds {
-        backend.observe_duration(
-            *chain,
-            ProofStage::BundleWait,
-            bundle_ready.saturating_duration_since(timing.ready_at),
-        );
+        let waited = bundle_ready.saturating_duration_since(timing.ready_at);
+        backend.observe_duration(*chain, ProofStage::BundleWait, waited);
+        if waited > Duration::from_secs(10) {
+            backend.bundle_delayed(*chain);
+        }
         tracing::info!(
             ?chain,
             generation = plan.generation,
@@ -323,9 +404,7 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
         "connecting",
         "Connecting to your full node…",
     );
-    let resolved = chain(&shared.config)?
-        .resolve()
-        .map_err(anyhow::Error::msg)?;
+    let resolved = crate::network::resolve(&shared.config.node)?;
     let minimum_deficit = resolved.constants.min_blocks_per_challenge_block;
     let bits = resolved.constants.discriminant_size_bits as usize;
     let mut scheduler = Scheduler::new(resolved.constants, resolved.allows_bootstrap, None)?;
@@ -490,7 +569,7 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                         let message: ChiaMessage = decode_exact(&bytes)?;
                         match message.msg_type {
                             ProtocolMessageTypes::NewPeakTimelord => {
-                                let peak: dg_xch_core::protocols::timelord::NewPeakTimelord=decode_exact(message.data.as_slice())?;
+                                let peak: dg_xch_core::protocols::timelord::NewPeakTimelord=decode_exact(message.data.as_slice()).context("Decoding timelord peak")?;
                                 metrics.peak_received();
                                 let result = scheduler.set_peak(peak.clone());
                                 metrics.peak_updated(match &result {
@@ -499,12 +578,18 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                                     Err(_) => PeakResult::Rejected,
                                 });
                                 let accepted = result?;
+                                for outcome in scheduler.take_retry_outcomes() {
+                                    handle_retry_outcome(outcome, &metrics);
+                                }
                                 if accepted {
                                     {
                                         let mut state=shared.runtime.lock().expect("runtime");
                                         state.scheduler_initialized=scheduler.initialized();
                                         state.scheduler_height=Some(peak.reward_chain_block.height);
                                         state.scheduler_deficit=Some(peak.deficit);
+                                        // A peak is the routing boundary for
+                                        // optional rebalancing.
+                                        state.peak_epoch = state.peak_epoch.wrapping_add(1);
                                     }
                                     infusion_submitted_at = None;
                                     let work=infused_from_peak(&peak,scheduler.generation(),bits,minimum_deficit)?;
@@ -512,7 +597,9 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                                 }
                             }
                             ProtocolMessageTypes::NewGenesisTimelord => { if scheduler.set_genesis(decode_exact(message.data.as_slice())?)? { prime_infused(&mut primers,backend.clone(),None); } }
-                            ProtocolMessageTypes::NewUnfinishedBlockTimelord => { if let Err(error) = scheduler.add_unfinished(decode_unfinished(message.data.as_slice()).context("Decoding unfinished block")?) { tracing::warn!(%error, "Rejected unfinished block"); } }
+                            ProtocolMessageTypes::NewUnfinishedBlockTimelord => {
+                                let _ = handle_unfinished(&mut scheduler,message.data.as_slice(),&metrics);
+                            }
                             ProtocolMessageTypes::RequestCompactProofOfTime => {},
                             _ => bail!("Unexpected node protocol message"),
                         }
@@ -550,351 +637,5 @@ pub async fn run(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::unix_now;
-    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
-    use std::{fs, path::PathBuf};
-    use tokio::net::TcpListener;
-    struct Files(PathBuf);
-    #[test]
-    fn busy_node_confirmation_keeps_the_connection_and_withholds_stale_work() {
-        let sent = Instant::now();
-        for seconds in [5, 10, 25, 32, 59] {
-            assert!(
-                waiting_for_infusion_confirmation(
-                    true,
-                    Some(sent),
-                    sent + Duration::from_secs(seconds),
-                )
-                .unwrap(),
-                "Expired scheduler must remain blocked while node validation finishes"
-            );
-        }
-        for seconds in [60, 90] {
-            assert!(
-                waiting_for_infusion_confirmation(
-                    true,
-                    Some(sent),
-                    sent + Duration::from_secs(seconds),
-                )
-                .is_err(),
-                "Repeated node messages must not extend the submission deadline"
-            );
-        }
-        assert!(waiting_for_infusion_confirmation(true, None, sent).is_err());
-        // An accepted peak clears the scheduler's wait and permits fresh work.
-        assert!(!waiting_for_infusion_confirmation(false, None, sent).unwrap());
-        assert!(
-            !waiting_for_infusion_confirmation(false, Some(sent), sent + Duration::from_secs(90))
-                .unwrap()
-        );
-        // A later successful infusion submission gets its own bounded window.
-        let later = sent + Duration::from_secs(100);
-        assert!(
-            waiting_for_infusion_confirmation(true, Some(later), later + Duration::from_secs(5))
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn current_unfinished_envelope_is_exact_and_does_not_silently_ignore_mmr() {
-        let current = include_bytes!("../tests/fixtures/unfinished-block.bin");
-        let decoded = decode_unfinished(current).unwrap();
-        assert_eq!(decoded.difficulty, 2416);
-        assert_eq!(decoded.sub_slot_iters, 587202560);
-        let legacy = &current[..current.len() - 1];
-        assert_eq!(decode_unfinished(legacy).unwrap(), decoded);
-        assert!(decode_unfinished(&legacy[..legacy.len() - 1]).is_err());
-        let mut mmr = legacy.to_vec();
-        mmr.push(1);
-        mmr.extend([42; 32]);
-        assert!(
-            decode_unfinished(&mmr)
-                .unwrap_err()
-                .to_string()
-                .contains("MMR")
-        );
-        for extension in [vec![2], vec![0, 0], vec![1], vec![1; 34]] {
-            let mut malformed = legacy.to_vec();
-            malformed.extend(extension);
-            assert!(decode_unfinished(&malformed).is_err());
-        }
-    }
-    impl Drop for Files {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-    #[test]
-    fn early_infused_request_keeps_the_validated_input_and_generation() {
-        use dg_xch_core::blockchain::{
-            class_group_element::ClassgroupElement,
-            sized_bytes::{Bytes32, Bytes100},
-        };
-        let input = ClassgroupElement {
-            data: Bytes100::const_new([5; 100]),
-        };
-        let work = primer_request(Bytes32::const_new([42; 32]), input, 73, 1024);
-        assert_eq!(work.input, input);
-        assert_eq!(work.generation, 73);
-        assert_eq!(work.iterations, 1);
-        assert_eq!(work.discriminant_bits, 1024);
-    }
-    #[test]
-    fn peer_role_network_and_message_type_are_all_required() {
-        let mut greeting = handshake("mainnet", NodeType::FullNode, 8444);
-        assert!(validate_handshake(ProtocolMessageTypes::Handshake, &greeting, "mainnet").is_ok());
-        assert!(
-            validate_handshake(ProtocolMessageTypes::Handshake, &greeting, "testnet11").is_err()
-        );
-        greeting.node_type = NodeType::Farmer as u8;
-        assert!(validate_handshake(ProtocolMessageTypes::Handshake, &greeting, "mainnet").is_err());
-        assert!(
-            validate_handshake(ProtocolMessageTypes::NewPeakTimelord, &greeting, "mainnet")
-                .is_err()
-        );
-    }
-    async fn fixture(server_name: &str, board_fault: bool) -> Result<()> {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let mut parameters = CertificateParams::new(vec!["fixture-ca".into()])?;
-        parameters.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let ca_key = KeyPair::generate()?;
-        let ca = parameters.self_signed(&ca_key)?;
-        let server_key = KeyPair::generate()?;
-        let server = CertificateParams::new(vec!["chia.net".into()])?.signed_by(
-            &server_key,
-            &ca,
-            &ca_key,
-        )?;
-        let client_key = KeyPair::generate()?;
-        let client = CertificateParams::new(vec!["timelord-fixture".into()])?.signed_by(
-            &client_key,
-            &ca,
-            &ca_key,
-        )?;
-        let directory = std::env::temp_dir().join(format!(
-            "timelord-tls-fixture-{}-{}-{}",
-            std::process::id(),
-            server_name,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos()
-        ));
-        fs::create_dir(&directory)?;
-        let _cleanup = Files(directory.clone());
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-        fs::write(directory.join("client.crt"), client.pem())?;
-        fs::write(directory.join("client.key"), client_key.serialize_pem())?;
-        fs::set_permissions(
-            directory.join("client.key"),
-            fs::Permissions::from_mode(0o600),
-        )?;
-        fs::write(directory.join("ca.crt"), ca.pem())?;
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(ca.der().clone())?;
-        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build()?;
-        let server_tls = rustls::ServerConfig::builder()
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(
-                vec![server.der().clone()],
-                rustls::pki_types::PrivateKeyDer::try_from(server_key.serialize_der())
-                    .map_err(anyhow::Error::msg)?,
-            )?;
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let mut config = Config::default();
-        config.node.host = "127.0.0.1".into();
-        config.node.port = listener.local_addr()?.port();
-        config.node.server_name = Some(server_name.into());
-        config.node.network = timelord_core::Network::Testnet11;
-        config.node.certificate = Some(directory.join("client.crt"));
-        config.node.private_key = Some(directory.join("client.key"));
-        config.node.ca_certificate = Some(directory.join("ca.crt"));
-        let task = tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await?;
-            let tls = tokio_rustls::TlsAcceptor::from(Arc::new(server_tls))
-                .accept(tcp)
-                .await?;
-            let mut socket = tokio_tungstenite::accept_async(tls).await?;
-            let incoming = socket.next().await.context("handshake missing")??;
-            let Message::Binary(bytes) = incoming else {
-                bail!("bad frame");
-            };
-            let message: ChiaMessage = decode_exact(&bytes)?;
-            let greeting: Handshake = decode_exact(message.data.as_slice())?;
-            assert_eq!(greeting.node_type, NodeType::Timelord as u8);
-            assert_eq!(greeting.network_id, "testnet11");
-            socket
-                .send(encode(
-                    ProtocolMessageTypes::Handshake,
-                    &handshake("testnet11", NodeType::FullNode, 8444),
-                    None,
-                )?)
-                .await?;
-            if board_fault {
-                socket
-                    .send(Message::Ping(b"board-isolation".to_vec().into()))
-                    .await?;
-                loop {
-                    match socket
-                        .next()
-                        .await
-                        .context("Peer closed during board fault")??
-                    {
-                        Message::Pong(value) if value.as_ref() == b"board-isolation" => break,
-                        Message::Ping(value) => socket.send(Message::Pong(value)).await?,
-                        _ => {}
-                    }
-                }
-            } else {
-                let _ = socket.next().await;
-            }
-            Ok::<_, anyhow::Error>(())
-        });
-        if board_fault {
-            config.hardware.boards = vec![toml::from_str(
-                "id='failed'\nname='Failed'\nclient_port=18110",
-            )?];
-            let process = crate::operational::State::fixture();
-            let runtime = Arc::new(std::sync::Mutex::new(RuntimeState::default()));
-            runtime.lock().unwrap().boards.insert(
-                "failed".into(),
-                HardwareState {
-                    lifecycle: crate::board_lifecycle::BoardLifecycle::fixture(
-                        crate::board_lifecycle::Phase::Fault,
-                        false,
-                        Some(crate::board_lifecycle::Fault::InvalidProof),
-                        None,
-                        0,
-                    ),
-                    ..Default::default()
-                },
-            );
-            let (backend, _offers) = AsicBackend::new(
-                &config,
-                &config.assignments().map_err(anyhow::Error::msg)?,
-                runtime.clone(),
-                process.clone(),
-            )?;
-            let shared = Arc::new(Shared {
-                native: None,
-                assignments: config.assignments().map_err(anyhow::Error::msg)?,
-                config,
-                clients: Default::default(),
-                process,
-                scope: crate::runtime::RuntimeScope::Production,
-                runtime,
-                started_unix: unix_now(),
-                service_started_unix: crate::unix_now(),
-            });
-            let session = tokio::spawn(session(shared, Arc::new(backend)));
-            let result = tokio::time::timeout(Duration::from_secs(3), task).await;
-            session.abort();
-            let _ = session.await;
-            result???;
-            return Ok(());
-        }
-        let result = connect(&config).await;
-        match result {
-            Ok(mut socket) => {
-                socket.close(None).await?;
-                task.await??;
-                Ok(())
-            }
-            Err(error) => {
-                task.abort();
-                let _ = task.await;
-                Err(error)
-            }
-        }
-    }
-    #[tokio::test]
-    async fn submissions_count_only_successful_sends() {
-        let metrics = crate::observability::Metrics::new(timelord_core::Network::Mainnet).unwrap();
-        let process = crate::operational::State::new(metrics.clone());
-        let shared = Shared {
-            native: None,
-            config: Config::default(),
-            assignments: vec![],
-            clients: Default::default(),
-            process,
-            scope: crate::runtime::RuntimeScope::Production,
-            runtime: Arc::new(std::sync::Mutex::new(RuntimeState::new(false))),
-            started_unix: unix_now(),
-            service_started_unix: unix_now(),
-        };
-        let stage = shared.process.progress.begin(
-            timelord_supervisor::progress::Resource::Scheduler,
-            0,
-            0,
-            timelord_supervisor::progress::Stage::Scheduler,
-        );
-        assert!(
-            submit(&shared, SubmissionKind::Signage, &stage, async {
-                bail!("fixture send failed")
-            })
-            .await
-            .is_err()
-        );
-        assert_eq!(metrics.counter("submissions_total", &["signage"]), 0);
-        submit(&shared, SubmissionKind::Signage, &stage, async { Ok(()) })
-            .await
-            .unwrap();
-        assert_eq!(metrics.counter("submissions_total", &["signage"]), 1);
-    }
-    #[tokio::test]
-    async fn submission_transitions_the_scheduler_owner_instead_of_replacing_it() {
-        use timelord_supervisor::progress::{Resource, Stage};
-        let metrics = crate::observability::Metrics::new(timelord_core::Network::Mainnet).unwrap();
-        let process = crate::operational::State::new(metrics.clone());
-        let shared = Shared {
-            native: None,
-            config: Config::default(),
-            assignments: vec![],
-            clients: Default::default(),
-            process,
-            scope: crate::runtime::RuntimeScope::Production,
-            runtime: Arc::new(std::sync::Mutex::new(RuntimeState::new(false))),
-            started_unix: unix_now(),
-            service_started_unix: unix_now(),
-        };
-        let process = shared.process.clone();
-        let guard = process
-            .progress
-            .begin(Resource::Scheduler, 12, 42, Stage::Scheduler);
-        let scheduler = |sequence| {
-            process
-                .progress
-                .snapshot(1, sequence)
-                .unwrap()
-                .slot(Resource::Scheduler)
-        };
-        let previous = scheduler(1).unwrap();
-        submit(&shared, SubmissionKind::Signage, &guard, async {
-            let work = scheduler(2).unwrap();
-            assert_eq!(work.id, previous.id);
-            assert_eq!(work.generation, previous.generation);
-            assert_eq!(work.stage, Stage::Submitting);
-            Ok(())
-        })
-        .await
-        .unwrap();
-        assert!(scheduler(3).is_some());
-        drop(guard);
-        assert!(scheduler(4).is_none());
-    }
-
-    #[tokio::test]
-    async fn authenticates_a_mutual_tls_chia_websocket_with_a_fixture_only_identity() {
-        fixture("chia.net", false).await.unwrap();
-    }
-    #[tokio::test]
-    async fn rejects_an_incorrect_tls_server_name() {
-        assert!(fixture("wrong.invalid", false).await.is_err());
-    }
-    #[tokio::test]
-    async fn full_node_session_keeps_answering_while_a_board_is_latched_off() {
-        fixture("chia.net", true).await.unwrap();
-    }
-}
+#[path = "runtime/tests.rs"]
+mod tests;

@@ -58,6 +58,15 @@ groups:
           severity: critical
         annotations:
           summary: An ASIC stopped at its temperature guard
+      - alert: TimelordSafetyJournalReset
+        expr: |
+          chia_timelord_safety_journal_resets_total{job="timelord-app"} > 0
+        for: 0m
+        keep_firing_for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Board safety journal was replaced with defaults
       - alert: TimelordNoVerifiedProgressMainnet
         expr: |
           (chia_timelord_work_pending{job="timelord-app",network="mainnet"} > 0 and on(job, instance, network, chain) increase(chia_timelord_proofs_verified_total{job="timelord-app",network="mainnet"}[5m]) == 0) and on(job, instance, network) chia_timelord_node_connected{job="timelord-app"} == 1

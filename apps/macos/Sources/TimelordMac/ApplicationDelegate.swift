@@ -20,6 +20,11 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate {
         super.init()
     }
 
+    // Closing the dashboard leaves the menu-bar interface available to reopen it.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if readyToTerminate { return .terminateNow }
         guard !terminating else { return .terminateLater }

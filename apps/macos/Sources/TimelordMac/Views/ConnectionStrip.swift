@@ -6,7 +6,7 @@ struct ConnectionStrip: View {
     private var asicTone: StatusTone {
         if model.snapshot.boards.contains(where: { $0.state == .thermalStop }) { return .critical }
         if model.snapshot.boards.contains(where: { $0.state == .disconnected }) { return .attention }
-        return model.snapshot.boards.contains(where: { $0.state == .active }) ? .positive : .neutral
+        return model.snapshot.boards.contains(where: \.deliveringProofs) ? .positive : .neutral
     }
     var body: some View {
         HStack(spacing: 10) {
@@ -23,7 +23,7 @@ struct ConnectionStrip: View {
                             Text(model.snapshot.boards.isEmpty ? "No boards connected" : "\(model.snapshot.boards.count) \(model.snapshot.boards.count == 1 ? "board" : "boards")").font(.headline)
                         }
                     }
-                    Text("\(model.snapshot.boards.filter { $0.state == .active }.count) producing proofs").font(.caption).foregroundStyle(.secondary)
+                    Text(model.snapshot.boardSummary).font(.caption).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, minHeight: 78, alignment: .leading).timelordCard(padding: 16)
             }.buttonStyle(.plain).accessibilityHint("Open board status")
         }

@@ -2,6 +2,7 @@ mod asic;
 mod assignment;
 mod automatic;
 use hardware::lifecycle as board_lifecycle;
+mod board_history;
 mod bounded_lines;
 mod config_checkpoint;
 mod connection;
@@ -11,6 +12,7 @@ mod hardware;
 mod history_buffer;
 mod history_store;
 mod inventory;
+mod network;
 mod node_status;
 mod observability;
 mod operational;
@@ -19,7 +21,6 @@ mod private_control;
 mod runtime;
 mod safety;
 mod service;
-mod stable_change;
 mod status_api;
 
 use anyhow::{Context, Result, bail};
@@ -31,7 +32,9 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use timelord_core::{Assignment, Config};
+#[cfg(test)]
+use timelord_core::Assignment;
+use timelord_core::Config;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -49,6 +52,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Select a saved full-node connection profile without starting hardware.
+    SelectNode {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        profile: String,
+    },
     /// Create an incomplete-setup configuration; never overwrite an existing file.
     Init {
         #[arg(long)]
@@ -125,6 +135,23 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Retry, disable or enable one board by serial without restarting others.
+    Board {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        serial: String,
+        #[arg(long, value_enum)]
+        action: private_control::BoardAction,
+        /// With `disable`, keep the board out of rotation for this many minutes.
+        #[arg(long)]
+        minutes: Option<u64>,
+    },
+    /// Apply a saved full-node profile change without restarting ASIC boards.
+    ReloadNode {
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Hold or resume Automatic tuning without pausing proof production.
     Tuning {
         #[arg(long)]
@@ -139,7 +166,7 @@ enum Command {
     },
 }
 
-fn load(path: &Path) -> Result<Config> {
+pub(crate) fn load(path: &Path) -> Result<Config> {
     let text = config_checkpoint::bounded_text(path, false)
         .with_context(|| format!("Reading {}", path.display()))?;
     parse_config(path, &text)
@@ -151,37 +178,58 @@ fn parse_config(path: &Path, text: &str) -> Result<Config> {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
         .canonicalize()?;
-    for credential in [
-        &mut config.node.certificate,
-        &mut config.node.private_key,
-        &mut config.node.ca_certificate,
-        &mut config.hardware.client_binary,
-        &mut config.hardware.driver_library,
-        &mut config.hardware.automatic_state,
-        &mut config.service.control_socket,
-    ] {
-        if let Some(relative) = credential
-            && relative.is_relative()
-        {
-            *relative = parent.join(&relative);
-        }
-    }
-    if let Some(rpc) = &mut config.node.rpc {
+    for node in std::iter::once(&mut config.node)
+        .chain(config.connections.profiles.iter_mut().map(|p| &mut p.node))
+    {
         for path in [
-            &mut rpc.certificate,
-            &mut rpc.private_key,
-            &mut rpc.ca_certificate,
-        ] {
+            &mut node.certificate,
+            &mut node.private_key,
+            &mut node.ca_certificate,
+        ]
+        .into_iter()
+        .flatten()
+        {
             if path.is_relative() {
                 *path = parent.join(&*path);
             }
         }
+        if let Some(rpc) = &mut node.rpc {
+            for path in [
+                &mut rpc.certificate,
+                &mut rpc.private_key,
+                &mut rpc.ca_certificate,
+            ] {
+                if path.is_relative() {
+                    *path = parent.join(&*path);
+                }
+            }
+        }
+    }
+    for path in [
+        &mut config.hardware.client_binary,
+        &mut config.hardware.driver_library,
+        &mut config.hardware.automatic_state,
+        &mut config.service.control_socket,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if path.is_relative() {
+            *path = parent.join(&*path);
+        }
+    }
+    if config.connections.active_id.is_none() && config.connections.profiles.is_empty() {
+        config.remember_connection().map_err(anyhow::Error::msg)?;
     }
     config.validate().map_err(anyhow::Error::msg)?;
+    network::resolve(&config.node)?;
+    for profile in &config.connections.profiles {
+        network::resolve(&profile.node)?;
+    }
     Ok(config)
 }
 
-fn set_default_automatic_state(config: &mut Config, path: &Path) -> Result<()> {
+pub(crate) fn set_default_automatic_state(config: &mut Config, path: &Path) -> Result<()> {
     if config.hardware.automatic_state.is_none() {
         let parent = path
             .parent()
@@ -193,14 +241,20 @@ fn set_default_automatic_state(config: &mut Config, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn save(path: &Path, config: &Config) -> Result<()> {
+pub(crate) fn save(path: &Path, config: &Config) -> Result<()> {
+    let mut config = config.clone();
+    config.remember_connection().map_err(anyhow::Error::msg)?;
     config.validate().map_err(anyhow::Error::msg)?;
+    network::resolve(&config.node)?;
+    for profile in &config.connections.profiles {
+        network::resolve(&profile.node)?;
+    }
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
-    timelord_supervisor::atomic::write(path, toml::to_string_pretty(config)?.as_bytes())
+    timelord_supervisor::atomic::write(path, toml::to_string_pretty(&config)?.as_bytes())
 }
 
 #[tokio::main]
@@ -215,6 +269,17 @@ async fn main() -> Result<()> {
         .with_writer(move || tracing_log.clone())
         .init();
     match Cli::parse().command {
+        Command::SelectNode { config, profile } => {
+            let mut updated = load(&config)?;
+            updated
+                .select_connection(&profile)
+                .map_err(anyhow::Error::msg)?;
+            save(&config, &updated)?;
+            println!(
+                "{}",
+                serde_json::json!({"saved":true,"restart_required":true})
+            );
+        }
         Command::Init { config } => {
             if let Some(parent) = config.parent().filter(|p| !p.as_os_str().is_empty()) {
                 std::fs::create_dir_all(parent)?;
@@ -295,7 +360,7 @@ async fn main() -> Result<()> {
         Command::CheckHardware { config } => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&diagnostics::check(load(&config)?).await?)?
+                serde_json::to_string_pretty(&diagnostics::check(load(&config)?, &config).await?)?
             );
         }
         Command::Validate { config, supervised } => {
@@ -312,7 +377,7 @@ async fn main() -> Result<()> {
             set_default_automatic_state(&mut value, &config)?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&assignment::resolve(&value)?)?
+                serde_json::to_string_pretty(&value.assignments().map_err(anyhow::Error::msg)?)?
             );
         }
         Command::Serve { config, supervised } => {
@@ -336,6 +401,33 @@ async fn main() -> Result<()> {
                 shutdown_signal_from(termination),
             )
             .await?;
+        }
+        Command::Board {
+            config,
+            serial,
+            action,
+            minutes,
+        } => {
+            let value = config_checkpoint::load_running(&config)?.0;
+            let result = private_control::command(
+                &automatic::socket_path(&config, &value),
+                private_control::Command::Board {
+                    serial,
+                    action,
+                    seconds: minutes.map(|m| m.saturating_mul(60)),
+                },
+            )
+            .await?;
+            println!("{}", serde_json::to_string(&result)?);
+        }
+        Command::ReloadNode { config } => {
+            let value = config_checkpoint::load_running(&config)?.0;
+            let result = private_control::command(
+                &automatic::socket_path(&config, &value),
+                private_control::Command::ReloadNode,
+            )
+            .await?;
+            println!("{}", serde_json::to_string(&result)?);
         }
         Command::Tuning { config, paused } => {
             let value = config_checkpoint::load_running(&config)?.0;
@@ -380,7 +472,6 @@ async fn main() -> Result<()> {
 struct Shared {
     native: Option<Arc<hardware::Facts>>,
     config: Config,
-    assignments: Vec<Assignment>,
     // These are socket slots, not authenticated board/engine identities.
     clients: Arc<Mutex<BTreeSet<(String, u8)>>>,
     process: Arc<operational::State>,
@@ -388,6 +479,65 @@ struct Shared {
     runtime: Arc<Mutex<runtime::RuntimeState>>,
     started_unix: u64,
     service_started_unix: u64,
+}
+impl Shared {
+    /// One production runtime; the caller supplies its own lifecycle state.
+    fn new(
+        native: Option<Arc<hardware::Facts>>,
+        config: Config,
+        runtime: Arc<Mutex<runtime::RuntimeState>>,
+        process: Arc<operational::State>,
+        started_unix: u64,
+        service_started_unix: u64,
+    ) -> Self {
+        Self {
+            native,
+            config,
+            clients: Default::default(),
+            process,
+            scope: runtime::RuntimeScope::Production,
+            runtime,
+            started_unix,
+            service_started_unix,
+        }
+    }
+    /// The current live chain routes. There is no separate static plan.
+    #[cfg(test)]
+    fn assignments(&self) -> Vec<Assignment> {
+        self.runtime.lock().expect("runtime").routing.clone()
+    }
+    #[cfg(test)]
+    fn with_clients(mut self, clients: Arc<Mutex<BTreeSet<(String, u8)>>>) -> Self {
+        self.clients = clients;
+        self
+    }
+    #[cfg(test)]
+    fn connected(self, board: &str, slots: &[u8]) -> Self {
+        self.clients
+            .lock()
+            .expect("clients")
+            .extend(slots.iter().map(|&s| (board.to_owned(), s)));
+        self
+    }
+    #[cfg(test)]
+    fn routed_by_config(self) -> Self {
+        let routes = self.config.assignments().expect("fixture routes");
+        self.routed(routes)
+    }
+    #[cfg(test)]
+    fn routed(self, routes: Vec<Assignment>) -> Self {
+        self.runtime.lock().expect("runtime").routing = routes;
+        self
+    }
+    fn engines(&self, board: &str) -> usize {
+        self.runtime
+            .lock()
+            .expect("runtime")
+            .routing
+            .iter()
+            .filter(|a| a.board_id == board)
+            .count()
+    }
 }
 
 impl Shared {

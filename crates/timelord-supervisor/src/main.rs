@@ -1,5 +1,6 @@
 mod monitor;
 mod process;
+mod startup;
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use process::OwnedProcess;
@@ -35,6 +36,19 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Start or reconnect to a user-session supervisor, preserving Run/Pause.
+    EnsureStarted {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        worker: Option<PathBuf>,
+        #[arg(long)]
+        monitor_listen: Option<std::net::SocketAddr>,
+        #[arg(long)]
+        status_listen: Option<std::net::SocketAddr>,
+        #[arg(long, default_value_t = Network::Mainnet)]
+        network: Network,
+    },
     /// Print the system LaunchDaemon registration without installing anything.
     LaunchdPlist {
         #[arg(long)]
@@ -45,7 +59,7 @@ enum Action {
         user: String,
         #[arg(long)]
         monitor_listen: Option<std::net::SocketAddr>,
-        #[arg(long, value_enum, default_value_t = Network::Mainnet)]
+        #[arg(long, default_value_t = Network::Mainnet)]
         network: Network,
     },
     /// Refuse migration while an existing coordinator holds its ownership lock.
@@ -60,7 +74,7 @@ enum Action {
         worker: Option<PathBuf>,
         #[arg(long)]
         monitor_listen: Option<std::net::SocketAddr>,
-        #[arg(long, value_enum, default_value_t = Network::Mainnet)]
+        #[arg(long, default_value_t = Network::Mainnet)]
         network: Network,
     },
     Status {
@@ -94,6 +108,19 @@ enum Action {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
+        Action::EnsureStarted {
+            config,
+            worker,
+            monitor_listen,
+            status_listen,
+            network,
+        } => {
+            let status =
+                startup::ensure_started(config, worker, monitor_listen, status_listen, network)
+                    .await?;
+            println!("{}", serde_json::to_string(&status)?);
+            Ok(())
+        }
         Action::LaunchdPlist {
             app,
             config,
@@ -159,6 +186,7 @@ async fn main() -> Result<()> {
                     expected_revision,
                 } => (config, Control::Reload, expected_revision),
                 Action::Run { .. }
+                | Action::EnsureStarted { .. }
                 | Action::LaunchdPlist { .. }
                 | Action::CheckOwner { .. }
                 | Action::Diagnostics { .. } => {
@@ -265,7 +293,7 @@ impl Worker {
         // Let the coordinator close native control channels and drain proof
         // work first. The group-wide hard stop remains the bounded fallback.
         self.process.signal_leader(libc::SIGTERM);
-        self.process.wait_for_exit(Duration::from_secs(10)).await?;
+        self.process.wait_for_exit(Duration::from_secs(25)).await?;
         let result = self.process.kill_and_reap(Duration::from_secs(3)).await?;
         for task in &mut self.log_tasks {
             if tokio::time::timeout(Duration::from_secs(1), &mut *task)
@@ -426,9 +454,11 @@ enum Lifecycle {
     StateError(String),
     Starting,
     Running(Box<Worker>),
-    Stopping {
-        pid: u32,
-    },
+    /// Graceful retirement runs as a task owned by this state. The task holds
+    /// the worker (and its reserved process-group identity) until it is reaped
+    /// or hands it back for a CleanupFailed retry; no replacement can start
+    /// before the loop observes that outcome.
+    Stopping(Box<Retiring>),
     CleanupFailed {
         worker: Box<Worker>,
         next: Instant,
@@ -438,6 +468,23 @@ enum Lifecycle {
         next: Instant,
         error: String,
     },
+}
+type Retirement = tokio::task::JoinHandle<(Box<Worker>, Result<std::process::ExitStatus>)>;
+/// Why a worker is being retired decides what follows a successful reap.
+enum Cause {
+    /// Pause, Reload, Resume of a failed cleanup, or a cleanup retry.
+    Requested,
+    /// Crash or watchdog failure: recorded as a recovery and backed off.
+    Failed { watchdog: Option<String> },
+}
+struct Retiring {
+    pid: u32,
+    uptime: Duration,
+    cause: Cause,
+    /// An explicit Reload/Resume arrived while stopping: start the
+    /// replacement without crash backoff once the old family is reaped.
+    restart: bool,
+    task: Retirement,
 }
 impl Lifecycle {
     fn worker(&self) -> Option<&Worker> {
@@ -510,7 +557,7 @@ impl SupervisorState {
                 Some(worker.process.pid()),
                 None,
             ),
-            Lifecycle::Stopping { pid } => (SupervisorPhase::Stopping, Some(*pid), None),
+            Lifecycle::Stopping(retiring) => (SupervisorPhase::Stopping, Some(retiring.pid), None),
             Lifecycle::CleanupFailed { worker, error, .. } => (
                 SupervisorPhase::Stopping,
                 Some(worker.process.pid()),
@@ -563,9 +610,7 @@ impl SupervisorState {
         self.intent.mode == Mode::Running
             || matches!(
                 self.lifecycle,
-                Lifecycle::Running(_)
-                    | Lifecycle::Stopping { .. }
-                    | Lifecycle::CleanupFailed { .. }
+                Lifecycle::Running(_) | Lifecycle::Stopping(_) | Lifecycle::CleanupFailed { .. }
             )
     }
     fn publish(&mut self, snapshots: &watch::Sender<Published>) {
@@ -581,44 +626,120 @@ impl SupervisorState {
         }
         snapshots.send_replace(self.published());
     }
-    async fn retire(
-        &mut self,
-        snapshots: &watch::Sender<Published>,
-    ) -> Result<Option<(Duration, std::process::ExitStatus)>> {
-        if self.lifecycle.worker().is_none() {
-            return Ok(None);
-        }
+    /// Hand a live or cleanup-failed worker to a background retirement task.
+    /// Returns without waiting: the loop keeps serving controls, progress and
+    /// ticks, and `poll_retirement` applies the outcome.
+    fn begin_retirement(&mut self, cause: Cause) {
         let mut worker = match std::mem::replace(&mut self.lifecycle, Lifecycle::Starting) {
             Lifecycle::Running(worker) | Lifecycle::CleanupFailed { worker, .. } => worker,
-            _ => unreachable!(),
+            other => {
+                self.lifecycle = other;
+                return;
+            }
         };
-        let elapsed = worker.started.elapsed();
-        self.lifecycle = Lifecycle::Stopping {
-            pid: worker.process.pid(),
+        let pid = worker.process.pid();
+        let uptime = worker.started.elapsed();
+        let task = tokio::spawn(async move {
+            let result = worker.stop().await;
+            (worker, result)
+        });
+        self.lifecycle = Lifecycle::Stopping(Box::new(Retiring {
+            pid,
+            uptime,
+            cause,
+            restart: false,
+            task,
+        }));
+    }
+    /// Apply a finished retirement. With `wait`, block until it finishes
+    /// (shutdown and tests); otherwise return at once if it is still running.
+    async fn poll_retirement(&mut self, snapshots: &watch::Sender<Published>, wait: bool) {
+        if !matches!(&self.lifecycle, Lifecycle::Stopping(retiring) if wait || retiring.task.is_finished())
+        {
+            return;
+        }
+        let Lifecycle::Stopping(retiring) =
+            std::mem::replace(&mut self.lifecycle, Lifecycle::Starting)
+        else {
+            unreachable!()
         };
-        self.publish(snapshots);
-        let exit = match (*worker).stop().await {
-            Ok(exit) => exit,
-            Err(error) => {
+        let Retiring {
+            pid,
+            uptime,
+            cause,
+            restart,
+            task,
+        } = *retiring;
+        let joined = task.await;
+        // Read intent after the task: a Pause accepted while stopping wins.
+        let paused = self.intent.mode == Mode::Paused;
+        self.lifecycle = match joined {
+            Ok((worker, Ok(exit))) => {
+                drop(worker); // Reaped: the group identity is released.
+                match cause {
+                    Cause::Failed { watchdog } => {
+                        let reason = watchdog.unwrap_or_else(|| format!("Worker exited: {exit}"));
+                        self.record_recovery(Some(pid), &reason);
+                        if paused {
+                            Lifecycle::Paused
+                        } else if restart {
+                            Lifecycle::Starting
+                        } else {
+                            let delay = retry_delay(&mut self.failures, Some(uptime));
+                            Lifecycle::Backoff {
+                                next: Instant::now() + Duration::from_secs(delay),
+                                error: format!("{reason}; retry in {delay}s"),
+                            }
+                        }
+                    }
+                    Cause::Requested if paused => Lifecycle::Paused,
+                    Cause::Requested => Lifecycle::Starting,
+                }
+            }
+            Ok((worker, Err(error))) => {
+                if let Cause::Failed { watchdog } = cause {
+                    let reason = watchdog
+                        .unwrap_or_else(|| format!("Worker exited; cleanup failed: {error:#}"));
+                    self.record_recovery(Some(pid), &reason);
+                }
                 // Keep the child handle and reserved process-group identity:
                 // neither durable Pause nor a retry grants retirement evidence.
-                self.lifecycle = Lifecycle::CleanupFailed {
+                Lifecycle::CleanupFailed {
                     worker,
                     next: Instant::now() + Duration::from_secs(120),
                     error: format!("Worker cleanup failed: {error:#}"),
-                };
-                self.publish(snapshots);
-                return Err(error);
+                }
+            }
+            Err(error) => {
+                // The task dropped the worker, whose owner SIGKILLed the group.
+                // Hold off a replacement rather than assume immediate exit.
+                let error = format!("Worker retirement task failed: {error}");
+                let _ = writeln!(&mut self.log, "{error}");
+                let delay = retry_delay(&mut self.failures, None);
+                Lifecycle::Backoff {
+                    next: Instant::now() + Duration::from_secs(delay),
+                    error,
+                }
             }
         };
-        self.lifecycle = if self.intent.mode == Mode::Paused {
-            Lifecycle::Paused
-        } else {
-            Lifecycle::Starting
-        };
         self.publish(snapshots);
-        Ok(Some((elapsed, exit)))
     }
+    /// Retire synchronously, finishing any retirement already in progress.
+    /// Used at shutdown, where blocking the (exiting) loop is intended.
+    async fn retire_now(&mut self, snapshots: &watch::Sender<Published>) -> Result<()> {
+        self.poll_retirement(snapshots, true).await;
+        if self.lifecycle.worker().is_some() {
+            self.begin_retirement(Cause::Requested);
+            self.publish(snapshots);
+            self.poll_retirement(snapshots, true).await;
+        }
+        if let Lifecycle::CleanupFailed { error, .. } = &self.lifecycle {
+            anyhow::bail!("{error}");
+        }
+        Ok(())
+    }
+    /// Mutations return once intent is durable and any retirement has started;
+    /// clients follow `phase`, `worker_pid` and `worker_generation` to completion.
     async fn control(
         &mut self,
         paths: &Paths,
@@ -653,29 +774,34 @@ impl SupervisorState {
                     paths.save_intent(&updated)?;
                     self.intent = updated;
                 }
-                if mode == Mode::Paused {
-                    self.retire(snapshots).await?;
-                    self.lifecycle = Lifecycle::Paused;
-                } else {
-                    if matches!(self.lifecycle, Lifecycle::CleanupFailed { .. }) {
-                        self.retire(snapshots).await?;
+                match &mut self.lifecycle {
+                    // An in-flight retirement reads durable intent when it
+                    // completes: Pause ends Paused and never starts a worker.
+                    Lifecycle::Stopping(retiring) => retiring.restart |= resuming,
+                    Lifecycle::Running(_) if mode == Mode::Running => {}
+                    Lifecycle::Running(_) | Lifecycle::CleanupFailed { .. } => {
+                        self.begin_retirement(Cause::Requested)
                     }
-                    if resuming
-                        || matches!(self.lifecycle, Lifecycle::Paused | Lifecycle::StateError(_))
-                    {
-                        self.lifecycle = Lifecycle::Starting;
+                    _ if mode == Mode::Paused => self.lifecycle = Lifecycle::Paused,
+                    Lifecycle::Paused | Lifecycle::StateError(_) => {
+                        self.lifecycle = Lifecycle::Starting
                     }
+                    _ if resuming => self.lifecycle = Lifecycle::Starting,
+                    _ => {}
                 }
             }
             Control::Reload => {
                 validate_before_reload(helper, &paths.config).await?;
-                self.retire(snapshots).await?;
-                if !matches!(self.lifecycle, Lifecycle::StateError(_)) {
-                    self.lifecycle = if self.intent.mode == Mode::Paused {
-                        Lifecycle::Paused
-                    } else {
-                        Lifecycle::Starting
-                    };
+                match &mut self.lifecycle {
+                    // Repeated reloads coalesce into the retirement in flight;
+                    // the replacement reads the configuration when it starts.
+                    Lifecycle::Stopping(retiring) => retiring.restart = true,
+                    Lifecycle::Running(_) | Lifecycle::CleanupFailed { .. } => {
+                        self.begin_retirement(Cause::Requested)
+                    }
+                    Lifecycle::StateError(_) => {}
+                    _ if self.intent.mode == Mode::Paused => self.lifecycle = Lifecycle::Paused,
+                    _ => self.lifecycle = Lifecycle::Starting,
                 }
             }
             Control::Status => {}
@@ -704,10 +830,12 @@ impl SupervisorState {
         progress_path: &Path,
         snapshots: &watch::Sender<Published>,
     ) -> Result<()> {
+        self.poll_retirement(snapshots, false).await;
         if matches!(self.lifecycle, Lifecycle::CleanupFailed { next, .. } if Instant::now() >= next)
         {
             // Keep failed cleanup owned and monitored until retirement succeeds.
-            let _ = self.retire(snapshots).await;
+            self.begin_retirement(Cause::Requested);
+            self.publish(snapshots);
             return Ok(());
         }
         let watchdog_failure = match &self.lifecycle {
@@ -717,24 +845,9 @@ impl SupervisorState {
         if watchdog_failure.is_some()
             || matches!(&self.lifecycle, Lifecycle::Running(worker) if worker.process.exited()?)
         {
-            let previous_pid = self.snapshot().worker_pid;
-            let (elapsed, exit) = match self.retire(snapshots).await {
-                Ok(retired) => retired.expect("failed worker"),
-                Err(error) => {
-                    let reason = watchdog_failure
-                        .unwrap_or_else(|| format!("Worker exited; cleanup failed: {error:#}"));
-                    self.record_recovery(previous_pid, &reason);
-                    self.publish(snapshots);
-                    return Ok(()); // CleanupFailed retains ownership and retries.
-                }
-            };
-            let delay = retry_delay(&mut self.failures, Some(elapsed));
-            let reason = watchdog_failure.unwrap_or_else(|| format!("Worker exited: {exit}"));
-            self.record_recovery(previous_pid, &reason);
-            self.lifecycle = Lifecycle::Backoff {
-                next: Instant::now() + Duration::from_secs(delay),
-                error: format!("{reason}; retry in {delay}s"),
-            };
+            self.begin_retirement(Cause::Failed {
+                watchdog: watchdog_failure,
+            });
         }
         let ready = matches!(self.lifecycle, Lifecycle::Starting)
             || matches!(self.lifecycle, Lifecycle::Backoff { next, .. } if Instant::now() >= next);
@@ -871,7 +984,7 @@ async fn run(
     .await;
     // Shutdown never changes durable intent. Retire the family while retaining
     // its sleep assertion, then RAII releases power protection on loop exit.
-    let cleanup = state.retire(&snapshots).await;
+    let cleanup = state.retire_now(&snapshots).await;
     if let Some(monitor) = monitor {
         monitor.abort();
     }
