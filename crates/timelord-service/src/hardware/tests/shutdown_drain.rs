@@ -1,34 +1,24 @@
+use super::chunked::Chunked;
+use crate::bounded_lines::Lines;
 use crate::hardware::retirement::drain_shutdown_diagnostics;
 use std::{
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
-use tokio::io::{AsyncRead, AsyncWriteExt};
+use tokio::io::{AsyncWriteExt, BufReader};
 
 const MARKER: &str = "Hardware shutdown: engines_paused=1 safe_point_restored=1";
 
-struct Chunked<'a> {
-    bytes: &'a [u8],
-    chunk: usize,
-}
-
-impl AsyncRead for Chunked<'_> {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        _: &mut std::task::Context<'_>,
-        output: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let count = self.bytes.len().min(self.chunk).min(output.remaining());
-        output.put_slice(&self.bytes[..count]);
-        self.bytes = &self.bytes[count..];
-        std::task::Poll::Ready(Ok(()))
-    }
-}
-
 async fn diagnostics(bytes: &[u8], chunk: usize) -> (bool, Vec<String>, bool) {
-    let mut source = Chunked { bytes, chunk };
+    let mut lines = Lines::new(BufReader::with_capacity(
+        chunk.max(1),
+        Chunked { bytes, chunk },
+    ));
     let observed = AtomicBool::new(false);
-    let (confirmed, records) = drain_shutdown_diagnostics(&mut source, &observed)
+    let (confirmed, records) = drain_shutdown_diagnostics(&mut lines, &observed)
         .await
         .unwrap();
     (confirmed, records, observed.load(Ordering::Acquire))
@@ -69,11 +59,14 @@ async fn framed_marker_confirms_before_eof_across_arbitrary_splits() {
         ],
     ];
     for pieces in cases {
-        let (mut writer, mut reader) = tokio::io::duplex(1024);
-        let observed = std::sync::Arc::new(AtomicBool::new(false));
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let observed = Arc::new(AtomicBool::new(false));
         let drain = tokio::spawn({
             let observed = observed.clone();
-            async move { drain_shutdown_diagnostics(&mut reader, &observed).await }
+            async move {
+                let mut lines = Lines::new(BufReader::new(reader));
+                drain_shutdown_diagnostics(&mut lines, &observed).await
+            }
         });
         for piece in &pieces {
             writer.write_all(piece).await.unwrap();
@@ -94,11 +87,13 @@ async fn framed_marker_confirms_before_eof_across_arbitrary_splits() {
 
 #[tokio::test]
 async fn oversized_garbage_cannot_confirm_or_log_a_discarded_suffix() {
-    let mut garbage = vec![b'x'; 5000];
+    // Put the diagnostic words in the first bytes of the discarded tail, where
+    // a second overflow cannot wipe them before this record is discarded.
+    let mut garbage = vec![b'x'; 4096];
     garbage.extend_from_slice(
         b" safe_readback Hardware shutdown: engines_paused=1 safe_point_restored=1 VDF client stopped:",
     );
-    garbage.extend_from_slice(&[b'y'; 5000]);
+    garbage.extend_from_slice(&[b'y'; 2000]);
 
     let result = tokio::time::timeout(Duration::from_secs(2), diagnostics(&garbage, 333))
         .await
@@ -138,4 +133,72 @@ async fn the_diagnostic_cap_holds_and_never_blocks_marker_confirmation() {
     assert!(observed);
     assert_eq!(records.len(), 8);
     assert!(!records.iter().any(|record| record == MARKER));
+}
+
+#[tokio::test]
+async fn line_limit_counts_content_not_lf_or_crlf_framing() {
+    let marker_content = |len: usize| {
+        let mut content = "x".repeat(len - MARKER.len());
+        content.push_str(MARKER);
+        content
+    };
+    for (len, ending, expected) in [
+        (4095, "\n", true),
+        (4095, "\r\n", true),
+        (4096, "\n", true),
+        (4096, "\r\n", true),
+        (4097, "\n", false),
+        (4097, "\r\n", false),
+    ] {
+        for chunk in [1, 1024, 8192] {
+            let text = format!("{}{ending}", marker_content(len));
+            let (confirmed, records, observed) = diagnostics(text.as_bytes(), chunk).await;
+            assert_eq!(
+                confirmed, expected,
+                "len={len}, ending={ending:?}, chunk={chunk}"
+            );
+            assert_eq!(
+                observed, expected,
+                "len={len}, ending={ending:?}, chunk={chunk}"
+            );
+            if expected {
+                assert_eq!(records.len(), 1);
+                assert!(records[0].ends_with(MARKER));
+            } else {
+                assert!(
+                    records.is_empty(),
+                    "an oversized line was logged as a diagnostic: {records:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_oversized_record_keeps_its_discard_state_through_handoff() {
+    let (mut writer, reader) = tokio::io::duplex(16 * 1024);
+    let mut lines = Lines::new(BufReader::new(reader));
+    writer.write_all(&vec![b'x'; 4097]).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), lines.next_line())
+            .await
+            .is_err()
+    );
+    // The suffix starts with a space but ends in the marker; losing `discarding`
+    // would re-frame it as a fresh line and confirm.
+    writer
+        .write_all(format!(" {MARKER}\n").as_bytes())
+        .await
+        .unwrap();
+    drop(writer);
+    let observed = AtomicBool::new(false);
+    let (confirmed, records) = drain_shutdown_diagnostics(&mut lines, &observed)
+        .await
+        .unwrap();
+    assert!(!confirmed);
+    assert!(!observed.load(Ordering::Acquire));
+    assert!(
+        records.is_empty(),
+        "a discarded suffix was logged: {records:?}"
+    );
 }

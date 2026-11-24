@@ -396,15 +396,9 @@ impl NativeControl {
             ..
         } = log;
         let _initialization = initialization;
-        super::retirement::retire(
-            child,
-            output.into_inner(),
-            lines.into_inner(),
-            stop_sequence,
-            shutdown_confirmed,
-        )
-        .await
-        .confirmed()
+        super::retirement::retire(child, output, lines, stop_sequence, shutdown_confirmed)
+            .await
+            .confirmed()
     }
     pub(super) async fn change(&mut self, target: Point, seconds: u64) -> Result<Point> {
         if !self.accepts(target) {

@@ -1,99 +1,11 @@
-use super::pool::Pool;
+use super::test_support::*;
 use super::*;
 use std::time::Duration;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
-    sync::mpsc,
-};
-
-async fn socket_pair() -> (TcpStream, TcpStream) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let client = TcpStream::connect(listener.local_addr().unwrap())
-        .await
-        .unwrap();
-    let (server, _) = listener.accept().await.unwrap();
-    (server, client)
-}
-
-fn lease(socket: TcpStream, slot: u8, generation: u64) -> Lease {
-    Lease {
-        socket,
-        board: "a".into(),
-        slot,
-        generation,
-        clients: Arc::new(SyncMutex::new(BTreeSet::new())),
-    }
-}
-
-fn route(board: &str, chain: Chain, engine: u8) -> Assignment {
-    Assignment {
-        board_id: board.into(),
-        chain,
-        engine,
-    }
-}
-
-fn work(iterations: u64, bits: usize) -> ProofRequest {
-    ProofRequest {
-        generation: 1,
-        challenge: dg_xch_core::blockchain::sized_bytes::Bytes32::const_new([42; 32]),
-        input: ClassgroupElement::get_default_element(),
-        iterations,
-        discriminant_bits: bits,
-    }
-}
-
-async fn read_initial(socket: &mut TcpStream) {
-    let mut header = [0; 4];
-    socket.read_exact(&mut header).await.unwrap();
-    let count: usize = std::str::from_utf8(&header[1..]).unwrap().parse().unwrap();
-    let mut body = vec![0; count + 101];
-    socket.read_exact(&mut body).await.unwrap();
-}
-
-async fn handshake(socket: &mut TcpStream) {
-    read_initial(socket).await;
-    socket.write_all(b"OK").await.unwrap();
-}
-
-async fn requested(socket: &mut TcpStream) -> u64 {
-    let mut length = [0; 2];
-    socket.read_exact(&mut length).await.unwrap();
-    let size: usize = std::str::from_utf8(&length).unwrap().parse().unwrap();
-    let mut value = vec![0; size];
-    socket.read_exact(&mut value).await.unwrap();
-    std::str::from_utf8(&value).unwrap().parse().unwrap()
-}
-
-async fn send_fixture_proof(socket: &mut TcpStream, request: &ProofRequest) {
-    let proof = dg_xch_vdf::proof::prove_result(
-        request.challenge.as_ref(),
-        request.input.data.as_ref(),
-        64,
-        request.iterations,
-    )
-    .unwrap();
-    let mut raw = request.iterations.to_be_bytes().to_vec();
-    raw.extend(100_u64.to_be_bytes());
-    raw.extend_from_slice(&proof[..100]);
-    raw.push(0);
-    raw.extend_from_slice(&proof[100..]);
-    let hex: Vec<_> = raw
-        .iter()
-        .flat_map(|b| format!("{b:02x}").into_bytes())
-        .collect();
-    socket
-        .write_all(&(hex.len() as u32).to_be_bytes())
-        .await
-        .unwrap();
-    socket.write_all(&hex).await.unwrap();
-}
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
 async fn waiters_on_different_slots_do_not_block_each_other() {
-    let (sender, receiver) = mpsc::channel(3);
-    let pool = Arc::new(Pool::new(receiver));
+    let (offers, pool) = pair();
     let slot0 = tokio::spawn({
         let pool = pool.clone();
         async move { pool.receive(Some(0), 1).await }
@@ -101,7 +13,7 @@ async fn waiters_on_different_slots_do_not_block_each_other() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let (socket, _peer) = socket_pair().await;
-    sender.send(lease(socket, 1, 1)).await.unwrap();
+    offers.offer(lease(socket, 1, 1));
     let acquired = tokio::time::timeout(Duration::from_millis(500), pool.receive(Some(1), 1))
         .await
         .expect("slot 1 must not wait behind slot 0")
@@ -110,7 +22,7 @@ async fn waiters_on_different_slots_do_not_block_each_other() {
     assert!(!slot0.is_finished(), "slot 0 must still be waiting");
 
     let (socket, _peer) = socket_pair().await;
-    sender.send(lease(socket, 0, 1)).await.unwrap();
+    offers.offer(lease(socket, 0, 1));
     let acquired = tokio::time::timeout(Duration::from_millis(500), slot0)
         .await
         .expect("slot 0 lease")
@@ -141,7 +53,7 @@ async fn slow_handshake_on_one_engine_does_not_block_another_engine() {
     let offer = backend.add_board("a");
 
     let (socket, mut stalled_peer) = socket_pair().await;
-    offer.send(lease(socket, 0, 1)).await.unwrap();
+    offer.offer(lease(socket, 0, 1));
     let stalled = tokio::spawn({
         let backend = backend.clone();
         async move {
@@ -165,7 +77,7 @@ async fn slow_handshake_on_one_engine_does_not_block_another_engine() {
     assert!(!stalled.is_finished());
 
     let (socket, mut peer) = socket_pair().await;
-    offer.send(lease(socket, 1, 1)).await.unwrap();
+    offer.offer(lease(socket, 1, 1));
     let proving = tokio::spawn({
         let backend = backend.clone();
         async move {
@@ -200,8 +112,7 @@ async fn slow_handshake_on_one_engine_does_not_block_another_engine() {
 
 #[tokio::test]
 async fn a_cancelled_waiter_does_not_lose_an_arriving_lease() {
-    let (sender, receiver) = mpsc::channel(3);
-    let pool = Arc::new(Pool::new(receiver));
+    let (offers, pool) = pair();
     let waiter = tokio::spawn({
         let pool = pool.clone();
         async move { pool.receive(Some(0), 1).await }
@@ -211,7 +122,7 @@ async fn a_cancelled_waiter_does_not_lose_an_arriving_lease() {
     let _ = waiter.await;
 
     let (socket, _peer) = socket_pair().await;
-    sender.send(lease(socket, 0, 1)).await.unwrap();
+    offers.offer(lease(socket, 0, 1));
     let acquired = tokio::time::timeout(Duration::from_millis(500), pool.receive(Some(0), 1))
         .await
         .expect("later waiter")
@@ -221,8 +132,7 @@ async fn a_cancelled_waiter_does_not_lose_an_arriving_lease() {
 
 #[tokio::test]
 async fn cancelling_the_waiter_polling_a_slot_does_not_wedge_other_slots() {
-    let (sender, receiver) = mpsc::channel(3);
-    let pool = Arc::new(Pool::new(receiver));
+    let (offers, pool) = pair();
     let slot0 = tokio::spawn({
         let pool = pool.clone();
         async move { pool.receive(Some(0), 1).await }
@@ -234,7 +144,7 @@ async fn cancelling_the_waiter_polling_a_slot_does_not_wedge_other_slots() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let (socket, _peer) = socket_pair().await;
-    sender.send(lease(socket, 1, 1)).await.unwrap();
+    offers.offer(lease(socket, 1, 1));
     let acquired = tokio::time::timeout(Duration::from_millis(500), slot1)
         .await
         .expect("slot 1 must acquire while slot 0 waits")
@@ -245,7 +155,7 @@ async fn cancelling_the_waiter_polling_a_slot_does_not_wedge_other_slots() {
     slot0.abort();
     let _ = slot0.await;
     let (socket, _peer) = socket_pair().await;
-    sender.send(lease(socket, 0, 1)).await.unwrap();
+    offers.offer(lease(socket, 0, 1));
     let acquired = tokio::time::timeout(Duration::from_millis(500), pool.receive(Some(0), 1))
         .await
         .expect("later slot 0 waiter")
@@ -256,8 +166,7 @@ async fn cancelling_the_waiter_polling_a_slot_does_not_wedge_other_slots() {
 #[tokio::test]
 async fn a_lease_racing_waiter_cancellation_is_never_silently_dropped() {
     for _ in 0..50 {
-        let (sender, receiver) = mpsc::channel(3);
-        let pool = Arc::new(Pool::new(receiver));
+        let (offers, pool) = pair();
         let waiter = tokio::spawn({
             let pool = pool.clone();
             async move { pool.receive(Some(0), 1).await }
@@ -265,7 +174,7 @@ async fn a_lease_racing_waiter_cancellation_is_never_silently_dropped() {
         tokio::task::yield_now().await;
 
         let (socket, _peer) = socket_pair().await;
-        sender.send(lease(socket, 0, 1)).await.unwrap();
+        offers.offer(lease(socket, 0, 1));
         waiter.abort();
         if let Ok(Some(_owned)) = waiter.await {
             // The waiter returned the lease; dropping it with the owner is correct.
@@ -281,8 +190,7 @@ async fn a_lease_racing_waiter_cancellation_is_never_silently_dropped() {
 
 #[tokio::test]
 async fn dropping_the_listener_wakes_every_waiter() {
-    let (sender, receiver) = mpsc::channel(3);
-    let pool = Arc::new(Pool::new(receiver));
+    let (offers, pool) = pair();
     let mut waiters = Vec::new();
     for slot in 0..3u8 {
         let pool = pool.clone();
@@ -291,7 +199,7 @@ async fn dropping_the_listener_wakes_every_waiter() {
         ));
     }
     tokio::time::sleep(Duration::from_millis(20)).await;
-    drop(sender);
+    drop(offers);
     for waiter in waiters {
         assert!(
             tokio::time::timeout(Duration::from_millis(500), waiter)
@@ -305,12 +213,11 @@ async fn dropping_the_listener_wakes_every_waiter() {
 
 #[tokio::test]
 async fn stale_generation_leases_are_discarded() {
-    let (sender, receiver) = mpsc::channel(3);
-    let pool = Arc::new(Pool::new(receiver));
+    let (offers, pool) = pair();
     let (socket, _peer) = socket_pair().await;
-    sender.send(lease(socket, 0, 0)).await.unwrap();
+    offers.offer(lease(socket, 0, 0));
     let (socket, _peer) = socket_pair().await;
-    sender.send(lease(socket, 0, 1)).await.unwrap();
+    offers.offer(lease(socket, 0, 1));
     let acquired = tokio::time::timeout(Duration::from_millis(500), pool.receive(Some(0), 1))
         .await
         .expect("fresh generation")
@@ -320,8 +227,7 @@ async fn stale_generation_leases_are_discarded() {
 
 #[tokio::test]
 async fn old_generation_waiter_does_not_drop_a_newer_live_lease() {
-    let (sender, receiver) = mpsc::channel(3);
-    let pool = Arc::new(Pool::new(receiver));
+    let (offers, pool) = pair();
     let slot0 = tokio::spawn({
         let pool = pool.clone();
         async move { pool.receive(Some(0), 1).await }
@@ -331,7 +237,7 @@ async fn old_generation_waiter_does_not_drop_a_newer_live_lease() {
     // Park a slot 1 lease for a newer generation while the gen-1 waiter is
     // already blocked. The gen-1 waiter wakes first and must not discard it.
     let (socket, _peer) = socket_pair().await;
-    sender.send(lease(socket, 1, 2)).await.unwrap();
+    offers.offer(lease(socket, 1, 2));
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(!slot0.is_finished(), "gen 1 slot 0 must still be waiting");
 
@@ -347,7 +253,7 @@ async fn old_generation_waiter_does_not_drop_a_newer_live_lease() {
 
     // The overlapping generations must not wedge the original waiter.
     let (socket, _peer) = socket_pair().await;
-    sender.send(lease(socket, 0, 1)).await.unwrap();
+    offers.offer(lease(socket, 0, 1));
     let acquired = tokio::time::timeout(Duration::from_millis(500), slot0)
         .await
         .expect("gen 1 slot 0 lease")
@@ -358,21 +264,20 @@ async fn old_generation_waiter_does_not_drop_a_newer_live_lease() {
 
 #[tokio::test]
 async fn stale_parked_slots_are_dropped_when_the_new_generation_waits() {
-    let (sender, receiver) = mpsc::channel(3);
-    let pool = Arc::new(Pool::new(receiver));
+    let (offers, pool) = pair();
     let (socket, _peer) = socket_pair().await;
-    sender.send(lease(socket, 1, 0)).await.unwrap();
+    offers.offer(lease(socket, 1, 0));
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let (socket, _peer) = socket_pair().await;
-    sender.send(lease(socket, 0, 1)).await.unwrap();
+    offers.offer(lease(socket, 0, 1));
     let acquired = tokio::time::timeout(Duration::from_millis(500), pool.receive(Some(0), 1))
         .await
         .expect("fresh generation")
         .expect("lease");
     assert_eq!((acquired.generation, acquired.slot), (1, 0));
 
-    drop(sender);
+    drop(offers);
     let leftover = tokio::time::timeout(Duration::from_millis(500), pool.receive(Some(1), 1))
         .await
         .expect("closed pool");
@@ -383,14 +288,13 @@ async fn stale_parked_slots_are_dropped_when_the_new_generation_waits() {
 }
 
 #[tokio::test]
-async fn clear_drops_parked_and_queued_leases_but_accepts_new_ones() {
-    let (sender, receiver) = mpsc::channel(3);
-    let pool = Arc::new(Pool::new(receiver));
+async fn clear_drops_parked_leases_but_accepts_new_ones() {
+    let (offers, pool) = pair();
     for slot in [0, 1, 2] {
         let (socket, _peer) = socket_pair().await;
-        sender.send(lease(socket, slot, 1)).await.unwrap();
+        offers.offer(lease(socket, slot, 1));
     }
-    pool.clear().await;
+    pool.clear();
     for slot in [0, 1, 2] {
         assert!(
             tokio::time::timeout(Duration::from_millis(100), pool.receive(Some(slot), 1))
@@ -400,7 +304,7 @@ async fn clear_drops_parked_and_queued_leases_but_accepts_new_ones() {
         );
     }
     let (socket, _peer) = socket_pair().await;
-    sender.send(lease(socket, 1, 1)).await.unwrap();
+    offers.offer(lease(socket, 1, 1));
     let acquired = tokio::time::timeout(Duration::from_millis(500), pool.receive(Some(1), 1))
         .await
         .expect("post-clear lease")
@@ -410,10 +314,9 @@ async fn clear_drops_parked_and_queued_leases_but_accepts_new_ones() {
 
 #[tokio::test]
 async fn clear_keeps_waiters_waiting_and_delivers_only_post_clear_leases() {
-    let (sender, receiver) = mpsc::channel(3);
-    let pool = Arc::new(Pool::new(receiver));
+    let (offers, pool) = pair();
     let (socket, _peer) = socket_pair().await;
-    sender.send(lease(socket, 1, 1)).await.unwrap();
+    offers.offer(lease(socket, 1, 1));
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let waiter = tokio::spawn({
@@ -421,7 +324,7 @@ async fn clear_keeps_waiters_waiting_and_delivers_only_post_clear_leases() {
         async move { pool.receive(Some(0), 1).await }
     });
     tokio::time::sleep(Duration::from_millis(20)).await;
-    pool.clear().await;
+    pool.clear();
 
     assert!(
         tokio::time::timeout(Duration::from_millis(100), pool.receive(Some(1), 1))
@@ -435,11 +338,143 @@ async fn clear_keeps_waiters_waiting_and_delivers_only_post_clear_leases() {
     );
 
     let (socket, _peer) = socket_pair().await;
-    sender.send(lease(socket, 0, 1)).await.unwrap();
+    offers.offer(lease(socket, 0, 1));
     let acquired = tokio::time::timeout(Duration::from_millis(500), waiter)
         .await
         .expect("post-clear lease")
         .unwrap()
         .expect("lease");
     assert_eq!(acquired.slot, 0);
+}
+
+#[tokio::test]
+async fn a_matching_lease_offered_after_the_first_poll_is_not_lost() {
+    let (offers, pool) = pair();
+    let (socket, _peer) = socket_pair().await;
+    // Interleave right between the empty recheck and `notified.await`, the only
+    // window a whole-future poll cannot reach. `enable()` has already registered
+    // the `Notified`, so `notify_waiters` must wake the pending receive.
+    pool.on_wait(move || offers.offer(lease(socket, 0, 1)));
+    let acquired = tokio::time::timeout(Duration::from_millis(500), pool.receive(Some(0), 1))
+        .await
+        .expect("the matching lease offered before the await did not wake receive")
+        .expect("lease");
+    assert_eq!(acquired.slot, 0);
+}
+
+#[tokio::test]
+async fn a_newer_generation_prunes_older_parked_leases_and_releases_their_claim() {
+    let (offers, pool) = pair();
+    let clients = Arc::new(SyncMutex::new(BTreeSet::new()));
+    let gen1 = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.receive(Some(0), 1).await }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // A gen-1 slot-1 lease is parked but cannot be used by the slot-0 waiter.
+    let (socket, _peer) = socket_pair().await;
+    offers.offer(claimed(socket, 1, 1, clients.clone()));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(clients.lock().unwrap().contains(&("a".to_string(), 1)));
+
+    // The gen-2 waiter must prune it, releasing its (board, slot) claim.
+    let gen2 = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.receive(Some(1), 2).await }
+    });
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while clients.lock().unwrap().contains(&("a".to_string(), 1)) {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("a stale gen-1 lease stayed pinned by its generation");
+
+    let (socket, _peer) = socket_pair().await;
+    offers.offer(claimed(socket, 1, 2, clients.clone()));
+    let acquired = tokio::time::timeout(Duration::from_millis(500), gen2)
+        .await
+        .expect("gen 2 waiter")
+        .unwrap()
+        .expect("gen 2 slot 1 lease");
+    assert_eq!((acquired.generation, acquired.slot), (2, 1));
+    assert!(!gen1.is_finished(), "gen 1 slot 0 must still be waiting");
+
+    let (socket, _peer) = socket_pair().await;
+    offers.offer(lease(socket, 0, 1));
+    let acquired = tokio::time::timeout(Duration::from_millis(500), gen1)
+        .await
+        .expect("gen 1 waiter")
+        .unwrap()
+        .expect("gen 1 slot 0 lease");
+    assert_eq!((acquired.generation, acquired.slot), (1, 0));
+}
+
+#[tokio::test]
+async fn a_waiter_never_takes_an_older_generation_lease() {
+    let (offers, pool) = pair();
+    let clients = Arc::new(SyncMutex::new(BTreeSet::new()));
+    let (socket, _peer) = socket_pair().await;
+    offers.offer(claimed(socket, 0, 0, clients.clone()));
+
+    let waiter = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.receive(Some(0), 1).await }
+    });
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while clients.lock().unwrap().contains(&("a".to_string(), 0)) {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("an older-generation lease was not pruned");
+    assert!(!waiter.is_finished(), "the older lease was accepted");
+
+    let (socket, _peer) = socket_pair().await;
+    offers.offer(lease(socket, 0, 1));
+    let acquired = tokio::time::timeout(Duration::from_millis(500), waiter)
+        .await
+        .expect("matching-generation lease")
+        .unwrap()
+        .expect("lease");
+    assert_eq!(acquired.generation, 1);
+}
+
+#[tokio::test]
+async fn a_parked_matching_lease_is_delivered_after_close() {
+    let (offers, pool) = pair();
+    let (socket, _peer) = socket_pair().await;
+    offers.offer(lease(socket, 0, 1));
+    drop(offers);
+
+    let acquired = tokio::time::timeout(Duration::from_millis(500), pool.receive(Some(0), 1))
+        .await
+        .expect("a closed pool hung instead of delivering its parked lease")
+        .expect("parked lease");
+    assert_eq!(acquired.slot, 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), pool.receive(Some(0), 1))
+            .await
+            .expect("a closed pool must return None promptly")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn clear_after_close_drops_parked_leases_and_receive_returns_none() {
+    let (offers, pool) = pair();
+    let clients = Arc::new(SyncMutex::new(BTreeSet::new()));
+    let (socket, _peer) = socket_pair().await;
+    offers.offer(claimed(socket, 0, 1, clients.clone()));
+    drop(offers);
+
+    pool.clear();
+    assert!(clients.lock().unwrap().is_empty());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), pool.receive(Some(0), 1))
+            .await
+            .expect("clear after close must not hang")
+            .is_none()
+    );
 }

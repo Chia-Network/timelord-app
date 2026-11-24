@@ -701,6 +701,7 @@ async fn oversized_or_invalid_native_diagnostic_does_not_retire_the_owner_or_hid
     child.kill().await.unwrap();
 }
 
+mod chunked;
 mod faults;
 #[cfg(test)]
 mod retirement;
