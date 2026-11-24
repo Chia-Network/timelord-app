@@ -200,11 +200,77 @@ class ExportTests(unittest.TestCase):
 
     def test_fullnode_specific_overrides_take_precedence(self):
         self.config["full_node"]["network_overrides"] = {
-            "constants": {"ephemeral-test": {"HARD_FORK2_HEIGHT": 123}}
+            "constants": {"ephemeral-test": {
+                "GENESIS_CHALLENGE": "ab" * 32, "HARD_FORK2_HEIGHT": 123
+            }}
         }
         output = self.run_export()
         metadata = json.loads((output / "network.json").read_text())
         self.assertEqual(metadata["constants"]["HARD_FORK2_HEIGHT"], 123)
+
+    def test_official_network_exports_with_null_root_overrides(self):
+        self.config["selected_network"] = "mainnet"
+        self.config["network_overrides"] = None
+        output = self.run_export()
+        metadata = json.loads((output / "network.json").read_text())
+        self.assertEqual(metadata["network_id"], "mainnet")
+        self.assertEqual(metadata["constants"], {})
+
+    def test_official_network_exports_with_null_full_node_overrides(self):
+        self.config["selected_network"] = "mainnet"
+        self.config["network_overrides"] = {
+            "constants": {"mainnet": {"DIFFICULTY_STARTING": 7}}
+        }
+        self.config["full_node"]["network_overrides"] = None
+        output = self.run_export()
+        metadata = json.loads((output / "network.json").read_text())
+        self.assertEqual(metadata["network_id"], "mainnet")
+        self.assertEqual(metadata["constants"], {})
+
+    def test_official_network_exports_without_genesis_challenge(self):
+        self.config["selected_network"] = "testnet11"
+        self.config["network_overrides"] = {"constants": {}}
+        output = self.run_export()
+        metadata = json.loads((output / "network.json").read_text())
+        self.assertEqual(metadata["network_id"], "testnet11")
+        self.assertNotIn("GENESIS_CHALLENGE", metadata["constants"])
+
+    def test_custom_network_with_genesis_challenge_exports(self):
+        self.config["network_overrides"] = {
+            "constants": {"ephemeral-test": {"GENESIS_CHALLENGE": "cd" * 32}}
+        }
+        output = self.run_export()
+        metadata = json.loads((output / "network.json").read_text())
+        self.assertEqual(
+            metadata["constants"], {"GENESIS_CHALLENGE": "cd" * 32}
+        )
+
+    def test_custom_network_without_genesis_challenge_is_rejected(self):
+        cases = {
+            "missing overrides": None,
+            "missing constants": {"config": {"ephemeral-test": {}}},
+            "missing challenge": {"constants": {"ephemeral-test": {}}},
+            "null challenge": {"constants": {"ephemeral-test": {
+                "GENESIS_CHALLENGE": None
+            }}},
+            "short challenge": {"constants": {"ephemeral-test": {
+                "GENESIS_CHALLENGE": "ab" * 31
+            }}},
+            "not hex": {"constants": {"ephemeral-test": {
+                "GENESIS_CHALLENGE": "zz" * 32
+            }}},
+            "not a string": {"constants": {"ephemeral-test": {
+                "GENESIS_CHALLENGE": 32
+            }}},
+        }
+        for label, overrides in cases.items():
+            with self.subTest(label=label):
+                self.config["network_overrides"] = overrides
+                with self.assertRaisesRegex(
+                    ValueError, "32-byte hex GENESIS_CHALLENGE"
+                ):
+                    self.run_export()
+                self.assertFalse(self.output.exists())
 
     def test_missing_package_metadata_uses_unknown_version(self):
         output = self.run_export(
