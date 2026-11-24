@@ -536,7 +536,7 @@ fn discriminant_starts_before_a_client_is_available_and_cancellation_releases_la
                 .is_cancelled()
         );
         assert!(backend.lanes[0].1.active.try_lock().unwrap().is_none());
-        assert!(backend.pools.read().unwrap()["a"].try_lock().is_ok());
+        assert!(backend.pools.read().unwrap().contains_key("a"));
         assert!(
             backend
                 .runtime

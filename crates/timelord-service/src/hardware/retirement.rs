@@ -122,56 +122,94 @@ pub(super) async fn retire(
 pub(super) async fn drain_shutdown(source: &mut (impl AsyncRead + Unpin)) -> Result<bool> {
     drain_shutdown_observed(source, &AtomicBool::new(false)).await
 }
-// Discard bounded raw chunks while retaining the marker plus a possible CR.
+
+#[cfg(test)]
+pub(super) async fn drain_shutdown_diagnostics(
+    source: &mut (impl AsyncRead + Unpin),
+    observed: &AtomicBool,
+) -> Result<(bool, Vec<String>)> {
+    let mut records = Vec::new();
+    let confirmed =
+        drain_shutdown_records(source, observed, |record| records.push(record.into())).await?;
+    Ok((confirmed, records))
+}
+
 // Native log prefixes are permitted; payload fields and LF/CRLF framing must
 // match exactly. An unterminated or truncated record is never confirmation.
 async fn drain_shutdown_observed(
-    source: &mut (impl tokio::io::AsyncRead + Unpin),
+    source: &mut (impl AsyncRead + Unpin),
     observed: &AtomicBool,
 ) -> Result<bool> {
-    const MARKER: &[u8] = b"Hardware shutdown: engines_paused=1 safe_point_restored=1";
+    drain_shutdown_records(source, observed, |record| {
+        tracing::info!(record, "Native shutdown diagnostic");
+    })
+    .await
+}
+
+async fn drain_shutdown_records(
+    source: &mut (impl AsyncRead + Unpin),
+    observed: &AtomicBool,
+    mut log: impl FnMut(&str),
+) -> Result<bool> {
     let mut buffer = [0u8; 1024];
-    let retained = MARKER.len() + 1;
-    let mut tail = Vec::with_capacity(buffer.len() + retained);
-    let mut confirmed = false;
-    let mut diagnostic_records = 0;
+    let mut drain = ShutdownDrain::default();
     loop {
         let count = source.read(&mut buffer).await?;
         if count == 0 {
-            return Ok(confirmed);
+            return Ok(drain.confirmed);
         }
-        tail.extend_from_slice(&buffer[..count]);
-        confirmed |= tail
-            .windows(MARKER.len())
-            .enumerate()
-            .any(|(offset, candidate)| {
-                candidate == MARKER
-                    && matches!(
-                        &tail[offset + MARKER.len()..],
-                        [b'\n', ..] | [b'\r', b'\n', ..]
-                    )
-            });
-        if confirmed {
+        for &byte in &buffer[..count] {
+            drain.feed(byte, observed, &mut log);
+        }
+    }
+}
+
+const MARKER: &[u8] = b"Hardware shutdown: engines_paused=1 safe_point_restored=1";
+const MAX_LINE: usize = 4096;
+const MAX_DIAGNOSTICS: usize = 8;
+const DIAGNOSTICS: [&str; 3] = ["safe_readback", "Hardware shutdown:", "VDF client stopped:"];
+
+#[derive(Default)]
+struct ShutdownDrain {
+    line: Vec<u8>,
+    discarding: bool,
+    diagnostics: usize,
+    confirmed: bool,
+}
+
+impl ShutdownDrain {
+    // Every newline-terminated record is consumed exactly once. An oversized
+    // unterminated record is dropped up to its newline so a suffix can never be
+    // mistaken for a diagnostic or a marker.
+    fn feed(&mut self, byte: u8, observed: &AtomicBool, log: &mut impl FnMut(&str)) {
+        if self.discarding {
+            if byte == b'\n' {
+                self.discarding = false;
+            }
+            return;
+        }
+        if byte != b'\n' {
+            if self.line.len() < MAX_LINE {
+                self.line.push(byte);
+            } else {
+                self.line.clear();
+                self.discarding = true;
+            }
+            return;
+        }
+        let content = self.line.strip_suffix(b"\r").unwrap_or(&self.line);
+        if content.ends_with(MARKER) {
+            self.confirmed = true;
             observed.store(true, Ordering::Release);
         }
-        // Shutdown diagnostics were previously discarded, hiding whether the
-        // client rejected readback or simply failed to exit. Keep bounded error
-        // records in the service log without interpreting them as confirmation.
-        for record in tail.split_inclusive(|byte| *byte == b'\n') {
-            if diagnostic_records >= 8 || !record.ends_with(b"\n") {
-                continue;
-            }
-            let text = String::from_utf8_lossy(record);
-            if ["safe_readback", "Hardware shutdown:", "VDF client stopped:"]
-                .iter()
-                .any(|marker| text.contains(marker))
-            {
-                tracing::info!(record = text.trim_end(), "Native shutdown diagnostic");
-                diagnostic_records += 1;
+        if self.diagnostics < MAX_DIAGNOSTICS {
+            let text = String::from_utf8_lossy(content);
+            if DIAGNOSTICS.iter().any(|marker| text.contains(marker)) {
+                log(text.trim_end());
+                self.diagnostics += 1;
             }
         }
-        let discard = tail.len().saturating_sub(retained);
-        tail.drain(..discard);
+        self.line.clear();
     }
 }
 

@@ -124,7 +124,7 @@ const LANE_ERROR_LIMIT: usize = 2;
 const LANE_ERROR_WINDOW_SECONDS: u64 = 120;
 pub struct AsicBackend {
     lanes: Vec<(Chain, Lane)>,
-    pools: RwLock<HashMap<String, Arc<Mutex<Pool>>>>,
+    pools: RwLock<HashMap<String, Arc<Pool>>>,
     process: Arc<crate::operational::State>,
     scope: RuntimeScope,
     runtime: Arc<SyncMutex<crate::runtime::RuntimeState>>,
@@ -163,7 +163,7 @@ impl AsicBackend {
             .pools
             .write()
             .expect("ASIC pools")
-            .insert(id.into(), Arc::new(Mutex::new(Pool::new(receiver))));
+            .insert(id.into(), Arc::new(Pool::new(receiver)));
         assert!(
             old.is_none(),
             "Board listener must be added once per runtime"
@@ -501,7 +501,6 @@ impl AsicBackend {
                     .get(board)
                     .cloned()
                     .context("Missing board listener")?;
-                let mut pool = pool.lock().await;
                 let mut lease = tokio::time::timeout(
                     Duration::from_secs(30),
                     pool.receive(physical, generation),
@@ -664,7 +663,7 @@ impl AsicBackend {
         }
         let pool = self.pools.read().expect("ASIC pools").get(board).cloned();
         if let Some(pool) = pool {
-            pool.lock().await.clear();
+            pool.clear().await;
         }
     }
     pub async fn stop_all(&self) {
@@ -682,7 +681,7 @@ impl AsicBackend {
             .cloned()
             .collect();
         for pool in pools {
-            pool.lock().await.clear();
+            pool.clear().await;
         }
     }
 }
@@ -755,5 +754,7 @@ pub fn verify(work: &ProofRequest, proof: UnverifiedProof) -> Result<ProofResult
     })
 }
 
+#[cfg(test)]
+mod pool_tests;
 #[cfg(test)]
 mod tests;
