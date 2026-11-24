@@ -218,7 +218,9 @@ tests:
     alertname: TimelordAdmissionSaturated
     exp_alerts:
     - exp_labels: {job: timelord-app, instance: 'fixture:9258', network: mainnet, severity: warning}
-      exp_annotations: {summary: Timelord is dropping unfinished-block work under load}
+      exp_annotations:
+        summary: Timelord is dropping unfinished-block work under load
+        description: Break down chia_timelord_unfinished_candidates_total by outcome and source to identify which admission limit is saturated.
 - name: sustained saturation just above the threshold still alerts
   interval: 1m
   input_series:
@@ -229,7 +231,9 @@ tests:
     alertname: TimelordAdmissionSaturated
     exp_alerts:
     - exp_labels: {job: timelord-app, instance: 'fixture:9258', network: mainnet, severity: warning}
-      exp_annotations: {summary: Timelord is dropping unfinished-block work under load}
+      exp_annotations:
+        summary: Timelord is dropping unfinished-block work under load
+        description: Break down chia_timelord_unfinished_candidates_total by outcome and source to identify which admission limit is saturated.
 - name: a single isolated dropped candidate does not alert
   interval: 1m
   input_series:
@@ -257,6 +261,15 @@ tests:
   - eval_time: 30m
     alertname: TimelordAdmissionSaturated
     exp_alerts: []
+- name: six drops per fifteen minutes stay below the threshold at a fifteen second scrape
+  interval: 15s
+  input_series:
+  - series: chia_timelord_unfinished_candidates_total{job="timelord-app",instance="fixture:9258",network="mainnet",outcome="deferred_queue_full",source="retry"}
+    values: 0+0x9 1+0x9 2+0x9 3+0x9 4+0x9 5+0x9 6+0x9 7+0x9 8+0x9 9+0x9 10+0x9 11+0x9 12+0x9 13+0x9 14+0x9 15+0x9 16+0x9 17+0x9
+  alert_rule_test:
+  - eval_time: 45m
+    alertname: TimelordAdmissionSaturated
+    exp_alerts: []
 - name: a burst above the threshold holds for the window then clears
   interval: 1m
   input_series:
@@ -267,7 +280,9 @@ tests:
     alertname: TimelordAdmissionSaturated
     exp_alerts:
     - exp_labels: {job: timelord-app, instance: 'fixture:9258', network: mainnet, severity: warning}
-      exp_annotations: {summary: Timelord is dropping unfinished-block work under load}
+      exp_annotations:
+        summary: Timelord is dropping unfinished-block work under load
+        description: Break down chia_timelord_unfinished_candidates_total by outcome and source to identify which admission limit is saturated.
   - eval_time: 30m
     alertname: TimelordAdmissionSaturated
     exp_alerts: []

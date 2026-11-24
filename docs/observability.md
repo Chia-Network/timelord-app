@@ -189,8 +189,8 @@ retries still count together, and one instance raises one alert rather than one
 per label combination. The rule uses a fifteen-minute window with a five-minute
 hold and a ten-minute keep-firing tail; sparse drops stay quiet, while sustained
 pressure alerts and does not immediately re-fire during short dips. A large burst
-can exceed the threshold, then clears after the window and hold. See
-`monitoring/alerts.yml` for the exact expression.
+can exceed the threshold; it then clears after the fifteen-minute window plus the
+ten-minute keep-firing tail. See `monitoring/alerts.yml` for the exact expression.
 
 The example alert set also covers scrape/metric loss, internal failure, sustained
 node disconnection, missing required chain clients, verification failure, thermal
