@@ -22,7 +22,7 @@ struct NodeRPCSettings: View {
                 Text("Use an address reachable from this Mac and the full node’s RPC port.")
                     .font(.caption).foregroundStyle(.secondary)
             } else {
-                Text("Sync status is saved only after all three RPC credential files are selected.")
+                Text("Sync status is saved only when the RPC host, port, TLS server name and all three credential files are set.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }

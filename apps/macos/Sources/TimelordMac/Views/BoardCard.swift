@@ -26,7 +26,7 @@ struct BoardCard: View {
                             HStack(spacing: 12) {
                                 let raw = board.rawSpeed(for: history.chain)
                                 Text("Raw \(raw?.displayText(at: snapshot.now) ?? "—")")
-                                    .help(raw?.state == "sampling" ? "Last sample; starting a new chain." : "Recent hardware speed.")
+                                    .help(raw?.state == .sampling ? "Last sample; starting a new chain." : "Recent hardware speed.")
                                 Text("Mean \(snapshot.recentSpeed(for: history))")
                                     .help("Delivered IPS · 5-minute mean")
                                 Text("Median \(snapshot.recentMedian(for: history))")

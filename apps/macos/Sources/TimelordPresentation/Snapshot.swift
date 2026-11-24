@@ -187,12 +187,12 @@ public struct BoardSnapshot: Identifiable, Sendable {
     public var automaticTitle: String {
         guard let automatic else { return "Learning starts with Timelord" }
         switch automatic.state {
-        case "paused": return "Settings held"
-        case "testing": return "Testing settings"
-        case "monitoring": return "Monitoring"
-        case "cooldown": return "Recovery cooldown"
-        case "waiting": return "Waiting for work"
-        default: return "Learning"
+        case .paused: return "Settings held"
+        case .testing: return "Testing settings"
+        case .monitoring: return "Monitoring"
+        case .cooldown: return "Recovery cooldown"
+        case .waiting: return "Waiting for work"
+        case .learning, .unknown(_): return "Learning"
         }
     }
     public var temperatureText: String { temperatureC.map { String(format: "%.1f°C", $0) } ?? "—" }
@@ -222,7 +222,7 @@ public struct AppSnapshot: Sendable {
         if phase == .serviceUnavailable && serviceAvailable { return "Proof service stopped" }
         if readyToRun { return "Ready to run" }
         let optimizing = phase == .running && !tuningPaused
-            && boards.contains { ["learning", "testing"].contains($0.automatic?.state ?? "") }
+            && boards.contains { $0.automatic?.state == .testing || $0.automatic?.state == .learning }
         return optimizing ? "Running · Optimizing" : phase.title
     }
 
@@ -272,81 +272,165 @@ public struct AppSnapshot: Sendable {
 
 /// Versioned wire states. Each enum keeps a fallback case so an older app can
 /// still decode a status payload that a newer service produced.
-public enum TimelordState: Decodable, Sendable, Equatable {
+public protocol StatusWireState: Decodable, Sendable, Equatable, CustomStringConvertible {
+    static var wireValues: [String: Self] { get }
+    static func unrecognized(_ wireValue: String) -> Self
+    var unrecognizedValue: String? { get }
+}
+
+public extension StatusWireState {
+    init?(wireValue: String) {
+        guard let value = Self.wireValues[wireValue] else { return nil }
+        self = value
+    }
+    init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        self = Self(wireValue: value) ?? Self.unrecognized(value)
+    }
+    /// The original wire string, including values this app does not know yet.
+    var wireValue: String {
+        if let unrecognizedValue { return unrecognizedValue }
+        return Self.wireValues.first { $0.value == self }?.key ?? "unknown"
+    }
+    var description: String { wireValue }
+}
+
+public enum TimelordState: StatusWireState {
     case setupRequired, waitingForNode, waitingForClients, running, fault
     case unknown(String)
 
-    public init(from decoder: Decoder) throws {
-        let value = try decoder.singleValueContainer().decode(String.self)
-        switch value {
-        case "setup_required": self = .setupRequired
-        case "waiting_for_node": self = .waitingForNode
-        case "waiting_for_clients": self = .waitingForClients
-        case "running": self = .running
-        case "fault": self = .fault
-        default: self = .unknown(value)
-        }
+    public static let wireValues: [String: TimelordState] = [
+        "setup_required": .setupRequired,
+        "waiting_for_node": .waitingForNode,
+        "waiting_for_clients": .waitingForClients,
+        "running": .running,
+        "fault": .fault,
+    ]
+    public static func unrecognized(_ wireValue: String) -> Self { .unknown(wireValue) }
+    public var unrecognizedValue: String? {
+        if case .unknown(let value) = self { return value }
+        return nil
     }
 }
 
-public enum FullNodeState: Decodable, Sendable, Equatable {
+public enum FullNodeState: StatusWireState {
     case notConfigured, notConnected, connecting, authenticated, ready, disconnected
     case waitingForHardware
     case unknown(String)
 
-    public init(from decoder: Decoder) throws {
-        let value = try decoder.singleValueContainer().decode(String.self)
-        switch value {
-        case "not_configured": self = .notConfigured
-        case "not_connected": self = .notConnected
-        case "connecting": self = .connecting
-        case "authenticated": self = .authenticated
-        case "ready": self = .ready
-        case "disconnected": self = .disconnected
-        case "waiting_for_hardware": self = .waitingForHardware
-        default: self = .unknown(value)
-        }
+    public static let wireValues: [String: FullNodeState] = [
+        "not_configured": .notConfigured,
+        "not_connected": .notConnected,
+        "connecting": .connecting,
+        "authenticated": .authenticated,
+        "ready": .ready,
+        "disconnected": .disconnected,
+        "waiting_for_hardware": .waitingForHardware,
+    ]
+    public static func unrecognized(_ wireValue: String) -> Self { .unknown(wireValue) }
+    public var unrecognizedValue: String? {
+        if case .unknown(let value) = self { return value }
+        return nil
     }
 }
 
-public enum HardwareState: Decodable, Sendable, Equatable {
+public enum HardwareState: StatusWireState {
     case notInspected, starting, checking, connected, stopped, reconnecting
     case thermalStop
     case invalidProof
     case unknown(String)
 
-    public init(from decoder: Decoder) throws {
-        let value = try decoder.singleValueContainer().decode(String.self)
-        switch value {
-        case "not_inspected": self = .notInspected
-        case "starting": self = .starting
-        case "checking": self = .checking
-        case "connected": self = .connected
-        case "stopped": self = .stopped
-        case "reconnecting": self = .reconnecting
-        case "thermal_stop": self = .thermalStop
-        case "invalid_proof": self = .invalidProof
-        default: self = .unknown(value)
-        }
+    public static let wireValues: [String: HardwareState] = [
+        "not_inspected": .notInspected,
+        "starting": .starting,
+        "checking": .checking,
+        "connected": .connected,
+        "stopped": .stopped,
+        "reconnecting": .reconnecting,
+        "thermal_stop": .thermalStop,
+        "invalid_proof": .invalidProof,
+    ]
+    public static func unrecognized(_ wireValue: String) -> Self { .unknown(wireValue) }
+    public var unrecognizedValue: String? {
+        if case .unknown(let value) = self { return value }
+        return nil
     }
 }
 
-public enum RoutingState: Decodable, Sendable, Equatable {
+public enum RoutingState: StatusWireState {
     case serving, probation, disabled, unavailable
     /// Reported by older services only; current ones never bench a working board.
     case benched
     case unknown(String)
 
-    public init(from decoder: Decoder) throws {
-        let value = try decoder.singleValueContainer().decode(String.self)
-        switch value {
-        case "serving": self = .serving
-        case "probation": self = .probation
-        case "disabled": self = .disabled
-        case "unavailable": self = .unavailable
-        case "benched": self = .benched
-        default: self = .unknown(value)
-        }
+    public static let wireValues: [String: RoutingState] = [
+        "serving": .serving,
+        "probation": .probation,
+        "disabled": .disabled,
+        "unavailable": .unavailable,
+        "benched": .benched,
+    ]
+    public static func unrecognized(_ wireValue: String) -> Self { .unknown(wireValue) }
+    public var unrecognizedValue: String? {
+        if case .unknown(let value) = self { return value }
+        return nil
+    }
+}
+
+public enum AutomaticState: StatusWireState {
+    case paused, testing, monitoring, cooldown, waiting
+    /// Used by older fixtures; current services report the states above.
+    case learning
+    case unknown(String)
+
+    public static let wireValues: [String: AutomaticState] = [
+        "paused": .paused,
+        "testing": .testing,
+        "monitoring": .monitoring,
+        "cooldown": .cooldown,
+        "waiting": .waiting,
+        "learning": .learning,
+    ]
+    public static func unrecognized(_ wireValue: String) -> Self { .unknown(wireValue) }
+    public var unrecognizedValue: String? {
+        if case .unknown(let value) = self { return value }
+        return nil
+    }
+}
+
+public enum RawSpeedState: StatusWireState {
+    case running, sampling, idle
+    case unknown(String)
+
+    public static let wireValues: [String: RawSpeedState] = [
+        "running": .running,
+        "sampling": .sampling,
+        "idle": .idle,
+    ]
+    public static func unrecognized(_ wireValue: String) -> Self { .unknown(wireValue) }
+    public var unrecognizedValue: String? {
+        if case .unknown(let value) = self { return value }
+        return nil
+    }
+}
+
+public enum FaultKind: StatusWireState {
+    case thermal, sensorUnavailable, controlClosed, readback, protocolFault, stalled, exited
+    case unknown(String)
+
+    public static let wireValues: [String: FaultKind] = [
+        "thermal": .thermal,
+        "sensor_unavailable": .sensorUnavailable,
+        "control_closed": .controlClosed,
+        "readback": .readback,
+        "protocol": .protocolFault,
+        "stalled": .stalled,
+        "exited": .exited,
+    ]
+    public static func unrecognized(_ wireValue: String) -> Self { .unknown(wireValue) }
+    public var unrecognizedValue: String? {
+        if case .unknown(let value) = self { return value }
+        return nil
     }
 }
 
@@ -382,9 +466,9 @@ public struct RawSpeed: Decodable, Sendable {
     public let engine: Int
     public let ips: Double
     public let timestampUnix: Double
-    public let state: String?
+    public let state: RawSpeedState?
     public func freshIPS(at now: Date) -> Double? {
-        guard state == nil || state == "running" else { return nil }
+        guard state == nil || state == .running else { return nil }
         return recentIPS(at: now)
     }
     private func recentIPS(at now: Date) -> Double? {
@@ -393,8 +477,8 @@ public struct RawSpeed: Decodable, Sendable {
     }
     public func displayText(at now: Date) -> String {
         switch state {
-        case "idle": return "Idle"
-        case "sampling": return recentIPS(at: now).map(DisplayFormat.ips) ?? "Starting"
+        case .idle?: return "Idle"
+        case .sampling?: return recentIPS(at: now).map(DisplayFormat.ips) ?? "Starting"
         default: return freshIPS(at: now).map(DisplayFormat.ips) ?? "—"
         }
     }
@@ -417,7 +501,7 @@ public struct BoardStatus: Decodable, Identifiable, Sendable {
     public let serial: String?
     public let automatic: AutomaticStatus?
     public let rawSpeeds: [RawSpeed]?
-    public let faultKind: String?
+    public let faultKind: FaultKind?
     public let recoveryReason: String?
     public let retryAfterUnix: Double?
     public let nativePid: Int?
@@ -458,7 +542,7 @@ public struct BoardEvent: Decodable, Sendable, Identifiable {
 }
 
 public struct AutomaticStatus: Decodable, Sendable {
-    public let state: String
+    public let state: AutomaticState
     public let message: String
     public let activeSeconds: Int
     public let cooldownSeconds: Int
@@ -614,7 +698,7 @@ public enum LivePresentation {
                 || admissionBlocked
                 || checkingHardware
                 || status.timelordState == .waitingForClients else { return nil }
-            if status.boards.contains(where: { $0.faultKind == "control_closed" }) {
+            if status.boards.contains(where: { $0.faultKind == .controlClosed }) {
                 return "The ASIC client connection closed unexpectedly. Proof production has stopped. "
                     + "Pause and Run to reconnect. Details: Native control closed before acknowledgement."
             }

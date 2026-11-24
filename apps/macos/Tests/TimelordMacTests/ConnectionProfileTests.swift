@@ -126,7 +126,12 @@ final class ConnectionProfileTests: XCTestCase {
         // Capture `configure` input, then return it for the reload.
         try Data("""
         #!/bin/sh
-        if [ "$1" = configuration ]; then cat '\(captured.path)'; else cp "$5" '\(captured.path)'; fi
+        if [ "$1" = configuration ]; then cat '\(captured.path)'; exit 0; fi
+        previous=
+        for argument in "$@"; do
+          if [ "$previous" = "--input" ]; then cp "$argument" '\(captured.path)'; break; fi
+          previous=$argument
+        done
         """.utf8).write(to: helper)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
         var other = NodeConfiguration(); other.host = "other.fixture"
@@ -204,7 +209,12 @@ final class ConnectionProfileTests: XCTestCase {
         let captured = directory.appendingPathComponent("submitted.json")
         try Data("""
         #!/bin/sh
-        if [ "$1" = configuration ]; then cat '\(captured.path)'; else cp "$5" '\(captured.path)'; fi
+        if [ "$1" = configuration ]; then cat '\(captured.path)'; exit 0; fi
+        previous=
+        for argument in "$@"; do
+          if [ "$previous" = "--input" ]; then cp "$argument" '\(captured.path)'; break; fi
+          previous=$argument
+        done
         """.utf8).write(to: helper)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
 
@@ -226,7 +236,8 @@ final class ConnectionProfileTests: XCTestCase {
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
 
         // Toggling sync status creates an RPC draft before any credential exists.
-        model.configuration.node.rpc = NodeRPCConfiguration(host: model.configuration.node.host)
+        let draft = NodeRPCConfiguration(host: model.configuration.node.host)
+        model.configuration.node.rpc = draft
         XCTAssertNotNil(model.configuration.node.rpc)
         XCTAssertTrue(model.hasUnsavedSettings, "The draft is unsaved UI state, not a persisted RPC profile")
         model.selectConnectionProfile("second")
@@ -236,7 +247,14 @@ final class ConnectionProfileTests: XCTestCase {
         let switchedConfig = try decoder.decode(AppConfiguration.self, from: Data(contentsOf: captured))
         XCTAssertNil(switchedConfig.connections?.profiles[0].node.rpc)
         XCTAssertEqual(switchedConfig.connections?.activeId, "second")
-        XCTAssertNil(model.configuration.connections?.profiles[0].node.rpc)
+        XCTAssertEqual(model.configuration.connections?.profiles[0].node.rpc, draft,
+            "The saved configuration strips the draft, but the form keeps it")
+        XCTAssertTrue(model.hasUnsavedSettings)
+
+        // Turning the draft off persists the absence of RPC settings.
+        model.configuration.connections?.profiles[0].node.rpc = nil
+        let clearedDraft = await model.saveConfiguration()
+        XCTAssertTrue(clearedDraft)
         XCTAssertFalse(model.hasUnsavedSettings)
 
         let valid = NodeRPCConfiguration(

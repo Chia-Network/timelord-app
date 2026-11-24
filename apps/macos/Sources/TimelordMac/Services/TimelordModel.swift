@@ -13,12 +13,12 @@ final class TimelordModel: ObservableObject {
     @Published var sheet: AppSheet?
     /// Action failures are transient. A startup failure survives a successful
     /// save until the supervisor is reachable, so saving cannot hide it.
-    @Published private var actionError: String?
+    @Published private(set) var actionError: String?
     @Published private var startupError: String?
-    var errorMessage: String? {
-        get { actionError ?? startupError }
-        set { actionError = newValue }
-    }
+    var errorMessage: String? { actionError ?? startupError }
+    /// The single mutation point for transient failures from user actions.
+    func reportActionError(_ message: String) { actionError = message }
+    func clearActionError() { actionError = nil }
     @Published private(set) var controlOperation: ServiceControlOperation?
     @Published var configuration = AppConfiguration()
     @Published private(set) var configurationLoaded = false
@@ -34,6 +34,7 @@ final class TimelordModel: ObservableObject {
     private let controller: ServiceController
     private var liveClient: LiveStatusClient
     private let configurationClient: ConfigurationClient
+    /// Read-only outside the model so regression tests can assert save rollback.
     private(set) var savedConfiguration = AppConfiguration()
     private var liveStatus: ServiceStatus?
     private var workerStatus = WorkerStatusObservation.absent
@@ -128,10 +129,10 @@ final class TimelordModel: ObservableObject {
                     savedConfiguration.hardware.clientBinary = packagedClient
                 }
                 useSavedStatusEndpoint()
-            } catch { errorMessage = error.localizedDescription }
+            } catch { reportActionError(error.localizedDescription) }
         }
         await controller.refresh()
-        if canControlService {
+        if canControlService, startupError != nil {
             startupError = nil
         }
         if monitoringEnabled { await restoreStartupIntent() }
@@ -252,9 +253,9 @@ final class TimelordModel: ObservableObject {
         operationInProgress = true; defer { operationInProgress = false }
         do {
             try await configurationClient.board(serial: serial, action: action, minutes: minutes)
-            errorMessage = nil
+            clearActionError()
             await refresh()
-        } catch { errorMessage = error.localizedDescription }
+        } catch { reportActionError(error.localizedDescription) }
     }
     func toggleTuning() async {
         guard canControlService, !operationInProgress, let pid = controller.processID else { return }
@@ -263,7 +264,7 @@ final class TimelordModel: ObservableObject {
             let response = try await configurationClient.tuning(paused: !snapshot.tuningPaused)
             guard response.servicePid == Int(pid) else { throw ConfigurationError.message("Tuning response came from another service.") }
             await refresh()
-        } catch { errorMessage = error.localizedDescription }
+        } catch { reportActionError(error.localizedDescription) }
     }
     private func performControl(_ operation: ServiceControlOperation) async {
         defer { controlOperation = nil; updateSnapshot() }
@@ -283,11 +284,11 @@ final class TimelordModel: ObservableObject {
                 liveStatus = nil; history = nil
                 configurationNeedsRestart = false; useSavedStatusEndpoint()
             }
-        } catch { errorMessage = error.localizedDescription }
+        } catch { reportActionError(error.localizedDescription) }
     }
     func startService() {
         guard canStartService else { return }
-        controlOperation = .start; errorMessage = nil; updateSnapshot()
+        controlOperation = .start; clearActionError(); updateSnapshot()
         Task {
             await performControl(.start)
             if monitoringEnabled { await refresh() }
@@ -295,7 +296,7 @@ final class TimelordModel: ObservableObject {
     }
     func stopService() {
         guard canPause else { return }
-        controlOperation = .pause; errorMessage = nil; updateSnapshot()
+        controlOperation = .pause; clearActionError(); updateSnapshot()
         Task {
             await performControl(.pause)
             if monitoringEnabled { await refresh() }
@@ -303,7 +304,7 @@ final class TimelordModel: ObservableObject {
     }
     func restartService() async {
         guard canControlService, !isBusy else { return }
-        controlOperation = .reload; errorMessage = nil; updateSnapshot()
+        controlOperation = .reload; clearActionError(); updateSnapshot()
         await performControl(.reload)
     }
     func installBackgroundService() async {
@@ -311,7 +312,7 @@ final class TimelordModel: ObservableObject {
         guard await saveConfiguration(), !quitting else { return }
         operationInProgress = true; defer { operationInProgress = false }
         do { try await controller.install(); await refresh() }
-        catch { errorMessage = error.localizedDescription }
+        catch { reportActionError(error.localizedDescription) }
     }
     var hasUnsavedSettings: Bool { configuration != savedConfiguration }
     /// Only the node profile differs between two configurations.
@@ -372,7 +373,7 @@ final class TimelordModel: ObservableObject {
                 do {
                     try await configurationClient.reloadNode()
                     configurationNeedsRestart = false; pendingChangeIsNodeOnly = true
-                    useSavedStatusEndpoint(); errorMessage = nil
+                    useSavedStatusEndpoint(); clearActionError()
                     connectionResult = "Switched the full-node connection. ASIC boards kept running."
                 } catch {
                     connectionResult = nil
@@ -401,30 +402,34 @@ final class TimelordModel: ObservableObject {
             let persisted = try await configurationClient.load()
             // Keep edits made while the helper was saving, but adopt its profile
             // migration whenever the submitted configuration is still current.
-            if configuration.normalizedForPersistence() == updated { configuration = persisted }
+            // Incomplete RPC drafts were stripped for validation, so restore the
+            // form state the user is still filling in.
+            if configuration.normalizedForPersistence() == updated {
+                configuration = persisted.restoringIncompleteRPCDrafts(from: configuration)
+            }
             savedConfiguration = persisted
             nodeSync = nil; lastNodeSyncFetch = .distantPast
             let needsRestart = (canControlService || liveStatus != nil) && runtimeChanged
             if needsRestart { pendingChangeIsNodeOnly = (configurationNeedsRestart ? pendingChangeIsNodeOnly : true) && nodeOnly }
             configurationNeedsRestart = configurationNeedsRestart || needsRestart
-            actionError = nil; configurationLoaded = true
+            clearActionError(); configurationLoaded = true
             connectionResult = configurationNeedsRestart ? "Saved. Restart Timelord to apply these settings." : "Settings saved."
             if !configurationNeedsRestart { useSavedStatusEndpoint() }
             updateSnapshot()
             return true
         } catch {
-            actionError = error.localizedDescription
+            reportActionError(error.localizedDescription)
             return false
         }
     }
     func testNode() async {
-        guard canInspectConnections else { errorMessage = "Pause Timelord before testing a connection."; return }
+        guard canInspectConnections else { reportActionError("Pause Timelord before testing a connection."); return }
         guard await saveConfiguration() else { return }
         operationInProgress = true; defer { operationInProgress = false }
-        do { connectionResult = try await configurationClient.testNode() } catch { errorMessage = error.localizedDescription; connectionResult = nil }
+        do { connectionResult = try await configurationClient.testNode() } catch { reportActionError(error.localizedDescription); connectionResult = nil }
     }
     func discoverBoards() async {
-        guard canInspectConnections else { errorMessage = "Pause Timelord before scanning USB devices."; return }
+        guard canInspectConnections else { reportActionError("Pause Timelord before scanning USB devices."); return }
         guard await saveConfiguration() else { return }
         operationInProgress = true; defer { operationInProgress = false }
         await refreshDevices()
@@ -444,13 +449,13 @@ final class TimelordModel: ObservableObject {
                 }
             }
             discoveredDevices=devices
-            if actionError==discoveryError {actionError=nil};discoveryError=nil
+            if actionError == discoveryError { clearActionError() }; discoveryError = nil
             savedConfiguration.hardware=BoardDiscovery.reconcile(devices,hardware:savedConfiguration.hardware,service:savedConfiguration.service)
             configuration.hardware=BoardDiscovery.reconcile(devices,hardware:configuration.hardware,service:configuration.service)
             // The service owns debounced topology changes, including headless
             // deployments. Discovery must not ask users to restart it manually.
             updateSnapshot()
-        } catch { if liveStatus == nil {discoveredDevices=[];updateSnapshot()}; discoveryError=error.localizedDescription;actionError=error.localizedDescription }
+        } catch { if liveStatus == nil {discoveredDevices=[];updateSnapshot()}; discoveryError=error.localizedDescription;reportActionError(error.localizedDescription) }
     }
     func importNode(local: Bool) async {
         guard !operationInProgress else { return }
@@ -467,12 +472,12 @@ final class TimelordModel: ObservableObject {
                 var isDirectory: ObjCBool = false; FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
                 try await configurationClient.importNode(bundle: isDirectory.boolValue ? url.appendingPathComponent("connection.toml").path : url.path)
             }
-            configuration = try await configurationClient.load(); savedConfiguration = configuration; configurationLoaded = true; errorMessage = nil
+            configuration = try await configurationClient.load(); savedConfiguration = configuration; configurationLoaded = true; clearActionError()
             nodeSync = nil; lastNodeSyncFetch = .distantPast
             configurationNeedsRestart = canControlService || liveStatus != nil
             connectionResult = "Connection profile imported. Save & Restart applies it to a running Timelord."
             updateSnapshot()
-        } catch { errorMessage = error.localizedDescription }
+        } catch { reportActionError(error.localizedDescription) }
     }
     func selectConnectionProfile(_ id: String) {
         guard !operationInProgress, var connections = configuration.connections,
@@ -502,10 +507,10 @@ final class TimelordModel: ObservableObject {
         return panel.runModal() == .OK ? panel.url?.path : nil
     }
     func revealConfig() {
-        do { try controller.prepareConfig(); NSWorkspace.shared.activateFileViewerSelecting([configURL]) } catch { errorMessage = error.localizedDescription }
+        do { try controller.prepareConfig(); NSWorkspace.shared.activateFileViewerSelecting([configURL]) } catch { reportActionError(error.localizedDescription) }
     }
     func openLog() {
-        if FileManager.default.fileExists(atPath: logsURL.path) { NSWorkspace.shared.open(logsURL) } else { errorMessage = "There is no service log yet." }
+        if FileManager.default.fileExists(atPath: logsURL.path) { NSWorkspace.shared.open(logsURL) } else { reportActionError("There is no service log yet.") }
     }
     func copyDiagnostics() {
         let lines = ["Timelord local status", "State: \(snapshot.phase.title)", "Boards shown: \(snapshot.boards.count)", snapshot.proofFreshness]

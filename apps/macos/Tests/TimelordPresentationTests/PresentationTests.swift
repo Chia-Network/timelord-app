@@ -97,7 +97,7 @@ final class PresentationTests: XCTestCase {
             var board = BoardSnapshot(id: "a", name: "A", state: .active, temperatureC: 40,
                 temperatureLimitC: 55, profile: "Automatic", frequencyMHz: 1900,
                 voltageV: 1, histories: histories, lastProof: now,
-                rawSpeeds: (0...2).map { RawSpeed(engine: $0, ips: Double(1_000_000 + $0), timestampUnix: now.timeIntervalSince1970, state: "running") })
+                rawSpeeds: (0...2).map { RawSpeed(engine: $0, ips: Double(1_000_000 + $0), timestampUnix: now.timeIntervalSince1970, state: .running) })
             for (index, history) in histories.enumerated() {
                 let expected = count == 1 ? 1 : index
                 XCTAssertEqual(board.rawSpeed(for: history.chain)?.engine, expected)
@@ -771,6 +771,15 @@ extension PresentationTests {
                 "id": "a", "name": "ASIC 1", "assigned_chains": ["challenge"],
                 "connected_clients": 0, "hardware_state": "future_hardware_state",
                 "routing_state": "future_routing_state", "profile": "Automatic",
+                "fault_kind": "future_fault_kind",
+                "raw_speeds": [[
+                    "engine": 0, "ips": 1_000_000, "timestamp_unix": 1_000_000,
+                    "state": "future_raw_state",
+                ]],
+                "automatic": [
+                    "state": "future_automatic_state", "message": "",
+                    "active_seconds": 0, "cooldown_seconds": 0,
+                ],
             ]],
         ]
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -779,6 +788,19 @@ extension PresentationTests {
         XCTAssertEqual(status.fullNode.state, .unknown("future_node_state"))
         XCTAssertEqual(status.boards[0].hardwareState, .unknown("future_hardware_state"))
         XCTAssertEqual(status.boards[0].routingState, .unknown("future_routing_state"))
+        XCTAssertEqual(status.boards[0].faultKind, .unknown("future_fault_kind"))
+        XCTAssertEqual(status.boards[0].rawSpeeds?[0].state, .unknown("future_raw_state"))
+        XCTAssertEqual(status.boards[0].automatic?.state, .unknown("future_automatic_state"))
+        // Unknown values keep their original wire text for diagnostics.
+        XCTAssertEqual(status.timelordState.wireValue, "future_timelord_state")
+        XCTAssertEqual(status.fullNode.state.description, "future_node_state")
+        XCTAssertEqual(status.boards[0].hardwareState.wireValue, "future_hardware_state")
+        XCTAssertEqual(status.boards[0].routingState?.description, "future_routing_state")
+        XCTAssertEqual(status.boards[0].faultKind?.wireValue, "future_fault_kind")
+        XCTAssertEqual(status.boards[0].rawSpeeds?[0].state?.wireValue, "future_raw_state")
+        XCTAssertEqual(status.boards[0].automatic?.state.description, "future_automatic_state")
+        XCTAssertEqual(TimelordState.running.wireValue, "running")
+        XCTAssertEqual(FaultKind.controlClosed.description, "control_closed")
         XCTAssertFalse(status.boards[0].hasLiveOwner)
         // The snapshot must remain renderable rather than failing to decode.
         XCTAssertEqual(LivePresentation.snapshot(status: status, now: now).phase, .waitingForNode)

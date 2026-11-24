@@ -40,6 +40,23 @@ public struct AppConfiguration: Codable, Sendable, Equatable {
         }
         return normalized
     }
+    /// Saving strips incomplete RPC drafts. Put the user's still-editable
+    /// drafts back so a connection test or board refresh does not clear the form.
+    public func restoringIncompleteRPCDrafts(from draft: Self) -> Self {
+        var restored = self
+        if var profiles = restored.connections, !profiles.profiles.isEmpty {
+            for index in profiles.profiles.indices {
+                let id = profiles.profiles[index].id
+                guard let source = draft.connections?.profiles.first(where: { $0.id == id }),
+                      let rpc = source.node.rpc, !rpc.isComplete else { continue }
+                profiles.profiles[index].node.rpc = rpc
+            }
+            restored.connections = profiles
+        } else if let rpc = draft.node.rpc, !rpc.isComplete {
+            restored.node.rpc = rpc
+        }
+        return restored
+    }
     private var activeProfileIndex: Int? {
         guard let connections else { return nil }
         return connections.profiles.firstIndex { $0.id == connections.activeId }
@@ -176,9 +193,7 @@ public struct NodeRPCConfiguration: Codable, Sendable, Equatable {
         !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && port != 0
             && !serverName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && ![certificate, privateKey, caCertificate].contains {
-                $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            }
+            && ![certificate, privateKey, caCertificate].contains(where: \.isEmpty)
     }
 }
 public struct ServiceConfiguration: Codable, Sendable, Equatable {

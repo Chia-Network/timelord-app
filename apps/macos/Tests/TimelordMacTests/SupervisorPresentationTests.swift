@@ -196,6 +196,8 @@ final class SupervisorPresentationTests: XCTestCase {
     }
 
     func testStatusFailureSurfacesStderrAndDoesNotRetry() async throws {
+        // A failed supervisor poll is deliberately fail-fast: surface the latest
+        // diagnostic instead of spending the refresh cycle on hidden retries.
         let fixture = try StatusFixture(statusFails: true)
         defer { fixture.close() }
         await fixture.controller.refresh()
@@ -303,6 +305,41 @@ final class SupervisorPresentationTests: XCTestCase {
         XCTAssertTrue(applied)
         XCTAssertEqual(try fixture.loggedCommands().filter { $0.hasPrefix("reload ") }.count, reloads + 1,
             "Editing the active profile must apply the saved configuration to a paused service")
+    }
+
+    func testConnectionTestKeepsIncompleteRPCDraftInTheForm() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        let first = runnableConfiguration(host: "first.fixture").node
+        var second = runnableConfiguration(host: "second.fixture").node
+        second.certificate = "/fixture/second.crt"
+        var profiles = ConnectionProfiles(); profiles.activeId = "first"
+        profiles.profiles = [
+            ConnectionProfile(id: "first", name: "First", node: first),
+            ConnectionProfile(id: "second", name: "Second", node: second),
+        ]
+        var configuration = AppConfiguration(); configuration.connections = profiles
+        try fixture.writeConfiguration(configuration)
+        let model = fixture.model(configuration)
+        let draft = NodeRPCConfiguration(
+            host: "rpc.first.fixture", port: 8555, serverName: "chia.net",
+            certificate: "/fixture/rpc.crt", privateKey: "/fixture/rpc.key")
+        model.configuration.node.rpc = draft
+
+        await model.testNode()
+        XCTAssertEqual(model.connectionResult, "Authenticated fixture node.")
+        XCTAssertEqual(model.configuration.node.rpc, draft,
+            "Saving for a connection test must not clear the half-filled RPC form")
+        XCTAssertTrue(model.hasUnsavedSettings)
+
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let persisted = try decoder.decode(AppConfiguration.self, from: Data(contentsOf: fixture.configurationURL))
+        XCTAssertNil(persisted.connections?.profiles[0].node.rpc,
+            "The incomplete draft must not be persisted")
+
+        await model.discoverBoards()
+        XCTAssertEqual(model.configuration.node.rpc, draft,
+            "Saving for a board refresh must not clear the half-filled RPC form")
     }
 
     private func runnableConfiguration(host: String = "fixture.node") -> AppConfiguration {
