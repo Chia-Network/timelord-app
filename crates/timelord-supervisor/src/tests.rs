@@ -1,12 +1,12 @@
 use super::*;
+/// Write an executable fixture and return its path. The write runs in a child
+/// because Linux refuses to exec a file while any process holds it open for
+/// writing: a descriptor opened here can be inherited by an unrelated test's
+/// `fork` until that child execs, which makes the fixture's own exec fail with
+/// ETXTBSY. The child owns the only writable descriptor, and waiting for it
+/// closes that descriptor before the fixture is ever exec'd.
 pub(crate) fn script_helper(dir: &Path, name: &str, body: &str) -> PathBuf {
     let helper = dir.join(name);
-    // Write from a child process: Linux refuses to exec a file while any
-    // process holds it open for writing, and a descriptor opened here can be
-    // inherited by an unrelated test's `fork` until that child execs, making
-    // the fixture's own exec fail with ETXTBSY. The child owns the only
-    // writable descriptor, and waiting for it closes that descriptor before the
-    // fixture is ever exec'd.
     let mut writer = std::process::Command::new("/bin/sh")
         .args(["-c", "cat > \"$1\" && chmod 700 \"$1\"", "fixture"])
         .arg(&helper)
