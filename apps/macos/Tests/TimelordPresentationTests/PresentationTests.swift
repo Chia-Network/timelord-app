@@ -97,7 +97,7 @@ final class PresentationTests: XCTestCase {
             var board = BoardSnapshot(id: "a", name: "A", state: .active, temperatureC: 40,
                 temperatureLimitC: 55, profile: "Automatic", frequencyMHz: 1900,
                 voltageV: 1, histories: histories, lastProof: now,
-                rawSpeeds: (0...2).map { RawSpeed(engine: $0, ips: Double(1_000_000 + $0), timestampUnix: now.timeIntervalSince1970, state: "running") })
+                rawSpeeds: (0...2).map { RawSpeed(engine: $0, ips: Double(1_000_000 + $0), timestampUnix: now.timeIntervalSince1970, state: .running) })
             for (index, history) in histories.enumerated() {
                 let expected = count == 1 ? 1 : index
                 XCTAssertEqual(board.rawSpeed(for: history.chain)?.engine, expected)
@@ -736,6 +736,21 @@ extension PresentationTests {
         let waiting = LivePresentation.snapshot(status: try status(boards: [healthy]), detectedDevices: [], now: now)
         XCTAssertEqual(waiting.phase, .waitingForProofs)
         XCTAssertNotEqual(waiting.phase, .boardMissing)
+        // A cold start before the first engine connects is indistinguishable
+        // from a genuinely absent board. Pin that known residual explicitly so
+        // the boundary is deliberate rather than an accident of the filter.
+        let coldStart: [String: Any] = ["id": "a", "name": "ASIC 1", "assigned_chains": ["challenge"],
+            "connected_clients": 0, "hardware_state": "starting", "routing_state": "serving", "profile": "Automatic"]
+        let coldStatus = try status(boards: [coldStart])
+        XCTAssertFalse(coldStatus.boards[0].hasLiveOwner)
+        XCTAssertNil(coldStatus.boards[0].recoveryReason)
+        XCTAssertEqual(LivePresentation.snapshot(status: coldStatus, detectedDevices: [], now: now).phase, .boardMissing)
+        // As soon as one engine owns the board the same lifecycle state is live.
+        var connectedStart = coldStart
+        connectedStart["connected_clients"] = 1
+        let connectedStatus = try status(boards: [connectedStart])
+        XCTAssertTrue(connectedStatus.boards[0].hasLiveOwner)
+        XCTAssertEqual(LivePresentation.snapshot(status: connectedStatus, detectedDevices: [], now: now).phase, .waitingForProofs)
         // An empty board list is still a genuinely missing board.
         XCTAssertEqual(LivePresentation.snapshot(status: try status(boards: []), detectedDevices: [], now: now).phase, .boardMissing)
         // A board the service still lists but cannot reach is missing too, even
@@ -744,6 +759,82 @@ extension PresentationTests {
             "hardware_state": "reconnecting", "routing_state": "serving", "profile": "Automatic"]
         let missing = LivePresentation.snapshot(status: try status(boards: [unplugged]), detectedDevices: [], now: now)
         XCTAssertEqual(missing.phase, .boardMissing)
+    }
+
+    func testAutomaticStateDecodesHoldingIdleAndLearning() throws {
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        func status(_ automaticState: String) throws -> ServiceStatus {
+            let board: [String: Any] = [
+                "id": "a", "name": "ASIC 1", "assigned_chains": ["challenge"],
+                "connected_clients": 1, "hardware_state": "connected", "profile": "Automatic",
+                "automatic": [
+                    "state": automaticState, "message": "",
+                    "active_seconds": 0, "cooldown_seconds": 0,
+                ],
+            ]
+            let object: [String: Any] = [
+                "api_version": 2, "service_pid": 42, "timestamp_unix": 1_000_000,
+                "started_unix": 999000, "timelord_state": "waiting_for_clients",
+                "message": "Waiting for ASIC clients", "production_enabled": true,
+                "proofs_delivered": 0, "tuning_paused": false,
+                "full_node": ["host": "fixture", "state": "ready"], "boards": [board],
+            ]
+            return try decoder.decode(ServiceStatus.self, from: JSONSerialization.data(withJSONObject: object))
+        }
+        let holding = LivePresentation.snapshot(status: try status("holding"), now: now)
+        XCTAssertEqual(holding.boards.first?.automatic?.state, .holding)
+        XCTAssertEqual(holding.boards.first?.automaticTitle, "Settings held while boards change")
+        let idle = LivePresentation.snapshot(status: try status("idle"), now: now)
+        XCTAssertEqual(idle.boards.first?.automatic?.state, .idle)
+        XCTAssertEqual(idle.boards.first?.automaticTitle, "Idle · no chains routed")
+        let learning = LivePresentation.snapshot(status: try status("learning"), now: now)
+        XCTAssertEqual(learning.boards.first?.automatic?.state, .learning)
+        XCTAssertEqual(learning.boards.first?.automaticTitle, "Learning")
+    }
+
+    func testUnknownStatusValuesDecodeWithoutBreakingOlderApps() throws {
+        let object: [String: Any] = [
+            "api_version": 99, "service_pid": 42, "timestamp_unix": 1_000_000, "started_unix": 999000,
+            "timelord_state": "future_timelord_state", "message": "Future state",
+            "production_enabled": true, "proofs_delivered": 0, "tuning_paused": false,
+            "full_node": ["host": "fixture", "state": "future_node_state"],
+            "boards": [[
+                "id": "a", "name": "ASIC 1", "assigned_chains": ["challenge"],
+                "connected_clients": 0, "hardware_state": "future_hardware_state",
+                "routing_state": "future_routing_state", "profile": "Automatic",
+                "fault_kind": "future_fault_kind",
+                "raw_speeds": [[
+                    "engine": 0, "ips": 1_000_000, "timestamp_unix": 1_000_000,
+                    "state": "future_raw_state",
+                ]],
+                "automatic": [
+                    "state": "future_automatic_state", "message": "",
+                    "active_seconds": 0, "cooldown_seconds": 0,
+                ],
+            ]],
+        ]
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let status = try decoder.decode(ServiceStatus.self, from: JSONSerialization.data(withJSONObject: object))
+        XCTAssertEqual(status.timelordState, .unknown("future_timelord_state"))
+        XCTAssertEqual(status.fullNode.state, .unknown("future_node_state"))
+        XCTAssertEqual(status.boards[0].hardwareState, .unknown("future_hardware_state"))
+        XCTAssertEqual(status.boards[0].routingState, .unknown("future_routing_state"))
+        XCTAssertEqual(status.boards[0].faultKind, .unknown("future_fault_kind"))
+        XCTAssertEqual(status.boards[0].rawSpeeds?[0].state, .unknown("future_raw_state"))
+        XCTAssertEqual(status.boards[0].automatic?.state, .unknown("future_automatic_state"))
+        // Unknown values keep their original wire text for diagnostics.
+        XCTAssertEqual(status.timelordState.wireValue, "future_timelord_state")
+        XCTAssertEqual(status.fullNode.state.description, "future_node_state")
+        XCTAssertEqual(status.boards[0].hardwareState.wireValue, "future_hardware_state")
+        XCTAssertEqual(status.boards[0].routingState?.description, "future_routing_state")
+        XCTAssertEqual(status.boards[0].faultKind?.wireValue, "future_fault_kind")
+        XCTAssertEqual(status.boards[0].rawSpeeds?[0].state?.wireValue, "future_raw_state")
+        XCTAssertEqual(status.boards[0].automatic?.state.description, "future_automatic_state")
+        XCTAssertEqual(TimelordState.running.wireValue, "running")
+        XCTAssertEqual(FaultKind.controlClosed.description, "control_closed")
+        XCTAssertFalse(status.boards[0].hasLiveOwner)
+        // The snapshot must remain renderable rather than failing to decode.
+        XCTAssertEqual(LivePresentation.snapshot(status: status, now: now).phase, .waitingForNode)
     }
 
 }

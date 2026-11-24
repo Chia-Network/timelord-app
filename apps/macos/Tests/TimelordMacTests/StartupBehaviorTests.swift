@@ -120,7 +120,7 @@ final class StartupBehaviorTests: XCTestCase {
         try FileManager.default.removeItem(at: failure)
         await model.refresh()
         XCTAssertNil(model.errorMessage)
-        model.errorMessage = "Unrelated settings error"
+        model.reportActionError("Unrelated settings error")
         await model.refresh()
         XCTAssertEqual(model.errorMessage, "Unrelated settings error")
     }

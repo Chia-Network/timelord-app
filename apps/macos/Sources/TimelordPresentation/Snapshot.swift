@@ -31,7 +31,12 @@ public enum AppPhase: String, Sendable {
         }
     }
     public var tone: StatusTone {
-        switch self { case .running: return .positive; case .boardMissing, .nodeUnreachable: return .attention; case .temperatureLimit, .serviceUnavailable: return .critical; default: return .neutral }
+        switch self {
+        case .running: return .positive
+        case .boardMissing, .nodeUnreachable: return .attention
+        case .temperatureLimit, .serviceUnavailable: return .critical
+        default: return .neutral
+        }
     }
 }
 
@@ -80,18 +85,18 @@ public enum BoardState: String, Sendable {
     public static func from(_ board: BoardStatus, productive: Bool, freshProof: Bool) -> BoardState {
         let failures = board.consecutiveFailures ?? 0
         switch (board.routingState, board.hardwareState) {
-        case ("disabled", _): return .disabled
-        case (_, "thermal_stop"): return failures >= 3 ? .needsAttention : .thermalStop
-        case (_, "invalid_proof"): return .needsAttention
-        case ("benched", _): return .benched
+        case (.disabled, _): return .disabled
+        case (_, .thermalStop): return failures >= 3 ? .needsAttention : .thermalStop
+        case (_, .invalidProof): return .needsAttention
+        case (.benched, _): return .benched
         default: break
         }
         if board.recoveryReason != nil { return .recovering }
         switch board.hardwareState {
-        case "checking", "starting": return .checking
-        case "reconnecting", "stopped": return .disconnected
-        case "connected":
-            if board.routingState == "probation" { return failures >= 6 ? .needsAttention : .probation }
+        case .checking, .starting: return .checking
+        case .reconnecting, .stopped: return .disconnected
+        case .connected:
+            if board.routingState == .probation { return failures >= 6 ? .needsAttention : .probation }
             return productive && freshProof ? .active : .waiting
         default: return .uninspected
         }
@@ -138,16 +143,25 @@ public struct BoardSnapshot: Identifiable, Sendable {
         let remaining = { (until: Double?) in until.map { max(0, Int(ceil(($0 - now.timeIntervalSince1970) / 60))) } }
         switch state {
         case .probation:
-            return "Working after \(consecutiveFailures) recent failure\(consecutiveFailures == 1 ? "" : "s"); prefers the infused-challenge chain" + (remaining(probationUntilUnix).map { " for about \($0) more min" } ?? "") + (lastFailure.map { ". Last: \($0)" } ?? "")
+            let wait = remaining(probationUntilUnix).map { " for about \($0) more min" } ?? ""
+            let last = lastFailure.map { ". Last: \($0)" } ?? ""
+            return "Working after \(consecutiveFailures) recent failure\(consecutiveFailures == 1 ? "" : "s")"
+                + "; prefers the infused-challenge chain" + wait + last
         case .benched:
             let wait = remaining(probationUntilUnix).map { "; next return in about \($0) min" } ?? ""
-            return "\(consecutiveFailures) failures in a row (\(failuresLastHour) in the last hour)\(wait)" + (lastFailure.map { ". Last: \($0)" } ?? "")
+            return "\(consecutiveFailures) failures in a row (\(failuresLastHour) in the last hour)\(wait)"
+                + (lastFailure.map { ". Last: \($0)" } ?? "")
         case .needsAttention where consecutiveFailures >= 6:
-            return "Still working, but \(consecutiveFailures) failures in a row (\(failuresLastHour) in the last hour)" + (lastFailure.map { ". Last: \($0)" } ?? "") + ". Check its cable, hub and power."
+            return "Still working, but \(consecutiveFailures) failures in a row (\(failuresLastHour) in the last hour)"
+                + (lastFailure.map { ". Last: \($0)" } ?? "") + ". Check its cable, hub and power."
         case .disabled:
-            return disabledUntilUnix.map { _ in "Kept out of rotation for about \(remaining(disabledUntilUnix) ?? 0) more min" } ?? "Disabled until you enable it"
+            return disabledUntilUnix.map {
+                _ in "Kept out of rotation for about \(remaining(disabledUntilUnix) ?? 0) more min"
+            } ?? "Disabled until you enable it"
         default:
-            return cautious ? "Started cautiously after an unconfirmed stop; returns to its saved setting after verified work" : nil
+            return cautious
+                ? "Started cautiously after an unconfirmed stop; returns to its saved setting after verified work"
+                : nil
         }
     }
     public func recoveryText(at now: Date) -> String? {
@@ -172,7 +186,16 @@ public struct BoardSnapshot: Identifiable, Sendable {
     public var isAutomatic: Bool { profile.lowercased() == "automatic" }
     public var automaticTitle: String {
         guard let automatic else { return "Learning starts with Timelord" }
-        switch automatic.state { case "paused": return "Settings held"; case "testing": return "Testing settings"; case "monitoring": return "Monitoring"; case "cooldown": return "Recovery cooldown"; case "waiting": return "Waiting for work"; default: return "Learning" }
+        switch automatic.state {
+        case .paused: return "Settings held"
+        case .testing: return "Testing settings"
+        case .monitoring: return "Monitoring"
+        case .cooldown: return "Recovery cooldown"
+        case .waiting: return "Waiting for work"
+        case .holding: return "Settings held while boards change"
+        case .idle: return "Idle · no chains routed"
+        case .learning, .unknown(_): return "Learning"
+        }
     }
     public var temperatureText: String { temperatureC.map { String(format: "%.1f°C", $0) } ?? "—" }
 }
@@ -197,7 +220,13 @@ public struct AppSnapshot: Sendable {
     }
     public var readyToRun = false
     public var sessionUptimeSeconds: TimeInterval? = nil
-    public var runningTitle: String { phase == .serviceUnavailable && serviceAvailable ? "Proof service stopped" : readyToRun ? "Ready to run" : phase == .running && !tuningPaused && boards.contains(where: { ["learning","testing"].contains($0.automatic?.state ?? "") }) ? "Running · Optimizing" : phase.title }
+    public var runningTitle: String {
+        if phase == .serviceUnavailable && serviceAvailable { return "Proof service stopped" }
+        if readyToRun { return "Ready to run" }
+        let optimizing = phase == .running && !tuningPaused
+            && boards.contains { $0.automatic?.state == .testing || $0.automatic?.state == .learning }
+        return optimizing ? "Running · Optimizing" : phase.title
+    }
 
     public let headlineHistory: ChainHistory?
     public init(phase: AppPhase, explanation: String, node: ConnectionSnapshot, timelord: ConnectionSnapshot,
@@ -243,10 +272,174 @@ public struct AppSnapshot: Sendable {
     }
 }
 
+/// Versioned wire states. Each enum keeps a fallback case so an older app can
+/// still decode a status payload that a newer service produced.
+public protocol StatusWireState: Decodable, Sendable, Equatable, CustomStringConvertible {
+    static var wireValues: [String: Self] { get }
+    static func unrecognized(_ wireValue: String) -> Self
+    var unrecognizedValue: String? { get }
+}
+
+public extension StatusWireState {
+    init?(wireValue: String) {
+        guard let value = Self.wireValues[wireValue] else { return nil }
+        self = value
+    }
+    init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        self = Self(wireValue: value) ?? Self.unrecognized(value)
+    }
+    /// The original wire string, including values this app does not know yet.
+    var wireValue: String {
+        if let unrecognizedValue { return unrecognizedValue }
+        return Self.wireValues.first { $0.value == self }?.key ?? "unknown"
+    }
+    var description: String { wireValue }
+}
+
+public enum TimelordState: StatusWireState {
+    case setupRequired, waitingForNode, waitingForClients, running, fault
+    case unknown(String)
+
+    public static let wireValues: [String: TimelordState] = [
+        "setup_required": .setupRequired,
+        "waiting_for_node": .waitingForNode,
+        "waiting_for_clients": .waitingForClients,
+        "running": .running,
+        "fault": .fault,
+    ]
+    public static func unrecognized(_ wireValue: String) -> Self { .unknown(wireValue) }
+    public var unrecognizedValue: String? {
+        if case .unknown(let value) = self { return value }
+        return nil
+    }
+}
+
+public enum FullNodeState: StatusWireState {
+    case notConfigured, notConnected, connecting, authenticated, ready, disconnected
+    case waitingForHardware
+    case unknown(String)
+
+    public static let wireValues: [String: FullNodeState] = [
+        "not_configured": .notConfigured,
+        "not_connected": .notConnected,
+        "connecting": .connecting,
+        "authenticated": .authenticated,
+        "ready": .ready,
+        "disconnected": .disconnected,
+        "waiting_for_hardware": .waitingForHardware,
+    ]
+    public static func unrecognized(_ wireValue: String) -> Self { .unknown(wireValue) }
+    public var unrecognizedValue: String? {
+        if case .unknown(let value) = self { return value }
+        return nil
+    }
+}
+
+public enum HardwareState: StatusWireState {
+    case notInspected, starting, checking, connected, stopped, reconnecting
+    case thermalStop
+    case invalidProof
+    case unknown(String)
+
+    public static let wireValues: [String: HardwareState] = [
+        "not_inspected": .notInspected,
+        "starting": .starting,
+        "checking": .checking,
+        "connected": .connected,
+        "stopped": .stopped,
+        "reconnecting": .reconnecting,
+        "thermal_stop": .thermalStop,
+        "invalid_proof": .invalidProof,
+    ]
+    public static func unrecognized(_ wireValue: String) -> Self { .unknown(wireValue) }
+    public var unrecognizedValue: String? {
+        if case .unknown(let value) = self { return value }
+        return nil
+    }
+}
+
+public enum RoutingState: StatusWireState {
+    case serving, probation, disabled, unavailable
+    /// Reported by older services only; current ones never bench a working board.
+    case benched
+    case unknown(String)
+
+    public static let wireValues: [String: RoutingState] = [
+        "serving": .serving,
+        "probation": .probation,
+        "disabled": .disabled,
+        "unavailable": .unavailable,
+        "benched": .benched,
+    ]
+    public static func unrecognized(_ wireValue: String) -> Self { .unknown(wireValue) }
+    public var unrecognizedValue: String? {
+        if case .unknown(let value) = self { return value }
+        return nil
+    }
+}
+
+public enum AutomaticState: StatusWireState {
+    case paused, testing, monitoring, cooldown, waiting, holding, idle, learning
+    case unknown(String)
+
+    public static let wireValues: [String: AutomaticState] = [
+        "paused": .paused,
+        "testing": .testing,
+        "monitoring": .monitoring,
+        "cooldown": .cooldown,
+        "waiting": .waiting,
+        "holding": .holding,
+        "idle": .idle,
+        "learning": .learning,
+    ]
+    public static func unrecognized(_ wireValue: String) -> Self { .unknown(wireValue) }
+    public var unrecognizedValue: String? {
+        if case .unknown(let value) = self { return value }
+        return nil
+    }
+}
+
+public enum RawSpeedState: StatusWireState {
+    case running, sampling, idle
+    case unknown(String)
+
+    public static let wireValues: [String: RawSpeedState] = [
+        "running": .running,
+        "sampling": .sampling,
+        "idle": .idle,
+    ]
+    public static func unrecognized(_ wireValue: String) -> Self { .unknown(wireValue) }
+    public var unrecognizedValue: String? {
+        if case .unknown(let value) = self { return value }
+        return nil
+    }
+}
+
+public enum FaultKind: StatusWireState {
+    case thermal, sensorUnavailable, controlClosed, readback, protocolFault, stalled, exited
+    case unknown(String)
+
+    public static let wireValues: [String: FaultKind] = [
+        "thermal": .thermal,
+        "sensor_unavailable": .sensorUnavailable,
+        "control_closed": .controlClosed,
+        "readback": .readback,
+        "protocol": .protocolFault,
+        "stalled": .stalled,
+        "exited": .exited,
+    ]
+    public static func unrecognized(_ wireValue: String) -> Self { .unknown(wireValue) }
+    public var unrecognizedValue: String? {
+        if case .unknown(let value) = self { return value }
+        return nil
+    }
+}
+
 public struct ServiceStatus: Decodable, Sendable {
     public let apiVersion: Int
     public let servicePid: Int
-    public let timelordState: String
+    public let timelordState: TimelordState
     public let message: String
     public let productionEnabled: Bool
     public let fullNode: NodeStatus
@@ -268,16 +461,16 @@ public struct NodeSyncStatus: Decodable, Sendable {
 
 public struct NodeStatus: Decodable, Sendable {
     public let host: String
-    public let state: String
+    public let state: FullNodeState
 }
 
 public struct RawSpeed: Decodable, Sendable {
     public let engine: Int
     public let ips: Double
     public let timestampUnix: Double
-    public let state: String?
+    public let state: RawSpeedState?
     public func freshIPS(at now: Date) -> Double? {
-        guard state == nil || state == "running" else { return nil }
+        guard state == nil || state == .running else { return nil }
         return recentIPS(at: now)
     }
     private func recentIPS(at now: Date) -> Double? {
@@ -286,8 +479,8 @@ public struct RawSpeed: Decodable, Sendable {
     }
     public func displayText(at now: Date) -> String {
         switch state {
-        case "idle": return "Idle"
-        case "sampling": return recentIPS(at: now).map(DisplayFormat.ips) ?? "Starting"
+        case .idle?: return "Idle"
+        case .sampling?: return recentIPS(at: now).map(DisplayFormat.ips) ?? "Starting"
         default: return freshIPS(at: now).map(DisplayFormat.ips) ?? "—"
         }
     }
@@ -299,7 +492,7 @@ public struct BoardStatus: Decodable, Identifiable, Sendable {
     public let assignedChains: [String]
     public let assignedEngines: [Int]?
     public let connectedClients: Int
-    public let hardwareState: String
+    public let hardwareState: HardwareState
     public let temperatureC: Double?
     public let temperatureLimitC: Double?
     public let frequencyMhz: Double?
@@ -310,11 +503,11 @@ public struct BoardStatus: Decodable, Identifiable, Sendable {
     public let serial: String?
     public let automatic: AutomaticStatus?
     public let rawSpeeds: [RawSpeed]?
-    public let faultKind: String?
+    public let faultKind: FaultKind?
     public let recoveryReason: String?
     public let retryAfterUnix: Double?
     public let nativePid: Int?
-    public var routingState: String? = nil
+    public var routingState: RoutingState? = nil
     public var consecutiveFailures: Int? = nil
     public var failuresLastHour: Int? = nil
     public var probationUntilUnix: Double? = nil
@@ -322,6 +515,12 @@ public struct BoardStatus: Decodable, Identifiable, Sendable {
     public var lastFailure: String? = nil
     public var cautious: Bool? = nil
     public var history: [BoardEvent]? = nil
+
+    /// A fresh supervised owner is presence evidence even while an ASIC engine
+    /// is still connecting. Enumeration alone can hide metadata for open USB interfaces.
+    public var hasLiveOwner: Bool {
+        hardwareState == .connected || (hardwareState == .starting && connectedClients > 0)
+    }
 }
 
 /// One saved board event from the service (failures, probation, cautious starts).
@@ -345,49 +544,73 @@ public struct BoardEvent: Decodable, Sendable, Identifiable {
 }
 
 public struct AutomaticStatus: Decodable, Sendable {
-    public let state: String
+    public let state: AutomaticState
     public let message: String
     public let activeSeconds: Int
     public let cooldownSeconds: Int
 }
 
 public enum LivePresentation {
-    public static func snapshot(status: ServiceStatus?, history: HistoryProjection? = nil, configuration: AppConfiguration? = nil, detectedDevices: [DiscoveredDevice]? = nil, nodeSync: NodeSyncStatus? = nil, paused: Bool = false, workerPID: Int? = nil, controlOperation: ServiceControlOperation? = nil, error: String? = nil, now: Date = Date()) -> AppSnapshot {
+    public static func snapshot(status: ServiceStatus?, history: HistoryProjection? = nil, configuration: AppConfiguration? = nil,
+                                detectedDevices: [DiscoveredDevice]? = nil, nodeSync: NodeSyncStatus? = nil,
+                                paused: Bool = false, workerPID: Int? = nil, controlOperation: ServiceControlOperation? = nil,
+                                error: String? = nil, now: Date = Date()) -> AppSnapshot {
         var cache = HistorySelectionCache()
         return snapshot(status: status, history: history, historyCache: &cache, configuration: configuration,
-            detectedDevices: detectedDevices, nodeSync: nodeSync, paused: paused, workerPID: workerPID, controlOperation: controlOperation, error: error, now: now)
+            detectedDevices: detectedDevices, nodeSync: nodeSync, paused: paused, workerPID: workerPID,
+            controlOperation: controlOperation, error: error, now: now)
     }
-    public static func snapshot(status: ServiceStatus?, history: HistoryProjection? = nil, historyCache: inout HistorySelectionCache, configuration: AppConfiguration? = nil, detectedDevices: [DiscoveredDevice]? = nil, nodeSync: NodeSyncStatus? = nil, paused: Bool = false, workerPID: Int? = nil, controlOperation: ServiceControlOperation? = nil, error: String? = nil, now: Date = Date()) -> AppSnapshot {
-        let recent = status.map { now.timeIntervalSince1970 - $0.timestampUnix <= 10 && $0.timestampUnix <= now.timeIntervalSince1970 + 5 } ?? false
+    public static func snapshot(status: ServiceStatus?, history: HistoryProjection? = nil,
+                                historyCache: inout HistorySelectionCache, configuration: AppConfiguration? = nil,
+                                detectedDevices: [DiscoveredDevice]? = nil, nodeSync: NodeSyncStatus? = nil,
+                                paused: Bool = false, workerPID: Int? = nil, controlOperation: ServiceControlOperation? = nil,
+                                error: String? = nil, now: Date = Date()) -> AppSnapshot {
+        let recent = status.map {
+            now.timeIntervalSince1970 - $0.timestampUnix <= 10 && $0.timestampUnix <= now.timeIntervalSince1970 + 5
+        } ?? false
         let live = recent ? status : nil
         let hostname = live?.fullNode.host ?? configuration?.node.host
         let nodeTitle = hostname.map { ["localhost", "127.0.0.1", "::1"].contains($0) ? "This Mac" : $0 } ?? "Not configured"
         let freshSync = nodeSync.flatMap { (0...30).contains(now.timeIntervalSince1970 - $0.timestampUnix) ? $0 : nil }
         let nodeDetail = freshSync.map { $0.syncing ? "Syncing" : $0.synced ? "Synced" : "Not synced" } ?? "Sync status unavailable"
         let nodeTone: StatusTone = freshSync.map { $0.synced && !$0.syncing ? .positive : .attention } ?? .neutral
-        let nodeReady = ["authenticated", "ready"].contains(live?.fullNode.state ?? "")
-        let productive = live?.boards.contains(where: { $0.hardwareState == "connected" }) == true && live?.productionEnabled == true && live?.timelordState == "running" && live?.latestProofUnix.map { now.timeIntervalSince1970 - $0 < 90 } == true
-        let thermal = live?.boards.contains { $0.hardwareState == "thermal_stop" } == true
-        let allBoardsFailed = live.map { !$0.boards.isEmpty && $0.boards.allSatisfy { ["invalid_proof", "thermal_stop"].contains($0.hardwareState) && $0.recoveryReason == nil } } ?? false
-        let admissionBlocked = !productive && live?.timelordState == "waiting_for_clients" && live?.boards.isEmpty == false && live?.boards.allSatisfy { $0.routingState == "disabled" } == true
-        let checkingHardware = live?.timelordState == "waiting_for_clients" && live?.boards.contains { $0.hardwareState == "checking" } == true
+        let nodeReady = live?.fullNode.state == .authenticated || live?.fullNode.state == .ready
+        let productive = live?.boards.contains { $0.hardwareState == .connected } == true
+            && live?.productionEnabled == true
+            && live?.timelordState == .running
+            && live?.latestProofUnix.map { now.timeIntervalSince1970 - $0 < 90 } == true
+        let thermal = live?.boards.contains { $0.hardwareState == .thermalStop } == true
+        let allBoardsFailed = live.map { status in
+            !status.boards.isEmpty && status.boards.allSatisfy {
+                ($0.hardwareState == .invalidProof || $0.hardwareState == .thermalStop) && $0.recoveryReason == nil
+            }
+        } ?? false
+        let admissionBlocked = !productive
+            && live?.timelordState == .waitingForClients
+            && live?.boards.isEmpty == false
+            && live?.boards.allSatisfy { $0.routingState == .disabled } == true
+        let checkingHardware = live?.timelordState == .waitingForClients
+            && live?.boards.contains { $0.hardwareState == .checking } == true
         let phase: AppPhase
         if controlOperation == .pause { phase = .pausing }
         else if controlOperation == .start { phase = .starting }
         else if controlOperation == .reload && !paused { phase = .restarting }
         else if thermal && !productive { phase = .temperatureLimit }
-        else if error != nil || live?.timelordState == "fault" || allBoardsFailed { phase = .serviceUnavailable }
+        else if error != nil || live?.timelordState == .fault || allBoardsFailed { phase = .serviceUnavailable }
         else if paused { phase = .paused }
         else if productive { phase = .running }
         else if live?.boards.contains(where: { $0.recoveryReason != nil }) == true { phase = .starting }
         else if admissionBlocked { phase = .boardMissing }
         else if checkingHardware { phase = .starting }
-        else if live?.timelordState == "waiting_for_clients" && live?.boards.contains(where: { $0.hardwareState == "connected" || ($0.hardwareState == "starting" && $0.connectedClients > 0) }) != true { phase = .boardMissing }
-        else if live?.fullNode.state == "disconnected" { phase = .nodeUnreachable }
+        else if live?.timelordState == .waitingForClients
+            && live?.boards.contains(where: \.hasLiveOwner) != true { phase = .boardMissing }
+        else if live?.fullNode.state == .disconnected { phase = .nodeUnreachable }
         else if live?.productionEnabled == true { phase = nodeReady ? .waitingForProofs : .waitingForNode }
         else { phase = .setupRequired }
         let proofCapable = live?.productionEnabled == true
-        let validHistory = history.flatMap { proofCapable && $0.servicePid == live?.servicePid && $0.apiVersion == 3 ? $0 : nil }
+        let validHistory = history.flatMap {
+            proofCapable && $0.servicePid == live?.servicePid && $0.apiVersion == 3 ? $0 : nil
+        }
         var boards: [BoardSnapshot]
         if let live {
             boards = live.boards.filter { board in
@@ -395,49 +618,91 @@ public enum LivePresentation {
                 // enumeration, which can hide metadata for open USB interfaces.
                 // Checking and quarantined are supervised lifecycle reports,
                 // not claims of detected hardware or productive work.
-                if ["checking", "invalid_proof", "thermal_stop"].contains(board.hardwareState) || ["benched", "disabled", "probation"].contains(board.routingState ?? "") || board.recoveryReason != nil { return true }
-                if board.hardwareState == "connected" || (board.hardwareState == "starting" && board.connectedClients > 0) { return true }
-                guard let detectedDevices else {return true}
-                let configured=configuration?.hardware.boards.first(where:{$0.id==board.id})
-                let location=board.deviceLocation ?? configured?.deviceLocation
-                let serial=board.serial ?? configured?.serial
-                return detectedDevices.contains { device in if let serial {return device.serial==serial};return device.location==location }
+                if board.hardwareState == .checking
+                    || board.hardwareState == .invalidProof
+                    || board.hardwareState == .thermalStop { return true }
+                if board.routingState == .benched
+                    || board.routingState == .disabled
+                    || board.routingState == .probation { return true }
+                if board.recoveryReason != nil || board.hasLiveOwner { return true }
+                guard let detectedDevices else { return true }
+                let configured = configuration?.hardware.boards.first { $0.id == board.id }
+                let location = board.deviceLocation ?? configured?.deviceLocation
+                let serial = board.serial ?? configured?.serial
+                return detectedDevices.contains { device in
+                    if let serial { return device.serial == serial }
+                    return device.location == location
+                }
             }.map { board in
                 let last = proofCapable ? board.latestProofUnix.map(Date.init(timeIntervalSince1970:)) : nil
-                let freshProof = last.map { now.timeIntervalSince($0) < BoardState.proofWindow(chains: board.assignedChains) } ?? false
+                let freshProof = last.map {
+                    now.timeIntervalSince($0) < BoardState.proofWindow(chains: board.assignedChains)
+                } ?? false
                 let state = BoardState.from(board, productive: productive, freshProof: freshProof)
-                let routed = board.hardwareState == "connected" && board.recoveryReason == nil && !["benched", "disabled"].contains(board.routingState ?? "")
+                let routed = board.hardwareState == .connected
+                    && board.recoveryReason == nil
+                    && board.routingState != .benched
+                    && board.routingState != .disabled
                 let histories = board.assignedChains.compactMap(Chain.init(rawValue:)).map { chain -> ChainHistory in
                     guard let validHistory else { return .empty(chain) }
                     return validHistory.history(boardID: board.id, chain: chain, now: now)
                 }
-                return BoardSnapshot(id: board.id, name: board.name, state: state, temperatureC: board.temperatureC, temperatureLimitC: board.temperatureLimitC, profile: board.profile, frequencyMHz: board.frequencyMhz, voltageV: board.voltageV, histories: histories, lastProof: last, rawSpeeds: board.rawSpeeds ?? [], automatic: board.automatic, recoveryReason: board.recoveryReason, retryAfterUnix: board.retryAfterUnix, assignedEngines: board.assignedEngines, serial: board.serial, consecutiveFailures: board.consecutiveFailures ?? 0, failuresLastHour: board.failuresLastHour ?? 0, probationUntilUnix: board.probationUntilUnix, disabledUntilUnix: board.disabledUntilUnix, lastFailure: board.lastFailure, cautious: board.cautious ?? false, events: board.history ?? [], deliveringProofs: routed && productive && freshProof, onProbation: board.routingState == "probation")
+                return BoardSnapshot(
+                    id: board.id, name: board.name, state: state, temperatureC: board.temperatureC,
+                    temperatureLimitC: board.temperatureLimitC, profile: board.profile,
+                    frequencyMHz: board.frequencyMhz, voltageV: board.voltageV, histories: histories,
+                    lastProof: last, rawSpeeds: board.rawSpeeds ?? [], automatic: board.automatic,
+                    recoveryReason: board.recoveryReason, retryAfterUnix: board.retryAfterUnix,
+                    assignedEngines: board.assignedEngines, serial: board.serial,
+                    consecutiveFailures: board.consecutiveFailures ?? 0,
+                    failuresLastHour: board.failuresLastHour ?? 0,
+                    probationUntilUnix: board.probationUntilUnix,
+                    disabledUntilUnix: board.disabledUntilUnix, lastFailure: board.lastFailure,
+                    cautious: board.cautious ?? false, events: board.history ?? [],
+                    deliveringProofs: routed && productive && freshProof,
+                    onProbation: board.routingState == .probation)
             }
         } else {
-            let connected = (detectedDevices ?? []).compactMap { BoardTopology.matching($0,in:configuration?.hardware.boards ?? []) }
-            let counts=BoardTopology.counts(connected)
+            let connected = (detectedDevices ?? []).compactMap {
+                BoardTopology.matching($0, in: configuration?.hardware.boards ?? [])
+            }
+            let counts = BoardTopology.counts(connected)
             boards = connected.enumerated().map { index, board in
-                let offset=counts.prefix(index).reduce(0,+)
+                let offset = counts.prefix(index).reduce(0, +)
                 let chains: [Chain]
                 if let mapping = configuration?.hardware.chainAssignments, let serial = board.serial {
                     let serials = [mapping.challenge, mapping.reward, mapping.infusedChallenge]
-                    chains = zip(Chain.allCases, serials).compactMap { chain, assigned in assigned == serial ? chain : nil }
+                    chains = zip(Chain.allCases, serials).compactMap { chain, assigned in
+                        assigned == serial ? chain : nil
+                    }
                 } else {
                     chains = Array(Chain.allCases.dropFirst(offset).prefix(counts[index]))
                 }
-                return BoardSnapshot(id: board.id, name: board.name, state: paused ? .paused : .waiting, temperatureC: nil, temperatureLimitC: board.temperatureLimitC, profile: board.profileName, frequencyMHz: nil, voltageV: nil, histories: chains.map(ChainHistory.empty), lastProof: nil)
+                return BoardSnapshot(
+                    id: board.id, name: board.name, state: paused ? .paused : .waiting,
+                    temperatureC: nil, temperatureLimitC: board.temperatureLimitC,
+                    profile: board.profileName, frequencyMHz: nil, voltageV: nil,
+                    histories: chains.map(ChainHistory.empty), lastProof: nil)
             }
         }
         if live != nil {
             for device in detectedDevices ?? [] {
-                guard let board=BoardTopology.matching(device,in:configuration?.hardware.boards ?? []),!boards.contains(where:{$0.id==board.id}) else {continue}
-                boards.append(BoardSnapshot(id:board.id,name:board.name,state:.waiting,temperatureC:nil,temperatureLimitC:board.temperatureLimitC,profile:board.profileName,frequencyMHz:nil,voltageV:nil,histories:[],lastProof:nil))
+                guard let board = BoardTopology.matching(device, in: configuration?.hardware.boards ?? []),
+                      !boards.contains(where: { $0.id == board.id }) else { continue }
+                boards.append(BoardSnapshot(
+                    id: board.id, name: board.name, state: .waiting, temperatureC: nil,
+                    temperatureLimitC: board.temperatureLimitC, profile: board.profileName,
+                    frequencyMHz: nil, voltageV: nil, histories: [], lastProof: nil))
             }
         }
         let faultReason = live.flatMap { status -> String? in
-            guard status.timelordState == "fault" || admissionBlocked || checkingHardware || status.timelordState == "waiting_for_clients" else { return nil }
-            if status.boards.contains(where: { $0.faultKind == "control_closed" }) {
-                return "The ASIC client connection closed unexpectedly. Proof production has stopped. Pause and Run to reconnect. Details: Native control closed before acknowledgement."
+            guard status.timelordState == .fault
+                || admissionBlocked
+                || checkingHardware
+                || status.timelordState == .waitingForClients else { return nil }
+            if status.boards.contains(where: { $0.faultKind == .controlClosed }) {
+                return "The ASIC client connection closed unexpectedly. Proof production has stopped. "
+                    + "Pause and Run to reconnect. Details: Native control closed before acknowledgement."
             }
             return status.message
         }
@@ -450,12 +715,33 @@ public enum LivePresentation {
         else { timelordTitle = workerPID == nil ? "Stopped" : "Starting" }
         // A retrying cleanup failure keeps the stopping phase but needs attention.
         let stoppingWithError = (phase == .pausing || phase == .restarting) && error != nil
-        let setupComplete = configuration?.node.hasIdentity == true && configuration?.hardware.clientBinary != nil && !boards.isEmpty
-        return AppSnapshot(phase: phase,
-            explanation: error ?? explanation(phase: phase, faultReason: faultReason, paused: paused, live: live, setupComplete: setupComplete),
-            node: ConnectionSnapshot(title: nodeTitle, detail: nodeDetail, tone: nodeTone, height: freshSync?.height),
-            timelord: ConnectionSnapshot(title: timelordTitle, detail: (phase == .pausing || phase == .restarting) ? error ?? "On this Mac" : "On this Mac", tone: phase == .serviceUnavailable ? .critical : productive ? .positive : stoppingWithError ? .attention : .neutral),
-            boards: boards, proofsToday: proofCapable ? live?.proofsDelivered : nil, uptimeSeconds: proofCapable ? live.map { max(0, now.timeIntervalSince1970 - ($0.serviceStartedUnix ?? $0.startedUnix)) } : nil, now: now, serviceAvailable: live != nil, tuningPaused: live?.tuningPaused ?? false, readyToRun: phase == .setupRequired && setupComplete, sessionUptimeSeconds: proofCapable ? live.map { max(0, now.timeIntervalSince1970 - $0.startedUnix) } : nil, headlineHistory: historyCache.headline(projection: validHistory, boards: boards, now: now))
+        let setupComplete = configuration?.node.hasIdentity == true
+            && configuration?.hardware.clientBinary != nil
+            && !boards.isEmpty
+        return AppSnapshot(
+            phase: phase,
+            explanation: error ?? explanation(phase: phase, faultReason: faultReason, paused: paused,
+                live: live, setupComplete: setupComplete),
+            node: ConnectionSnapshot(title: nodeTitle, detail: nodeDetail, tone: nodeTone,
+                height: freshSync?.height),
+            timelord: ConnectionSnapshot(
+                title: timelordTitle,
+                detail: (phase == .pausing || phase == .restarting) ? error ?? "On this Mac" : "On this Mac",
+                tone: phase == .serviceUnavailable ? .critical : productive ? .positive
+                    : stoppingWithError ? .attention : .neutral),
+            boards: boards,
+            proofsToday: proofCapable ? live?.proofsDelivered : nil,
+            uptimeSeconds: proofCapable
+                ? live.map { max(0, now.timeIntervalSince1970 - ($0.serviceStartedUnix ?? $0.startedUnix)) }
+                : nil,
+            now: now,
+            serviceAvailable: live != nil,
+            tuningPaused: live?.tuningPaused ?? false,
+            readyToRun: phase == .setupRequired && setupComplete,
+            sessionUptimeSeconds: proofCapable
+                ? live.map { max(0, now.timeIntervalSince1970 - $0.startedUnix) }
+                : nil,
+            headlineHistory: historyCache.headline(projection: validHistory, boards: boards, now: now))
     }
 
     /// A fault outranks every phase message except an in-progress Pause.

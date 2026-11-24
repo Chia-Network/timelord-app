@@ -58,7 +58,7 @@ public enum PresentationScenario: String, CaseIterable, Identifiable, Sendable {
             return BoardSnapshot(id: "fixture-\(boardIndex)", name: "ASIC \(["A", "B", "C"][boardIndex])", state: state,
                 temperatureC: missing ? nil : hot ? 55 : single ? 48.2 : 42.5 + Double(boardIndex) * 1.2,
                 temperatureLimitC: 55, profile: self == .automatic ? "Automatic" : "Standard", frequencyMHz: self == .automatic ? 1450 : single ? 1540 : 1620, voltageV: 1,
-                histories: histories, lastProof: histories.flatMap(\.samples).map(\.date).max(), automatic: self == .automatic ? AutomaticStatus(state:"learning",message:"Observing verified proofs before a frequency increase",activeSeconds:90,cooldownSeconds:0) : nil)
+                histories: histories, lastProof: histories.flatMap(\.samples).map(\.date).max(), automatic: self == .automatic ? AutomaticStatus(state: .learning, message:"Observing verified proofs before a frequency increase",activeSeconds:90,cooldownSeconds:0) : nil)
         }
         let explanation: String = {
             switch phase {

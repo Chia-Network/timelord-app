@@ -149,7 +149,6 @@ final class ConfigurationClientTests: XCTestCase {
     func testSaveAndRestartPersistsBeforeReplacingOnlyTheOwnedFixtureProcess() async throws {
         let fixture = try SupervisedFixture()
         defer { fixture.close() }
-        let client = fixture.client
         let nativeHelper = fixture.nativeHelper
         let helper = fixture.helper
         let controller = fixture.controller

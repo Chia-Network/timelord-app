@@ -126,7 +126,12 @@ final class ConnectionProfileTests: XCTestCase {
         // Capture `configure` input, then return it for the reload.
         try Data("""
         #!/bin/sh
-        if [ "$1" = configuration ]; then cat '\(captured.path)'; else cp "$5" '\(captured.path)'; fi
+        if [ "$1" = configuration ]; then cat '\(captured.path)'; exit 0; fi
+        previous=
+        for argument in "$@"; do
+          if [ "$previous" = "--input" ]; then cp "$argument" '\(captured.path)'; break; fi
+          previous=$argument
+        done
         """.utf8).write(to: helper)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
         var other = NodeConfiguration(); other.host = "other.fixture"
@@ -194,6 +199,82 @@ final class ConnectionProfileTests: XCTestCase {
         XCTAssertEqual(model.configuration.node.host, "edited.fixture")
         XCTAssertEqual(model.configuration.connections?.activeId, "keep")
         XCTAssertEqual(model.configuration.connections?.profiles.map(\.id), ["keep"])
+    }
+
+    func testIncompleteRPCDraftDoesNotPoisonProfileSwitchOrSave() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("timelord-rpc-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let helper = directory.appendingPathComponent("helper")
+        let captured = directory.appendingPathComponent("submitted.json")
+        try Data("""
+        #!/bin/sh
+        if [ "$1" = configuration ]; then cat '\(captured.path)'; exit 0; fi
+        previous=
+        for argument in "$@"; do
+          if [ "$previous" = "--input" ]; then cp "$argument" '\(captured.path)'; break; fi
+          previous=$argument
+        done
+        """.utf8).write(to: helper)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+
+        var first = NodeConfiguration(); first.host = "first.fixture"
+        first.certificate = "/fixture/first.crt"; first.privateKey = "/fixture/first.key"
+        first.caCertificate = "/fixture/ca.crt"
+        var second = first; second.host = "second.fixture"
+        var profiles = ConnectionProfiles(); profiles.activeId = "first"
+        profiles.profiles = [
+            ConnectionProfile(id: "first", name: "First", node: first),
+            ConnectionProfile(id: "second", name: "Second", node: second),
+        ]
+        var configuration = AppConfiguration(); configuration.connections = profiles
+        let controller = ServiceController(
+            configURL: directory.appendingPathComponent("config.toml"), helperURL: helper,
+            supervisorURL: helper)
+        let model = TimelordModel(
+            controller: controller, initialConfiguration: configuration, monitoringEnabled: false)
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+
+        // Toggling sync status creates an RPC draft before any credential exists.
+        let draft = NodeRPCConfiguration(host: model.configuration.node.host)
+        model.configuration.node.rpc = draft
+        XCTAssertNotNil(model.configuration.node.rpc)
+        XCTAssertTrue(model.hasUnsavedSettings, "The draft is unsaved UI state, not a persisted RPC profile")
+        model.selectConnectionProfile("second")
+        let switched = await model.saveConfiguration()
+        XCTAssertTrue(switched, "An incomplete RPC draft must not block a profile switch")
+        XCTAssertNil(model.errorMessage)
+        let switchedConfig = try decoder.decode(AppConfiguration.self, from: Data(contentsOf: captured))
+        XCTAssertNil(switchedConfig.connections?.profiles[0].node.rpc)
+        XCTAssertEqual(switchedConfig.connections?.activeId, "second")
+        XCTAssertEqual(model.configuration.connections?.profiles[0].node.rpc, draft,
+            "The saved configuration strips the draft, but the form keeps it")
+        XCTAssertTrue(model.hasUnsavedSettings)
+
+        // Turning the draft off persists the absence of RPC settings.
+        model.configuration.connections?.profiles[0].node.rpc = nil
+        let clearedDraft = await model.saveConfiguration()
+        XCTAssertTrue(clearedDraft)
+        XCTAssertFalse(model.hasUnsavedSettings)
+
+        let valid = NodeRPCConfiguration(
+            host: "rpc.second.fixture", port: 8555, serverName: "chia.net",
+            certificate: "/fixture/rpc.crt", privateKey: "/fixture/rpc.key",
+            caCertificate: "/fixture/rpc-ca.crt")
+        model.configuration.node.rpc = valid
+        let enabledSave = await model.saveConfiguration()
+        XCTAssertTrue(enabledSave)
+        let enabled = try decoder.decode(AppConfiguration.self, from: Data(contentsOf: captured))
+        XCTAssertEqual(enabled.connections?.profiles[1].node.rpc, valid)
+        XCTAssertEqual(model.configuration.node.rpc, valid)
+
+        model.configuration.node.rpc = nil
+        let disabledSave = await model.saveConfiguration()
+        XCTAssertTrue(disabledSave)
+        let disabled = try decoder.decode(AppConfiguration.self, from: Data(contentsOf: captured))
+        XCTAssertNil(disabled.connections?.profiles[1].node.rpc)
+        XCTAssertNil(model.configuration.node.rpc)
+        XCTAssertFalse(model.hasUnsavedSettings)
     }
 
 }

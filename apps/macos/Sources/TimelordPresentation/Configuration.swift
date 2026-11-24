@@ -25,6 +25,41 @@ public struct AppConfiguration: Codable, Sendable, Equatable {
             }
         }
     }
+    /// Resolve incomplete RPC drafts for saving. A draft is UI state, but it
+    /// must not erase RPC settings that are already saved: an incomplete draft
+    /// falls back to the last saved RPC settings for the same profile. Only an
+    /// explicit `rpc = nil` (toggle off) persists no RPC settings.
+    public func resolvedForPersistence(against saved: Self) -> Self {
+        var resolved = self
+        if var profiles = resolved.connections, !profiles.profiles.isEmpty {
+            for index in profiles.profiles.indices {
+                let id = profiles.profiles[index].id
+                let savedRPC = saved.connections?.profiles.first { $0.id == id }?.node.rpc
+                profiles.profiles[index].node.resolveIncompleteRPC(using: savedRPC)
+            }
+            resolved.connections = profiles
+        } else {
+            resolved.node.resolveIncompleteRPC(using: saved.node.rpc)
+        }
+        return resolved
+    }
+    /// Saving strips incomplete RPC drafts. Put the user's still-editable
+    /// drafts back so a connection test or board refresh does not clear the form.
+    public func restoringIncompleteRPCDrafts(from draft: Self) -> Self {
+        var restored = self
+        if var profiles = restored.connections, !profiles.profiles.isEmpty {
+            for index in profiles.profiles.indices {
+                let id = profiles.profiles[index].id
+                guard let source = draft.connections?.profiles.first(where: { $0.id == id }),
+                      let rpc = source.node.rpc, !rpc.isComplete else { continue }
+                profiles.profiles[index].node.rpc = rpc
+            }
+            restored.connections = profiles
+        } else if let rpc = draft.node.rpc, !rpc.isComplete {
+            restored.node.rpc = rpc
+        }
+        return restored
+    }
     private var activeProfileIndex: Int? {
         guard let connections else { return nil }
         return connections.profiles.firstIndex { $0.id == connections.activeId }
@@ -101,6 +136,11 @@ public struct NodeConfiguration: Codable, Sendable, Equatable {
     public var rpc: NodeRPCConfiguration?
     public init() {}
     public var hasIdentity: Bool { certificate != nil && privateKey != nil && caCertificate != nil }
+    /// The service accepts RPC only when every endpoint and credential is set.
+    public mutating func resolveIncompleteRPC(using saved: NodeRPCConfiguration?) {
+        guard let rpc, !rpc.isComplete else { return }
+        self.rpc = saved
+    }
 }
 public struct NetworkDefinition: Codable, Sendable, Equatable {
     public var schemaVersion: Int
@@ -150,6 +190,14 @@ public struct NodeRPCConfiguration: Codable, Sendable, Equatable {
                 certificate: String = "", privateKey: String = "", caCertificate: String = "") {
         self.host = host; self.port = port; self.serverName = serverName
         self.certificate = certificate; self.privateKey = privateKey; self.caCertificate = caCertificate
+    }
+    /// Mirrors `NodeConfig::validate` in `timelord-core`: a partial RPC profile
+    /// would make the whole connection profile unsavable.
+    public var isComplete: Bool {
+        !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && port != 0
+            && !serverName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && ![certificate, privateKey, caCertificate].contains(where: \.isEmpty)
     }
 }
 public struct ServiceConfiguration: Codable, Sendable, Equatable {

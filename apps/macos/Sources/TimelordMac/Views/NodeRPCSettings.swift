@@ -11,15 +11,20 @@ struct NodeRPCSettings: View {
             get: { rpc != nil },
             set: { rpc = $0 ? NodeRPCConfiguration(host: defaultHost) : nil }
         ))
-        if rpc != nil {
+        if let current = rpc {
             TextField("RPC host", text: field(\.host))
             TextField("RPC port", value: field(\.port), format: .number.grouping(.never))
             TextField("RPC TLS server name", text: field(\.serverName))
             credential("RPC client certificate", path: field(\.certificate))
             credential("RPC private key", path: field(\.privateKey))
             credential("RPC CA certificate", path: field(\.caCertificate))
-            Text("Use an address reachable from this Mac and the full node’s RPC port.")
-                .font(.caption).foregroundStyle(.secondary)
+            if current.isComplete {
+                Text("Use an address reachable from this Mac and the full node’s RPC port.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                Text("Sync status is saved only when the RPC host, port, TLS server name and all three credential files are set.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
     }
 
