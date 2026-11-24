@@ -1,4 +1,5 @@
 //! Retirement evidence outlives soft deadlines and stream cancellation.
+use super::SHUTDOWN_CONFIRMED as MARKER;
 use crate::bounded_lines::{Line, Lines};
 use anyhow::Result;
 use std::{
@@ -121,7 +122,9 @@ where
 
 #[cfg(test)]
 pub(super) async fn drain_shutdown<R: AsyncBufRead + Unpin>(lines: &mut Lines<R>) -> Result<bool> {
-    drain_shutdown_observed(lines, &AtomicBool::new(false)).await
+    let observed = AtomicBool::new(false);
+    drain_shutdown_observed(lines, &observed).await?;
+    Ok(observed.load(Ordering::Acquire))
 }
 
 #[cfg(test)]
@@ -130,9 +133,8 @@ pub(super) async fn drain_shutdown_diagnostics<R: AsyncBufRead + Unpin>(
     observed: &AtomicBool,
 ) -> Result<(bool, Vec<String>)> {
     let mut records = Vec::new();
-    let confirmed =
-        drain_shutdown_records(lines, observed, |record| records.push(record.into())).await?;
-    Ok((confirmed, records))
+    drain_shutdown_records(lines, observed, |record| records.push(record.into())).await?;
+    Ok((observed.load(Ordering::Acquire), records))
 }
 
 // Native log prefixes are permitted; payload fields and LF/CRLF framing must
@@ -140,7 +142,7 @@ pub(super) async fn drain_shutdown_diagnostics<R: AsyncBufRead + Unpin>(
 async fn drain_shutdown_observed<R: AsyncBufRead + Unpin>(
     lines: &mut Lines<R>,
     observed: &AtomicBool,
-) -> Result<bool> {
+) -> Result<()> {
     drain_shutdown_records(lines, observed, |record| {
         tracing::info!(record, "Native shutdown diagnostic");
     })
@@ -151,16 +153,14 @@ async fn drain_shutdown_records<R: AsyncBufRead + Unpin>(
     lines: &mut Lines<R>,
     observed: &AtomicBool,
     mut log: impl FnMut(&str),
-) -> Result<bool> {
+) -> Result<()> {
     let mut diagnostics = 0;
-    let mut confirmed = false;
     while let Some(record) = lines.next_line().await? {
         let Line::Text(text) = record else {
             continue;
         };
         // A discarded suffix is already gone; only a terminated marker confirms.
         if lines.terminated() && text.ends_with(MARKER) {
-            confirmed = true;
             observed.store(true, Ordering::Release);
         }
         if diagnostics < MAX_DIAGNOSTICS && DIAGNOSTICS.iter().any(|marker| text.contains(marker)) {
@@ -168,10 +168,9 @@ async fn drain_shutdown_records<R: AsyncBufRead + Unpin>(
             diagnostics += 1;
         }
     }
-    Ok(confirmed)
+    Ok(())
 }
 
-const MARKER: &str = "Hardware shutdown: engines_paused=1 safe_point_restored=1";
 const MAX_DIAGNOSTICS: usize = 8;
 const DIAGNOSTICS: [&str; 3] = ["safe_readback", "Hardware shutdown:", "VDF client stopped:"];
 

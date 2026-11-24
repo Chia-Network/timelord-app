@@ -202,3 +202,22 @@ async fn a_cancelled_oversized_record_keeps_its_discard_state_through_handoff() 
         "a discarded suffix was logged: {records:?}"
     );
 }
+
+#[tokio::test]
+async fn invalid_utf8_diagnostic_before_the_marker_does_not_hide_confirmation() {
+    let mut bytes = b"safe_readback \xff\xfe bad\n".to_vec();
+    bytes.extend_from_slice(MARKER.as_bytes());
+    bytes.push(b'\n');
+    let (confirmed, records, observed) = diagnostics(&bytes, 5).await;
+    assert!(confirmed);
+    assert!(observed);
+    assert_eq!(records, vec![MARKER.to_string()]);
+}
+
+#[tokio::test]
+async fn unterminated_diagnostic_at_eof_is_logged_without_confirmation() {
+    let (confirmed, records, observed) = diagnostics(b"safe_readback last words", 4).await;
+    assert!(!confirmed);
+    assert!(!observed);
+    assert_eq!(records, vec!["safe_readback last words".to_string()]);
+}

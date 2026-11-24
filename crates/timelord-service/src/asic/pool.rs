@@ -34,14 +34,7 @@ pub(crate) fn pair() -> (Offers, Pool) {
 
 impl Offers {
     pub fn offer(&self, lease: Lease) {
-        let mut state = self.0.state.lock().expect("ASIC pool");
-        if state.closed {
-            // Lease::drop takes the clients lock; never hold the pool lock here.
-            drop(state);
-            return drop(lease);
-        }
-        state.parked.push(lease);
-        drop(state);
+        self.0.state.lock().expect("ASIC pool").parked.push(lease);
         self.0.notify.notify_waiters();
     }
 }
@@ -57,7 +50,9 @@ impl Pool {
         loop {
             let notified = self.0.notify.notified();
             tokio::pin!(notified);
-            // Subscribe before rechecking so a later offer cannot be missed.
+            // The `Notified` is created before the recheck, so a later
+            // `notify_waiters` cannot be missed; `enable()` is only defensive
+            // under this signalling.
             notified.as_mut().enable();
             let (found, pruned) = {
                 let mut state = self.0.state.lock().expect("ASIC pool");

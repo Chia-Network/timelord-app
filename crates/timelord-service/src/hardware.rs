@@ -115,6 +115,11 @@ pub(crate) const TEMPERATURE_TIMEOUT_SECONDS: u64 = 60;
 /// stuck (for example inside a blocked USB write), not merely idle.
 pub(crate) const LIVENESS_TIMEOUT_SECONDS: u64 = 15;
 
+/// The one native record that proves the client paused its engines and restored
+/// its safe point. Any reader that consumes it must keep the evidence.
+pub(super) const SHUTDOWN_CONFIRMED: &str =
+    "Hardware shutdown: engines_paused=1 safe_point_restored=1";
+
 /// A proof backend for owner fixtures; it is also the runtime's recovery prover.
 #[cfg(test)]
 pub(crate) fn fixture_backend(shared: &Shared) -> Arc<crate::asic::AsicBackend> {

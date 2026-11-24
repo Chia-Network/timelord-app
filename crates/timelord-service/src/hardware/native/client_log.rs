@@ -1,3 +1,4 @@
+use super::super::SHUTDOWN_CONFIRMED;
 use super::*;
 
 pub(crate) struct ClientLog {
@@ -17,9 +18,6 @@ pub(crate) struct ClientLog {
     pub(crate) recent: std::collections::VecDeque<String>,
     pub(super) shutdown_confirmed: bool,
 }
-/// The one native record that proves the client paused its engines and restored
-/// its safe point. Any reader that consumes it must keep the evidence.
-const SHUTDOWN_CONFIRMED: &str = "Hardware shutdown: engines_paused=1 safe_point_restored=1";
 /// Routine per-second native output. Kept at debug so the worker log retains
 /// days of decisions instead of minutes of throughput chatter.
 fn routine(line: &str) -> bool {

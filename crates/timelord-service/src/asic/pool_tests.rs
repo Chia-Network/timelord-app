@@ -263,6 +263,33 @@ async fn old_generation_waiter_does_not_drop_a_newer_live_lease() {
 }
 
 #[tokio::test]
+async fn an_older_generation_waiter_does_not_take_a_newer_same_slot_lease() {
+    let (offers, pool) = pair();
+    let (socket, _peer) = socket_pair().await;
+    offers.offer(lease(socket, 0, 2));
+
+    let gen1 = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.receive(Some(0), 1).await }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!gen1.is_finished(), "gen 1 must not take the gen-2 lease");
+
+    let acquired = tokio::time::timeout(Duration::from_millis(500), pool.receive(Some(0), 2))
+        .await
+        .expect("the gen-2 waiter did not receive its same-slot lease")
+        .expect("gen 2 slot 0 lease");
+    assert_eq!((acquired.generation, acquired.slot), (2, 0));
+    assert!(
+        !gen1.is_finished(),
+        "gen 1 must remain blocked after gen 2 acquires the same slot"
+    );
+
+    gen1.abort();
+    let _ = gen1.await;
+}
+
+#[tokio::test]
 async fn stale_parked_slots_are_dropped_when_the_new_generation_waits() {
     let (offers, pool) = pair();
     let (socket, _peer) = socket_pair().await;
@@ -350,16 +377,19 @@ async fn clear_keeps_waiters_waiting_and_delivers_only_post_clear_leases() {
 #[tokio::test]
 async fn a_matching_lease_offered_after_the_first_poll_is_not_lost() {
     let (offers, pool) = pair();
+    let offers = Arc::new(SyncMutex::new(offers));
     let (socket, _peer) = socket_pair().await;
     // Interleave right between the empty recheck and `notified.await`, the only
-    // window a whole-future poll cannot reach. `enable()` has already registered
-    // the `Notified`, so `notify_waiters` must wake the pending receive.
-    pool.on_wait(move || offers.offer(lease(socket, 0, 1)));
+    // window a whole-future poll cannot reach. The `Notified` was created before
+    // the recheck, so `notify_waiters` must wake the pending receive.
+    let offered = offers.clone();
+    pool.on_wait(move || offered.lock().expect("offers").offer(lease(socket, 0, 1)));
     let acquired = tokio::time::timeout(Duration::from_millis(500), pool.receive(Some(0), 1))
         .await
         .expect("the matching lease offered before the await did not wake receive")
         .expect("lease");
     assert_eq!(acquired.slot, 0);
+    drop(offers);
 }
 
 #[tokio::test]
