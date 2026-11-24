@@ -1,7 +1,9 @@
+mod cause;
 mod monitor;
 mod process;
 mod startup;
 use anyhow::{Context, Result, ensure};
+use cause::{Cause, Retiring};
 use clap::{Parser, Subcommand};
 use process::OwnedProcess;
 use std::{
@@ -14,8 +16,7 @@ use std::{
 };
 use timelord_supervisor::{
     AcceptBackoff, CONTROL_SERVER_TIMEOUT, Control, InstanceLock, Intent, KILL_AND_REAP, LOG_DRAIN,
-    Mode, Network, Paths, Request, Response, Status, SupervisorPhase, graceful_stop_wait,
-    peer_is_owner,
+    Mode, Network, Paths, Request, Response, Status, SupervisorPhase, peer_is_owner,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -291,11 +292,20 @@ impl Worker {
             self.stop_failures -= 1;
             anyhow::bail!("Injected worker cleanup failure");
         }
+        // Let the coordinator close native control channels and drain proof work first.
+        // The group-wide hard stop remains the bounded fallback.
         self.process.signal_leader(libc::SIGTERM);
         self.process.wait_for_exit(graceful).await?;
         let result = self.process.kill_and_reap(KILL_AND_REAP).await?;
-        for task in &mut self.log_tasks {
-            if tokio::time::timeout(LOG_DRAIN, &mut *task).await.is_err() {
+        if tokio::time::timeout(LOG_DRAIN, async {
+            for task in &mut self.log_tasks {
+                let _ = task.await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            for task in &self.log_tasks {
                 task.abort();
             }
         }
@@ -309,6 +319,7 @@ impl Drop for Worker {
         }
     }
 }
+const VALIDATOR_REAP: Duration = Duration::from_secs(3);
 async fn validate_before_reload(helper: &Path, config: &Path) -> Result<()> {
     let mut owner = OwnedProcess::spawn(
         Command::new(helper)
@@ -325,7 +336,7 @@ async fn validate_before_reload(helper: &Path, config: &Path) -> Result<()> {
     // identity before reporting either a timeout, observation error, or result.
     let completed = owner.wait_for_exit(Duration::from_secs(5)).await;
     let status = owner
-        .kill_and_reap(KILL_AND_REAP)
+        .kill_and_reap(VALIDATOR_REAP)
         .await
         .context("Configuration validator did not retire")?;
     ensure!(
@@ -464,23 +475,6 @@ enum Lifecycle {
         next: Instant,
         error: String,
     },
-}
-type Retirement = tokio::task::JoinHandle<(Box<Worker>, Result<std::process::ExitStatus>)>;
-/// Why a worker is being retired decides what follows a successful reap.
-enum Cause {
-    /// Pause, Reload, Resume of a failed cleanup, or a cleanup retry.
-    Requested,
-    /// Crash or watchdog failure: recorded as a recovery and backed off.
-    Failed { watchdog: Option<String> },
-}
-struct Retiring {
-    pid: u32,
-    uptime: Duration,
-    cause: Cause,
-    /// An explicit Reload/Resume arrived while stopping: start the
-    /// replacement without crash backoff once the old family is reaped.
-    restart: bool,
-    task: Retirement,
 }
 impl Lifecycle {
     fn worker(&self) -> Option<&Worker> {
@@ -635,7 +629,7 @@ impl SupervisorState {
         };
         let pid = worker.process.pid();
         let uptime = worker.started.elapsed();
-        let graceful = graceful_stop_wait(matches!(&cause, Cause::Failed { watchdog: Some(_) }));
+        let graceful = cause.grace();
         let task = tokio::spawn(async move {
             let result = worker.stop(graceful).await;
             (worker, result)
@@ -675,7 +669,9 @@ impl SupervisorState {
                 drop(worker); // Reaped: the group identity is released.
                 match cause {
                     Cause::Failed { watchdog } => {
-                        let reason = watchdog.unwrap_or_else(|| format!("Worker exited: {exit}"));
+                        let reason = watchdog
+                            .map(|failure| failure.reason)
+                            .unwrap_or_else(|| format!("Worker exited: {exit}"));
                         self.record_recovery(Some(pid), &reason);
                         if paused {
                             Lifecycle::Paused
@@ -689,13 +685,14 @@ impl SupervisorState {
                             }
                         }
                     }
-                    Cause::Requested if paused => Lifecycle::Paused,
-                    Cause::Requested => Lifecycle::Starting,
+                    Cause::Requested | Cause::CleanupRetry if paused => Lifecycle::Paused,
+                    Cause::Requested | Cause::CleanupRetry => Lifecycle::Starting,
                 }
             }
             Ok((worker, Err(error))) => {
                 if let Cause::Failed { watchdog } = cause {
                     let reason = watchdog
+                        .map(|failure| failure.reason)
                         .unwrap_or_else(|| format!("Worker exited; cleanup failed: {error:#}"));
                     self.record_recovery(Some(pid), &reason);
                 }
@@ -726,7 +723,12 @@ impl SupervisorState {
     async fn retire_now(&mut self, snapshots: &watch::Sender<Published>) -> Result<()> {
         self.poll_retirement(snapshots, true).await;
         if self.lifecycle.worker().is_some() {
-            self.begin_retirement(Cause::Requested);
+            // A worker that already ignored group-SIGKILL gets no further SIGTERM wait.
+            let cause = match self.lifecycle {
+                Lifecycle::CleanupFailed { .. } => Cause::CleanupRetry,
+                _ => Cause::Requested,
+            };
+            self.begin_retirement(cause);
             self.publish(snapshots);
             self.poll_retirement(snapshots, true).await;
         }
@@ -776,9 +778,8 @@ impl SupervisorState {
                     // completes: Pause ends Paused and never starts a worker.
                     Lifecycle::Stopping(retiring) => retiring.restart |= resuming,
                     Lifecycle::Running(_) if mode == Mode::Running => {}
-                    Lifecycle::Running(_) | Lifecycle::CleanupFailed { .. } => {
-                        self.begin_retirement(Cause::Requested)
-                    }
+                    Lifecycle::Running(_) => self.begin_retirement(Cause::Requested),
+                    Lifecycle::CleanupFailed { .. } => self.begin_retirement(Cause::CleanupRetry),
                     _ if mode == Mode::Paused => self.lifecycle = Lifecycle::Paused,
                     Lifecycle::Paused | Lifecycle::StateError(_) => {
                         self.lifecycle = Lifecycle::Starting
@@ -793,9 +794,8 @@ impl SupervisorState {
                     // Repeated reloads coalesce into the retirement in flight;
                     // the replacement reads the configuration when it starts.
                     Lifecycle::Stopping(retiring) => retiring.restart = true,
-                    Lifecycle::Running(_) | Lifecycle::CleanupFailed { .. } => {
-                        self.begin_retirement(Cause::Requested)
-                    }
+                    Lifecycle::Running(_) => self.begin_retirement(Cause::Requested),
+                    Lifecycle::CleanupFailed { .. } => self.begin_retirement(Cause::CleanupRetry),
                     Lifecycle::StateError(_) => {}
                     _ if self.intent.mode == Mode::Paused => self.lifecycle = Lifecycle::Paused,
                     _ => self.lifecycle = Lifecycle::Starting,
@@ -831,7 +831,7 @@ impl SupervisorState {
         if matches!(self.lifecycle, Lifecycle::CleanupFailed { next, .. } if Instant::now() >= next)
         {
             // Keep failed cleanup owned and monitored until retirement succeeds.
-            self.begin_retirement(Cause::Requested);
+            self.begin_retirement(Cause::CleanupRetry);
             self.publish(snapshots);
             return Ok(());
         }

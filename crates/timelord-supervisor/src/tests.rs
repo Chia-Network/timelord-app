@@ -629,6 +629,69 @@ async fn resume_and_reload_during_stopping_start_exactly_one_replacement_after_r
     fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn retirement_grace_depends_on_watchdog_classification() {
+    use timelord_supervisor::progress::{Failure, FailureKind};
+    let failure = |kind, reason: &str| Failure {
+        kind,
+        reason: reason.into(),
+    };
+    let unresponsive = failure(FailureKind::Unresponsive, "heartbeat");
+    let reported = failure(FailureKind::Reported, "essential");
+    let normal = timelord_supervisor::NORMAL_GRACEFUL_STOP;
+    assert_eq!(
+        Cause::Failed {
+            watchdog: Some(unresponsive)
+        }
+        .grace(),
+        timelord_supervisor::WATCHDOG_GRACEFUL_STOP
+    );
+    assert_eq!(
+        Cause::Failed {
+            watchdog: Some(reported)
+        }
+        .grace(),
+        normal
+    );
+    assert_eq!(Cause::Requested.grace(), normal);
+    assert_eq!(Cause::CleanupRetry.grace(), Duration::ZERO);
+    assert_eq!(Cause::Failed { watchdog: None }.grace(), normal);
+}
+
+#[tokio::test]
+async fn unresponsive_watchdog_failure_reaps_under_the_short_grace() {
+    use timelord_supervisor::progress::{Failure, FailureKind};
+    let dir = std::env::temp_dir().join(format!("tl-unresponsive-grace-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let helper = dir.join("worker");
+    let d = dir.display();
+    fs::write(
+        &helper,
+        format!("#!/bin/sh\ntouch '{d}/alive.'$$\ntrap '' TERM\nwhile :; do sleep 0.1; done\n"),
+    )
+    .unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    let (mut state, pid) = running_state(&dir, &helper).await;
+    let (snapshots, _) = watch::channel(state.published());
+    let started = Instant::now();
+    state.begin_retirement(Cause::Failed {
+        watchdog: Some(Failure {
+            kind: FailureKind::Unresponsive,
+            reason: "fixture heartbeat expiry".into(),
+        }),
+    });
+    state.poll_retirement(&snapshots, true).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "unresponsive retirement took {:?}",
+        started.elapsed()
+    );
+    assert!(reaped(pid));
+    assert!(matches!(state.lifecycle, Lifecycle::Backoff { .. }));
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[tokio::test]
 async fn rejected_reload_retains_the_running_worker() {
     let dir = std::env::temp_dir().join(format!("tl-reload-reject-{}", std::process::id()));

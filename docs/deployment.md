@@ -60,8 +60,13 @@ commands support `--expected-revision` for concurrent administration. They retur
 promptly and never wait for a worker to exit: the supervisor acknowledges once
 the intent change is durable and retirement of the old worker family has
 *started*, and the returned status may show `"phase":"stopping"` while the worker
-drains (a 25-second SIGTERM wait, then a 3-second group-wide kill and reap;
-worst case about 30 seconds). Pause is persisted
+drains (a 25-second SIGTERM wait, then a 3-second group-wide kill and reap,
+then up to a 1-second shared log drain; about 29 seconds worst case, within the
+35-second launchd `ExitTimeOut`). A live worker that reported a failure keeps
+the normal graceful wait; only an unresponsive worker (no startup progress or no
+fresh heartbeat) gets a 2-second wait. On an existing installation the first
+`launchctl bootout` still runs under the old 20-second `ExitTimeOut` plist unless
+the service is paused first and its worker family has retired before bootout. Pause is persisted
 before acknowledgment; poll `status` until `phase` is `paused` and `worker_pid`
 is null to confirm the family has retired. Reload first validates the requested
 file (a rejected file keeps the running worker and returns an error), then starts

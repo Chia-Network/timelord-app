@@ -20,48 +20,45 @@ use std::{
     time::Duration,
 };
 
-/// Graceful SIGTERM wait for a healthy worker; native ASIC retirement can take
-/// up to about 25 seconds.
+/// Graceful SIGTERM wait for a healthy worker. Native ASIC retirement escalates
+/// over about 28 seconds (1 s TLSTOP, 5 s soft, 10 s SIGTERM, 10 s SIGKILL and
+/// two 1 s drains), and node stop, history flush or checkpointing can extend a
+/// worker to about 32 seconds. The 25 s wait therefore covers a normal native
+/// shutdown and intentionally truncates any forced-cleanup tail.
 pub const NORMAL_GRACEFUL_STOP: Duration = Duration::from_secs(25);
-/// Graceful SIGTERM wait after a watchdog failure: the worker is already hung,
-/// so do not spend the normal ASIC drain budget.
+/// Graceful SIGTERM wait for an unresponsive worker that sent no startup progress
+/// or let its heartbeat expire. A live worker that reported a failure keeps the
+/// normal native retirement budget.
 pub const WATCHDOG_GRACEFUL_STOP: Duration = Duration::from_secs(2);
 /// Bound on reaping the whole worker process group after the graceful wait.
 pub const KILL_AND_REAP: Duration = Duration::from_secs(3);
-/// Bound on draining one worker log pump.
+/// Bound on draining the worker's concurrent log pumps under one deadline.
 pub const LOG_DRAIN: Duration = Duration::from_secs(1);
-/// Worker stdout and stderr each have one log pump.
-pub const LOG_TASK_COUNT: u64 = 2;
 
-// Each outer deadline leaves margin so it cannot race the stop budget.
-const EXIT_TIME_OUT_MARGIN: Duration = Duration::from_secs(5);
-const CONTROL_SERVER_MARGIN: Duration = Duration::from_secs(10);
-const CONTROL_CLIENT_MARGIN: Duration = Duration::from_secs(5);
+const EXIT_TIME_OUT_MARGIN: Duration = Duration::from_secs(6);
 
 /// Worst-case time to retire a worker: normal graceful wait, group kill/reap,
-/// then draining both log pumps.
+/// then one shared log-drain deadline for both pumps.
 pub const WORST_CASE_STOP: Duration = Duration::from_secs(
-    NORMAL_GRACEFUL_STOP.as_secs() + KILL_AND_REAP.as_secs() + LOG_TASK_COUNT * LOG_DRAIN.as_secs(),
+    NORMAL_GRACEFUL_STOP.as_secs() + KILL_AND_REAP.as_secs() + LOG_DRAIN.as_secs(),
 );
 /// launchd's deadline for the supervisor to exit, with margin over the stop budget.
 pub const EXIT_TIME_OUT: Duration =
     Duration::from_secs(WORST_CASE_STOP.as_secs() + EXIT_TIME_OUT_MARGIN.as_secs());
-/// Server-side bound on a control request awaiting the lifecycle loop.
-pub const CONTROL_SERVER_TIMEOUT: Duration =
-    Duration::from_secs(WORST_CASE_STOP.as_secs() + CONTROL_SERVER_MARGIN.as_secs());
+/// Server-side bound on a control-loop reply, including reload validation. It
+/// does not wait for worker retirement, so it is independent of the stop budget.
+pub const CONTROL_SERVER_TIMEOUT: Duration = Duration::from_secs(30);
 /// Client-side bound on a control transaction; must exceed the server bound.
-pub const CONTROL_CLIENT_TIMEOUT: Duration =
-    Duration::from_secs(CONTROL_SERVER_TIMEOUT.as_secs() + CONTROL_CLIENT_MARGIN.as_secs());
+pub const CONTROL_CLIENT_TIMEOUT: Duration = Duration::from_secs(35);
 
-/// Graceful SIGTERM wait for a retirement: a watchdog failure means the worker
-/// is already hung, so use the short wait instead of the normal ASIC drain.
-pub fn graceful_stop_wait(watchdog_failure: bool) -> Duration {
-    if watchdog_failure {
-        WATCHDOG_GRACEFUL_STOP
-    } else {
-        NORMAL_GRACEFUL_STOP
-    }
-}
+const _: () = assert!(NORMAL_GRACEFUL_STOP.as_secs() == 25);
+const _: () = assert!(WATCHDOG_GRACEFUL_STOP.as_secs() == 2);
+const _: () = assert!(KILL_AND_REAP.as_secs() == 3);
+const _: () = assert!(LOG_DRAIN.as_secs() == 1);
+const _: () = assert!(WORST_CASE_STOP.as_secs() == 29);
+const _: () = assert!(EXIT_TIME_OUT.as_secs() == 35);
+const _: () = assert!(EXIT_TIME_OUT.as_secs() > WORST_CASE_STOP.as_secs());
+const _: () = assert!(WATCHDOG_GRACEFUL_STOP.as_secs() < NORMAL_GRACEFUL_STOP.as_secs());
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -463,30 +460,6 @@ mod phase_tests {
 mod stop_budget_tests {
     use super::*;
     use std::path::Path;
-    use std::time::Duration;
-
-    #[test]
-    fn stop_budget_components_and_derived_bounds_are_exact() {
-        assert_eq!(NORMAL_GRACEFUL_STOP, Duration::from_secs(25));
-        assert_eq!(WATCHDOG_GRACEFUL_STOP, Duration::from_secs(2));
-        assert_eq!(KILL_AND_REAP, Duration::from_secs(3));
-        assert_eq!(LOG_DRAIN, Duration::from_secs(1));
-        assert_eq!(WORST_CASE_STOP, Duration::from_secs(30));
-        assert_eq!(EXIT_TIME_OUT, Duration::from_secs(35));
-        assert_eq!(CONTROL_SERVER_TIMEOUT, Duration::from_secs(40));
-        assert_eq!(CONTROL_CLIENT_TIMEOUT, Duration::from_secs(45));
-        assert_eq!(graceful_stop_wait(true), Duration::from_secs(2));
-        assert_eq!(graceful_stop_wait(false), Duration::from_secs(25));
-    }
-
-    #[test]
-    fn stop_budget_deadlines_are_ordered() {
-        assert!(EXIT_TIME_OUT > WORST_CASE_STOP);
-        assert!(CONTROL_SERVER_TIMEOUT > WORST_CASE_STOP);
-        assert!(CONTROL_SERVER_TIMEOUT > EXIT_TIME_OUT);
-        assert!(CONTROL_CLIENT_TIMEOUT > CONTROL_SERVER_TIMEOUT);
-        assert!(WATCHDOG_GRACEFUL_STOP < NORMAL_GRACEFUL_STOP);
-    }
 
     #[test]
     fn launchd_exit_timeout_covers_the_stop_budget() {
@@ -496,6 +469,10 @@ mod stop_budget_tests {
             "operator",
         )
         .unwrap();
+        assert!(xml.contains(&format!(
+            "<key>ExitTimeOut</key><integer>{}</integer>",
+            EXIT_TIME_OUT.as_secs()
+        )));
         assert!(xml.contains("<key>ExitTimeOut</key><integer>35</integer>"));
     }
 }
