@@ -97,6 +97,12 @@ pub(crate) enum RuntimeScope {
     Production,
     Admission,
 }
+/// Whether a node reset keeps or clears the chain-scoped history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NodeContext {
+    Same,
+    New,
+}
 impl RuntimeScope {
     /// Process metrics belong to the production service. Admission probes run
     /// against the same process state but publish no operational telemetry.
@@ -214,9 +220,10 @@ impl RuntimeState {
     pub fn disturbed(&self, now: u64) -> bool {
         now < self.disturbed_until_unix
     }
-    /// A different node profile starts a new chain context. Board state,
-    /// routes and per-board history are retained.
-    pub fn reset_node_context(&mut self) {
+    /// `Same` is a same-scope reload (such as a certificate change) and keeps
+    /// the archive and observations; `New` is a different node profile and
+    /// clears them. Board state, routes and per-board history are retained.
+    pub fn reset_node_context(&mut self, context: NodeContext) {
         self.scheduler_initialized = false;
         self.scheduler_height = None;
         self.scheduler_deficit = None;
@@ -226,6 +233,14 @@ impl RuntimeState {
         // node as evidence that the new profile works.
         self.proofs_delivered = 0;
         self.failed_proofs = 0;
+        if context == NodeContext::New {
+            // Restored history belongs to the previous node context.
+            self.archive = None;
+            // Chain measurements from another node never join this chart.
+            self.observations = Default::default();
+            self.estimated_observations = Default::default();
+        }
+        self.event(None, "node_profile_change");
         self.transition(
             "waiting_for_node",
             "connecting",

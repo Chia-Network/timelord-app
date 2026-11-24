@@ -99,6 +99,7 @@ impl NativeControl {
 /// the journaled, launched and applied points are the same value.
 pub(super) struct Startup {
     pub(super) point: Point,
+    engines: usize,
     learned: Option<automatic::Learned>,
     /// A thermal recovery probes at low power, then resumes here once fresh
     /// telemetry is cool.
@@ -162,6 +163,7 @@ pub(super) async fn startup(shared: &Shared, board: &BoardConfig) -> Result<Star
                 frequency_mhz: 200.,
                 voltage_v: 0.7,
             },
+            engines,
             learned,
             resume: Some(resume),
             ramp: (best != resume).then_some(best),
@@ -172,6 +174,7 @@ pub(super) async fn startup(shared: &Shared, board: &BoardConfig) -> Result<Star
         let point = cautious_point(recovery_point(shared, board));
         return Ok(Startup {
             point,
+            engines,
             learned,
             resume: None,
             ramp: (best != point).then_some(best),
@@ -180,6 +183,7 @@ pub(super) async fn startup(shared: &Shared, board: &BoardConfig) -> Result<Star
     }
     Ok(Startup {
         point: best,
+        engines,
         learned,
         resume: None,
         ramp: None,
@@ -257,7 +261,7 @@ impl NativeOwner {
                 experiment: None,
                 policy,
                 serial,
-                engines: shared.engines(&board.id).max(1),
+                engines: startup.engines,
                 hash: facts.hash.clone(),
                 host: facts.host.clone(),
                 raw_window: Default::default(),
