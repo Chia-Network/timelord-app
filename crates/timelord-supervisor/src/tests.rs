@@ -730,22 +730,35 @@ async fn cleanup_retry_skips_the_graceful_wait() {
 #[test]
 fn a_retry_only_spends_what_the_first_attempt_left() {
     let now = std::time::Instant::now();
+    let grace = |budget, spent| Grace {
+        started: now - spent,
+        budget,
+    };
     let normal = timelord_supervisor::NORMAL_GRACEFUL_STOP;
-    assert_eq!(remaining_grace(false, None, now), normal);
-    assert_eq!(remaining_grace(true, Some(now), now), Duration::ZERO);
+    assert_eq!(grace(normal, Duration::ZERO).remaining(now), normal);
     assert_eq!(
-        remaining_grace(false, Some(now - Duration::from_secs(20)), now),
+        grace(normal, Duration::from_secs(20)).remaining(now),
         Duration::from_secs(5)
     );
     assert_eq!(
-        remaining_grace(false, Some(now - Duration::from_secs(60)), now),
+        grace(normal, Duration::from_secs(60)).remaining(now),
         Duration::ZERO,
         "a spent budget must not be renewed"
+    );
+    // An unresponsive worker keeps its 2-second watchdog grace through a retry.
+    let watchdog = timelord_supervisor::WATCHDOG_GRACEFUL_STOP;
+    assert_eq!(
+        grace(watchdog, Duration::from_secs(1)).remaining(now),
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        grace(watchdog, Duration::from_secs(3)).remaining(now),
+        Duration::ZERO
     );
 }
 
 #[tokio::test]
-async fn shutdown_retry_spends_only_what_the_first_attempt_left() {
+async fn shutdown_retry_keeps_the_first_attempts_short_grace() {
     let dir = std::env::temp_dir().join(format!("tl-shutdown-retry-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
@@ -775,26 +788,26 @@ async fn shutdown_retry_spends_only_what_the_first_attempt_left() {
     let mut state = SupervisorState::new(Ok(Intent::default()), log);
     state.lifecycle = Lifecycle::Running(Box::new(worker));
     let (snapshots, _) = watch::channel(state.published());
-    state.begin_retirement(Cause::Failed { watchdog: None });
+    // The first attempt is an unresponsive worker's 2-second watchdog wait and
+    // fails before SIGTERM, so it records that short budget.
+    state.begin_retirement(Cause::Failed {
+        watchdog: Some(timelord_supervisor::progress::Failure::unresponsive(
+            "fixture short grace",
+        )),
+    });
     state.poll_retirement(&snapshots, true).await;
     assert!(matches!(state.lifecycle, Lifecycle::CleanupFailed { .. }));
     assert!(!state.lifecycle.worker().unwrap().killed);
-    // The first attempt failed with about 2 s of its graceful budget left, as a
-    // waitid error late in a Pause would.
-    state.lifecycle.worker_mut().unwrap().stop_started = Some(
-        std::time::Instant::now()
-            - (timelord_supervisor::NORMAL_GRACEFUL_STOP - Duration::from_secs(2)),
-    );
     let started = Instant::now();
     state.retire_now(&snapshots).await.unwrap();
     let elapsed = started.elapsed();
     assert!(
         elapsed >= Duration::from_secs(1),
-        "shutdown skipped the remaining grace: {elapsed:?}"
+        "shutdown skipped the remaining watchdog grace: {elapsed:?}"
     );
     assert!(
         elapsed < Duration::from_secs(5),
-        "shutdown granted a second full grace: {elapsed:?}"
+        "shutdown upgraded the watchdog grace to the normal one: {elapsed:?}"
     );
     assert!(reaped(pid));
     fs::remove_dir_all(dir).unwrap();

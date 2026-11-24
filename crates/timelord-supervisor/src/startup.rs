@@ -64,7 +64,7 @@ pub async fn ensure_started(
         .arg(network.label())
         // This CLI owns the child's stderr pipe to capture a startup failure, so
         // the supervisor releases fd 2 once it serves status.
-        .arg("--own-stderr");
+        .arg("--release-stderr");
     supervisor_stdio(&mut command);
     if let Some(worker) = worker {
         command.arg("--worker").arg(worker);
@@ -191,10 +191,12 @@ impl Reading {
     /// showing up as a replacement character.
     fn text(&self) -> String {
         let mut bytes = &self.kept[..];
-        while let [first, rest @ ..] = bytes
-            && *first & 0xC0 == 0x80
-        {
-            bytes = rest;
+        if self.truncated {
+            while let [first, rest @ ..] = bytes
+                && *first & 0xC0 == 0x80
+            {
+                bytes = rest;
+            }
         }
         String::from_utf8_lossy(bytes).trim().to_string()
     }

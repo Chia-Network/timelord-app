@@ -68,26 +68,27 @@ progress or no fresh heartbeat) gets a 2-second wait. If the group kill itself
 fails, shutdown spends the 25-second wait plus a failed 3-second reap, then a
 3-second retry reap and, for an owner that still cannot be reaped, a final bounded
 3-second drop: a 34.1-second worst case, still within the 35-second launchd
-`ExitTimeOut`. All retirement attempts for one worker share a single 25-second
-graceful wait: a retry gets only what the first attempt left, so a failed attempt
-cannot stretch that budget. An in-flight Reload validation is cancelled on
-supervisor shutdown and its validator child is reaped, so shutdown stays within that
-budget rather than waiting for validation. On an existing installation the first
-`launchctl bootout` still runs under the old 20-second `ExitTimeOut` plist unless
-the service is paused first and its worker family has retired before bootout. Pause
-is persisted before acknowledgment; poll `status` until `phase` is `paused` and
-`worker_pid` is null to confirm the family has retired. Reload first validates the
-requested file (a rejected file keeps the running worker and returns an error), then
-starts retirement and returns; the replacement is running once `phase` is
-`worker_started` with a higher `worker_generation`. A Pause sent while stopping
-takes effect immediately and no replacement starts; repeated reloads while stopping
-coalesce into one replacement; a new worker never starts until the old process group
-has been reaped. Reload preserves Run/Pause. If cleanup fails, the status stays
-`stopping` with a `Worker cleanup failed` error while the supervisor keeps ownership
-and retries. A corrupt intent file keeps production stopped with `state_error` until
-an explicit administrator command repairs it; it is never treated as a fresh Run.
-The private supervisor directory beside config holds its socket, locks and intent.
-Do not delete lock files while processes may still be alive.
+`ExitTimeOut`. All retirement attempts for one worker share a single graceful
+budget: a retry gets only what its first attempt left of the wait that attempt was
+granted (25 seconds normally, 2 seconds for an unresponsive worker), so a failed
+attempt cannot stretch it. An in-flight Reload validation is cancelled on supervisor
+shutdown and its validator child is reaped, so shutdown stays within that budget
+rather than waiting for validation. On an existing installation the first `launchctl
+bootout` still runs under the old 20-second `ExitTimeOut` plist unless the service
+is paused first and its worker family has retired before bootout. Pause is persisted
+before acknowledgment; poll `status` until `phase` is `paused` and `worker_pid` is
+null to confirm the family has retired. Reload first validates the requested file (a
+rejected file keeps the running worker and returns an error), then starts retirement
+and returns; the replacement is running once `phase` is `worker_started` with a
+higher `worker_generation`. A Pause sent while stopping takes effect immediately and
+no replacement starts; repeated reloads while stopping coalesce into one
+replacement; a new worker never starts until the old process group has been reaped.
+Reload preserves Run/Pause. If cleanup fails, the status stays `stopping` with a
+`Worker cleanup failed` error while the supervisor keeps ownership and retries. A
+corrupt intent file keeps production stopped with `state_error` until an explicit
+administrator command repairs it; it is never treated as a fresh Run. The private
+supervisor directory beside config holds its socket, locks and intent. Do not delete
+lock files while processes may still be alive.
 
 Status reports supervisor/worker process identity and recovery state. It is **not**
 a claim that ASICs are connected or verified proofs are being submitted. Worker

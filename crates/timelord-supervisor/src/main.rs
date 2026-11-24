@@ -21,8 +21,7 @@ use std::{
 };
 use timelord_supervisor::{
     AcceptBackoff, CONTROL_SERVER_TIMEOUT, Control, InstanceLock, Intent, KILL_AND_REAP, LOG_DRAIN,
-    Mode, NORMAL_GRACEFUL_STOP, Network, Paths, Request, Response, Status, SupervisorPhase,
-    peer_is_owner,
+    Mode, Network, Paths, Request, Response, Status, SupervisorPhase, peer_is_owner,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -87,8 +86,8 @@ enum Action {
         /// Set by ensure-started, which owns the startup stderr pipe and needs
         /// it closed once this supervisor serves status. Without it (launchd,
         /// a terminal, a test harness) stderr stays where the caller put it.
-        #[arg(long, hide = true)]
-        own_stderr: bool,
+        #[arg(long = "release-stderr", hide = true)]
+        release_stderr: bool,
     },
     Status {
         #[arg(long)]
@@ -165,7 +164,7 @@ async fn main() -> Result<()> {
             worker,
             monitor_listen,
             network,
-            own_stderr,
+            release_stderr,
         } => {
             let helper =
                 worker.unwrap_or(std::env::current_exe()?.with_file_name("timelord-service"));
@@ -174,7 +173,7 @@ async fn main() -> Result<()> {
                 helper,
                 monitor_listen,
                 network,
-                own_stderr,
+                release_stderr,
             )
             .await
         }
@@ -256,9 +255,10 @@ struct Worker {
     /// Set once a stop has reached the group SIGKILL. A retry then has nothing
     /// left to wait for.
     killed: bool,
-    /// When this worker's first stop attempt began. All attempts share one
-    /// graceful budget, so a retry only gets what the first one left.
-    stop_started: Option<std::time::Instant>,
+    /// The grace granted to this worker's first stop attempt. Every later
+    /// attempt shares that budget, so an unresponsive worker is not upgraded to
+    /// the normal grace by a retry.
+    grace: Option<Grace>,
     #[cfg(test)]
     stop_failures: usize,
     #[cfg(test)]
@@ -310,7 +310,7 @@ impl Worker {
             started: Instant::now(),
             progress: None,
             killed: false,
-            stop_started: None,
+            grace: None,
             #[cfg(test)]
             stop_failures: 0,
             #[cfg(test)]
@@ -318,12 +318,19 @@ impl Worker {
         })
     }
     async fn stop(&mut self, graceful: Duration) -> Result<std::process::ExitStatus> {
-        // One graceful budget per worker: `stop` is only repeated for a worker
-        // that was not reaped, so a retry gets what its first attempt left and
-        // nothing at all once the group has been SIGKILLed.
-        let graceful = graceful.min(self.remaining_grace());
-        self.stop_started
-            .get_or_insert_with(std::time::Instant::now);
+        // One graceful budget per worker, fixed by this attempt if it is the
+        // first: `stop` is only repeated for a worker that was not reaped, so a
+        // retry gets what its first attempt left and nothing at all once the
+        // group has been SIGKILLed.
+        let grace = *self.grace.get_or_insert(Grace {
+            started: std::time::Instant::now(),
+            budget: graceful,
+        });
+        let graceful = if self.killed {
+            Duration::ZERO
+        } else {
+            grace.remaining(std::time::Instant::now())
+        };
         #[cfg(test)]
         if self.stop_failures > 0 {
             self.stop_failures -= 1;
@@ -354,23 +361,18 @@ impl Worker {
         }
         Ok(result)
     }
-    fn remaining_grace(&self) -> Duration {
-        remaining_grace(self.killed, self.stop_started, std::time::Instant::now())
-    }
 }
-/// What a worker may still spend of its single graceful budget, counted from
-/// its first stop attempt. A group that was already SIGKILLed gets nothing.
-fn remaining_grace(
-    killed: bool,
-    first_attempt: Option<std::time::Instant>,
-    now: std::time::Instant,
-) -> Duration {
-    if killed {
-        return Duration::ZERO;
+/// The graceful budget a worker's first stop attempt was granted.
+#[derive(Clone, Copy)]
+struct Grace {
+    started: std::time::Instant,
+    budget: Duration,
+}
+impl Grace {
+    fn remaining(&self, now: std::time::Instant) -> Duration {
+        self.budget
+            .saturating_sub(now.saturating_duration_since(self.started))
     }
-    first_attempt.map_or(NORMAL_GRACEFUL_STOP, |started| {
-        NORMAL_GRACEFUL_STOP.saturating_sub(now.saturating_duration_since(started))
-    })
 }
 impl Drop for Worker {
     fn drop(&mut self) {
@@ -834,7 +836,7 @@ async fn run(
     helper: PathBuf,
     monitor_listen: Option<std::net::SocketAddr>,
     network: Network,
-    own_stderr: bool,
+    release_stderr: bool,
 ) -> Result<()> {
     let _owner = InstanceLock::acquire(&paths.lock)?;
     if let Ok(meta) = fs::symlink_metadata(&paths.socket) {
@@ -897,7 +899,7 @@ async fn run(
     // /dev/null: the CLI's read ends, and a later child that inherits stderr
     // cannot hold the CLI's descriptor open. launchd, a terminal, or a test
     // harness keeps the stderr it chose. Best effort: the CLI's read is bounded.
-    if own_stderr && let Ok(null) = fs::OpenOptions::new().write(true).open("/dev/null") {
+    if release_stderr && let Ok(null) = fs::OpenOptions::new().write(true).open("/dev/null") {
         unsafe {
             libc::dup2(null.as_raw_fd(), libc::STDERR_FILENO);
         }

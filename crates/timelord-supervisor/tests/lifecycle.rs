@@ -71,7 +71,7 @@ fn supervise(fixture: &Fixture, helper: &Path, own_stderr: bool) -> tokio::proce
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     if own_stderr {
-        command.arg("--own-stderr");
+        command.arg("--release-stderr");
     }
     command.spawn().unwrap()
 }
