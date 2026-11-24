@@ -362,10 +362,6 @@ impl Metrics {
                 .proof_duration
                 .with_label_values(labels)
                 .get_sample_count(),
-            "submission_duration_seconds" => self
-                .submission_duration
-                .with_label_values(labels)
-                .get_sample_count(),
             _ => panic!("Unknown test histogram: {name}"),
         }
     }

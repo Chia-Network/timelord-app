@@ -178,8 +178,6 @@ impl AsicBackend {
         let state = self.runtime.lock().expect("runtime");
         state.routing.iter().find(|a| a.chain == chain).cloned()
     }
-    /// Production callers observe process metrics; admission probes and board
-    /// recovery checks publish nothing.
     fn metrics(&self) -> Option<&Arc<crate::observability::Metrics>> {
         self.scope.metrics(&self.process)
     }

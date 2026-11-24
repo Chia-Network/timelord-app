@@ -670,7 +670,7 @@ fn productive_work_survives_observer_failure_but_not_essential_failure() {
     assert_eq!(state.epoch, None);
 }
 #[test]
-fn admission_activity_counts_pending_work_without_telemetry() {
+fn admission_activity_counts_pending_work_without_a_metric_handle() {
     let runtime = Mutex::new(RuntimeState::admission());
     let mut completed = Activity::new(&runtime, Chain::Challenge, None);
     assert_eq!(runtime.lock().unwrap().pending[0], 1);

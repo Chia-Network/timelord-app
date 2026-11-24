@@ -698,11 +698,19 @@ async fn cancelled_proof_closes_its_partial_frame_and_releases_the_slot() {
     });
     let proving = tokio::spawn({
         let backend = backend.clone();
-        async move { backend.prove(Chain::Challenge, work(10, 64)).await }
+        async move {
+            backend
+                .prove_when_available(Chain::Challenge, work(10, 64), true)
+                .await
+        }
     });
     received.await.unwrap();
+    assert_eq!(backend.runtime.lock().unwrap().pending[0], 1);
     proving.abort();
     let _ = proving.await;
+    assert_eq!(backend.runtime.lock().unwrap().pending[0], 0);
+    let metrics = &backend.process.metrics;
+    assert_eq!(metrics.counter("work_cancelled_total", &["challenge"]), 1);
     tokio::time::timeout(Duration::from_secs(2), fixture)
         .await
         .unwrap()
@@ -846,77 +854,6 @@ async fn live_route_failover_preserves_the_healthy_engine_session() {
     );
 }
 
-async fn serve_recovery_proof(
-    offer: &mpsc::Sender<Lease>,
-    slot: u8,
-    generation: u64,
-    invalid: bool,
-) -> tokio::task::JoinHandle<()> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut peer = TcpStream::connect(listener.local_addr().unwrap())
-        .await
-        .unwrap();
-    let (socket, _) = listener.accept().await.unwrap();
-    offer
-        .send(Lease {
-            socket,
-            board: "a".into(),
-            slot,
-            generation,
-            clients: Default::default(),
-        })
-        .await
-        .ok()
-        .unwrap();
-    tokio::spawn(async move {
-        handshake(&mut peer).await;
-        assert_eq!(requested(&mut peer).await, 360);
-        let blob = include_bytes!("../../tests/fixtures/checkpointed-proof.bin");
-        let mut raw = 360_u64.to_be_bytes().to_vec();
-        raw.extend(100_u64.to_be_bytes());
-        raw.extend_from_slice(&blob[..100]);
-        raw.push(((blob.len() - 200) / 141) as u8);
-        raw.extend_from_slice(&blob[100..]);
-        if invalid {
-            raw[16] ^= 1;
-        }
-        let frame: Vec<_> = raw
-            .iter()
-            .flat_map(|v| format!("{v:02x}").into_bytes())
-            .collect();
-        peer.write_all(&(frame.len() as u32).to_be_bytes())
-            .await
-            .unwrap();
-        peer.write_all(&frame).await.unwrap();
-        if !invalid {
-            assert_eq!(requested(&mut peer).await, 0);
-            peer.write_all(b"STOP").await.unwrap();
-            let mut ack = [0; 3];
-            peer.read_exact(&mut ack).await.unwrap();
-        }
-    })
-}
-fn checking_backend(
-    config: &Config,
-    fault: Option<crate::board_lifecycle::Fault>,
-) -> (
-    Arc<AsicBackend>,
-    std::collections::HashMap<String, mpsc::Sender<Lease>>,
-) {
-    let mut state = crate::runtime::RuntimeState::new(false);
-    state.routing = config.assignments().unwrap();
-    state.boards.entry("a".into()).or_default().lifecycle =
-        crate::board_lifecycle::BoardLifecycle::fixture(
-            crate::board_lifecycle::Phase::Checking,
-            true,
-            fault,
-            0,
-        );
-    let runtime = Arc::new(SyncMutex::new(state));
-    let backend = AsicBackend::new(runtime, crate::operational::State::fixture());
-    let offers = offers_for(&backend, config);
-    (Arc::new(backend), offers)
-}
 #[tokio::test]
 async fn recovery_proofs_use_the_live_owner_pool_without_publishing_or_trusting_bad_proofs() {
     let mut config = Config::default();
@@ -924,10 +861,62 @@ async fn recovery_proofs_use_the_live_owner_pool_without_publishing_or_trusting_
         .hardware
         .boards
         .push(toml::from_str("id='a'\nname='A'\nprofile='manual'\nclient_port=18110").unwrap());
-    let (backend, offers) =
-        checking_backend(&config, Some(crate::board_lifecycle::Fault::InvalidProof));
+    let mut state = crate::runtime::RuntimeState::new(false);
+    state.routing = config.assignments().unwrap();
+    state.boards.entry("a".into()).or_default().lifecycle =
+        crate::board_lifecycle::BoardLifecycle::fixture(
+            crate::board_lifecycle::Phase::Checking,
+            true,
+            Some(crate::board_lifecycle::Fault::InvalidProof),
+            0,
+        );
+    let runtime = Arc::new(SyncMutex::new(state));
+    let backend = AsicBackend::new(runtime.clone(), crate::operational::State::fixture());
+    let offers = offers_for(&backend, &config);
     for invalid in [false, true] {
-        let fixture = serve_recovery_proof(&offers["a"], 1, 0, invalid).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        offers["a"]
+            .send(Lease {
+                socket,
+                board: "a".into(),
+                slot: 1,
+                generation: 0,
+                clients: Default::default(),
+            })
+            .await
+            .ok()
+            .unwrap();
+        let fixture = tokio::spawn(async move {
+            handshake(&mut peer).await;
+            assert_eq!(requested(&mut peer).await, 360);
+            let blob = include_bytes!("../../tests/fixtures/checkpointed-proof.bin");
+            let mut raw = 360_u64.to_be_bytes().to_vec();
+            raw.extend(100_u64.to_be_bytes());
+            raw.extend_from_slice(&blob[..100]);
+            raw.push(((blob.len() - 200) / 141) as u8);
+            raw.extend_from_slice(&blob[100..]);
+            if invalid {
+                raw[16] ^= 1;
+            }
+            let frame: Vec<_> = raw
+                .iter()
+                .flat_map(|v| format!("{v:02x}").into_bytes())
+                .collect();
+            peer.write_all(&(frame.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
+            peer.write_all(&frame).await.unwrap();
+            if !invalid {
+                assert_eq!(requested(&mut peer).await, 0);
+                peer.write_all(b"STOP").await.unwrap();
+                let mut ack = [0; 3];
+                peer.read_exact(&mut ack).await.unwrap();
+            }
+        });
         let checked = backend.check_board("a").await;
         assert_eq!(checked.is_err(), invalid);
         if let Err(error) = checked {
@@ -935,7 +924,7 @@ async fn recovery_proofs_use_the_live_owner_pool_without_publishing_or_trusting_
         }
         fixture.await.unwrap();
     }
-    let state = backend.runtime.lock().unwrap();
+    let state = runtime.lock().unwrap();
     assert_eq!(state.proofs_delivered, 0);
     assert!(state.observations.is_empty());
     assert!(state.estimated_observations.is_empty());
@@ -943,81 +932,15 @@ async fn recovery_proofs_use_the_live_owner_pool_without_publishing_or_trusting_
         state.boards["a"].lifecycle.status().fault,
         Some(crate::board_lifecycle::Fault::InvalidProof)
     );
-    assert_eq!(
-        backend
-            .process
-            .metrics
-            .counter("proofs_verified_total", &["challenge"]),
-        0
-    );
-}
-#[tokio::test]
-async fn admission_checks_publish_no_production_telemetry() {
-    let mut config = Config::default();
-    config
-        .hardware
-        .boards
-        .push(toml::from_str("id='a'\nname='A'\nprofile='manual'\nclient_port=18110").unwrap());
-    let (backend, offers) = checking_backend(&config, None);
-    let fixture = serve_recovery_proof(&offers["a"], 1, 0, false).await;
-    backend.check_board("a").await.unwrap();
-    fixture.await.unwrap();
+    // Admission probes verify without publishing production telemetry.
     let metrics = &backend.process.metrics;
-    assert_eq!(
-        metrics.histogram_count("proof_duration_seconds", &["challenge", "discriminant"]),
-        0,
-        "Admission probes must not publish discriminant durations"
-    );
-    assert_eq!(
-        metrics.histogram_count("proof_duration_seconds", &["challenge", "client_wait"]),
-        0,
-        "Admission probes must not publish client wait durations"
-    );
-    assert_eq!(
-        metrics.session_starts(Chain::Challenge),
-        0,
-        "Admission probes must not publish client sessions"
-    );
+    assert_eq!(metrics.counter("proofs_verified_total", &["challenge"]), 0);
+    for stage in ["client_wait", "discriminant"] {
+        assert_eq!(
+            metrics.histogram_count("proof_duration_seconds", &["challenge", stage]),
+            0
+        );
+    }
+    assert_eq!(metrics.session_starts(Chain::Challenge), 0);
     assert_eq!(metrics.counter("work_cancelled_total", &["challenge"]), 0);
-}
-#[tokio::test]
-async fn cancelled_scheduled_request_records_cancellation_and_releases_pending() {
-    let (backend, mut socket, _clients) = setup().await;
-    let (sent, received) = tokio::sync::oneshot::channel();
-    let fixture = tokio::spawn(async move {
-        handshake(&mut socket).await;
-        requested(&mut socket).await;
-        sent.send(()).unwrap();
-        // Hold the session open without answering so the scheduled request stays pending.
-        let mut byte = [0];
-        let _ = socket.read(&mut byte).await;
-    });
-    let proving = tokio::spawn({
-        let backend = backend.clone();
-        async move {
-            backend
-                .prove_when_available(Chain::Challenge, work(10, 64), true)
-                .await
-        }
-    });
-    received.await.unwrap();
-    assert_eq!(backend.runtime.lock().unwrap().pending[0], 1);
-    proving.abort();
-    assert!(
-        proving
-            .await
-            .err()
-            .expect("Cancelled proof task")
-            .is_cancelled()
-    );
-    assert_eq!(backend.runtime.lock().unwrap().pending[0], 0);
-    assert_eq!(
-        backend
-            .process
-            .metrics
-            .counter("work_cancelled_total", &["challenge"]),
-        1
-    );
-    fixture.abort();
-    let _ = fixture.await;
 }
