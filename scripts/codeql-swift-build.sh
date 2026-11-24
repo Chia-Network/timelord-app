@@ -61,6 +61,13 @@ while IFS= read -r source; do
     mac+=("$source")
 done < <(find apps/macos/Sources/TimelordMac -name '*.swift' | sort)
 
+expected_sources="$(find apps/macos/Sources -name '*.swift' | wc -l | tr -d ' ')"
+found_sources="$(( ${#presentation[@]} + ${#mac[@]} ))"
+if [[ "$found_sources" -ne "$expected_sources" ]]; then
+    echo "error: compiled $found_sources of $expected_sources Swift sources; update the module list in this script" >&2
+    exit 1
+fi
+
 common=(
     -c -whole-module-optimization -Onone -parse-as-library
     -sdk "$sdk"
