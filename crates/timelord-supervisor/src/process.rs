@@ -188,9 +188,13 @@ mod tests {
         let started = std::time::Instant::now();
         drop(owner);
         let elapsed = started.elapsed();
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
+        // Drop must not leave a waitable child behind. Probed with waitpid, not
+        // kill(pid, 0): waitpid only reports on this process's own children, so
+        // a reused PID cannot be touched or misreported.
+        assert!(
+            crate::test_support::reaped(pid),
+            "Drop left the leader unreaped"
+        );
         assert!(elapsed >= timelord_supervisor::KILL_AND_REAP);
         assert!(
             elapsed < timelord_supervisor::KILL_AND_REAP + Duration::from_secs(1),

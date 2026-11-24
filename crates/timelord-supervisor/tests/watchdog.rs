@@ -1,7 +1,7 @@
 mod common;
 
 use common::Fixture;
-use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
+use std::{fs, time::Duration};
 use timelord_supervisor::{Control, request};
 use tokio::time::sleep;
 
@@ -70,10 +70,9 @@ async fn shutdown_cancels_slow_reload_validation_and_reaps_the_validator() {
     let d = fixture.0.display();
     let validator_pid = fixture.0.join("validator.pid");
     let ready = fixture.0.join("ready");
-    let helper = fixture.0.join("worker");
-    fs::write(
-        &helper,
-        format!(
+    let helper = fixture.script(
+        "worker",
+        &format!(
             "#!/bin/sh\n\
              if [ \"$1\" = validate ]; then\n\
                echo $$ >> '{d}/pids'\n\
@@ -85,9 +84,7 @@ async fn shutdown_cancels_slow_reload_validation_and_reaps_the_validator() {
              touch '{d}/ready'\n\
              while :; do sleep 0.05; done\n"
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    );
     let mut supervisor = fixture.supervisor(&helper);
     fixture.status(|s| s.worker_pid.is_some()).await;
     tokio::time::timeout(Duration::from_secs(3), async {

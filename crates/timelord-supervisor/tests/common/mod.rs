@@ -1,6 +1,10 @@
+// The unit tests use the same fixture writer; one copy, two crates.
+#[allow(dead_code)]
+#[path = "../../src/test_support.rs"]
+mod test_support;
+
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -32,17 +36,19 @@ impl Fixture {
         self.0.join("config.toml")
     }
     pub(crate) fn helper(&self, body: &str) -> PathBuf {
-        let path = self.0.join("worker");
-        fs::write(
-            &path,
-            format!(
+        self.script(
+            "worker",
+            &format!(
                 "#!/bin/sh\nif [ \"$1\" = validate ]; then [ ! -e \"$0.reject\" ]; exit $?; fi\necho $$ >> '{}'\n{body}\n",
                 self.0.join("pids").display()
             ),
         )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-        path
+    }
+    /// Write an executable fixture script through the shared child-process
+    /// writer, so a concurrent test's `fork` cannot inherit a writable
+    /// descriptor and make the exec fail with ETXTBSY.
+    pub(crate) fn script(&self, name: &str, body: &str) -> PathBuf {
+        test_support::script_helper(&self.0, name, body)
     }
     pub(crate) fn supervisor(&self, helper: &Path) -> Child {
         self.supervisor_with_monitor(helper, None)

@@ -1,9 +1,19 @@
 use super::*;
-fn script_helper(dir: &Path, name: &str, body: &str) -> PathBuf {
-    let helper = dir.join(name);
-    fs::write(&helper, body).unwrap();
-    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
-    helper
+use crate::test_support::{reaped, script_helper};
+
+#[test]
+fn script_helper_writes_the_whole_executable() {
+    let dir = std::env::temp_dir().join(format!("tl-script-helper-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let helper = script_helper(&dir, "worker", "#!/bin/sh\nexit 3\n");
+    assert_eq!(fs::read_to_string(&helper).unwrap(), "#!/bin/sh\nexit 3\n");
+    assert_eq!(fs::symlink_metadata(&helper).unwrap().mode() & 0o777, 0o700);
+    assert_eq!(
+        std::process::Command::new(&helper).status().unwrap().code(),
+        Some(3)
+    );
+    fs::remove_dir_all(dir).unwrap();
 }
 #[tokio::test]
 async fn completed_validator_is_reaped_before_reporting_success_or_failure() {
@@ -248,7 +258,6 @@ async fn failed_pause_retains_owner_and_power_until_confirmed_cleanup() {
         assert_eq!(state.snapshot().worker_pid, Some(pid as u32));
         assert!(state.snapshot().error.unwrap().contains("cleanup failed"));
         assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
-        assert!(matches!(state.cleanup_cause(), Cause::Requested));
         // No replacement is admitted while the cleanup retry is pending.
         state
             .tick(
@@ -445,11 +454,6 @@ fn alive_families(dir: &Path) -> usize {
         })
         .count()
 }
-fn reaped(pid: i32) -> bool {
-    let mut status = 0;
-    let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-    result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
-}
 async fn running_state(dir: &Path, helper: &Path) -> (SupervisorState, i32) {
     let log = timelord_supervisor::logging::Writer::stderr();
     let mut state = SupervisorState::new(Ok(Intent::default()), log);
@@ -644,7 +648,6 @@ fn retirement_grace_depends_on_watchdog_classification() {
         normal
     );
     assert_eq!(Cause::Requested.grace(), normal);
-    assert_eq!(Cause::CleanupRetry.grace(), Duration::ZERO);
     assert_eq!(Cause::Failed { watchdog: None }.grace(), normal);
 }
 
@@ -658,7 +661,7 @@ async fn unresponsive_watchdog_failure_reaps_under_the_short_grace() {
     let helper = script_helper(
         &dir,
         "worker",
-        &format!("#!/bin/sh\ntouch '{d}/alive.'$$\ntrap '' TERM\nwhile :; do sleep 0.1; done\n"),
+        &format!("#!/bin/sh\ntrap '' TERM\ntouch '{d}/alive.'$$\nwhile :; do sleep 0.1; done\n"),
     );
     let (mut state, pid) = running_state(&dir, &helper).await;
     let (snapshots, _) = watch::channel(state.published());
@@ -692,7 +695,7 @@ async fn cleanup_retry_skips_the_graceful_wait() {
     let helper = script_helper(
         &dir,
         "worker",
-        &format!("#!/bin/sh\ntouch '{d}/alive.'$$\ntrap '' TERM\nwhile :; do sleep 0.1; done\n"),
+        &format!("#!/bin/sh\ntrap '' TERM\ntouch '{d}/alive.'$$\nwhile :; do sleep 0.1; done\n"),
     );
     let paths = Paths::for_config(&dir.join("config.toml")).unwrap();
     let (mut state, pid) = running_state(&dir, &helper).await;
@@ -716,10 +719,96 @@ async fn cleanup_retry_skips_the_graceful_wait() {
     state.poll_retirement(&snapshots, true).await;
     assert!(
         started.elapsed() < Duration::from_secs(5),
-        "CleanupRetry waited for the graceful budget: {:?}",
+        "a group that was already SIGKILLed waited out a graceful budget: {:?}",
         started.elapsed()
     );
     assert!(matches!(state.lifecycle, Lifecycle::Paused));
+    assert!(reaped(pid));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_retry_only_spends_what_the_first_attempt_left() {
+    let now = std::time::Instant::now();
+    let grace = |budget, spent| Grace {
+        started: now - spent,
+        budget,
+    };
+    let normal = timelord_supervisor::NORMAL_GRACEFUL_STOP;
+    assert_eq!(grace(normal, Duration::ZERO).remaining(now), normal);
+    assert_eq!(
+        grace(normal, Duration::from_secs(20)).remaining(now),
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        grace(normal, Duration::from_secs(60)).remaining(now),
+        Duration::ZERO,
+        "a spent budget must not be renewed"
+    );
+    // An unresponsive worker keeps its 2-second watchdog grace through a retry.
+    let watchdog = timelord_supervisor::WATCHDOG_GRACEFUL_STOP;
+    assert_eq!(
+        grace(watchdog, Duration::from_secs(1)).remaining(now),
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        grace(watchdog, Duration::from_secs(3)).remaining(now),
+        Duration::ZERO
+    );
+}
+
+#[tokio::test]
+async fn shutdown_retry_keeps_the_first_attempts_short_grace() {
+    let dir = std::env::temp_dir().join(format!("tl-shutdown-retry-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let helper = script_helper(
+        &dir,
+        "worker",
+        &format!(
+            "#!/bin/sh\ntrap '' TERM\ntouch '{}/ready'\nwhile :; do sleep 0.1; done\n",
+            dir.display()
+        ),
+    );
+    let paths = Paths::for_config(&dir.join("config.toml")).unwrap();
+    let log = timelord_supervisor::logging::Writer::stderr();
+    let mut worker =
+        Worker::spawn(&helper, &paths.config, &dir.join("progress.sock"), 1, &log).unwrap();
+    let pid = worker.process.pid() as i32;
+    // Let the worker install its TERM trap before the retry's SIGTERM arrives.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !dir.join("ready").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fixture worker did not start");
+    // Fail before SIGTERM, so the failed attempt never reached the group kill.
+    worker.stop_failures = 1;
+    let mut state = SupervisorState::new(Ok(Intent::default()), log);
+    state.lifecycle = Lifecycle::Running(Box::new(worker));
+    let (snapshots, _) = watch::channel(state.published());
+    // The first attempt is an unresponsive worker's 2-second watchdog wait and
+    // fails before SIGTERM, so it records that short budget.
+    state.begin_retirement(Cause::Failed {
+        watchdog: Some(timelord_supervisor::progress::Failure::unresponsive(
+            "fixture short grace",
+        )),
+    });
+    state.poll_retirement(&snapshots, true).await;
+    assert!(matches!(state.lifecycle, Lifecycle::CleanupFailed { .. }));
+    assert!(!state.lifecycle.worker().unwrap().killed);
+    let started = Instant::now();
+    state.retire_now(&snapshots).await.unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "shutdown skipped the remaining watchdog grace: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "shutdown upgraded the watchdog grace to the normal one: {elapsed:?}"
+    );
     assert!(reaped(pid));
     fs::remove_dir_all(dir).unwrap();
 }

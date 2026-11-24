@@ -147,12 +147,10 @@ mod tests {
     }
     #[tokio::test]
     async fn monitor_listener_failure_preserves_the_live_worker_and_controls() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("tl-monitor-failure-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let helper = dir.join("worker");
-        std::fs::write(&helper, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
-        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let helper =
+            crate::test_support::script_helper(&dir, "worker", "#!/bin/sh\nexec /bin/sleep 60\n");
         let config = dir.join("config.toml");
         let progress = dir.join("progress.sock");
         let log = timelord_supervisor::logging::Writer::stderr();

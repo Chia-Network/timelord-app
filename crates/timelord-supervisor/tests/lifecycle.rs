@@ -56,6 +56,67 @@ async fn stop_session(fixture: &Fixture, status: &Status) {
     .unwrap();
 }
 
+/// Run the supervisor directly, as a terminal or test harness does, with its
+/// stderr on a pipe this process owns.
+fn supervise(fixture: &Fixture, helper: &Path, own_stderr: bool) -> tokio::process::Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_timelord-supervisor"));
+    command
+        .arg("run")
+        .arg("--config")
+        .arg(fixture.config())
+        .arg("--worker")
+        .arg(helper)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    if own_stderr {
+        command.arg("--release-stderr");
+    }
+    command.spawn().unwrap()
+}
+
+#[tokio::test]
+async fn an_inherited_stderr_stays_open_past_startup() {
+    use tokio::io::AsyncReadExt;
+    let fixture = Fixture::new();
+    let helper = fixture.helper("exec /bin/sleep 60");
+    let mut supervisor = supervise(&fixture, &helper, false);
+    fixture.status(|s| s.worker_pid.is_some()).await;
+    let mut stderr = supervisor.stderr.take().unwrap();
+    let mut buffer = [0u8; 64];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), stderr.read(&mut buffer))
+            .await
+            .is_err(),
+        "a supervisor that does not own fd 2 must keep the stderr it inherited"
+    );
+    request(&fixture.config(), Control::Pause, None)
+        .await
+        .unwrap();
+    fixture.terminate(supervisor).await;
+}
+
+#[tokio::test]
+async fn a_cli_owned_stderr_pipe_is_released_once_status_is_served() {
+    use tokio::io::AsyncReadExt;
+    let fixture = Fixture::new();
+    let helper = fixture.helper("exec /bin/sleep 60");
+    let mut supervisor = supervise(&fixture, &helper, true);
+    fixture.status(|s| s.worker_pid.is_some()).await;
+    let mut stderr = supervisor.stderr.take().unwrap();
+    let mut buffer = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), stderr.read_to_end(&mut buffer))
+        .await
+        .expect("the CLI-owned stderr pipe stayed open")
+        .unwrap();
+    assert!(buffer.is_empty(), "{}", String::from_utf8_lossy(&buffer));
+    request(&fixture.config(), Control::Pause, None)
+        .await
+        .unwrap();
+    fixture.terminate(supervisor).await;
+}
+
 #[tokio::test]
 async fn session_start_survives_cli_exit_reuses_owner_and_preserves_pause() {
     let fixture = Fixture::new();
