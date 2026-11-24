@@ -208,7 +208,7 @@ async fn engine_sockets_need_a_unique_identity_and_reach_their_board_pool() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let shared = shared();
-    let (offer, mut leases) = tokio::sync::mpsc::channel(3);
+    let (offer, pool) = crate::asic::pair();
     let (stop, rx) = watch::channel(false);
     let task = tokio::spawn(client_listener(
         listener,
@@ -229,7 +229,7 @@ async fn engine_sockets_need_a_unique_identity_and_reach_their_board_pool() {
         0
     );
     let _first = identified(address, 1).await;
-    let lease = tokio::time::timeout(Duration::from_secs(2), leases.recv())
+    let lease = tokio::time::timeout(Duration::from_secs(2), pool.receive(Some(1), 0))
         .await
         .unwrap()
         .unwrap();
@@ -268,7 +268,7 @@ async fn observability_failures_leave_client_service_running() {
             unix_now(),
             unix_now(),
         ));
-        let (offer, mut leases) = tokio::sync::mpsc::channel(3);
+        let (offer, pool) = crate::asic::pair();
         let (stop, rx) = watch::channel(false);
         let mut client = tokio::spawn(client_listener(listener, "a".into(), shared, rx, offer));
         let mut observer = Some(tokio::spawn(async move {
@@ -288,7 +288,7 @@ async fn observability_failures_leave_client_service_running() {
         assert!(!process.snapshot().healthy());
         // The independent client listener still accepts engine sockets.
         let _socket = identified(address, 0).await;
-        tokio::time::timeout(Duration::from_secs(2), leases.recv())
+        tokio::time::timeout(Duration::from_secs(2), pool.receive(Some(0), 0))
             .await
             .unwrap()
             .unwrap();
@@ -305,7 +305,7 @@ async fn transient_accept_errors_keep_client_listener_available() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let shared = shared();
-    let (offer, mut leases) = tokio::sync::mpsc::channel(3);
+    let (offer, pool) = crate::asic::pair();
     let (stop, rx) = watch::channel(false);
     let started = std::time::Instant::now();
     let mut task = tokio::spawn(client_listener_with(
@@ -320,7 +320,7 @@ async fn transient_accept_errors_keep_client_listener_available() {
         offer,
     ));
     let _socket = identified(address, 2).await;
-    let lease = tokio::time::timeout(Duration::from_secs(2), leases.recv())
+    let lease = tokio::time::timeout(Duration::from_secs(2), pool.receive(Some(2), 0))
         .await
         .unwrap()
         .unwrap();
@@ -339,7 +339,7 @@ async fn transient_accept_errors_keep_client_listener_available() {
 #[tokio::test(start_paused = true)]
 async fn shutdown_interrupts_accept_backoff_promptly() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (offer, _leases) = tokio::sync::mpsc::channel(3);
+    let (offer, _pool) = crate::asic::pair();
     let (stop, rx) = watch::channel(false);
     let mut task = tokio::spawn(client_listener_with(
         AcceptBackoff::with_injected(

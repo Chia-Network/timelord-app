@@ -1,4 +1,6 @@
 //! Retirement evidence outlives soft deadlines and stream cancellation.
+use super::SHUTDOWN_CONFIRMED as MARKER;
+use crate::bounded_lines::{Line, Lines};
 use anyhow::Result;
 use std::{
     sync::{
@@ -7,10 +9,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{
-    io::{AsyncRead, AsyncReadExt},
-    process::Child,
-};
+use tokio::{io::AsyncBufRead, process::Child};
 
 #[derive(Debug)]
 pub(super) struct Retirement {
@@ -37,19 +36,23 @@ impl Drop for Readers {
     }
 }
 
-pub(super) async fn retire(
+pub(super) async fn retire<S, E>(
     child: &mut Child,
-    stdout: impl AsyncRead + Unpin + Send + 'static,
-    stderr: impl AsyncRead + Unpin + Send + 'static,
+    output: Lines<S>,
+    mut stderr: Lines<E>,
     sequence: u64,
     initial_evidence: bool,
-) -> Retirement {
+) -> Retirement
+where
+    S: AsyncBufRead + Unpin + Send + 'static,
+    E: AsyncBufRead + Unpin + Send + 'static,
+{
     let evidence = Arc::new(AtomicBool::new(initial_evidence));
     let confirmed = evidence.clone();
     let mut output = tokio::spawn(async move {
-        let mut records = crate::bounded_lines::Lines::new(tokio::io::BufReader::new(stdout));
+        let mut records = output;
         while let Ok(Some(record)) = records.next_line().await {
-            if let crate::bounded_lines::Line::Text(line) = record {
+            if let Line::Text(line) = record {
                 let expected = format!("TLSTOPACK 1 {sequence} 1 1");
                 if records.terminated() && (line == expected || line == "TLSTOPACK 1 0 1 1") {
                     confirmed.store(true, Ordering::Release);
@@ -59,9 +62,8 @@ pub(super) async fn retire(
     });
     let confirmed = evidence.clone();
     let mut diagnostics = tokio::spawn(async move {
-        let mut source = stderr;
         // Record evidence as soon as it arrives, independently of EOF/reaping.
-        drain_shutdown_observed(&mut source, &confirmed).await
+        drain_shutdown_observed(&mut stderr, &confirmed).await
     });
     let _readers = Readers(output.abort_handle(), diagnostics.abort_handle());
     let mut forced = false;
@@ -119,72 +121,77 @@ pub(super) async fn retire(
 }
 
 #[cfg(test)]
-pub(super) async fn drain_shutdown(source: &mut (impl AsyncRead + Unpin)) -> Result<bool> {
-    drain_shutdown_observed(source, &AtomicBool::new(false)).await
+pub(super) async fn drain_shutdown<R: AsyncBufRead + Unpin>(lines: &mut Lines<R>) -> Result<bool> {
+    let observed = AtomicBool::new(false);
+    drain_shutdown_observed(lines, &observed).await?;
+    Ok(observed.load(Ordering::Acquire))
 }
-// Discard bounded raw chunks while retaining the marker plus a possible CR.
+
+#[cfg(test)]
+pub(super) async fn drain_shutdown_diagnostics<R: AsyncBufRead + Unpin>(
+    lines: &mut Lines<R>,
+    observed: &AtomicBool,
+) -> Result<(bool, Vec<String>)> {
+    let mut records = Vec::new();
+    drain_shutdown_records(lines, observed, |record| records.push(record.into())).await?;
+    Ok((observed.load(Ordering::Acquire), records))
+}
+
 // Native log prefixes are permitted; payload fields and LF/CRLF framing must
 // match exactly. An unterminated or truncated record is never confirmation.
-async fn drain_shutdown_observed(
-    source: &mut (impl tokio::io::AsyncRead + Unpin),
+async fn drain_shutdown_observed<R: AsyncBufRead + Unpin>(
+    lines: &mut Lines<R>,
     observed: &AtomicBool,
-) -> Result<bool> {
-    const MARKER: &[u8] = b"Hardware shutdown: engines_paused=1 safe_point_restored=1";
-    let mut buffer = [0u8; 1024];
-    let retained = MARKER.len() + 1;
-    let mut tail = Vec::with_capacity(buffer.len() + retained);
-    let mut confirmed = false;
-    let mut diagnostic_records = 0;
-    loop {
-        let count = source.read(&mut buffer).await?;
-        if count == 0 {
-            return Ok(confirmed);
-        }
-        tail.extend_from_slice(&buffer[..count]);
-        confirmed |= tail
-            .windows(MARKER.len())
-            .enumerate()
-            .any(|(offset, candidate)| {
-                candidate == MARKER
-                    && matches!(
-                        &tail[offset + MARKER.len()..],
-                        [b'\n', ..] | [b'\r', b'\n', ..]
-                    )
-            });
-        if confirmed {
+) -> Result<()> {
+    drain_shutdown_records(lines, observed, |record| {
+        tracing::info!(record, "Native shutdown diagnostic");
+    })
+    .await
+}
+
+async fn drain_shutdown_records<R: AsyncBufRead + Unpin>(
+    lines: &mut Lines<R>,
+    observed: &AtomicBool,
+    mut log: impl FnMut(&str),
+) -> Result<()> {
+    let mut diagnostics = 0;
+    while let Some(record) = lines.next_line().await? {
+        let Line::Text(text) = record else {
+            continue;
+        };
+        // A discarded suffix is already gone; only a terminated marker confirms.
+        if lines.terminated() && text.ends_with(MARKER) {
             observed.store(true, Ordering::Release);
         }
-        // Shutdown diagnostics were previously discarded, hiding whether the
-        // client rejected readback or simply failed to exit. Keep bounded error
-        // records in the service log without interpreting them as confirmation.
-        for record in tail.split_inclusive(|byte| *byte == b'\n') {
-            if diagnostic_records >= 8 || !record.ends_with(b"\n") {
-                continue;
-            }
-            let text = String::from_utf8_lossy(record);
-            if ["safe_readback", "Hardware shutdown:", "VDF client stopped:"]
-                .iter()
-                .any(|marker| text.contains(marker))
-            {
-                tracing::info!(record = text.trim_end(), "Native shutdown diagnostic");
-                diagnostic_records += 1;
-            }
+        if diagnostics < MAX_DIAGNOSTICS && DIAGNOSTICS.iter().any(|marker| text.contains(marker)) {
+            log(text.trim_end());
+            diagnostics += 1;
         }
-        let discard = tail.len().saturating_sub(retained);
-        tail.drain(..discard);
     }
+    Ok(())
 }
+
+const MAX_DIAGNOSTICS: usize = 8;
+const DIAGNOSTICS: [&str; 3] = ["safe_readback", "Hardware shutdown:", "VDF client stopped:"];
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Stdio;
+    use tokio::io::BufReader;
     use tokio::{io::AsyncWriteExt, process::Command};
+
+    fn lines<R>(reader: R) -> Lines<BufReader<R>>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        Lines::new(BufReader::new(reader))
+    }
 
     #[tokio::test]
     async fn partial_live_record_survives_reader_handoff() {
         let (mut write, read) = tokio::io::duplex(1024);
-        let mut lines = crate::bounded_lines::Lines::new(tokio::io::BufReader::new(read));
+        let mut lines = lines(read);
         write
             .write_all(b"Hardware shutdown: engines_paused=")
             .await
@@ -196,7 +203,8 @@ mod tests {
         );
         write.write_all(b"1 safe_point_restored=1\n").await.unwrap();
         drop(write);
-        assert!(drain_shutdown(&mut lines.into_inner()).await.unwrap());
+        // Drain the same cancellation-aware value, keeping any discard state.
+        assert!(drain_shutdown(&mut lines).await.unwrap());
     }
 
     #[tokio::test]
@@ -222,8 +230,8 @@ while :; do sleep .01; done
                 .kill_on_drop(true)
                 .spawn()
                 .unwrap();
-            let stdout = child.stdout.take().unwrap();
-            let stderr = child.stderr.take().unwrap();
+            let stdout = lines(child.stdout.take().unwrap());
+            let stderr = lines(child.stderr.take().unwrap());
             // EOF is the legacy fail-safe retirement request in this fixture.
             drop(child.stdin.take());
             let retired = retire(&mut child, stdout, stderr, 1, false).await;
@@ -250,8 +258,8 @@ while :; do sleep .01; done
                 .kill_on_drop(true)
                 .spawn()
                 .unwrap();
-            let stdout = child.stdout.take().unwrap();
-            let stderr = child.stderr.take().unwrap();
+            let stdout = lines(child.stdout.take().unwrap());
+            let stderr = lines(child.stderr.take().unwrap());
             assert_eq!(
                 retire(&mut child, stdout, stderr, 7, false)
                     .await

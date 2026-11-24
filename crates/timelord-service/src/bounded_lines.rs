@@ -1,5 +1,5 @@
 //! Cancellation-safe native logs: at most 4096 content bytes plus one provisional CR framing byte.
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 const MAX_LINE: usize = 4096;
 #[derive(Debug, PartialEq, Eq)]
 pub enum Line {
@@ -25,11 +25,6 @@ impl<R: AsyncBufRead + Unpin> Lines<R> {
     }
     pub fn terminated(&self) -> bool {
         self.last_terminated
-    }
-    pub fn into_inner(self) -> impl AsyncRead + Unpin {
-        // next_line may have consumed a partial record before cancellation.
-        // Preserve it when transferring this stream to the retirement reader.
-        std::io::Cursor::new(self.pending).chain(self.reader)
     }
     pub async fn next_line(&mut self) -> std::io::Result<Option<Line>> {
         loop {

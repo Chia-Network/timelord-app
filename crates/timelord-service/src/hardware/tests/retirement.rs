@@ -1,25 +1,12 @@
 //! Native retirement and unopened journal-owner rollback contracts.
+use super::chunked::Chunked;
 use super::*;
+use crate::bounded_lines::Lines;
 use crate::hardware::retirement::drain_shutdown;
+use tokio::io::BufReader;
 
 #[tokio::test]
 async fn shutdown_confirmation_requires_exact_fields_and_complete_lf_or_crlf_framing() {
-    struct Chunked<'a> {
-        bytes: &'a [u8],
-        chunk: usize,
-    }
-    impl tokio::io::AsyncRead for Chunked<'_> {
-        fn poll_read(
-            mut self: std::pin::Pin<&mut Self>,
-            _: &mut std::task::Context<'_>,
-            output: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            let count = self.bytes.len().min(self.chunk).min(output.remaining());
-            output.put_slice(&self.bytes[..count]);
-            self.bytes = &self.bytes[count..];
-            std::task::Poll::Ready(Ok(()))
-        }
-    }
     const MARKER: &str = "Hardware shutdown: engines_paused=1 safe_point_restored=1";
     let cases = [
         (format!("{MARKER}\n"), true),
@@ -58,12 +45,15 @@ async fn shutdown_confirmation_requires_exact_fields_and_complete_lf_or_crlf_fra
             MARKER.len() + 1,
             1024,
         ] {
-            let mut source = Chunked {
-                bytes: record.as_bytes(),
-                chunk,
-            };
+            let mut lines = Lines::new(BufReader::with_capacity(
+                chunk.max(1),
+                Chunked {
+                    bytes: record.as_bytes(),
+                    chunk,
+                },
+            ));
             assert_eq!(
-                drain_shutdown(&mut source).await.unwrap(),
+                drain_shutdown(&mut lines).await.unwrap(),
                 expected,
                 "chunk={chunk}, record={record:?}"
             );

@@ -507,7 +507,7 @@ pub(crate) async fn client_listener(
     id: String,
     shared: Arc<Shared>,
     shutdown: watch::Receiver<bool>,
-    offers: tokio::sync::mpsc::Sender<asic::Lease>,
+    offers: asic::Offers,
 ) -> Result<()> {
     client_listener_with(AcceptBackoff::new(), listener, id, shared, shutdown, offers).await
 }
@@ -518,7 +518,7 @@ async fn client_listener_with(
     id: String,
     shared: Arc<Shared>,
     mut shutdown: watch::Receiver<bool>,
-    offers: tokio::sync::mpsc::Sender<asic::Lease>,
+    offers: asic::Offers,
 ) -> Result<()> {
     loop {
         tokio::select! {
@@ -547,7 +547,7 @@ async fn client_listener_with(
                     hardware.lifecycle.status().generation
                 };
                 let lease = asic::Lease { socket, board: id.clone(), slot, generation, clients: shared.clients.clone() };
-                if offers.try_send(lease).is_err() { tracing::warn!(board=%id, "ASIC socket queue full"); }
+                offers.offer(lease);
             }
         }
     }

@@ -13,7 +13,7 @@ use dg_xch_core::{
 };
 use dg_xch_timelord::worker::{ProofRequest, ProofResult};
 use dg_xch_vdf::{discriminant::create_discriminant_bytes, proof::verify_vdf_serial};
-use pool::Pool;
+pub(crate) use pool::{Offers, Pool, pair};
 use std::{
     collections::{BTreeSet, HashMap},
     sync::{Arc, Mutex as SyncMutex, RwLock, atomic::AtomicBool},
@@ -21,11 +21,7 @@ use std::{
 };
 use timelord_core::{Assignment, Chain};
 use timelord_supervisor::progress::Stage;
-use tokio::{
-    io::AsyncWriteExt,
-    net::TcpStream,
-    sync::{Mutex, mpsc},
-};
+use tokio::{io::AsyncWriteExt, net::TcpStream, sync::Mutex};
 use vdf_client_protocol::{
     ClientMessage, MAX_REQUEST_ITERATIONS, UnverifiedProof, acknowledge_stop, encode_initial,
     read_message, request, request_stop,
@@ -124,7 +120,7 @@ const LANE_ERROR_LIMIT: usize = 2;
 const LANE_ERROR_WINDOW_SECONDS: u64 = 120;
 pub struct AsicBackend {
     lanes: Vec<(Chain, Lane)>,
-    pools: RwLock<HashMap<String, Arc<Mutex<Pool>>>>,
+    pools: RwLock<HashMap<String, Pool>>,
     process: Arc<crate::operational::State>,
     scope: RuntimeScope,
     runtime: Arc<SyncMutex<crate::runtime::RuntimeState>>,
@@ -157,18 +153,18 @@ impl AsicBackend {
             runtime,
         }
     }
-    pub fn add_board(&self, id: &str) -> mpsc::Sender<Lease> {
-        let (sender, receiver) = mpsc::channel(3);
+    pub fn add_board(&self, id: &str) -> Offers {
+        let (offers, pool) = pair();
         let old = self
             .pools
             .write()
             .expect("ASIC pools")
-            .insert(id.into(), Arc::new(Mutex::new(Pool::new(receiver))));
+            .insert(id.into(), pool);
         assert!(
             old.is_none(),
             "Board listener must be added once per runtime"
         );
-        sender
+        offers
     }
     pub async fn remove_board(&self, id: &str) {
         self.stop_board(id).await;
@@ -501,7 +497,6 @@ impl AsicBackend {
                     .get(board)
                     .cloned()
                     .context("Missing board listener")?;
-                let mut pool = pool.lock().await;
                 let mut lease = tokio::time::timeout(
                     Duration::from_secs(30),
                     pool.receive(physical, generation),
@@ -664,7 +659,7 @@ impl AsicBackend {
         }
         let pool = self.pools.read().expect("ASIC pools").get(board).cloned();
         if let Some(pool) = pool {
-            pool.lock().await.clear();
+            pool.clear();
         }
     }
     pub async fn stop_all(&self) {
@@ -682,7 +677,7 @@ impl AsicBackend {
             .cloned()
             .collect();
         for pool in pools {
-            pool.lock().await.clear();
+            pool.clear();
         }
     }
 }
@@ -755,5 +750,9 @@ pub fn verify(work: &ProofRequest, proof: UnverifiedProof) -> Result<ProofResult
     })
 }
 
+#[cfg(test)]
+mod pool_tests;
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;

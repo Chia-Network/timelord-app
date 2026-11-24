@@ -1,34 +1,15 @@
+use super::test_support::*;
 use super::*;
-use dg_xch_core::blockchain::sized_bytes::Bytes32;
 use timelord_core::Config;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use vdf_client_protocol::Checkpoint;
-fn offers_for(
-    backend: &AsicBackend,
-    config: &Config,
-) -> std::collections::HashMap<String, mpsc::Sender<Lease>> {
+fn offers_for(backend: &AsicBackend, config: &Config) -> std::collections::HashMap<String, Offers> {
     config
         .hardware
         .boards
         .iter()
         .map(|b| (b.id.clone(), backend.add_board(&b.id)))
         .collect()
-}
-fn route(board: &str, chain: Chain, engine: u8) -> Assignment {
-    Assignment {
-        board_id: board.into(),
-        chain,
-        engine,
-    }
-}
-fn work(iterations: u64, bits: usize) -> ProofRequest {
-    ProofRequest {
-        generation: 1,
-        challenge: Bytes32::const_new([42; 32]),
-        input: ClassgroupElement::get_default_element(),
-        iterations,
-        discriminant_bits: bits,
-    }
 }
 fn canonical() -> UnverifiedProof {
     let blob = include_bytes!("../../tests/fixtures/checkpointed-proof.bin");
@@ -113,58 +94,14 @@ async fn setup() -> (
         .unwrap();
     let (socket, _) = listener.accept().await.unwrap();
     let clients = Arc::new(SyncMutex::new(BTreeSet::from([("a".into(), 0)])));
-    offer
-        .send(Lease {
-            socket,
-            board: "a".into(),
-            slot: 0,
-            generation: 1,
-            clients: clients.clone(),
-        })
-        .await
-        .ok()
-        .unwrap();
+    offer.offer(Lease {
+        socket,
+        board: "a".into(),
+        slot: 0,
+        generation: 1,
+        clients: clients.clone(),
+    });
     (Arc::new(backend), client, clients)
-}
-async fn handshake(socket: &mut TcpStream) {
-    let mut header = [0; 4];
-    socket.read_exact(&mut header).await.unwrap();
-    assert_eq!(header[0], b'N');
-    let count: usize = std::str::from_utf8(&header[1..]).unwrap().parse().unwrap();
-    let mut body = vec![0; count + 101];
-    socket.read_exact(&mut body).await.unwrap();
-    socket.write_all(b"OK").await.unwrap();
-}
-async fn requested(socket: &mut TcpStream) -> u64 {
-    let mut length = [0; 2];
-    socket.read_exact(&mut length).await.unwrap();
-    let size: usize = std::str::from_utf8(&length).unwrap().parse().unwrap();
-    let mut value = vec![0; size];
-    socket.read_exact(&mut value).await.unwrap();
-    std::str::from_utf8(&value).unwrap().parse().unwrap()
-}
-async fn send_fixture_proof(socket: &mut TcpStream, request: &ProofRequest) {
-    let proof = dg_xch_vdf::proof::prove_result(
-        request.challenge.as_ref(),
-        request.input.data.as_ref(),
-        64,
-        request.iterations,
-    )
-    .unwrap();
-    let mut raw = request.iterations.to_be_bytes().to_vec();
-    raw.extend(100_u64.to_be_bytes());
-    raw.extend_from_slice(&proof[..100]);
-    raw.push(0);
-    raw.extend_from_slice(&proof[100..]);
-    let hex: Vec<_> = raw
-        .iter()
-        .flat_map(|b| format!("{b:02x}").into_bytes())
-        .collect();
-    socket
-        .write_all(&(hex.len() as u32).to_be_bytes())
-        .await
-        .unwrap();
-    socket.write_all(&hex).await.unwrap();
 }
 #[tokio::test]
 async fn icc_primer_does_not_supply_unmanaged_readiness_evidence() {
@@ -218,17 +155,13 @@ async fn icc_primer_does_not_supply_unmanaged_readiness_evidence() {
             .unwrap();
         let (socket, _) = listener.accept().await.unwrap();
         shared.clients.lock().unwrap().insert(("a".into(), slot));
-        offers["a"]
-            .send(Lease {
-                socket,
-                board: "a".into(),
-                slot,
-                generation: 1,
-                clients: shared.clients.clone(),
-            })
-            .await
-            .ok()
-            .unwrap();
+        offers["a"].offer(Lease {
+            socket,
+            board: "a".into(),
+            slot,
+            generation: 1,
+            clients: shared.clients.clone(),
+        });
         let request = work(if record_metric { 20 } else { 1 }, 64);
         let proving = tokio::spawn({
             let backend = backend.clone();
@@ -294,24 +227,20 @@ async fn a_dropped_session_retries_on_its_owner_and_repeated_failures_retire_onl
     let connect = |board: &'static str, generation: u64| {
         let listener = &listener;
         let clients = clients.clone();
-        let offer = offers[board].clone();
+        let offer = &offers[board];
         async move {
             let client = TcpStream::connect(listener.local_addr().unwrap())
                 .await
                 .unwrap();
             let (socket, _) = listener.accept().await.unwrap();
             clients.lock().unwrap().insert((board.into(), 0));
-            offer
-                .send(Lease {
-                    socket,
-                    board: board.into(),
-                    slot: 0,
-                    generation,
-                    clients,
-                })
-                .await
-                .ok()
-                .unwrap();
+            offer.offer(Lease {
+                socket,
+                board: board.into(),
+                slot: 0,
+                generation,
+                clients,
+            });
             client
         }
     };
@@ -515,7 +444,7 @@ fn discriminant_starts_before_a_client_is_available_and_cancellation_releases_la
         let runtime: Arc<SyncMutex<crate::runtime::RuntimeState>> = Default::default();
         runtime.lock().unwrap().routing = config.assignments().unwrap();
         let backend = AsicBackend::new(runtime, crate::operational::State::fixture());
-        let _offers = offers_for(&backend, &config);
+        let offers = offers_for(&backend, &config);
         let backend = Arc::new(backend);
         let proving = tokio::spawn({
             let backend = backend.clone();
@@ -536,7 +465,15 @@ fn discriminant_starts_before_a_client_is_available_and_cancellation_releases_la
                 .is_cancelled()
         );
         assert!(backend.lanes[0].1.active.try_lock().unwrap().is_none());
-        assert!(backend.pools.read().unwrap()["a"].try_lock().is_ok());
+        // Cancelling the proof must not wedge the board pool for later work.
+        let (socket, _peer) = socket_pair().await;
+        offers["a"].offer(lease(socket, 0, 0));
+        let pool = backend.pools.read().unwrap().get("a").cloned().unwrap();
+        let lease = tokio::time::timeout(Duration::from_millis(500), pool.receive(Some(0), 0))
+            .await
+            .expect("the cancelled proof wedged its board pool")
+            .expect("a lease after cancellation");
+        assert_eq!((lease.generation, lease.slot), (0, 0));
         assert!(
             backend
                 .runtime
@@ -769,17 +706,13 @@ async fn live_route_failover_preserves_the_healthy_engine_session() {
             .unwrap();
         let (socket, _) = listener.accept().await.unwrap();
         clients.lock().unwrap().insert((id.into(), slot));
-        offers[id]
-            .send(Lease {
-                socket,
-                board: id.into(),
-                slot,
-                generation: 0,
-                clients: clients.clone(),
-            })
-            .await
-            .ok()
-            .unwrap();
+        offers[id].offer(Lease {
+            socket,
+            board: id.into(),
+            slot,
+            generation: 0,
+            clients: clients.clone(),
+        });
         sockets.push(peer);
     }
     let mut failed = sockets.remove(0);
@@ -879,17 +812,13 @@ async fn recovery_proofs_use_the_live_owner_pool_without_publishing_or_trusting_
             .await
             .unwrap();
         let (socket, _) = listener.accept().await.unwrap();
-        offers["a"]
-            .send(Lease {
-                socket,
-                board: "a".into(),
-                slot: 1,
-                generation: 0,
-                clients: Default::default(),
-            })
-            .await
-            .ok()
-            .unwrap();
+        offers["a"].offer(Lease {
+            socket,
+            board: "a".into(),
+            slot: 1,
+            generation: 0,
+            clients: Default::default(),
+        });
         let fixture = tokio::spawn(async move {
             handshake(&mut peer).await;
             assert_eq!(requested(&mut peer).await, 360);
