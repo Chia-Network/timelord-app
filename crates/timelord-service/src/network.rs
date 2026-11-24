@@ -21,12 +21,12 @@ const UNUSED_CHIA_CONSTANTS: &[&str] = &[
 ];
 
 pub fn resolve(node: &NodeConfig) -> Result<ResolvedChain> {
+    let identity = node.chain_identity().map_err(anyhow::Error::msg)?;
     let Network::Custom(_) = &node.network else {
         return ChainSelection::from_config(node.network.label(), None)
             .and_then(|chain| chain.resolve())
             .map_err(anyhow::Error::msg);
     };
-    let identity = node.chain_identity().map_err(anyhow::Error::msg)?;
     let definitions = identity
         .constants()
         .context("Custom network definition has no constants")?;
@@ -455,6 +455,15 @@ pub(crate) mod tests {
         let resolved = resolve(&with_constants(modern)).unwrap();
         assert_eq!(resolved.constants.min_plot_size, 18);
         assert!(resolved.constants.is_testnet);
+    }
+
+    #[test]
+    fn built_in_networks_cannot_resolve_with_a_custom_definition() {
+        let mut node = node();
+        node.network = "mainnet".parse().unwrap();
+        assert!(resolve(&node).is_err());
+        node.network_definition = None;
+        assert_eq!(resolve(&node).unwrap().handshake_network_id, "mainnet");
     }
 
     #[test]
