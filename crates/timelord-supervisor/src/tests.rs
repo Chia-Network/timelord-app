@@ -1,5 +1,5 @@
 use super::*;
-fn script_helper(dir: &Path, name: &str, body: &str) -> PathBuf {
+pub(crate) fn script_helper(dir: &Path, name: &str, body: &str) -> PathBuf {
     let helper = dir.join(name);
     // Write from a child process: Linux refuses to exec a file while any
     // process holds it open for writing, and a descriptor opened here can be
