@@ -394,6 +394,47 @@ final class SupervisorPresentationTests: XCTestCase {
             "A profile without saved RPC settings remains without them")
     }
 
+    func testIncompleteRPCDraftDoesNotHideSavedNodeSync() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        let rpc = completeRPC(host: "rpc.sync.fixture")
+        var configuration = runnableConfiguration(host: "sync.fixture")
+        configuration.node.rpc = rpc
+        try fixture.writeConfiguration(configuration)
+        let model = fixture.model(configuration)
+        var node = model.configuration.node
+        node.rpc?.host = ""
+        model.configuration.node = node
+
+        await model.testNode()
+        try fixture.publish(mode: "paused", phase: "paused")
+        await model.refresh()
+        XCTAssertEqual(model.snapshot.node.detail, "Synced",
+            "A draft that will fall back to the saved RPC must not clear live sync data")
+        XCTAssertEqual(model.snapshot.node.height, 123456)
+    }
+
+    func testFinishingSettingsResolvesIncompleteRPCDraft() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        let rpc = completeRPC(host: "rpc.done.fixture")
+        var configuration = runnableConfiguration(host: "done.fixture")
+        configuration.node.rpc = rpc
+        try fixture.writeConfiguration(configuration)
+        let model = fixture.model(configuration)
+        var node = model.configuration.node
+        node.rpc?.host = ""
+        model.configuration.node = node
+
+        let finished = await model.finishSettings()
+        XCTAssertTrue(finished)
+        XCTAssertEqual(model.configuration.node.rpc, rpc,
+            "Done resolves the invalid draft back to the saved RPC settings")
+        XCTAssertFalse(model.hasUnsavedSettings)
+        let persisted = try decode(fixture.configurationURL)
+        XCTAssertEqual(persisted.node.rpc, rpc)
+    }
+
     private func completeRPC(host: String) -> NodeRPCConfiguration {
         NodeRPCConfiguration(
             host: host, port: 8555, serverName: "chia.net",
@@ -489,6 +530,7 @@ private final class StatusFixture {
             done ;;
           devices) printf '%s' '[{"name":"Fixture","location":1}]' ;;
           test-node) printf '%s' '{"authenticated":true,"message":"Authenticated fixture node."}' ;;
+          node-state) printf '{"synced":true,"syncing":false,"height":123456,"timestamp_unix":%s}' "$(date +%s)" ;;
           *) printf 'unsupported fixture command: %s\\n' "$*" >&2; exit 1 ;;
         esac
         """

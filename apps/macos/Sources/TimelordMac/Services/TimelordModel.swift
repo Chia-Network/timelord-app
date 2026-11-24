@@ -36,6 +36,11 @@ final class TimelordModel: ObservableObject {
     private let configurationClient: ConfigurationClient
     /// Read-only outside the model so regression tests can assert save rollback.
     private(set) var savedConfiguration = AppConfiguration()
+    /// What the next save would persist: incomplete RPC drafts fall back to
+    /// their last saved settings and do not look like runtime changes.
+    private var resolvedConfiguration: AppConfiguration {
+        configuration.resolvedForPersistence(against: savedConfiguration)
+    }
     private var liveStatus: ServiceStatus?
     private var workerStatus = WorkerStatusObservation.absent
     private var historyCache = HistorySelectionCache()
@@ -187,12 +192,14 @@ final class TimelordModel: ObservableObject {
     }
 
     private func refreshNodeSync() async {
-        guard configuration.node == savedConfiguration.node, !configurationNeedsRestart else { nodeSync = nil; return }
+        guard resolvedConfiguration.node == savedConfiguration.node, !configurationNeedsRestart else { nodeSync = nil; return }
         if configurationLoaded && Date().timeIntervalSince(lastNodeSyncFetch) >= 15 {
             lastNodeSyncFetch = Date()
             let expectedNode = savedConfiguration.node
             let result = expectedNode.rpc == nil ? nil : try? await configurationClient.nodeState()
-            if savedConfiguration.node == expectedNode && configuration.node == expectedNode && !configurationNeedsRestart { nodeSync = result }
+            if savedConfiguration.node == expectedNode
+                && resolvedConfiguration.node == expectedNode
+                && !configurationNeedsRestart { nodeSync = result }
         }
     }
 
@@ -333,7 +340,7 @@ final class TimelordModel: ObservableObject {
             || candidate.node != saved.node
     }
     private var hasRuntimeSettingsChanges: Bool {
-        Self.hasRuntimeChanges(configuration.resolvedForPersistence(against: savedConfiguration), from: savedConfiguration)
+        Self.hasRuntimeChanges(resolvedConfiguration, from: savedConfiguration)
     }
     var settingsDoneTitle: String {
         guard canControlService && (hasRuntimeSettingsChanges || configurationNeedsRestart) else { return "Done" }
@@ -350,7 +357,7 @@ final class TimelordModel: ObservableObject {
         }
         if canControlService {
             let pending = hasRuntimeSettingsChanges || configurationNeedsRestart
-            let nodeOnly = pendingChangeIsNodeOnly && Self.onlyNodeDiffers(savedConfiguration, configuration.resolvedForPersistence(against: savedConfiguration))
+            let nodeOnly = pendingChangeIsNodeOnly && Self.onlyNodeDiffers(savedConfiguration, resolvedConfiguration)
             return pending
                 ? (nodeOnly ? "Save & Restart switches the full-node connection. ASIC boards keep running." : "Save & Restart applies your changes and briefly restarts Timelord.")
                 : "Your settings are saved. Timelord keeps running."
@@ -379,12 +386,19 @@ final class TimelordModel: ObservableObject {
                     connectionResult = nil
                 }
                 operationInProgress = false
-                if !configurationNeedsRestart { updateSnapshot(); return true }
+                if !configurationNeedsRestart { return finishSettingsSuccessfully() }
             }
             await restartService()
             guard !configurationNeedsRestart else { return false }
             pendingChangeIsNodeOnly = true
         }
+        return finishSettingsSuccessfully()
+    }
+    /// A completed settings sheet must not leave an invalid RPC draft dirty for
+    /// the rest of the session. Implicit saves still keep it for editing.
+    private func finishSettingsSuccessfully() -> Bool {
+        configuration = resolvedConfiguration
+        updateSnapshot()
         return true
     }
     /// Persists the editable configuration. A transient save failure is reported
@@ -395,7 +409,7 @@ final class TimelordModel: ObservableObject {
         guard !operationInProgress else { return false }
         operationInProgress = true; defer { operationInProgress = false }
         do {
-            let updated = configuration.resolvedForPersistence(against: savedConfiguration)
+            let updated = resolvedConfiguration
             let runtimeChanged = Self.hasRuntimeChanges(updated, from: savedConfiguration)
             let nodeOnly = Self.onlyNodeDiffers(savedConfiguration, updated)
             try await configurationClient.save(updated)
@@ -404,7 +418,7 @@ final class TimelordModel: ObservableObject {
             // migration whenever the submitted configuration is still current.
             // Incomplete RPC drafts were resolved for validation, so restore the
             // form state the user is still filling in.
-            if configuration.resolvedForPersistence(against: savedConfiguration) == updated {
+            if resolvedConfiguration == updated {
                 configuration = persisted.restoringIncompleteRPCDrafts(from: configuration)
             }
             savedConfiguration = persisted
