@@ -180,9 +180,23 @@ Alerts use counter progress and timestamps rather than `rate(estimated_ips)`.
 No-progress alerts retain a 15-minute mainnet / two-hour testnet pending-work
 window, after a five-minute counter lookback. Ordinary ASIC recoveries are allowed
 and are not independently an alert. Inspect recovery rates together with delivered
-IPS and temperatures before adjusting a deployment's policy. Alert examples also
-cover scrape/metric loss, internal failure, sustained node disconnection, missing
-required clients, verification failure and thermal stops.
+IPS and temperatures before adjusting a deployment's policy.
+
+`TimelordAdmissionSaturated` is a warning for sustained unfinished-block admission
+pressure, not a safety-critical fault. It sums `candidates_full` and
+`deferred_queue_full` across `source`, so drops split between node frames and peak
+retries still count together, and one instance raises one alert rather than one
+per label combination. The rule uses a fifteen-minute window with a five-minute
+hold and a ten-minute keep-firing tail; sparse drops stay quiet, while sustained
+pressure alerts and does not immediately re-fire during short dips. A large burst
+can exceed the threshold; it then clears after the fifteen-minute window plus the
+ten-minute keep-firing tail. See `monitoring/alerts.yml` for the exact expression.
+
+The example alert set also covers scrape/metric loss, internal failure, sustained
+node disconnection, missing required chain clients, verification failure, thermal
+stops, safety-journal resets, admission saturation, no-verified-progress,
+supervisor health and worker availability, lost diagnostics, last-good
+configuration fallback and unavailable sleep prevention.
 
 Keep full-node monitoring with the existing full-node exporter. This service does
 not emit `chia_full_node_*`, compact-proof series, exporter build information,

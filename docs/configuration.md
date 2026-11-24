@@ -344,16 +344,19 @@ refused, with the reason, when board or service settings also changed, which
 still need a supervised restart.
 
 `configuration` prints JSON; `configure --input JSON_FILE` validates before
-replacement. `check-hardware --config FILE` explicitly starts the configured
-clients for a bounded synthetic three-chain proof check without a full node.
-Never point it at boards in use. It applies the configured operating point and
-thermal guard, verifies retained sessions and a reset, then stops its own clients.
-It does not train Automatic tuning or change saved settings. It refuses to run
+replacement. `check-hardware --config FILE` starts the configured native client
+and boards for a bounded, isolated three-chain proof check without a full node.
+Never point it at boards in use. Manual boards use their configured frequency and
+voltage; Automatic boards use their automatic start point. It applies that
+operating point and the configured thermal guard, verifies a retained session
+across two rounds and a new session after a generation reset, then stops its own
+clients. It shares the safety journal for owner epochs and restrictions but does
+not train Automatic tuning or save learned operating points. It refuses to run
 when the board safety journal is missing or unreadable after a prior write, and
 stays refused until the worker has saved board state (not merely run once) so the
-reset is recorded and an unreadable journal is archived; then rerun the check.
-It takes the worker lock, so it does not run at the same time as the serving
-worker and fails clearly when that lock is held.
+reset is recorded and an unreadable journal is archived; then rerun the check. It
+takes the worker lock, so it does not run at the same time as the serving worker
+and fails clearly when that lock is held.
 
 The status/history HTTP API is read-only and bound to loopback. Same-user,
 mode-0600 Unix IPC handles Pause/Resume tuning. `service.control_socket` optionally

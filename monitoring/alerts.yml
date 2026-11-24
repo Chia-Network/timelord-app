@@ -58,6 +58,18 @@ groups:
           severity: critical
         annotations:
           summary: An ASIC stopped at its temperature guard
+      - alert: TimelordAdmissionSaturated
+        expr: |
+          sum without (outcome, source) (
+            increase(chia_timelord_unfinished_candidates_total{job="timelord-app",outcome=~"candidates_full|deferred_queue_full"}[15m])
+          ) > 7
+        for: 5m
+        keep_firing_for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Timelord is dropping unfinished-block work under load
+          description: Break down chia_timelord_unfinished_candidates_total by outcome and source to identify which admission limit is saturated.
       - alert: TimelordSafetyJournalReset
         expr: |
           chia_timelord_safety_journal_resets_total{job="timelord-app"} > 0

@@ -199,6 +199,135 @@ tests:
         severity: critical
       exp_annotations:
         summary: An ASIC stopped at its temperature guard
+- name: sustained unfinished admission saturation alerts once while drops are split across labels
+  interval: 1m
+  input_series:
+  - series: chia_timelord_unfinished_candidates_total{job="timelord-app",instance="fixture:9258",network="mainnet",outcome="candidates_full",source="node"}
+    values: 0+0x4 1+0x4 2+0x4 3+0x4 4+0x4 5+0x4 6+0x4
+  - series: chia_timelord_unfinished_candidates_total{job="timelord-app",instance="fixture:9258",network="mainnet",outcome="candidates_full",source="retry"}
+    values: 0+0x4 1+0x4 2+0x4 3+0x4 4+0x4 5+0x4 6+0x4
+  - series: chia_timelord_unfinished_candidates_total{job="timelord-app",instance="fixture:9258",network="mainnet",outcome="deferred_queue_full",source="node"}
+    values: 0+0x4 1+0x4 2+0x4 3+0x4 4+0x4 5+0x4 6+0x4
+  - series: chia_timelord_unfinished_candidates_total{job="timelord-app",instance="fixture:9258",network="mainnet",outcome="deferred_queue_full",source="retry"}
+    values: 0+0x4 1+0x4 2+0x4 3+0x4 4+0x4 5+0x4 6+0x4
+  alert_rule_test:
+  - eval_time: 14m
+    alertname: TimelordAdmissionSaturated
+    exp_alerts: []
+  - eval_time: 16m
+    alertname: TimelordAdmissionSaturated
+    exp_alerts:
+    - exp_labels: {job: timelord-app, instance: 'fixture:9258', network: mainnet, severity: warning}
+      exp_annotations:
+        summary: Timelord is dropping unfinished-block work under load
+        description: Break down chia_timelord_unfinished_candidates_total by outcome and source to identify which admission limit is saturated.
+- name: sustained saturation just above the threshold still alerts
+  interval: 1m
+  input_series:
+  - series: chia_timelord_unfinished_candidates_total{job="timelord-app",instance="fixture:9258",network="mainnet",outcome="deferred_queue_full",source="retry"}
+    values: 0+0x1 1+0x1 2+0x1 3+0x1 4+0x1 5+0x1 6+0x1 7+0x1 8+0x1 9+0x1 10+0x1 11+0x1 12+0x1 13+0x1 14+0x1 15+0x1
+  alert_rule_test:
+  - eval_time: 30m
+    alertname: TimelordAdmissionSaturated
+    exp_alerts:
+    - exp_labels: {job: timelord-app, instance: 'fixture:9258', network: mainnet, severity: warning}
+      exp_annotations:
+        summary: Timelord is dropping unfinished-block work under load
+        description: Break down chia_timelord_unfinished_candidates_total by outcome and source to identify which admission limit is saturated.
+- name: a single isolated dropped candidate does not alert
+  interval: 1m
+  input_series:
+  - series: chia_timelord_unfinished_candidates_total{job="timelord-app",instance="fixture:9258",network="mainnet",outcome="candidates_full",source="node"}
+    values: 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
+  - series: chia_timelord_unfinished_candidates_total{job="timelord-app",instance="fixture:9258",network="mainnet",outcome="candidates_full",source="retry"}
+    values: 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
+  - series: chia_timelord_unfinished_candidates_total{job="timelord-app",instance="fixture:9258",network="mainnet",outcome="deferred_queue_full",source="node"}
+    values: 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
+  - series: chia_timelord_unfinished_candidates_total{job="timelord-app",instance="fixture:9258",network="mainnet",outcome="deferred_queue_full",source="retry"}
+    values: 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
+  alert_rule_test:
+  - eval_time: 3m
+    alertname: TimelordAdmissionSaturated
+    exp_alerts: []
+  - eval_time: 25m
+    alertname: TimelordAdmissionSaturated
+    exp_alerts: []
+- name: sparse dropped candidates at a fifteen second scrape stay below the threshold
+  interval: 15s
+  input_series:
+  - series: chia_timelord_unfinished_candidates_total{job="timelord-app",instance="fixture:9258",network="mainnet",outcome="candidates_full",source="node"}
+    values: 0+0x19 1+0x19 2+0x19 3+0x19 4+0x19 5+0x19 6+0x19
+  alert_rule_test:
+  - eval_time: 30m
+    alertname: TimelordAdmissionSaturated
+    exp_alerts: []
+- name: six drops per fifteen minutes stay below the threshold at a fifteen second scrape
+  interval: 15s
+  input_series:
+  - series: chia_timelord_unfinished_candidates_total{job="timelord-app",instance="fixture:9258",network="mainnet",outcome="deferred_queue_full",source="retry"}
+    values: 0+0x9 1+0x9 2+0x9 3+0x9 4+0x9 5+0x9 6+0x9 7+0x9 8+0x9 9+0x9 10+0x9 11+0x9 12+0x9 13+0x9 14+0x9 15+0x9 16+0x9 17+0x9
+  alert_rule_test:
+  - eval_time: 45m
+    alertname: TimelordAdmissionSaturated
+    exp_alerts: []
+- name: a burst above the threshold holds for the window then clears
+  interval: 1m
+  input_series:
+  - series: chia_timelord_unfinished_candidates_total{job="timelord-app",instance="fixture:9258",network="mainnet",outcome="candidates_full",source="node"}
+    values: 0 20+0x40
+  alert_rule_test:
+  - eval_time: 20m
+    alertname: TimelordAdmissionSaturated
+    exp_alerts:
+    - exp_labels: {job: timelord-app, instance: 'fixture:9258', network: mainnet, severity: warning}
+      exp_annotations:
+        summary: Timelord is dropping unfinished-block work under load
+        description: Break down chia_timelord_unfinished_candidates_total by outcome and source to identify which admission limit is saturated.
+  - eval_time: 30m
+    alertname: TimelordAdmissionSaturated
+    exp_alerts: []
+- name: a small burst below the threshold does not alert
+  interval: 1m
+  input_series:
+  - series: chia_timelord_unfinished_candidates_total{job="timelord-app",instance="fixture:9258",network="mainnet",outcome="candidates_full",source="node"}
+    values: 0 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3
+  alert_rule_test:
+  - eval_time: 10m
+    alertname: TimelordAdmissionSaturated
+    exp_alerts: []
+  - eval_time: 20m
+    alertname: TimelordAdmissionSaturated
+    exp_alerts: []
+- name: healthy unfinished admission outcomes do not alert
+  interval: 1m
+  input_series:
+  - series: chia_timelord_unfinished_candidates_total{job="timelord-app",instance="fixture:9258",network="mainnet",outcome="admitted",source="node"}
+    values: 0+1x30
+  - series: chia_timelord_unfinished_candidates_total{job="timelord-app",instance="fixture:9258",network="mainnet",outcome="admitted",source="retry"}
+    values: 0+1x30
+  - series: chia_timelord_unfinished_candidates_total{job="timelord-app",instance="fixture:9258",network="mainnet",outcome="deferred",source="node"}
+    values: 0+1x30
+  - series: chia_timelord_unfinished_candidates_total{job="timelord-app",instance="fixture:9258",network="mainnet",outcome="deferred",source="retry"}
+    values: 0+1x30
+  - series: chia_timelord_unfinished_candidates_total{job="timelord-app",instance="fixture:9258",network="mainnet",outcome="duplicate",source="node"}
+    values: 0+1x30
+  - series: chia_timelord_unfinished_candidates_total{job="timelord-app",instance="fixture:9258",network="mainnet",outcome="duplicate",source="retry"}
+    values: 0+1x30
+  alert_rule_test:
+  - eval_time: 30m
+    alertname: TimelordAdmissionSaturated
+    exp_alerts: []
+- name: other jobs do not alert
+  interval: 1m
+  input_series:
+  - series: chia_timelord_unfinished_candidates_total{job="timelord-supervisor",instance="fixture:9259",network="mainnet",outcome="candidates_full",source="node"}
+    values: 0+1x30
+  - series: chia_timelord_unfinished_candidates_total{job="timelord-supervisor",instance="fixture:9259",network="mainnet",outcome="deferred_queue_full",source="retry"}
+    values: 0+1x30
+  alert_rule_test:
+  - eval_time: 30m
+    alertname: TimelordAdmissionSaturated
+    exp_alerts: []
 - name: a missing safety journal is unexpected
   interval: 1m
   input_series:
