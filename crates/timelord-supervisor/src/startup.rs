@@ -61,7 +61,10 @@ pub async fn ensure_started(
         .arg("--config")
         .arg(&paths.config)
         .arg("--network")
-        .arg(network.label());
+        .arg(network.label())
+        // This CLI owns the child's stderr pipe to capture a startup failure, so
+        // the supervisor releases fd 2 once it serves status.
+        .arg("--own-stderr");
     supervisor_stdio(&mut command);
     if let Some(worker) = worker {
         command.arg("--worker").arg(worker);
@@ -154,11 +157,19 @@ async fn wait_for_status(
     }
 }
 
-/// A bounded copy of the child's stderr, drained from the moment it starts so a
-/// chatty child cannot block on a full pipe. Only the most recent bytes are
-/// kept: `main` writes its `Error: …` line last, after any noise.
+/// Bounded capture of the child's stderr. A reader thread drains the pipe from
+/// the moment the child starts, so a chatty child cannot block on a full pipe.
+/// Only the most recent bytes are kept: `main` writes its decisive `Error: …`
+/// line last, after any noise.
 struct Diagnostics {
-    captured: tokio::sync::oneshot::Receiver<Captured>,
+    reading: std::sync::Arc<std::sync::Mutex<Reading>>,
+    done: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+#[derive(Default)]
+struct Reading {
+    kept: Vec<u8>,
+    truncated: bool,
 }
 
 struct Captured {
@@ -166,48 +177,73 @@ struct Captured {
     truncated: bool,
 }
 
-impl Diagnostics {
-    fn read(mut pipe: std::process::ChildStderr) -> Self {
-        use std::io::Read;
-        let (sender, captured) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            let mut kept = Vec::new();
-            let mut truncated = false;
-            let mut chunk = [0u8; 1024];
-            loop {
-                match pipe.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(size) => truncated |= keep_tail(&mut kept, &chunk[..size]),
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(_) => break,
-                }
-            }
-            let _ = sender.send(Captured {
-                text: String::from_utf8_lossy(&kept).trim().to_string(),
-                truncated,
-            });
-        });
-        Self { captured }
+impl Reading {
+    fn push(&mut self, chunk: &[u8]) {
+        self.kept.extend_from_slice(chunk);
+        if self.kept.len() > STARTUP_DIAGNOSTICS {
+            let excess = self.kept.len() - STARTUP_DIAGNOSTICS;
+            self.kept.drain(..excess);
+            self.truncated = true;
+        }
     }
-    /// The child has exited, so its output is buffered and the reader is about
-    /// to see EOF. Wait briefly rather than forever.
-    async fn finish(self) -> Option<Captured> {
-        tokio::time::timeout(STARTUP_DIAGNOSTICS_WAIT, self.captured)
-            .await
-            .ok()?
-            .ok()
+    /// Decode the kept bytes. A truncated window can begin inside a multi-byte
+    /// character, so its leading continuation bytes are skipped rather than
+    /// showing up as a replacement character.
+    fn text(&self) -> String {
+        let mut bytes = &self.kept[..];
+        while let [first, rest @ ..] = bytes
+            && *first & 0xC0 == 0x80
+        {
+            bytes = rest;
+        }
+        String::from_utf8_lossy(bytes).trim().to_string()
     }
 }
 
-/// Keep the most recent STARTUP_DIAGNOSTICS bytes and report whether any were
-/// dropped.
-fn keep_tail(kept: &mut Vec<u8>, chunk: &[u8]) -> bool {
-    kept.extend_from_slice(chunk);
-    if kept.len() <= STARTUP_DIAGNOSTICS {
-        return false;
+impl Diagnostics {
+    fn read(mut pipe: std::process::ChildStderr) -> Self {
+        use std::io::Read;
+        let reading = std::sync::Arc::new(std::sync::Mutex::new(Reading::default()));
+        let sink = reading.clone();
+        let (sender, done) = tokio::sync::oneshot::channel();
+        let reader = std::thread::Builder::new()
+            .name("supervisor-startup-stderr".into())
+            .spawn(move || {
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match pipe.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(size) => sink.lock().expect("stderr capture").push(&chunk[..size]),
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                    }
+                }
+                let _ = sender.send(());
+            });
+        // A reader that cannot start only costs diagnostics; the startup error
+        // is still reported.
+        Self {
+            reading,
+            done: reader.ok().map(|_| done),
+        }
     }
-    kept.drain(..kept.len() - STARTUP_DIAGNOSTICS);
-    true
+    /// The child has exited, so its output is buffered and the reader is about
+    /// to see EOF. Wait briefly, then report what was captured even if a stray
+    /// descendant kept the pipe open.
+    async fn finish(self) -> Option<Captured> {
+        if let Some(done) = self.done {
+            let _ = tokio::time::timeout(STARTUP_DIAGNOSTICS_WAIT, done).await;
+        }
+        let reading = self.reading.lock().expect("stderr capture");
+        let text = reading.text();
+        if text.is_empty() {
+            return None;
+        }
+        Some(Captured {
+            text,
+            truncated: reading.truncated,
+        })
+    }
 }
 
 /// Quote a reaped child's output for the startup error.
@@ -290,6 +326,20 @@ mod tests {
             captured("{ printf 'HEAD-MARKER'; printf '%8181s' '' | tr ' ' a; } >&2; exit 7").await;
         assert!(!captured.truncated);
         assert!(captured.text.contains("HEAD-MARKER"), "{}", captured.text);
+    }
+
+    #[tokio::test]
+    async fn startup_diagnostics_do_not_garble_a_split_character() {
+        // Two bytes, then 10000 bytes of two-byte characters: the kept window
+        // begins inside a character, so its continuation bytes are skipped.
+        let captured =
+            captured("{ printf 'XY'; yes 'é' | tr -d '\\n' | head -c 10000; } >&2; exit 7").await;
+        assert!(captured.truncated);
+        assert!(
+            captured.text.chars().all(|character| character == 'é'),
+            "{:?}",
+            captured.text.chars().take(4).collect::<String>()
+        );
     }
 
     #[tokio::test]

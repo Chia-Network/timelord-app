@@ -1,6 +1,20 @@
 use super::*;
 use crate::test_support::{reaped, script_helper};
 
+#[test]
+fn script_helper_writes_the_whole_executable() {
+    let dir = std::env::temp_dir().join(format!("tl-script-helper-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let helper = script_helper(&dir, "worker", "#!/bin/sh\nexit 3\n");
+    assert_eq!(fs::read_to_string(&helper).unwrap(), "#!/bin/sh\nexit 3\n");
+    assert_eq!(fs::symlink_metadata(&helper).unwrap().mode() & 0o777, 0o700);
+    assert_eq!(
+        std::process::Command::new(&helper).status().unwrap().code(),
+        Some(3)
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
 #[tokio::test]
 async fn completed_validator_is_reaped_before_reporting_success_or_failure() {
     let dir = std::env::temp_dir().join(format!("tl-validator-completed-{}", std::process::id()));
@@ -244,7 +258,6 @@ async fn failed_pause_retains_owner_and_power_until_confirmed_cleanup() {
         assert_eq!(state.snapshot().worker_pid, Some(pid as u32));
         assert!(state.snapshot().error.unwrap().contains("cleanup failed"));
         assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
-        assert!(matches!(state.cleanup_cause(), Cause::Requested));
         // No replacement is admitted while the cleanup retry is pending.
         state
             .tick(
@@ -635,7 +648,6 @@ fn retirement_grace_depends_on_watchdog_classification() {
         normal
     );
     assert_eq!(Cause::Requested.grace(), normal);
-    assert_eq!(Cause::CleanupRetry.grace(), Duration::ZERO);
     assert_eq!(Cause::Failed { watchdog: None }.grace(), normal);
 }
 
@@ -715,8 +727,25 @@ async fn cleanup_retry_skips_the_graceful_wait() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn a_retry_only_spends_what_the_first_attempt_left() {
+    let now = std::time::Instant::now();
+    let normal = timelord_supervisor::NORMAL_GRACEFUL_STOP;
+    assert_eq!(remaining_grace(false, None, now), normal);
+    assert_eq!(remaining_grace(true, Some(now), now), Duration::ZERO);
+    assert_eq!(
+        remaining_grace(false, Some(now - Duration::from_secs(20)), now),
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        remaining_grace(false, Some(now - Duration::from_secs(60)), now),
+        Duration::ZERO,
+        "a spent budget must not be renewed"
+    );
+}
+
 #[tokio::test]
-async fn shutdown_retry_never_waits_out_a_second_grace() {
+async fn shutdown_retry_spends_only_what_the_first_attempt_left() {
     let dir = std::env::temp_dir().join(format!("tl-shutdown-retry-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
@@ -733,8 +762,7 @@ async fn shutdown_retry_never_waits_out_a_second_grace() {
     let mut worker =
         Worker::spawn(&helper, &paths.config, &dir.join("progress.sock"), 1, &log).unwrap();
     let pid = worker.process.pid() as i32;
-    // Let the worker install its TERM trap, or the retry's SIGTERM would end it
-    // before the grace it must not wait out could be observed.
+    // Let the worker install its TERM trap before the retry's SIGTERM arrives.
     tokio::time::timeout(Duration::from_secs(3), async {
         while !dir.join("ready").exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -751,12 +779,22 @@ async fn shutdown_retry_never_waits_out_a_second_grace() {
     state.poll_retirement(&snapshots, true).await;
     assert!(matches!(state.lifecycle, Lifecycle::CleanupFailed { .. }));
     assert!(!state.lifecycle.worker().unwrap().killed);
+    // The first attempt failed with about 2 s of its graceful budget left, as a
+    // waitid error late in a Pause would.
+    state.lifecycle.worker_mut().unwrap().stop_started = Some(
+        std::time::Instant::now()
+            - (timelord_supervisor::NORMAL_GRACEFUL_STOP - Duration::from_secs(2)),
+    );
     let started = Instant::now();
     state.retire_now(&snapshots).await.unwrap();
+    let elapsed = started.elapsed();
     assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "shutdown granted a second 25 s grace: {:?}",
-        started.elapsed()
+        elapsed >= Duration::from_secs(1),
+        "shutdown skipped the remaining grace: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "shutdown granted a second full grace: {elapsed:?}"
     );
     assert!(reaped(pid));
     fs::remove_dir_all(dir).unwrap();

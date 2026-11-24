@@ -68,9 +68,9 @@ worker (no startup progress or no fresh heartbeat) gets a 2-second wait. If the
 group kill itself fails, shutdown spends the 25-second wait plus a failed
 3-second reap, then a 3-second retry reap and, for an owner that still cannot be
 reaped, a final bounded 3-second drop: a 34.1-second worst case, still within
-the 35-second launchd `ExitTimeOut`. A worker that already spent its grace is
-retried at shutdown without another SIGTERM wait, so a failed attempt cannot
-stretch that budget. An in-flight Reload validation is cancelled on supervisor
+the 35-second launchd `ExitTimeOut`. All retirement attempts for one worker
+share a single 25-second graceful wait: a retry gets only what the first attempt
+left, so a failed attempt cannot stretch that budget. An in-flight Reload validation is cancelled on supervisor
 shutdown and its validator child is reaped, so shutdown stays within that budget
 rather than waiting for validation. On an existing installation the first
 `launchctl bootout` still runs under the old 20-second `ExitTimeOut` plist

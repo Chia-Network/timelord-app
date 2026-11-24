@@ -1,6 +1,10 @@
+// The unit tests use the same fixture writer; one copy, two crates.
+#[allow(dead_code)]
+#[path = "../../src/test_support.rs"]
+mod test_support;
+
 use std::{
     fs,
-    io::Write,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -40,26 +44,11 @@ impl Fixture {
             ),
         )
     }
-    /// Write an executable fixture script. The write runs in a child process:
-    /// Linux refuses to exec a file while any process holds it open for
-    /// writing, and a descriptor opened here can be inherited by another
-    /// test's `fork` until that child execs (rust-lang/rust#114554).
+    /// Write an executable fixture script through the shared child-process
+    /// writer, so a concurrent test's `fork` cannot inherit a writable
+    /// descriptor and make the exec fail with ETXTBSY.
     pub(crate) fn script(&self, name: &str, body: &str) -> PathBuf {
-        let path = self.0.join(name);
-        let mut writer = std::process::Command::new("/bin/sh")
-            .args(["-c", "cat > \"$1\" && chmod 700 \"$1\"", "fixture"])
-            .arg(&path)
-            .stdin(Stdio::piped())
-            .spawn()
-            .expect("fixture writer");
-        writer
-            .stdin
-            .take()
-            .expect("fixture stdin")
-            .write_all(body.as_bytes())
-            .expect("fixture body");
-        assert!(writer.wait().expect("fixture writer").success());
-        path
+        test_support::script_helper(&self.0, name, body)
     }
     pub(crate) fn supervisor(&self, helper: &Path) -> Child {
         self.supervisor_with_monitor(helper, None)

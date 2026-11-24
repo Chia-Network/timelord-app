@@ -29,34 +29,12 @@ pub(crate) fn script_helper(dir: &Path, name: &str, body: &str) -> PathBuf {
     helper
 }
 
-/// Whether `pid` was reaped: it is no longer a child this process can wait for.
-/// Unlike `kill(pid, 0)`, this cannot touch a process that reused the PID.
+/// Whether `pid` is no longer a child this process can wait for. Unlike
+/// `kill(pid, 0)` this never signals a live process, but a PID reused by
+/// another test's child is still this process's child, so in that rare case
+/// the probe would reap that child instead.
 pub(crate) fn reaped(pid: i32) -> bool {
     let mut status = 0;
     let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
     waited == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-
-    #[test]
-    fn script_helper_writes_the_whole_executable() {
-        let dir = std::env::temp_dir().join(format!("tl-script-helper-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let helper = script_helper(&dir, "worker", "#!/bin/sh\nexit 3\n");
-        assert_eq!(fs::read_to_string(&helper).unwrap(), "#!/bin/sh\nexit 3\n");
-        assert_eq!(
-            std::os::unix::fs::MetadataExt::mode(&fs::symlink_metadata(&helper).unwrap()) & 0o777,
-            0o700
-        );
-        assert_eq!(
-            std::process::Command::new(&helper).status().unwrap().code(),
-            Some(3)
-        );
-        fs::remove_dir_all(dir).unwrap();
-    }
 }

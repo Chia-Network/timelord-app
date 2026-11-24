@@ -21,7 +21,8 @@ use std::{
 };
 use timelord_supervisor::{
     AcceptBackoff, CONTROL_SERVER_TIMEOUT, Control, InstanceLock, Intent, KILL_AND_REAP, LOG_DRAIN,
-    Mode, Network, Paths, Request, Response, Status, SupervisorPhase, peer_is_owner,
+    Mode, NORMAL_GRACEFUL_STOP, Network, Paths, Request, Response, Status, SupervisorPhase,
+    peer_is_owner,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -83,6 +84,11 @@ enum Action {
         monitor_listen: Option<std::net::SocketAddr>,
         #[arg(long, default_value_t = Network::Mainnet)]
         network: Network,
+        /// Set by ensure-started, which owns the startup stderr pipe and needs
+        /// it closed once this supervisor serves status. Without it (launchd,
+        /// a terminal, a test harness) stderr stays where the caller put it.
+        #[arg(long, hide = true)]
+        own_stderr: bool,
     },
     Status {
         #[arg(long)]
@@ -159,10 +165,18 @@ async fn main() -> Result<()> {
             worker,
             monitor_listen,
             network,
+            own_stderr,
         } => {
             let helper =
                 worker.unwrap_or(std::env::current_exe()?.with_file_name("timelord-service"));
-            run(Paths::for_config(&config)?, helper, monitor_listen, network).await
+            run(
+                Paths::for_config(&config)?,
+                helper,
+                monitor_listen,
+                network,
+                own_stderr,
+            )
+            .await
         }
         Action::Diagnostics { config } => {
             let paths = Paths::for_config(&config)?;
@@ -239,9 +253,12 @@ struct Worker {
     watchdog: timelord_supervisor::progress::Watchdog,
     started: Instant,
     progress: Option<(timelord_supervisor::progress::Snapshot, std::time::Instant)>,
-    /// Set once a stop has reached the group SIGKILL, so a later CleanupFailed
-    /// retry skips the SIGTERM wait instead of repeating it.
+    /// Set once a stop has reached the group SIGKILL. A retry then has nothing
+    /// left to wait for.
     killed: bool,
+    /// When this worker's first stop attempt began. All attempts share one
+    /// graceful budget, so a retry only gets what the first one left.
+    stop_started: Option<std::time::Instant>,
     #[cfg(test)]
     stop_failures: usize,
     #[cfg(test)]
@@ -293,6 +310,7 @@ impl Worker {
             started: Instant::now(),
             progress: None,
             killed: false,
+            stop_started: None,
             #[cfg(test)]
             stop_failures: 0,
             #[cfg(test)]
@@ -300,6 +318,12 @@ impl Worker {
         })
     }
     async fn stop(&mut self, graceful: Duration) -> Result<std::process::ExitStatus> {
+        // One graceful budget per worker: `stop` is only repeated for a worker
+        // that was not reaped, so a retry gets what its first attempt left and
+        // nothing at all once the group has been SIGKILLed.
+        let graceful = graceful.min(self.remaining_grace());
+        self.stop_started
+            .get_or_insert_with(std::time::Instant::now);
         #[cfg(test)]
         if self.stop_failures > 0 {
             self.stop_failures -= 1;
@@ -330,6 +354,23 @@ impl Worker {
         }
         Ok(result)
     }
+    fn remaining_grace(&self) -> Duration {
+        remaining_grace(self.killed, self.stop_started, std::time::Instant::now())
+    }
+}
+/// What a worker may still spend of its single graceful budget, counted from
+/// its first stop attempt. A group that was already SIGKILLed gets nothing.
+fn remaining_grace(
+    killed: bool,
+    first_attempt: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> Duration {
+    if killed {
+        return Duration::ZERO;
+    }
+    first_attempt.map_or(NORMAL_GRACEFUL_STOP, |started| {
+        NORMAL_GRACEFUL_STOP.saturating_sub(now.saturating_duration_since(started))
+    })
 }
 impl Drop for Worker {
     fn drop(&mut self) {
@@ -677,10 +718,7 @@ impl SupervisorState {
                     Lifecycle::Stopping(retiring) => retiring.restart |= resuming,
                     Lifecycle::Running(_) if mode == Mode::Running => {}
                     Lifecycle::Running(_) => self.begin_retirement(Cause::Requested),
-                    Lifecycle::CleanupFailed { .. } => {
-                        let cause = self.cleanup_cause();
-                        self.begin_retirement(cause)
-                    }
+                    Lifecycle::CleanupFailed { .. } => self.begin_retirement(Cause::Requested),
                     _ if mode == Mode::Paused => self.lifecycle = Lifecycle::Paused,
                     Lifecycle::Paused | Lifecycle::StateError(_) => {
                         self.lifecycle = Lifecycle::Starting
@@ -696,10 +734,7 @@ impl SupervisorState {
                     // the replacement reads the configuration when it starts.
                     Lifecycle::Stopping(retiring) => retiring.restart = true,
                     Lifecycle::Running(_) => self.begin_retirement(Cause::Requested),
-                    Lifecycle::CleanupFailed { .. } => {
-                        let cause = self.cleanup_cause();
-                        self.begin_retirement(cause)
-                    }
+                    Lifecycle::CleanupFailed { .. } => self.begin_retirement(Cause::Requested),
                     Lifecycle::StateError(_) => {}
                     _ if self.intent.mode == Mode::Paused => self.lifecycle = Lifecycle::Paused,
                     _ => self.lifecycle = Lifecycle::Starting,
@@ -735,8 +770,7 @@ impl SupervisorState {
         if matches!(self.lifecycle, Lifecycle::CleanupFailed { next, .. } if Instant::now() >= next)
         {
             // Keep failed cleanup owned and monitored until retirement succeeds.
-            let cause = self.cleanup_cause();
-            self.begin_retirement(cause);
+            self.begin_retirement(Cause::Requested);
             self.publish(snapshots);
             return Ok(());
         }
@@ -800,6 +834,7 @@ async fn run(
     helper: PathBuf,
     monitor_listen: Option<std::net::SocketAddr>,
     network: Network,
+    own_stderr: bool,
 ) -> Result<()> {
     let _owner = InstanceLock::acquire(&paths.lock)?;
     if let Ok(meta) = fs::symlink_metadata(&paths.socket) {
@@ -857,11 +892,12 @@ async fn run(
     let mut controls = tokio::spawn(accept_controls(listener, current, tx, state.log.clone()));
     let mut timer = tokio::time::interval(Duration::from_millis(100));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Every fallible startup step is done, so stop reporting diagnostics on the
-    // caller's stderr pipe. Replacing fd 2 closes that pipe for the short-lived
-    // CLI and keeps any later child that inherits stderr from holding the
-    // CLI's descriptor open. Best effort: the CLI's read is bounded anyway.
-    if let Ok(null) = fs::OpenOptions::new().write(true).open("/dev/null") {
+    // ensure-started owns this supervisor's stderr pipe to capture a startup
+    // failure. Every fallible startup step is done, so hand fd 2 back to
+    // /dev/null: the CLI's read ends, and a later child that inherits stderr
+    // cannot hold the CLI's descriptor open. launchd, a terminal, or a test
+    // harness keeps the stderr it chose. Best effort: the CLI's read is bounded.
+    if own_stderr && let Ok(null) = fs::OpenOptions::new().write(true).open("/dev/null") {
         unsafe {
             libc::dup2(null.as_raw_fd(), libc::STDERR_FILENO);
         }

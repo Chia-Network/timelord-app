@@ -14,13 +14,10 @@ pub(crate) type Retirement =
 /// Why a worker is being retired decides what follows a successful reap and how
 /// long the process group gets to honour SIGTERM.
 pub(crate) enum Cause {
-    /// Pause, Reload, or Resume of a running worker.
+    /// Pause, Reload, Resume, a cleanup retry, or shutdown. The worker's single
+    /// graceful budget decides how long this attempt may wait, so a retry
+    /// inherits only what its first attempt left.
     Requested,
-    /// A stop with no SIGTERM grace. The group may already have been SIGKILLed
-    /// without reaping (CleanupFailed), or shutdown interrupted an attempt that
-    /// already spent its grace. Still send SIGTERM to the leader, skip the
-    /// wait, then group-SIGKILL and reap.
-    CleanupRetry,
     /// Crash or watchdog failure: recorded as a recovery and backed off.
     Failed { watchdog: Option<Failure> },
 }
@@ -41,7 +38,6 @@ impl Cause {
                         ..
                     }),
             } => NORMAL_GRACEFUL_STOP,
-            Self::CleanupRetry => Duration::ZERO,
             Self::Requested | Self::Failed { watchdog: None } => NORMAL_GRACEFUL_STOP,
         }
     }
@@ -130,8 +126,8 @@ impl SupervisorState {
                             }
                         }
                     }
-                    Cause::Requested | Cause::CleanupRetry if paused => Lifecycle::Paused,
-                    Cause::Requested | Cause::CleanupRetry => Lifecycle::Starting,
+                    Cause::Requested if paused => Lifecycle::Paused,
+                    Cause::Requested => Lifecycle::Starting,
                 }
             }
             Ok((worker, Err(error))) => {
@@ -168,16 +164,10 @@ impl SupervisorState {
     pub(crate) async fn retire_now(&mut self, snapshots: &watch::Sender<Published>) -> Result<()> {
         self.poll_retirement(snapshots, true).await;
         if self.lifecycle.worker().is_some() {
-            // A worker still running gets the normal grace. One that already
-            // stopped once has spent its grace, even when that attempt failed
-            // before the group kill (a waitid error), so shutdown retries
-            // without another SIGTERM wait and cannot exceed the stop budget.
-            let cause = if matches!(self.lifecycle, Lifecycle::Running(_)) {
-                Cause::Requested
-            } else {
-                Cause::CleanupRetry
-            };
-            self.begin_retirement(cause);
+            // The worker's single graceful budget decides the wait: a retry
+            // inherits only what its first attempt left, so shutdown cannot
+            // exceed the stop budget even after a waitid error.
+            self.begin_retirement(Cause::Requested);
             self.publish(snapshots);
             self.poll_retirement(snapshots, true).await;
         }
@@ -185,15 +175,5 @@ impl SupervisorState {
             anyhow::bail!("{error}");
         }
         Ok(())
-    }
-    /// Retry policy for an interactive Pause or Reload: skip the SIGTERM wait
-    /// only when the group was already SIGKILLed, otherwise the worker may
-    /// still be retiring natively. Shutdown retries without a wait instead, so
-    /// it never grants a second grace.
-    pub(crate) fn cleanup_cause(&self) -> Cause {
-        match &self.lifecycle {
-            Lifecycle::CleanupFailed { worker, .. } if worker.killed => Cause::CleanupRetry,
-            _ => Cause::Requested,
-        }
     }
 }
