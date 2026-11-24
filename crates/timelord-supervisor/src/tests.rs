@@ -1,9 +1,41 @@
 use super::*;
 fn script_helper(dir: &Path, name: &str, body: &str) -> PathBuf {
     let helper = dir.join(name);
-    fs::write(&helper, body).unwrap();
-    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    // Write from a child process: Linux refuses to exec a file while any
+    // process holds it open for writing, and a descriptor opened here can be
+    // inherited by an unrelated test's `fork` until that child execs, making
+    // the fixture's own exec fail with ETXTBSY. The child owns the only
+    // writable descriptor, and waiting for it closes that descriptor before the
+    // fixture is ever exec'd.
+    let mut writer = std::process::Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\" && chmod 700 \"$1\"", "fixture"])
+        .arg(&helper)
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("fixture writer");
+    writer
+        .stdin
+        .take()
+        .expect("fixture stdin")
+        .write_all(body.as_bytes())
+        .expect("fixture body");
+    assert!(writer.wait().expect("fixture writer").success());
     helper
+}
+
+#[test]
+fn script_helper_writes_the_whole_executable() {
+    let dir = std::env::temp_dir().join(format!("tl-script-helper-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let helper = script_helper(&dir, "worker", "#!/bin/sh\nexit 3\n");
+    assert_eq!(fs::read_to_string(&helper).unwrap(), "#!/bin/sh\nexit 3\n");
+    assert_eq!(fs::symlink_metadata(&helper).unwrap().mode() & 0o777, 0o700);
+    assert_eq!(
+        std::process::Command::new(&helper).status().unwrap().code(),
+        Some(3)
+    );
+    fs::remove_dir_all(dir).unwrap();
 }
 #[tokio::test]
 async fn completed_validator_is_reaped_before_reporting_success_or_failure() {

@@ -41,22 +41,30 @@ pub const WORST_CASE_STOP: Duration = Duration::from_secs(
     NORMAL_GRACEFUL_STOP.as_secs() + KILL_AND_REAP.as_secs() + LOG_DRAIN.as_secs(),
 );
 
-/// Worst-case time for shutdown to settle a worker when a stop fails at the
-/// group kill: the first attempt is NORMAL_GRACEFUL_STOP + KILL_AND_REAP
-/// without reaching the log drain, then a CleanupRetry adds Duration::ZERO +
-/// KILL_AND_REAP + LOG_DRAIN. That equals WORST_CASE_STOP + KILL_AND_REAP,
-/// because the first attempt's unused drain is exactly the retry's drain. This
-/// is the shutdown worst case for that path; the rare waitid-error path can
-/// exceed it.
-pub const SHUTDOWN_WORST_CASE: Duration =
-    Duration::from_secs(WORST_CASE_STOP.as_secs() + KILL_AND_REAP.as_secs());
+/// Scheduling allowance for the bounded waits, which poll on 10-20 ms sleeps.
+const WAIT_SLOP: Duration = Duration::from_millis(100);
+/// Reap bounds a failing shutdown can spend: the first stop, the CleanupRetry
+/// and the final `OwnedProcess::Drop`.
+const SHUTDOWN_REAP_BOUNDS: u128 = 3;
 
-const EXIT_TIME_OUT_MARGIN: Duration = Duration::from_secs(3);
+/// Worst-case time for shutdown to settle a worker. A stop that fails at the
+/// group kill waits out NORMAL_GRACEFUL_STOP and then its own KILL_AND_REAP,
+/// never reaching the log drain; the CleanupRetry spends another KILL_AND_REAP
+/// and fails the same way; the unreaped owner left behind then spends a final
+/// KILL_AND_REAP in `OwnedProcess::Drop` before the supervisor can exit.
+pub const SHUTDOWN_WORST_CASE: Duration = Duration::from_millis(
+    (NORMAL_GRACEFUL_STOP.as_millis()
+        + KILL_AND_REAP.as_millis() * SHUTDOWN_REAP_BOUNDS
+        + WAIT_SLOP.as_millis()) as u64,
+);
 
-/// launchd's deadline for the supervisor to exit, with margin over the shutdown
-/// worst case.
-pub const EXIT_TIME_OUT: Duration =
-    Duration::from_secs(SHUTDOWN_WORST_CASE.as_secs() + EXIT_TIME_OUT_MARGIN.as_secs());
+/// launchd's deadline for the supervisor to exit. This is the external ceiling
+/// the whole shutdown budget has to fit under, so it is not derived from the
+/// budget it bounds.
+pub const EXIT_TIME_OUT: Duration = Duration::from_secs(35);
+/// Minimum headroom the launchd deadline keeps over the derived worst case.
+const EXIT_TIME_OUT_MARGIN: Duration = Duration::from_millis(500);
+
 /// Server-side bound on a control-loop reply, including reload validation. It
 /// does not wait for worker retirement, so it is independent of the stop budget.
 pub const CONTROL_SERVER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -64,7 +72,10 @@ pub const CONTROL_SERVER_TIMEOUT: Duration = Duration::from_secs(30);
 pub const CONTROL_CLIENT_TIMEOUT: Duration = Duration::from_secs(35);
 
 const _: () = assert!(CONTROL_CLIENT_TIMEOUT.as_secs() > CONTROL_SERVER_TIMEOUT.as_secs());
-const _: () = assert!(EXIT_TIME_OUT.as_secs() > SHUTDOWN_WORST_CASE.as_secs());
+const _: () = assert!(EXIT_TIME_OUT.as_millis() > SHUTDOWN_WORST_CASE.as_millis());
+const _: () = assert!(
+    EXIT_TIME_OUT.as_millis() >= SHUTDOWN_WORST_CASE.as_millis() + EXIT_TIME_OUT_MARGIN.as_millis()
+);
 const _: () = assert!(WATCHDOG_GRACEFUL_STOP.as_secs() < NORMAL_GRACEFUL_STOP.as_secs());
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -480,5 +491,14 @@ mod stop_budget_tests {
             "<key>ExitTimeOut</key><integer>{}</integer>",
             EXIT_TIME_OUT.as_secs()
         )));
+    }
+
+    #[test]
+    fn shutdown_budget_counts_the_grace_three_reap_bounds_and_slack() {
+        // 25 s graceful + 3 s first reap + 3 s retry reap + 3 s drop reap + 0.1 s.
+        assert_eq!(WORST_CASE_STOP, Duration::from_secs(29));
+        assert_eq!(SHUTDOWN_WORST_CASE, Duration::from_millis(34_100));
+        assert_eq!(EXIT_TIME_OUT, Duration::from_secs(35));
+        assert!(EXIT_TIME_OUT > SHUTDOWN_WORST_CASE);
     }
 }

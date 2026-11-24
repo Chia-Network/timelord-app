@@ -65,10 +65,13 @@ then up to a 1-second shared log drain; about 29 seconds worst case, within the
 35-second launchd `ExitTimeOut`). A live worker that reported a failure or
 exceeded a work deadline keeps the normal 25-second wait; only an unresponsive
 worker (no startup progress or no fresh heartbeat) gets a 2-second wait. If the
-group kill itself fails, shutdown settles the retry within a 32-second worst
-case. An in-flight Reload validation is cancelled on supervisor shutdown and its
-validator child is reaped, so shutdown stays within that budget rather than
-waiting for validation. On an existing installation the first `launchctl bootout`
+group kill itself fails, shutdown spends the 25-second wait plus a failed
+3-second reap, then a 3-second retry reap and, for an owner that still cannot be
+reaped, a final bounded 3-second drop: about 34.1 seconds worst case, still
+within the 35-second launchd `ExitTimeOut`. An in-flight Reload validation is
+cancelled on supervisor shutdown and its validator child is reaped, so shutdown
+stays within that budget rather than waiting for validation. On an existing
+installation the first `launchctl bootout`
 still runs under the old 20-second `ExitTimeOut` plist unless the service is
 paused first and its worker family has retired before bootout. Pause is persisted
 before acknowledgment; poll `status` until `phase` is `paused` and `worker_pid`

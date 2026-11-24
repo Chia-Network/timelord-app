@@ -786,7 +786,13 @@ async fn monitoring_exit(
             .take(512)
             .collect(),
     );
-    eprintln!("{}", state.monitor_error.as_deref().expect("monitor error"));
+    // A closed startup pipe (the CLI has exited) must not panic the supervisor
+    // through eprintln's write-failure panic.
+    let _ = writeln!(
+        std::io::stderr(),
+        "{}",
+        state.monitor_error.as_deref().expect("monitor error")
+    );
     state.publish(snapshots);
 }
 
