@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 # Build the macOS Swift sources for CodeQL while tracing only the compiler.
 #
-# CodeQL's Swift extractor works by injecting a tracer into every process the
-# build starts. That makes the build itself (SwiftPM planning, the manifest
-# sandbox, linking) many times slower, and on this package it spends most of
-# the step in a long silent pause before SwiftPM prints anything.
+# CodeQL's Swift extractor injects a tracer into every process the build
+# starts. Running SwiftPM under that tracer costs several minutes in a silent
+# pause before it prints anything, and on this package the extraction of the
+# few source files is cheaper than that planning overhead.
 #
-# This script clears DYLD_INSERT_LIBRARIES so SwiftPM plans and links natively,
-# and builds through a shadow copy of the active toolchain whose swiftc is a
-# wrapper that starts the compiler under the tracer. The wrapper carries the
-# CodeQL variables itself because SwiftPM starts the manifest compiler with a
-# reduced environment.
+# Instead of driving SwiftPM, compile the two modules directly through a
+# swiftc wrapper that loads the tracer. There are only two compiler
+# invocations, both use whole-module compilation, and neither needs linking:
+# CodeQL only needs the compiler to see the sources.
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -23,47 +22,24 @@ unset DYLD_INSERT_LIBRARIES
 : "${SEMMLE_PRELOAD_libtrace:?CodeQL tracing is not initialized}"
 
 scratch="build/codeql-swift"
-swiftc="$(xcrun --find swiftc)"
-case "$swiftc" in
-    *.xctoolchain/usr/bin/swiftc) ;;
-    *)
-        echo "error: xcrun did not locate an Xcode toolchain compiler (got $swiftc)" >&2
-        exit 1
-        ;;
-esac
 mkdir -p "$scratch"
 scratch="$(cd "$scratch" && pwd)"
-toolchain="$scratch/toolchain"
-shadow_swiftc="$toolchain/usr/bin/swiftc"
+wrapper="$scratch/bin/swiftc"
 wrapper_calls="$scratch/wrapper-calls"
-real_toolchain="$(dirname "$(dirname "$(dirname "$swiftc")")")"
+modules="$scratch/modules"
+objects="$scratch/objects"
+module_cache="$scratch/module-cache"
+rm -rf "${scratch:?}/bin" "${modules:?}" "${objects:?}" "${module_cache:?}"
+mkdir -p "$scratch/bin" "$modules" "$objects" "$module_cache"
 
-# The shadow toolchain is a symlink farm around the active Xcode toolchain with
-# one difference: usr/bin/swiftc is the tracing wrapper. Keeping the wrapper's
-# name exactly "swiftc" matters because the Swift driver validates argv[0].
-rm -rf "$toolchain"
-mkdir -p "$toolchain/usr/bin"
-for entry in "$real_toolchain"/*; do
-    name="$(basename "$entry")"
-    [[ "$name" == usr ]] && continue
-    ln -s "$entry" "$toolchain/$name"
-done
-for entry in "$real_toolchain"/usr/*; do
-    name="$(basename "$entry")"
-    [[ "$name" == bin ]] && continue
-    ln -s "$entry" "$toolchain/usr/$name"
-done
-for entry in "$real_toolchain"/usr/bin/*; do
-    name="$(basename "$entry")"
-    [[ "$name" == swiftc ]] && continue
-    ln -s "$entry" "$toolchain/usr/bin/$name"
-done
+swiftc="$(xcrun --find swiftc)"
+sdk="$(xcrun --show-sdk-path)"
+target="$(uname -m)-apple-macos14.0"
 
 # Keep every CodeQL/SEMMLE setting on the compiler wrapper, including the
 # extractor's trap and source-archive directories. Exec the compiler directly
-# with the tracer preloaded: routing every compile through the separate
-# CODEQL_RUNNER process made each compiler invocation start a fresh extractor
-# and was slower than tracing the whole build.
+# with the tracer preloaded; SwiftPM, Xcode and the separate CODEQL_RUNNER
+# process all add work that this analysis does not need.
 {
     echo '#!/bin/bash'
     printf 'printf x >> %q\n' "$wrapper_calls"
@@ -72,26 +48,45 @@ done
     done < <(compgen -e | grep -E '^(CODEQL|SEMMLE)_' || true)
     printf 'export DYLD_INSERT_LIBRARIES=%q\n' "$SEMMLE_PRELOAD_libtrace"
     printf 'exec %q "$@"\n' "$swiftc"
-} > "$shadow_swiftc"
-chmod +x "$shadow_swiftc"
+} > "$wrapper"
+chmod +x "$wrapper"
 : > "$wrapper_calls"
 
-# The native build system honours --toolchain for compilation. The default
-# Swift Build engine registers the Xcode toolchain with its build service and
-# ignores the override. Build one architecture, as CodeQL's Swift
-# documentation recommends.
-SWIFT_EXEC="$shadow_swiftc" \
-SWIFT_EXEC_MANIFEST="$shadow_swiftc" \
-    swift build \
-    --package-path apps/macos \
-    --scratch-path "$scratch" \
-    --build-system native \
-    --toolchain "$toolchain" \
-    --arch "$(uname -m)"
+presentation=()
+while IFS= read -r source; do
+    presentation+=("$source")
+done < <(find apps/macos/Sources/TimelordPresentation -name '*.swift' | sort)
+mac=()
+while IFS= read -r source; do
+    mac+=("$source")
+done < <(find apps/macos/Sources/TimelordMac -name '*.swift' | sort)
+
+common=(
+    -c -whole-module-optimization -Onone -parse-as-library
+    -sdk "$sdk"
+    -target "$target"
+    -swift-version 5
+    -D SWIFT_PACKAGE -D DEBUG
+    -Xcc -DSWIFT_PACKAGE
+    -module-cache-path "$module_cache"
+)
+
+"$wrapper" "${common[@]}" \
+    -module-name TimelordPresentation \
+    -emit-module -emit-module-path "$modules/TimelordPresentation.swiftmodule" \
+    -o "$objects/TimelordPresentation.o" \
+    "${presentation[@]}"
+
+"$wrapper" "${common[@]}" \
+    -module-name TimelordMac \
+    -I "$modules" \
+    -emit-module -emit-module-path "$modules/TimelordMac.swiftmodule" \
+    -o "$objects/TimelordMac.o" \
+    "${mac[@]}"
 
 trap_count="$(find "${CODEQL_EXTRACTOR_SWIFT_TRAP_DIR:?}" -type f | wc -l | tr -d ' ')"
 if [[ "$trap_count" -eq 0 ]]; then
-    echo "error: the traced Swift build produced no CodeQL trap files" >&2
+    echo "error: the traced Swift compilation produced no CodeQL trap files" >&2
     exit 1
 fi
 calls="$(wc -c < "$wrapper_calls" | tr -d ' ')"
