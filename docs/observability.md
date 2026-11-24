@@ -136,11 +136,12 @@ archive preserves the original reason. This signal
 catches accidental loss, not a same-UID adversary, who can remove the write-lock
 sidecar as well as the journal.
 
-Chains are `challenge`, `reward`, `infused_challenge`. Bundle kinds are `signage`,
-`infusion`, `end_of_sub_slot`. Unfinished candidate outcomes are `admitted`,
-`deferred`, `deferred_queue_full`, `duplicate`, `stale`, `ignored` and `rejected`;
-sources are `node` and `retry`. All reason/state labels use fixed enumerations;
-error text, paths, hashes, request IDs and heights are never labels.
+Chains are `challenge`, `reward`, `infused_challenge`. Bundle kinds are
+`signage`, `infusion`, `end_of_sub_slot`. Unfinished candidate outcomes are
+`admitted`, `deferred`, `deferred_queue_full`, `candidates_full`, `duplicate`,
+`stale`, `ignored` and `rejected`; sources are `node` and `retry`. All
+reason/state labels use fixed enumerations; error text, paths, hashes, request
+IDs and heights are never labels.
 
 The legacy `estimated_ips` uses existing receipt-time elapsed work and truncation
 to tenths, published only after successful native verification. It is absent

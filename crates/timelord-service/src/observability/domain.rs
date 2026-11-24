@@ -120,16 +120,18 @@ pub enum UnfinishedOutcome {
     Admitted,
     Deferred,
     DeferredQueueFull,
+    CandidatesFull,
     Duplicate,
     Stale,
     Ignored,
     Rejected,
 }
 impl UnfinishedOutcome {
-    pub(super) const ALL: [Self; 7] = [
+    pub(super) const ALL: [Self; 8] = [
         Self::Admitted,
         Self::Deferred,
         Self::DeferredQueueFull,
+        Self::CandidatesFull,
         Self::Duplicate,
         Self::Stale,
         Self::Ignored,
@@ -140,6 +142,7 @@ impl UnfinishedOutcome {
             Self::Admitted => "admitted",
             Self::Deferred => "deferred",
             Self::DeferredQueueFull => "deferred_queue_full",
+            Self::CandidatesFull => "candidates_full",
             Self::Duplicate => "duplicate",
             Self::Stale => "stale",
             Self::Ignored => "ignored",
