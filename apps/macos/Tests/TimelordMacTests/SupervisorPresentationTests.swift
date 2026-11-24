@@ -194,6 +194,127 @@ final class SupervisorPresentationTests: XCTestCase {
         XCTAssertEqual(fixture.controller.supervisor?.phase, .paused)
         XCTAssertNotNil(fixture.controller.errorMessage)
     }
+
+    func testStatusFailureSurfacesStderrAndDoesNotRetry() async throws {
+        let fixture = try StatusFixture(statusFails: true)
+        defer { fixture.close() }
+        await fixture.controller.refresh()
+        XCTAssertEqual(fixture.controller.errorMessage,
+            "Background supervision unavailable: status fixture failed")
+        XCTAssertEqual(try fixture.loggedCommands().filter { $0.hasPrefix("status") }.count, 1,
+            "A failed status poll must fail fast instead of hiding the diagnostic behind retries")
+    }
+
+    func testSuccessfulSaveKeepsUnresolvedStartupErrorVisible() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        let configuration = runnableConfiguration()
+        try fixture.writeConfiguration(configuration)
+        let model = fixture.model(configuration)
+        try fixture.setStartupFailure(true)
+        await model.restoreStartupIntent()
+        XCTAssertEqual(model.errorMessage, "startup fixture failed")
+
+        let saved = await model.saveConfiguration()
+        XCTAssertTrue(saved, "A persistent startup failure is not a save failure")
+        XCTAssertEqual(model.errorMessage, "startup fixture failed", "A successful save must not hide startup failure")
+        let finished = await model.finishSettings()
+        XCTAssertTrue(finished, "The startup error must not block settings")
+        XCTAssertEqual(model.errorMessage, "startup fixture failed")
+
+        await model.testNode()
+        XCTAssertEqual(model.connectionResult, "Authenticated fixture node.")
+        XCTAssertEqual(model.errorMessage, "startup fixture failed", "The startup error must not block a connection test")
+        await model.discoverBoards()
+        XCTAssertFalse(model.discoveredDevices.isEmpty)
+        XCTAssertEqual(model.errorMessage, "startup fixture failed", "The startup error must not block board discovery")
+
+        try fixture.setStartupFailure(false)
+        try fixture.publish(mode: "paused", phase: "paused")
+        await model.refresh()
+        XCTAssertTrue(model.canControlService)
+        XCTAssertNil(model.errorMessage, "Contact with the supervisor resolves the startup error")
+    }
+
+    func testFailedSaveKeepsPersistedStateAndPendingRestart() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        let configuration = runnableConfiguration(host: "first.fixture")
+        try fixture.writeConfiguration(configuration)
+        try fixture.publish(mode: "running", phase: "worker_started")
+        let model = fixture.model(configuration)
+        await model.refresh()
+        XCTAssertTrue(model.canControlService)
+
+        model.configuration.node.host = "second.fixture"
+        let firstSave = await model.saveConfiguration()
+        XCTAssertTrue(firstSave)
+        XCTAssertTrue(model.configurationNeedsRestart)
+        let persisted = model.savedConfiguration
+        XCTAssertEqual(persisted.node.host, "second.fixture")
+
+        model.configuration.node.host = "third.fixture"
+        try fixture.setSaveFailure(true)
+        let failedSave = await model.saveConfiguration()
+        XCTAssertFalse(failedSave)
+        XCTAssertEqual(model.errorMessage, "configuration fixture failed")
+        XCTAssertEqual(model.savedConfiguration, persisted, "A failed save must not adopt the rejected draft")
+        XCTAssertTrue(model.configurationNeedsRestart, "A failed save must not clear the pending restart")
+        XCTAssertTrue(model.hasUnsavedSettings)
+        XCTAssertEqual(model.settingsCompletionHint,
+            "Save & Restart switches the full-node connection. ASIC boards keep running.",
+            "A failed save must not turn a node-only change into a full restart")
+    }
+
+    func testProfileSwitchAndActiveProfileEditRequireRestart() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        let main = runnableConfiguration(host: "main.fixture").node
+        var other = runnableConfiguration(host: "other.fixture").node
+        other.certificate = "/fixture/other.crt"
+        var profiles = ConnectionProfiles(); profiles.activeId = "main"
+        profiles.profiles = [
+            ConnectionProfile(id: "main", name: "Main", node: main),
+            ConnectionProfile(id: "other", name: "Other", node: other),
+        ]
+        var configuration = AppConfiguration(); configuration.connections = profiles
+        try fixture.writeConfiguration(configuration)
+        try fixture.publish(mode: "running", phase: "worker_started")
+        let model = fixture.model(configuration)
+        await model.refresh()
+        XCTAssertTrue(model.canControlService)
+        XCTAssertEqual(model.settingsDoneTitle, "Done")
+
+        model.selectConnectionProfile("other")
+        XCTAssertTrue(model.hasUnsavedSettings)
+        XCTAssertEqual(model.settingsDoneTitle, "Save & Restart")
+        let switched = await model.finishSettings()
+        XCTAssertTrue(switched)
+        XCTAssertTrue(try fixture.loggedCommands().contains { $0.hasPrefix("reload ") },
+            "Switching the active profile must reload the running service")
+
+        try fixture.publish(mode: "paused", phase: "paused")
+        await model.refresh()
+        XCTAssertEqual(model.settingsDoneTitle, "Done")
+        model.configuration.node.host = "edited-other.fixture"
+        XCTAssertEqual(model.settingsDoneTitle, "Save & Apply")
+        let reloads = try fixture.loggedCommands().filter { $0.hasPrefix("reload ") }.count
+        let applied = await model.finishSettings()
+        XCTAssertTrue(applied)
+        XCTAssertEqual(try fixture.loggedCommands().filter { $0.hasPrefix("reload ") }.count, reloads + 1,
+            "Editing the active profile must apply the saved configuration to a paused service")
+    }
+
+    private func runnableConfiguration(host: String = "fixture.node") -> AppConfiguration {
+        var configuration = AppConfiguration()
+        configuration.node.host = host
+        configuration.node.certificate = "/fixture/cert"
+        configuration.node.privateKey = "/fixture/key"
+        configuration.node.caCertificate = "/fixture/ca"
+        configuration.hardware.clientBinary = "/fixture/client"
+        configuration.hardware.boards = [ConfiguredBoard(id: "fixture", name: "Fixture", port: 18110, location: 1)]
+        return configuration
+    }
 }
 
 /// A CLI-only supervisor fixture: no worker, launchd, hardware, or TCP listener.
@@ -201,20 +322,51 @@ final class SupervisorPresentationTests: XCTestCase {
 private final class StatusFixture {
     let directory: URL
     let response: URL
+    let configurationURL: URL
     let controller: ServiceController
-    init(endpoint: URL = URL(string: "http://127.0.0.1:0/v1/status")!, pauseFails: Bool = false) throws {
+    private let commands: URL
+    private let statusFailure: URL
+    private let pauseFailure: URL
+    private let startupFailure: URL
+    private let saveFailure: URL
+
+    init(endpoint: URL = URL(string: "http://127.0.0.1:0/v1/status")!, pauseFails: Bool = false, statusFails: Bool = false) throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent("supervisor-presentation-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         response = directory.appendingPathComponent("status.json")
+        configurationURL = directory.appendingPathComponent("configuration.json")
+        commands = directory.appendingPathComponent("commands.log")
+        statusFailure = directory.appendingPathComponent("fail-status")
+        pauseFailure = directory.appendingPathComponent("fail-pause")
+        startupFailure = directory.appendingPathComponent("fail-startup")
+        saveFailure = directory.appendingPathComponent("fail-save")
+        if pauseFails { try Data().write(to: pauseFailure) }
+        if statusFails { try Data().write(to: statusFailure) }
+        try Self.write(AppConfiguration(), to: configurationURL)
         let helper = directory.appendingPathComponent("helper")
-        let pauseResult = pauseFails ? "exit 1" : "cat '\(response.path)'"
         let script = """
         #!/bin/sh
+        printf '%s\\n' "$*" >> '\(commands.path)'
         case "$1" in
-          status) cat '\(response.path)' ;;
+          status)
+            if [ -f '\(statusFailure.path)' ]; then
+              printf '%s\\n' 'status fixture failed' >&2
+              exit 1
+            fi
+            cat '\(response.path)' ;;
+          ensure-started)
+            if [ -f '\(startupFailure.path)' ]; then
+              printf '%s\\n' 'startup fixture failed' >&2
+              exit 1
+            fi
+            printf '%s' '{"api_version":1,"supervisor_pid":123,"worker_pid":null,"mode":"paused","revision":1,"worker_generation":0,"restarts":0,"phase":"paused"}' ;;
           pause)
             printf '%s' '{"api_version":1,"supervisor_pid":123,"mode":"paused","revision":2,"worker_generation":1,"restarts":0,"phase":"paused"}' > '\(response.path)'
-            \(pauseResult) ;;
+            if [ -f '\(pauseFailure.path)' ]; then
+              printf '%s\\n' 'pause fixture failed' >&2
+              exit 1
+            fi
+            cat '\(response.path)' ;;
           resume)
             printf '%s' '{"api_version":1,"supervisor_pid":123,"mode":"running","revision":2,"worker_generation":1,"restarts":0,"phase":"starting"}' > '\(response.path)'
             cat '\(response.path)' ;;
@@ -222,16 +374,50 @@ private final class StatusFixture {
             sleep 1
             printf '%s' '{"api_version":1,"supervisor_pid":123,"mode":"paused","revision":2,"worker_generation":2,"restarts":0,"phase":"paused"}' > '\(response.path)'
             cat '\(response.path)' ;;
+          configuration)
+            cat '\(configurationURL.path)' ;;
+          configure)
+            if [ -f '\(saveFailure.path)' ]; then
+              printf '%s\\n' 'configuration fixture failed' >&2
+              exit 1
+            fi
+            previous=
+            for argument in "$@"; do
+              if [ "$previous" = "--input" ]; then cp "$argument" '\(configurationURL.path)'; break; fi
+              previous=$argument
+            done ;;
           devices) printf '%s' '[{"name":"Fixture","location":1}]' ;;
-          *) exit 1 ;;
+          test-node) printf '%s' '{"authenticated":true,"message":"Authenticated fixture node."}' ;;
+          *) printf 'unsupported fixture command: %s\\n' "$*" >&2; exit 1 ;;
         esac
         """
         try Data(script.utf8).write(to: helper)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
-        controller = ServiceController(configURL: directory.appendingPathComponent("config.toml"), logsURL: directory.appendingPathComponent("log"), helperURL: helper, endpoint: endpoint, supervisorURL: helper)
+        controller = ServiceController(
+            configURL: directory.appendingPathComponent("config.toml"),
+            logsURL: directory.appendingPathComponent("log"),
+            helperURL: helper, endpoint: endpoint, supervisorURL: helper)
     }
     func model(_ configuration: AppConfiguration) -> TimelordModel {
         TimelordModel(controller: controller, initialConfiguration: configuration, monitoringEnabled: false)
+    }
+    func writeConfiguration(_ configuration: AppConfiguration) throws {
+        try Self.write(configuration, to: configurationURL)
+    }
+    private static func write(_ configuration: AppConfiguration, to url: URL) throws {
+        let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
+        try encoder.encode(configuration).write(to: url)
+    }
+    func loggedCommands() throws -> [String] {
+        guard FileManager.default.fileExists(atPath: commands.path) else { return [] }
+        return try String(contentsOf: commands, encoding: .utf8)
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+    }
+    func setStartupFailure(_ enabled: Bool) throws { try setMarker(startupFailure, enabled) }
+    func setSaveFailure(_ enabled: Bool) throws { try setMarker(saveFailure, enabled) }
+    private func setMarker(_ url: URL, _ enabled: Bool) throws {
+        if enabled { try Data().write(to: url) } else { try? FileManager.default.removeItem(at: url) }
     }
     func publish(mode: String, phase: String, error: String? = nil, workerPID: Int? = nil) throws {
         var status: [String: Any] = ["api_version": 1, "supervisor_pid": 123, "mode": mode, "revision": 1, "worker_generation": 1, "restarts": 0, "phase": phase]

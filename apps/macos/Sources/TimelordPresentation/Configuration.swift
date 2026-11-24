@@ -25,6 +25,21 @@ public struct AppConfiguration: Codable, Sendable, Equatable {
             }
         }
     }
+    /// An RPC draft with missing credentials is UI state, not a saved setting.
+    /// Dropping it here keeps profile switches and saves valid without forcing
+    /// every caller to know the full-node validation rules.
+    public func normalizedForPersistence() -> Self {
+        var normalized = self
+        if var profiles = normalized.connections, !profiles.profiles.isEmpty {
+            for index in profiles.profiles.indices {
+                profiles.profiles[index].node.discardIncompleteRPC()
+            }
+            normalized.connections = profiles
+        } else {
+            normalized.node.discardIncompleteRPC()
+        }
+        return normalized
+    }
     private var activeProfileIndex: Int? {
         guard let connections else { return nil }
         return connections.profiles.firstIndex { $0.id == connections.activeId }
@@ -101,6 +116,10 @@ public struct NodeConfiguration: Codable, Sendable, Equatable {
     public var rpc: NodeRPCConfiguration?
     public init() {}
     public var hasIdentity: Bool { certificate != nil && privateKey != nil && caCertificate != nil }
+    /// The service accepts RPC only when every endpoint and credential is set.
+    public mutating func discardIncompleteRPC() {
+        if rpc?.isComplete != true { rpc = nil }
+    }
 }
 public struct NetworkDefinition: Codable, Sendable, Equatable {
     public var schemaVersion: Int
@@ -150,6 +169,16 @@ public struct NodeRPCConfiguration: Codable, Sendable, Equatable {
                 certificate: String = "", privateKey: String = "", caCertificate: String = "") {
         self.host = host; self.port = port; self.serverName = serverName
         self.certificate = certificate; self.privateKey = privateKey; self.caCertificate = caCertificate
+    }
+    /// Mirrors `NodeConfig::validate` in `timelord-core`: a partial RPC profile
+    /// would make the whole connection profile unsavable.
+    public var isComplete: Bool {
+        !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && port != 0
+            && !serverName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && ![certificate, privateKey, caCertificate].contains {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
     }
 }
 public struct ServiceConfiguration: Codable, Sendable, Equatable {
