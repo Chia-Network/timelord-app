@@ -57,7 +57,7 @@ impl Default for Timing {
             restart: [1, 5, 30].map(Duration::from_secs),
             absent: Duration::from_secs(5),
             liveness: Duration::from_secs(crate::hardware::LIVENESS_TIMEOUT_SECONDS),
-            canary: Duration::from_secs(native::CANARY_SECONDS),
+            canary: Duration::from_secs(native::supervision::CANARY_SECONDS),
         }
     }
 }
