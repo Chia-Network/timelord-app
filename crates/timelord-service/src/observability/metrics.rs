@@ -64,15 +64,23 @@ fn registered<M: Collector + Clone + 'static>(registry: &Registry, metric: M) ->
     registry.register(Box::new(metric.clone()))?;
     Ok(metric)
 }
+fn counter_vec(
+    registry: &Registry,
+    name: &str,
+    help: &str,
+    labels: &[&str],
+) -> Result<IntCounterVec> {
+    registered(registry, IntCounterVec::new(Opts::new(name, help), labels)?)
+}
+/// Timestamp gauges stay absent until their first observation. An untouched
+/// gauge vector has no series, which is deliberate: exporting 0 would claim
+/// the event happened at the Unix epoch.
 #[derive(Clone)]
 struct EventTimestamp(IntGaugeVec);
 impl EventTimestamp {
     fn new(name: &str, help: &str, labels: &[&str]) -> Result<Self> {
         Ok(Self(IntGaugeVec::new(Opts::new(name, help), labels)?))
     }
-    /// Timestamp gauges stay absent until their first observation. An untouched
-    /// gauge vector has no series, which is deliberate: exporting 0 would claim
-    /// the event happened at the Unix epoch.
     fn record(&self, labels: &[&str]) {
         self.0
             .with_label_values(labels)
@@ -117,99 +125,79 @@ impl Metrics {
         ];
         let metrics = Arc::new(Self {
             current: Default::default(),
-            proofs_verified_total: registered(
+            proofs_verified_total: counter_vec(
                 &registry,
-                IntCounterVec::new(
-                    Opts::new("proofs_verified_total", "proofs verified total"),
-                    &["chain"],
-                )?,
+                "proofs_verified_total",
+                "proofs verified total",
+                &["chain"],
             )?,
-            proof_verification_failures_total: registered(
+            proof_verification_failures_total: counter_vec(
                 &registry,
-                IntCounterVec::new(
-                    Opts::new(
-                        "proof_verification_failures_total",
-                        "proof verification failures total",
-                    ),
-                    &["chain"],
-                )?,
+                "proof_verification_failures_total",
+                "proof verification failures total",
+                &["chain"],
             )?,
-            submissions_total: registered(
+            submissions_total: counter_vec(
                 &registry,
-                IntCounterVec::new(
-                    Opts::new("submissions_total", "submissions total"),
-                    &["kind"],
-                )?,
+                "submissions_total",
+                "submissions total",
+                &["kind"],
             )?,
-            unfinished_candidates_total: registered(
+            unfinished_candidates_total: counter_vec(
                 &registry,
-                IntCounterVec::new(
-                    Opts::new(
-                        "unfinished_candidates_total",
-                        "unfinished candidate admission outcomes total",
-                    ),
-                    &["outcome", "source"],
-                )?,
+                "unfinished_candidates_total",
+                "unfinished candidate admission outcomes total",
+                &["outcome", "source"],
             )?,
             topology_changes_total: registered(
                 &registry,
                 IntCounter::new("topology_changes_total", "topology changes total")?,
             )?,
-            asic_recoveries_total: registered(
+            asic_recoveries_total: counter_vec(
                 &registry,
-                IntCounterVec::new(
-                    Opts::new("asic_recoveries_total", "asic recoveries total"),
-                    &["board", "engine"],
-                )?,
+                "asic_recoveries_total",
+                "asic recoveries total",
+                &["board", "engine"],
             )?,
-            client_restarts_total: registered(
+            client_restarts_total: counter_vec(
                 &registry,
-                IntCounterVec::new(
-                    Opts::new("client_restarts_total", "client restarts total"),
-                    &["board", "reason"],
-                )?,
+                "client_restarts_total",
+                "client restarts total",
+                &["board", "reason"],
             )?,
-            thermal_stops_total: registered(
+            thermal_stops_total: counter_vec(
                 &registry,
-                IntCounterVec::new(
-                    Opts::new("thermal_stops_total", "thermal stops total"),
-                    &["board"],
-                )?,
+                "thermal_stops_total",
+                "thermal stops total",
+                &["board"],
             )?,
             node_reconnects_total: registered(
                 &registry,
                 IntCounter::new("node_reconnects_total", "node reconnects total")?,
             )?,
-            peak_updates_total: registered(
+            peak_updates_total: counter_vec(
                 &registry,
-                IntCounterVec::new(
-                    Opts::new("peak_updates_total", "peak updates total"),
-                    &["result"],
-                )?,
+                "peak_updates_total",
+                "peak updates total",
+                &["result"],
             )?,
-            work_cancelled_total: registered(
+            work_cancelled_total: counter_vec(
                 &registry,
-                IntCounterVec::new(
-                    Opts::new("work_cancelled_total", "work cancelled total"),
-                    &["chain"],
-                )?,
+                "work_cancelled_total",
+                "work cancelled total",
+                &["chain"],
             )?,
-            vdf_sessions_started_total: registered(
+            vdf_sessions_started_total: counter_vec(
                 &registry,
-                IntCounterVec::new(
-                    Opts::new("vdf_sessions_started_total", "vdf sessions started total"),
-                    &["chain", "reason"],
-                )?,
+                "vdf_sessions_started_total",
+                "vdf sessions started total",
+                &["chain", "reason"],
             )?,
-            operating_point_changes_total: registered(
+            operating_point_changes_total: counter_vec(
                 &registry,
-                IntCounterVec::new(
-                    Opts::new(
-                        "operating_point_changes_total",
-                        "operating point changes total",
-                    ),
-                    &["board", "reason"],
-                )?,
+                "operating_point_changes_total",
+                "operating point changes total",
+                &["board", "reason"],
             )?,
             last_verified_proof_timestamp_seconds: registered(
                 &registry,
@@ -268,39 +256,27 @@ impl Metrics {
             last: Mutex::new(Last::default()),
             ever_connected: AtomicBool::new(false),
             clients_started: Mutex::new(BTreeSet::new()),
-            board_failures_total: registered(
+            board_failures_total: counter_vec(
                 &registry,
-                IntCounterVec::new(
-                    Opts::new(
-                        "board_failures_total",
-                        "Native owner failures counted against board reliability",
-                    ),
-                    &["board"],
-                )?,
+                "board_failures_total",
+                "Native owner failures counted against board reliability",
+                &["board"],
             )?,
-            safety_journal_resets_total: registered(
+            safety_journal_resets_total: counter_vec(
                 &registry,
-                IntCounterVec::new(
-                    Opts::new(
-                        "safety_journal_resets_total",
-                        "Processes that found a previously written but now absent or unreadable board safety journal and started from cautious defaults; at most 1 per process, exported only by the process that reported the reset, so use the raw value, not increase()",
-                    ),
-                    &["reason"],
-                )?,
+                "safety_journal_resets_total",
+                "Processes that found a previously written but now absent or unreadable board safety journal and started from cautious defaults; at most 1 per process, exported only by the process that reported the reset, so use the raw value, not increase()",
+                &["reason"],
             )?,
             chain_moves_total: registered(
                 &registry,
                 IntCounter::new("chain_moves_total", "Chains moved between boards")?,
             )?,
-            delayed_bundles_total: registered(
+            delayed_bundles_total: counter_vec(
                 &registry,
-                IntCounterVec::new(
-                    Opts::new(
-                        "delayed_bundles_total",
-                        "Verified chain proofs that waited over 10 seconds for their bundle partner",
-                    ),
-                    &["chain"],
-                )?,
+                "delayed_bundles_total",
+                "Verified chain proofs that waited over 10 seconds for their bundle partner",
+                &["chain"],
             )?,
             network: Mutex::new(network),
             registry,
@@ -349,14 +325,14 @@ impl Metrics {
                 .with_label_values(labels)
                 .get(),
             "topology_changes_total" => {
-                debug_assert!(labels.is_empty());
+                assert!(labels.is_empty());
                 self.topology_changes_total.get()
             }
             "asic_recoveries_total" => self.asic_recoveries_total.with_label_values(labels).get(),
             "client_restarts_total" => self.client_restarts_total.with_label_values(labels).get(),
             "thermal_stops_total" => self.thermal_stops_total.with_label_values(labels).get(),
             "node_reconnects_total" => {
-                debug_assert!(labels.is_empty());
+                assert!(labels.is_empty());
                 self.node_reconnects_total.get()
             }
             "peak_updates_total" => self.peak_updates_total.with_label_values(labels).get(),
@@ -367,7 +343,7 @@ impl Metrics {
                 .get(),
             "board_failures_total" => self.board_failures_total.with_label_values(labels).get(),
             "chain_moves_total" => {
-                debug_assert!(labels.is_empty());
+                assert!(labels.is_empty());
                 self.chain_moves_total.get()
             }
             "operating_point_changes_total" => self

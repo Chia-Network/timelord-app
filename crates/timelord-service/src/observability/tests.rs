@@ -499,6 +499,8 @@ fn process_totals_and_label_less_metrics_keep_their_exposition() {
         );
     }
     for name in [
+        "chia_timelord_last_verified_proof_timestamp_seconds",
+        "chia_timelord_last_submission_timestamp_seconds",
         "chia_timelord_last_node_message_timestamp_seconds",
         "chia_timelord_last_peak_received_timestamp_seconds",
     ] {
