@@ -24,6 +24,8 @@ mod service;
 mod status_api;
 #[cfg(test)]
 mod test_pki;
+#[cfg(test)]
+mod test_scripts;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};

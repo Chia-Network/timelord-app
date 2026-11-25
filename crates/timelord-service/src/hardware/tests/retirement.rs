@@ -80,7 +80,6 @@ async fn failed_spawn_closes_the_unopened_journal_owner_without_a_cautious_start
 
 #[tokio::test]
 async fn first_handshake_retirement_distinguishes_cancellation_failure_and_confirmation() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("tl-handshake-stop-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     for (confirmed, rejection, prior_fault) in [
@@ -96,9 +95,9 @@ async fn first_handshake_retirement_distinguishes_cancellation_failure_and_confi
         let variant = rejection.unwrap_or("none");
         let binary = dir.join(format!("client-{confirmed}-{variant}-{prior_fault}"));
         let started = binary.with_extension("started");
-        std::fs::write(
+        crate::test_scripts::write_executable_script(
             &binary,
-            format!(
+            &format!(
                 r#"#!/bin/sh
 read command version id frequency voltage
 printf 'started' > '{}'
@@ -113,15 +112,19 @@ cat >/dev/null
                     .unwrap_or_default(),
                 if confirmed {
                     // The clean cancellation fixture exercises native CRLF too.
-                    let ending = if !rejected && !prior_fault { "\\r\\n" } else { "\\n" };
-                    format!("printf '%s{ending}' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2")
+                    let ending = if !rejected && !prior_fault {
+                        "\\r\\n"
+                    } else {
+                        "\\n"
+                    };
+                    format!(
+                        "printf '%s{ending}' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2"
+                    )
                 } else {
                     String::new()
                 }
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let board: BoardConfig = toml::from_str("id='handshake'\nname='Handshake'\nserial='fixture'\nclient_port=18110\ndevice_location=1\nprofile='manual'").unwrap();
         let mut config = Config::default();
         config.hardware.client_binary = Some(binary);

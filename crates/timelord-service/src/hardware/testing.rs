@@ -83,7 +83,6 @@ impl Rig {
         format!("{}{index}", self.prefix)
     }
     pub async fn new(name: &str, count: u32, profile: &str, known: bool) -> Self {
-        use std::os::unix::fs::PermissionsExt;
         // Rigs run one at a time: each runs several shell clients emitting
         // telemetry, and timing assertions need an unloaded host.
         static EXCLUSIVE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -103,8 +102,7 @@ impl Rig {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let binary = dir.join("client");
-        std::fs::write(&binary, CLIENT).unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_scripts::write_executable_script(&binary, CLIENT);
         let mut config = Config::default();
         config.hardware.client_binary = Some(binary.clone());
         config.hardware.automatic_state = Some(dir.join("automatic-profiles.json"));

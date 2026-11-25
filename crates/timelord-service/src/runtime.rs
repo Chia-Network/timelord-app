@@ -162,7 +162,7 @@ fn log_admission(
     hash: Option<dg_xch_core::blockchain::sized_bytes::Bytes32>,
 ) {
     let source = source.label();
-    let hash = hash.map(tracing::field::display);
+    let logged_hash = hash.map(tracing::field::display);
     match admission {
         Admission::Admitted(hash) => match proof_version {
             Some(proof_version) => {
@@ -177,11 +177,15 @@ fn log_admission(
             )
         }
         Admission::DeferredQueueFull => {
-            tracing::warn!(source, hash, "Deferred unfinished block queue is full")
+            tracing::warn!(
+                source,
+                hash = logged_hash,
+                "Deferred unfinished block queue is full"
+            )
         }
         Admission::CandidatesFull => tracing::warn!(
             source,
-            hash,
+            hash = logged_hash,
             "Unfinished block matches the current peak but the scheduled-candidate set is full"
         ),
         Admission::Duplicate => tracing::debug!(source, "Ignored duplicate unfinished block"),

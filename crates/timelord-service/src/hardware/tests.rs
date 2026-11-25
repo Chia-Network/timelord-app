@@ -63,11 +63,10 @@ fn handoff_preserves_last_raw_value_without_refreshing_its_age_or_calling_it_cur
 use super::*;
 #[tokio::test]
 async fn live_backoff_drains_a_full_stderr_pipe_before_acknowledgement() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("tl-storm-pipe-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let binary = dir.join("client");
-    std::fs::write(
+    crate::test_scripts::write_executable_script(
         &binary,
         r#"#!/bin/sh
 if [ "$1" = --control-frequencies ]; then echo '[1430,1450,1460]'; exit 0; fi
@@ -82,9 +81,7 @@ while read command version id frequency voltage; do
  printf 'TLACK 1 %s %s %s\n' "$id" "$frequency" "$voltage"
 done
 "#,
-    )
-    .unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
     let mut config: Config = toml::from_str("[[hardware.boards]]\nid='storm'\nname='Storm'\nclient_port=18110\ndevice_location=1\nserial='fixture-only'\n").unwrap();
     config.hardware.client_binary = Some(binary.clone());
     let board = config.hardware.boards[0].clone();
@@ -108,13 +105,13 @@ done
         crate::unix_now(),
     )
     .routed_by_config();
-    let mut child = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
+        .kill_on_drop(true);
+    let mut child = command.spawn().unwrap();
     let mut owner = NativeOwner::attach(&board, &mut child).unwrap();
     let startup = startup(&shared, &board).await.unwrap();
     let mut log = ClientLog::new(child.stderr.take().unwrap());
@@ -153,11 +150,10 @@ done
 
 #[tokio::test]
 async fn initialization_drains_a_full_stderr_pipe_before_the_first_acknowledgement() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("tl-init-storm-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let binary = dir.join("client");
-    std::fs::write(
+    crate::test_scripts::write_executable_script(
         &binary,
         r#"#!/bin/sh
 if [ "$1" = --control-frequencies ]; then echo '[1430,1450,1460]'; exit 0; fi
@@ -170,9 +166,7 @@ while read command version id frequency voltage; do
  printf 'TLACK 1 %s %s %s\n' "$id" "$frequency" "$voltage"
 done
 "#,
-    )
-    .unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
     let mut config: Config = toml::from_str("[[hardware.boards]]\nid='storm-init'\nname='Storm init'\nclient_port=18110\ndevice_location=1\nprofile='manual'\n").unwrap();
     config.hardware.client_binary = Some(binary.clone());
     let board = config.hardware.boards[0].clone();
@@ -188,13 +182,13 @@ done
         crate::unix_now(),
     )
     .routed(assignments);
-    let mut child = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
+        .kill_on_drop(true);
+    let mut child = command.spawn().unwrap();
     let mut owner = NativeOwner::attach(&board, &mut child).unwrap();
     let startup = startup(&shared, &board).await.unwrap();
     let mut log = ClientLog::new(child.stderr.take().unwrap());
@@ -312,11 +306,10 @@ async fn healthy_journal_failure_does_not_fail_profile_record_or_retire_owner() 
 
 #[tokio::test]
 async fn eof_drains_large_native_output_and_reaps_a_confirmed_owner() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("tl-eof-drain-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let binary = dir.join("client");
-    std::fs::write(
+    crate::test_scripts::write_executable_script(
         &binary,
         r#"#!/bin/sh
 while read command version id frequency voltage; do
@@ -330,9 +323,7 @@ while [ "$n" -lt 4000 ]; do
 done
 printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
 "#,
-    )
-    .unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
     let board: BoardConfig = toml::from_str(
         "id='eof'\nname='EOF'\nclient_port=18110\ndevice_location=1\nprofile='manual'",
     )
@@ -424,18 +415,19 @@ fn live_thermal_rejection_survives_retirement_checkpoint_and_policy_restore() {
 
 #[tokio::test]
 async fn thermal_shutdown_does_not_wait_for_the_safety_journal() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("tl-thermal-journal-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let binary = dir.join("client");
-    std::fs::write(&binary,r#"#!/bin/sh
+    crate::test_scripts::write_executable_script(
+        &binary,
+        r#"#!/bin/sh
 while read command version id frequency voltage; do
  printf 'TLACK 1 %s %s %s\n' "$id" "$frequency" "$voltage"
  printf '%s\n' 'Connected to timelord, waiting for challenge' 'ASIC Temp = 60 C; Frequency = 1450 MHz' >&2
 done
 printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
-"#).unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+"#,
+    );
     let board:BoardConfig=toml::from_str("id='hot'\nname='Hot'\nserial='fixture'\nclient_port=18110\ndevice_location=1\nprofile='manual'").unwrap();
     let mut config = Config::default();
     config.hardware.client_binary = Some(binary);
@@ -518,11 +510,10 @@ printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
 
 #[tokio::test]
 async fn thermal_trip_during_initialization_records_exactly_one_stop() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("tl-init-thermal-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let binary = dir.join("client");
-    std::fs::write(
+    crate::test_scripts::write_executable_script(
         &binary,
         r#"#!/bin/sh
 while read command version id frequency voltage; do
@@ -532,9 +523,7 @@ while read command version id frequency voltage; do
 done
 printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
 "#,
-    )
-    .unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
     let board: BoardConfig = toml::from_str("id='hot-init'\nname='Hot init'\nserial='fixture'\nclient_port=18110\ndevice_location=1\nprofile='manual'").unwrap();
     let mut config = Config::default();
     config.hardware.client_binary = Some(binary);

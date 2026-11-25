@@ -71,7 +71,6 @@ pub(super) async fn establish(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     #[tokio::test]
@@ -117,18 +116,23 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let helper = directory.join("client");
         let commands = directory.join("commands");
-        std::fs::write(&helper,format!(r#"#!/bin/sh
-while read command version id frequency voltage; do
- printf '%s\n' "$command $id $frequency $voltage" >> '{}'
- if [ "$command" = TLSTOP ]; then
-  printf 'TLSTOPACK 1 %s 1 1\n' "$id"
-  exit 0
- fi
- printf 'TLACK 1 %s %s %s\n' "$id" "$frequency" "$voltage"
- printf '%s\n' 'Connected to timelord, waiting for challenge' 'ASIC Temp = {temperature} C; Frequency = 1450 MHz' >&2
-done
-"#,commands.display())).unwrap();
-        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_scripts::write_executable_script(
+            &helper,
+            &format!(
+                r#"#!/bin/sh
+ while read command version id frequency voltage; do
+  printf '%s\n' "$command $id $frequency $voltage" >> '{}'
+  if [ "$command" = TLSTOP ]; then
+   printf 'TLSTOPACK 1 %s 1 1\n' "$id"
+   exit 0
+  fi
+  printf 'TLACK 1 %s %s %s\n' "$id" "$frequency" "$voltage"
+  printf '%s\n' 'Connected to timelord, waiting for challenge' 'ASIC Temp = {temperature} C; Frequency = 1450 MHz' >&2
+ done
+ "#,
+                commands.display()
+            ),
+        );
         let mut config = Config::default();
         config.hardware.boards.push(toml::from_str("id='warm'\nname='Warm'\nserial='warm-fixture'\ndevice_location=1\nprofile='manual'\nclient_port=18110\nfrequency_mhz=1450.0\nvoltage_v=1.0").unwrap());
         config.hardware.client_binary = Some(helper.clone());
@@ -163,13 +167,13 @@ done
         );
         let startup = startup(&shared, &board).await.unwrap();
         store.begin_owner("warm-fixture", startup.point).unwrap();
-        let child = Command::new(&helper)
+        let mut command = Command::new(&helper);
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
+            .kill_on_drop(true);
+        let child = command.spawn().unwrap();
         let pid = child.id().unwrap();
         let (stop, rx) = watch::channel(false);
         let initialization: &'static tokio::sync::Mutex<()> =

@@ -1,13 +1,20 @@
 use super::*;
 use crate::hardware::native::{ClientLog, NativeOwner, startup};
-use std::{os::unix::fs::PermissionsExt, process::Stdio};
+use std::process::Stdio;
 
 #[tokio::test]
 async fn owners_reuse_the_validated_capabilities_and_running_binary_identity() {
-    let directory = std::env::temp_dir().join(format!("tl-native-facts-{}", std::process::id()));
+    let directory = std::env::temp_dir().join(format!(
+        "tl-native-facts-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
     std::fs::create_dir_all(&directory).unwrap();
     let binary = directory.join("client");
-    std::fs::write(
+    crate::test_scripts::write_executable_script(
         &binary,
         r#"#!/bin/sh
 root=$(dirname "$0")
@@ -20,9 +27,7 @@ while read command version id frequency voltage; do
  printf 'TLACK 1 %s %s %s\n' "$id" "$frequency" "$voltage"
 done
 "#,
-    )
-    .unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
     let mut config = Config::default();
     config.hardware.client_binary = Some(binary.clone());
     config.hardware.boards = (0..3).map(|index| toml::from_str(&format!(
@@ -39,13 +44,13 @@ done
         crate::unix_now(),
     )
     .routed_by_config();
-    let mut child = Command::new(&binary)
+    let mut command = Command::new(&binary);
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
+        .kill_on_drop(true);
+    let mut child = command.spawn().unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         while !directory.join("running").exists() {
             tokio::task::yield_now().await;
@@ -80,11 +85,17 @@ done
 
 #[tokio::test]
 async fn prepare_rejects_unsupported_automatic_start_frequency() {
-    let directory =
-        std::env::temp_dir().join(format!("tl-prepare-frequency-{}", std::process::id()));
+    let directory = std::env::temp_dir().join(format!(
+        "tl-prepare-frequency-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
     std::fs::create_dir_all(&directory).unwrap();
     let binary = directory.join("client");
-    std::fs::write(
+    crate::test_scripts::write_executable_script(
         &binary,
         r#"#!/bin/sh
 case "$1" in
@@ -92,9 +103,7 @@ case "$1" in
  --control-frequencies) echo '[1450]'; exit 0;;
 esac
 "#,
-    )
-    .unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
     let mut config = Config::default();
     config.hardware.client_binary = Some(binary);
     config.hardware.boards.push(

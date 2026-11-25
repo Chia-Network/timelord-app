@@ -476,7 +476,6 @@ impl Tuning {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn exploration_needs_a_serving_board_its_own_trial_and_no_disturbance() {
@@ -533,7 +532,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tl-journal-thermal-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let binary = dir.join("client");
-        std::fs::write(
+        crate::test_scripts::write_executable_script(
             &binary,
             r#"#!/bin/sh
 read command version id frequency voltage
@@ -543,9 +542,7 @@ printf '%s\n' 'ASIC Temp = 60 C; Frequency = 1450 MHz' >&2
 cat >/dev/null
 printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let board: BoardConfig = toml::from_str("id='a'\nname='A'\nserial='fixture'\nclient_port=18110\ndevice_location=1\nprofile='manual'").unwrap();
         let mut config = Config::default();
         config.hardware.boards = vec![board.clone()];
