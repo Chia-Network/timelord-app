@@ -22,6 +22,7 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use board::*;
 pub(crate) use native::INITIALIZATION;
+use native::supervision::NativeSupervision;
 use native::*;
 pub(crate) use recovery_point::CAUTIOUS_CEILING_MHZ;
 use recovery_point::recovery_point;
