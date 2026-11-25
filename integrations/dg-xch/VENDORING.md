@@ -22,8 +22,10 @@ The fork keeps changes in two layers so the first stays easy to offer upstream:
   - Unfinished-block admission classifies a full scheduled-candidate set as
     CandidatesFull (`c536285`).
 - `chia/timelord-app-deps`: `chia/timelord-app-patches` plus dependency alignment
-  with this workspace (currently num-bigint 0.5, and rsa 0.10 / x509-cert 0.3 /
-  der 0.8 for certificate generation). The app pins this branch's head.
+  with this workspace (currently num-bigint 0.5, rsa 0.10 / x509-cert 0.3 /
+  der 0.8 for certificate generation, and tokio-tungstenite / hyper-tungstenite
+  0.30 so `transport::encode` returns the app's `tungstenite::Message` type).
+  The app pins this branch's head.
 
 Changes that existed only because of vendoring (explicit package metadata, Git pins
 inside crate manifests, removed upstream tests/benches, sqlx and prometheus removal,
