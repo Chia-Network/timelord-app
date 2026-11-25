@@ -5,22 +5,105 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use timelord_core::Chain;
 
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) enum Gauge {
+    BoardUp,
+    BoardState,
+    BoardTemperatureCelsius,
+    BoardFrequencyHertz,
+    BoardVoltageVolts,
+    RawIps,
+    RawSampleTimestampSeconds,
+    ChainAssignment,
+    ChainEstimatedIps,
+    EstimatedIps,
+    ClientsConfigured,
+    ClientsConnected,
+    ChainRequired,
+    ChainAvailable,
+    TuningPaused,
+    TuningState,
+    SchedulerPeakHeight,
+    Deficit,
+    WorkPending,
+    NodeConnected,
+    Healthy,
+    Ready,
+}
+impl Gauge {
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::BoardUp => "board_up",
+            Self::BoardState => "board_state",
+            Self::BoardTemperatureCelsius => "board_temperature_celsius",
+            Self::BoardFrequencyHertz => "board_frequency_hertz",
+            Self::BoardVoltageVolts => "board_voltage_volts",
+            Self::RawIps => "raw_ips",
+            Self::RawSampleTimestampSeconds => "raw_sample_timestamp_seconds",
+            Self::ChainAssignment => "chain_assignment",
+            Self::ChainEstimatedIps => "chain_estimated_ips",
+            Self::EstimatedIps => "estimated_ips",
+            Self::ClientsConfigured => "clients_configured",
+            Self::ClientsConnected => "clients_connected",
+            Self::ChainRequired => "chain_required",
+            Self::ChainAvailable => "chain_available",
+            Self::TuningPaused => "tuning_paused",
+            Self::TuningState => "tuning_state",
+            Self::SchedulerPeakHeight => "scheduler_peak_height",
+            Self::Deficit => "deficit",
+            Self::WorkPending => "work_pending",
+            Self::NodeConnected => "node_connected",
+            Self::Healthy => "healthy",
+            Self::Ready => "ready",
+        }
+    }
+
+    pub(super) fn help(self) -> &'static str {
+        match self {
+            Self::BoardUp => "Board passes managed/unmanaged readiness checks",
+            Self::BoardState => "Current state as a one-hot value 1",
+            Self::BoardTemperatureCelsius => {
+                "Observed board temperature; omitted without current telemetry"
+            }
+            Self::BoardFrequencyHertz => {
+                "Observed board frequency; omitted without current telemetry"
+            }
+            Self::BoardVoltageVolts => "Observed board voltage; omitted without current telemetry",
+            Self::RawIps => "Running engine's native rate; expires after six seconds",
+            Self::RawSampleTimestampSeconds => {
+                "Running engine's observation time; expires after six seconds"
+            }
+            Self::ChainAssignment => "Current assignment, value 1",
+            Self::ChainEstimatedIps => "Latest validated completion for each chain in this session",
+            Self::EstimatedIps => "Latest validated completion from any chain in this node session",
+            Self::ClientsConfigured => "Assigned client capacity",
+            Self::ClientsConnected => "Observed client sockets (not proof readiness)",
+            Self::ChainRequired => "Required work roles, for alerts",
+            Self::ChainAvailable => "Usable assigned capacity, for alerts",
+            Self::TuningPaused => "Automatic tuning paused, not proof service paused",
+            Self::TuningState => "Current bounded tuning state",
+            Self::SchedulerPeakHeight => {
+                "Accepted peak height, absent before a peak or after session replacement"
+            }
+            Self::Deficit => {
+                "Accepted peak deficit, absent before a peak or after session replacement"
+            }
+            Self::WorkPending => "Adapter has an unfinished scheduled request, 0 or 1",
+            Self::NodeConnected => "Authenticated node link",
+            Self::Healthy | Self::Ready => "Probe state, 0 or 1",
+        }
+    }
+}
 #[derive(Default)]
-pub(super) struct Samples(pub(super) BTreeMap<&'static str, Group>);
+pub(super) struct Samples(pub(super) BTreeMap<Gauge, Group>);
 pub(super) struct Group {
     pub(super) keys: Vec<&'static str>,
     pub(super) values: Vec<(Vec<String>, f64)>,
 }
 impl Samples {
-    pub(super) fn add(
-        &mut self,
-        name: &'static str,
-        keys: &[&'static str],
-        labels: &[&str],
-        value: f64,
-    ) {
+    pub(super) fn add(&mut self, gauge: Gauge, keys: &[&'static str], labels: &[&str], value: f64) {
         self.0
-            .entry(name)
+            .entry(gauge)
             .or_insert_with(|| Group {
                 keys: keys.to_vec(),
                 values: vec![],
@@ -73,7 +156,7 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> Snapshot {
         }
     };
     if !process.producing() {
-        samples.add("node_connected", &[], &[], 0.);
+        samples.add(Gauge::NodeConnected, &[], &[], 0.);
         return Snapshot {
             samples,
             readiness: Readiness {
@@ -85,16 +168,21 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> Snapshot {
             epoch: None,
         };
     }
-    samples.add("clients_configured", &[], &[], assignments.len() as f64);
-    samples.add("clients_connected", &[], &[], clients.len() as f64);
+    samples.add(Gauge::ClientsConfigured, &[], &[], assignments.len() as f64);
+    samples.add(Gauge::ClientsConnected, &[], &[], clients.len() as f64);
     let connected = ["authenticated", "ready"].contains(&state.node.as_str());
-    samples.add("node_connected", &[], &[], f64::from(connected));
-    samples.add("tuning_paused", &[], &[], f64::from(state.tuning_paused));
+    samples.add(Gauge::NodeConnected, &[], &[], f64::from(connected));
+    samples.add(
+        Gauge::TuningPaused,
+        &[],
+        &[],
+        f64::from(state.tuning_paused),
+    );
     if let Some(height) = state.scheduler_height {
-        samples.add("scheduler_peak_height", &[], &[], height as f64);
+        samples.add(Gauge::SchedulerPeakHeight, &[], &[], height as f64);
     }
     if let Some(deficit) = state.scheduler_deficit {
-        samples.add("deficit", &[], &[], f64::from(deficit));
+        samples.add(Gauge::Deficit, &[], &[], f64::from(deficit));
     }
     let managed = shared.config.hardware.client_binary.is_some();
     // Managed sockets are usable on connect; unmanaged ones once verified.
@@ -114,7 +202,12 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> Snapshot {
     let mut required = vec![Chain::Challenge, Chain::Reward];
     for c in Chain::ALL {
         let pending = state.pending[index(c)] > 0;
-        samples.add("work_pending", &["chain"], &[chain(c)], f64::from(pending));
+        samples.add(
+            Gauge::WorkPending,
+            &["chain"],
+            &[chain(c)],
+            f64::from(pending),
+        );
         if pending && !required.contains(&c) {
             required.push(c);
         }
@@ -132,13 +225,13 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> Snapshot {
                 && sockets(&a.board_id) >= needed.max(1)
         });
         samples.add(
-            "chain_required",
+            Gauge::ChainRequired,
             &["chain"],
             &[chain(c)],
             f64::from(required.contains(&c)),
         );
         samples.add(
-            "chain_available",
+            Gauge::ChainAvailable,
             &["chain"],
             &[chain(c)],
             f64::from(available),
@@ -159,14 +252,19 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> Snapshot {
         if needed > 0 && (!up || sockets < needed) {
             usable = false;
         }
-        samples.add("board_up", &["board"], &[label], f64::from(up));
+        samples.add(Gauge::BoardUp, &["board"], &[label], f64::from(up));
         let state_name = hardware
             .map(|h| h.lifecycle.status().phase.as_str())
             .unwrap_or("not_inspected");
-        samples.add("board_state", &["board", "state"], &[label, state_name], 1.);
+        samples.add(
+            Gauge::BoardState,
+            &["board", "state"],
+            &[label, state_name],
+            1.,
+        );
         for assignment in assignments.iter().filter(|a| a.board_id == b.id) {
             samples.add(
-                "chain_assignment",
+                Gauge::ChainAssignment,
                 &["board", "chain"],
                 &[label, chain(assignment.chain)],
                 1.,
@@ -178,18 +276,18 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> Snapshot {
             {
                 if h.temperature_unix <= now && now - h.temperature_unix <= 30 {
                     if let Some(value) = h.temperature_c.filter(|v| v.is_finite()) {
-                        samples.add("board_temperature_celsius", &["board"], &[label], value);
+                        samples.add(Gauge::BoardTemperatureCelsius, &["board"], &[label], value);
                     }
                     if let Some(value) = h.frequency_mhz {
                         samples.add(
-                            "board_frequency_hertz",
+                            Gauge::BoardFrequencyHertz,
                             &["board"],
                             &[label],
                             value * 1_000_000.,
                         );
                     }
                     if let Some(value) = h.voltage_v {
-                        samples.add("board_voltage_volts", &["board"], &[label], value);
+                        samples.add(Gauge::BoardVoltageVolts, &["board"], &[label], value);
                     }
                 }
                 for raw in &h.raw_speeds {
@@ -200,9 +298,14 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> Snapshot {
                         && now - raw.timestamp_unix < 6
                     {
                         let engine = raw.engine.to_string();
-                        samples.add("raw_ips", &["board", "engine"], &[label, &engine], raw.ips);
                         samples.add(
-                            "raw_sample_timestamp_seconds",
+                            Gauge::RawIps,
+                            &["board", "engine"],
+                            &[label, &engine],
+                            raw.ips,
+                        );
+                        samples.add(
+                            Gauge::RawSampleTimestampSeconds,
                             &["board", "engine"],
                             &[label, &engine],
                             raw.timestamp_unix as f64,
@@ -225,9 +328,14 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> Snapshot {
                 } else {
                     "other"
                 };
-                samples.add("tuning_state", &["board", "state"], &[label, name], 1.);
+                samples.add(Gauge::TuningState, &["board", "state"], &[label, name], 1.);
             } else if b.profile == timelord_core::ProfileMode::Manual {
-                samples.add("tuning_state", &["board", "state"], &[label, "manual"], 1.);
+                samples.add(
+                    Gauge::TuningState,
+                    &["board", "state"],
+                    &[label, "manual"],
+                    1.,
+                );
             }
         }
     }

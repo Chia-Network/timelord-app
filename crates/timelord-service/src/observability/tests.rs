@@ -1,5 +1,7 @@
+use super::metrics::{REVISION, VERSION};
 use super::*;
 use crate::runtime::{HardwareState, RuntimeState};
+use crate::safety::JournalReset;
 use crate::{Shared, runtime::RawState};
 use axum::http::{StatusCode, header};
 use axum::{
@@ -7,6 +9,7 @@ use axum::{
     http::Request,
 };
 use std::{
+    collections::BTreeMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -72,6 +75,20 @@ fn value(body: &str, name: &str, labels: &[&str]) -> Option<f64> {
         })
         .and_then(|line| line.rsplit_once(' '))
         .and_then(|(_, v)| v.parse().ok())
+}
+fn labels<'a>(body: &'a str, name: &str) -> BTreeMap<&'a str, &'a str> {
+    let line = body
+        .lines()
+        .find(|line| line.starts_with(&format!("{name}{{")))
+        .unwrap();
+    let labels = line.split_once('{').unwrap().1.split_once('}').unwrap().0;
+    labels
+        .split(',')
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap();
+            (key, value.trim_matches('"'))
+        })
+        .collect()
 }
 async fn response(http: HttpState, path: &str) -> (StatusCode, String, String) {
     let response = routes()
@@ -606,6 +623,108 @@ fn process_totals_and_label_less_metrics_keep_their_exposition() {
         ),
         Some(0.)
     );
+}
+
+// Keep this fixture covering every documented metric family, including gauges
+// that only appear in specific runtime states.
+fn fixture_with_every_family() -> (Arc<Shared>, Arc<Metrics>) {
+    let (shared, metrics, _) = fixture();
+    let now = crate::unix_now();
+    let epoch = shared.runtime.lock().unwrap().metric_epoch;
+    {
+        let mut state = shared.runtime.lock().unwrap();
+        state.scheduler_height = Some(1_000);
+        state.scheduler_deficit = Some(0);
+        state
+            .boards
+            .get_mut("a")
+            .unwrap()
+            .raw_sample(1, 1_200_000., RawState::Running, now);
+    }
+    metrics.verified(epoch, Chain::Challenge, 1_000_000.);
+    metrics.submitted(SubmissionKind::Signage, Duration::from_millis(1));
+    metrics.duration(
+        Chain::Challenge,
+        ProofStage::Discriminant,
+        Duration::from_millis(1),
+    );
+    metrics.safety_journal_reset(JournalReset::Missing);
+    metrics.node_message_received();
+    metrics.peak_received();
+    (shared, metrics)
+}
+
+#[test]
+fn build_info_series_have_version_and_revision_labels() {
+    let (shared, metrics, _) = fixture();
+    let body = metrics.render(&shared, crate::unix_now()).unwrap();
+    assert_eq!(
+        labels(&body, "chia_timelord_version"),
+        BTreeMap::from([("network", "mainnet"), ("version", VERSION)])
+    );
+    assert_eq!(value(&body, "chia_timelord_version", &[]), Some(1.));
+    assert_eq!(
+        labels(&body, "chia_timelord_build_info"),
+        BTreeMap::from([
+            ("network", "mainnet"),
+            ("revision", REVISION),
+            ("version", VERSION),
+        ])
+    );
+    assert_eq!(value(&body, "chia_timelord_build_info", &[]), Some(1.));
+}
+
+#[test]
+fn documented_metric_help_matches_exposition() {
+    let (shared, metrics) = fixture_with_every_family();
+    let body = metrics.render(&shared, crate::unix_now()).unwrap();
+
+    let docs = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/observability.md"
+    ))
+    .unwrap();
+    let table = docs
+        .split_once("| Metrics | Type / extra labels | Meaning |")
+        .unwrap()
+        .1;
+    let mut documented = BTreeMap::new();
+    for line in table.lines().skip(1) {
+        if !line.starts_with('|') {
+            break;
+        }
+        if line.starts_with("| ---") {
+            continue;
+        }
+        let cells = line.split('|').map(str::trim).collect::<Vec<_>>();
+        assert_eq!(cells.len(), 5, "unexpected docs row: {line}");
+        let name = cells[1].trim_matches('`');
+        assert!(
+            documented
+                .insert(name.to_owned(), cells[3].replace('`', ""))
+                .is_none(),
+            "duplicate docs row for {name}"
+        );
+    }
+    let mut exported = BTreeMap::new();
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("# HELP chia_timelord_") {
+            let (name, help) = rest.split_once(' ').unwrap();
+            assert!(
+                exported.insert(name.to_owned(), help.to_owned()).is_none(),
+                "duplicate HELP for {name}"
+            );
+        }
+    }
+    for (name, help) in &exported {
+        assert_eq!(documented.get(name), Some(help), "HELP drift for {name}");
+    }
+    for name in documented.keys() {
+        assert!(
+            exported.contains_key(name),
+            "documented metric {name} is not exported"
+        );
+    }
 }
 
 #[test]

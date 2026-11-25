@@ -18,13 +18,14 @@ impl Current {
         for family in families.values() {
             family.gauge.reset();
         }
-        for (name, group) in samples.0 {
+        for (sample, group) in samples.0 {
+            let name = sample.name();
             let family = match families.entry(name) {
                 Entry::Vacant(entry) => {
                     let mut keys = vec!["network"];
                     keys.extend(group.keys.iter().copied());
                     let gauge = GaugeVec::new(
-                        Opts::new(format!("chia_timelord_{name}"), name.replace('_', " ")),
+                        Opts::new(format!("chia_timelord_{name}"), sample.help()),
                         &keys,
                     )?;
                     entry.insert(Family {
