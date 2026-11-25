@@ -37,6 +37,7 @@ struct OperationFeedback: View {
     var body: some View {
         if model.operationInProgress { ProgressView().controlSize(.small) }
         if let result = model.connectionResult { Text(result).font(.callout).foregroundStyle(.secondary).textSelection(.enabled) }
+        if let notice = model.notice { NoticeLine(message: notice) }
         if let error = model.errorMessage { Label(error, systemImage: "exclamationmark.circle").font(.callout).foregroundStyle(.orange).textSelection(.enabled) }
     }
 }
@@ -112,7 +113,7 @@ struct NodeConnectionSheet: View {
                     Text(model.settingsCompletionHint).font(.caption).foregroundStyle(.secondary)
                     OperationFeedback(model: model)
                 }
-            }.formStyle(.grouped).disabled(model.operationInProgress)
+            }.formStyle(.grouped).disabled(model.operationInProgress || model.isBusy)
         }.frame(width: 660, height: 650).interactiveDismissDisabled()
         .confirmationDialog("Remove connection profile?", isPresented: Binding(
             get: { removalTarget != nil }, set: { if !$0 { removalTarget = nil } }
@@ -182,7 +183,7 @@ struct BoardSetupSheet: View {
                     Text(model.settingsCompletionHint).font(.caption).foregroundStyle(.secondary)
                     OperationFeedback(model: model)
                 }
-            }.formStyle(.grouped).disabled(model.operationInProgress)
+            }.formStyle(.grouped).disabled(model.operationInProgress || model.isBusy)
         }.frame(width: 700, height: 760).interactiveDismissDisabled()
     }
     private func engineCount(_ id:String)->Int {guard let index=model.configuration.hardware.boards.firstIndex(where:{$0.id==id}) else {return 0};return BoardTopology.counts(model.configuration.hardware.boards)[index]}
@@ -218,7 +219,7 @@ struct SettingsSheet: View {
                     }
                     OperationFeedback(model: model)
                 }
-            }.formStyle(.grouped).disabled(model.operationInProgress)
+            }.formStyle(.grouped).disabled(model.operationInProgress || model.isBusy)
         }.frame(width: 660, height: 600).interactiveDismissDisabled()
     }
 }

@@ -17,8 +17,29 @@ final class TimelordModel: ObservableObject {
     @Published private var startupError: String?
     var errorMessage: String? { actionError ?? startupError }
     /// The single mutation point for transient failures from user actions.
-    func reportActionError(_ message: String) { actionError = message }
+    func reportActionError(_ message: String) {
+        noticeTask?.cancel(); notice = nil
+        actionError = message
+    }
     func clearActionError() { actionError = nil }
+    /// A short, non-blocking notice that clears itself. It is separate from
+    /// `actionError` so a completed save cannot hide a persistent startup error.
+    @Published private(set) var notice: String?
+    private var noticeTask: Task<Void, Never>?
+    private let noticeDuration: Duration
+    private func showNotice(_ message: String) {
+        noticeTask?.cancel()
+        notice = message
+        noticeTask = Task { [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(for: self.noticeDuration)
+            guard !Task.isCancelled else { return }
+            self.notice = nil
+        }
+    }
+    private func clearNotice() {
+        noticeTask?.cancel(); noticeTask = nil; notice = nil
+    }
     @Published private(set) var controlOperation: ServiceControlOperation?
     @Published var configuration = AppConfiguration()
     @Published private(set) var configurationLoaded = false
@@ -39,7 +60,7 @@ final class TimelordModel: ObservableObject {
     /// What the next save would persist: incomplete RPC drafts fall back to
     /// their last saved settings and do not look like runtime changes.
     private var resolvedConfiguration: AppConfiguration {
-        configuration.resolvedForPersistence(against: savedConfiguration).configuration
+        configuration.resolvedForPersistence(against: savedConfiguration)
     }
     private var liveStatus: ServiceStatus?
     private var workerStatus = WorkerStatusObservation.absent
@@ -68,9 +89,10 @@ final class TimelordModel: ObservableObject {
     var canStartService: Bool { !quitting && (canControlService || hasRunnableConfiguration) && !controller.desiredRunning && presentationOperation != .pause && !isBusy }
     var canInspectConnections: Bool { !controller.desiredRunning && controller.processID == nil && liveStatus == nil && !isBusy }
 
-    init(controller suppliedController: ServiceController? = nil, initialConfiguration: AppConfiguration? = nil, monitoringEnabled: Bool = true) {
+    init(controller suppliedController: ServiceController? = nil, initialConfiguration: AppConfiguration? = nil, monitoringEnabled: Bool = true, noticeDuration: Duration = .seconds(8)) {
         let controller = suppliedController ?? ServiceController(); self.controller = controller
         self.monitoringEnabled = monitoringEnabled
+        self.noticeDuration = noticeDuration
         liveClient = LiveStatusClient(endpoint: controller.endpoint)
         configurationClient = ConfigurationClient(helper: controller.helperURL, config: controller.configURL)
         if let initialConfiguration {
@@ -394,14 +416,19 @@ final class TimelordModel: ObservableObject {
         }
         return finishSettingsSuccessfully()
     }
-    /// A completed settings sheet must not leave an invalid RPC draft dirty for
-    /// the rest of the session; tell the user when Done discards one. Implicit
-    /// saves still keep it for editing.
+    /// Done drops only the draft the user can see, and only from the sheet
+    /// that shows RPC fields. Inactive drafts stay editable.
     private func finishSettingsSuccessfully() -> Bool {
         let resolved = configuration.resolvedForPersistence(against: savedConfiguration)
-        configuration = resolved.configuration
-        if resolved.droppedIncompleteRPCDrafts {
-            reportActionError("RPC changes not saved: the RPC settings are incomplete.")
+        // An edit made while a restart was awaiting must not be overwritten by
+        // the "completed" form. Keep the sheet open and report it instead.
+        guard resolved == savedConfiguration else {
+            reportActionError("Settings changed while applying. Review and save again.")
+            updateSnapshot()
+            return false
+        }
+        if case .node? = sheet, configuration.resolveActiveIncompleteRPC(against: savedConfiguration) {
+            showNotice("RPC changes not saved: the RPC settings are incomplete.")
         }
         updateSnapshot()
         return true
@@ -413,6 +440,7 @@ final class TimelordModel: ObservableObject {
     func saveConfiguration() async -> Bool {
         guard !operationInProgress else { return false }
         operationInProgress = true; defer { operationInProgress = false }
+        clearNotice()
         do {
             let updated = resolvedConfiguration
             let runtimeChanged = Self.hasRuntimeChanges(updated, from: savedConfiguration)
@@ -540,6 +568,7 @@ final class TimelordModel: ObservableObject {
     func prepareForTermination() async {
         quitting = true
         monitoring?.cancel(); monitoring = nil
+        clearNotice()
         controller.onChange = nil
         // An accepted intent transaction must complete, even before it is sent; interface exit
         // never sends Pause or terminates the independent supervisor.

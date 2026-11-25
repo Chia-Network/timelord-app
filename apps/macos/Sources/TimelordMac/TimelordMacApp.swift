@@ -12,7 +12,9 @@ private struct TimelordScenes: Scene {
     @ObservedObject var model: TimelordModel
     var body: some Scene {
         // Menu-bar open requests should focus the single dashboard window.
-        Window("Timelord", id: DashboardWindow.id) { Overview(model: model) }
+        Window("Timelord", id: DashboardWindow.id) {
+            Overview(model: model).registersDashboardWindow()
+        }
             .defaultSize(width: 1180, height: 820)
             .windowResizability(.contentMinSize)
             .commands {
@@ -29,6 +31,7 @@ private struct TimelordScenes: Scene {
             Image(nsImage: MenuBarIcon.image(for: MenuBarGlyph(snapshot: model.snapshot)))
                 .renderingMode(.template)
                 .accessibilityLabel("Timelord, \(model.snapshot.phase.title)")
+                .registersDashboardWindow()
         }
             .menuBarExtraStyle(.window)
     }

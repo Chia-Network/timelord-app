@@ -28,10 +28,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldHandleReopen(
         _ sender: NSApplication, hasVisibleWindows flag: Bool
     ) -> Bool {
-        if DashboardWindow.shouldShowDashboard(hasVisibleWindows: flag) {
-            DashboardWindow.show(in: sender)
-        }
-        return true
+        DashboardWindow.reopen(hasVisibleWindows: flag)
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

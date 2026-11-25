@@ -58,6 +58,7 @@ struct Overview: View {
                 Text("Chain assignments").font(.caption).foregroundStyle(.secondary)
             }
             boardLayout.frame(maxHeight: .infinity)
+            if let notice = model.notice { NoticeLine(message: notice).lineLimit(2) }
             if let error = model.errorMessage { Label(error, systemImage: "exclamationmark.circle").font(.callout).foregroundStyle(.orange).lineLimit(2).help(error).textSelection(.enabled) }
             HStack {
                 Label("Closing this window keeps Timelord in the menu bar.", systemImage: "menubar.rectangle").font(.caption).foregroundStyle(.secondary)

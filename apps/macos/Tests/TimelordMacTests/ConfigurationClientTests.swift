@@ -118,6 +118,55 @@ final class ConfigurationClientTests: XCTestCase {
     }
 
     @MainActor
+    func testDoneReportsIncompleteRPCDraftAfterHelperMigratesFirstTimeSetup() async throws {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { root.deleteLastPathComponent() }
+        let helper = root.appendingPathComponent("build/rust/debug/timelord-service")
+        guard FileManager.default.isExecutableFile(atPath: helper.path) else { throw XCTSkip("Build the native helper first.") }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("timelord-rpc-migration-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let config = directory.appendingPathComponent("config.toml")
+        try Data("""
+        schema_version = 1
+
+        [node]
+        host = "migration.fixture.invalid"
+        port = 8444
+        network = "mainnet"
+        certificate = "/fixture/cert"
+        private_key = "/fixture/key"
+        ca_certificate = "/fixture/ca"
+        """.utf8).write(to: config)
+        var initial = AppConfiguration()
+        initial.node.host = "migration.fixture.invalid"
+        initial.node.certificate = "/fixture/cert"
+        initial.node.privateKey = "/fixture/key"
+        initial.node.caCertificate = "/fixture/ca"
+        let controller = ServiceController(
+            configURL: config, logsURL: directory.appendingPathComponent("service.log"),
+            helperURL: helper)
+        let model = TimelordModel(
+            controller: controller, initialConfiguration: initial, monitoringEnabled: false)
+        model.sheet = .node
+        model.configuration.node.rpc = NodeRPCConfiguration(host: "rpc.draft.fixture")
+
+        let finished = await model.finishSettings()
+
+        XCTAssertTrue(finished)
+        XCTAssertEqual(model.notice,
+            "RPC changes not saved: the RPC settings are incomplete.")
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.configuration.connections?.activeId, "connection-1")
+        XCTAssertNil(model.configuration.node.rpc)
+        let persisted = try await ConfigurationClient(helper: helper, config: config).load()
+        XCTAssertEqual(persisted.connections?.profiles.count, 1)
+        XCTAssertEqual(persisted.connections?.activeId, "connection-1")
+        XCTAssertNil(persisted.node.rpc)
+        XCTAssertNil(persisted.connections?.profiles.first?.node.rpc)
+    }
+
+    @MainActor
     func testRunAppliesSettingsSavedWhilePausedWithoutRestartingAgain() async throws {
         let fixture = try SupervisedFixture()
         defer { fixture.close() }

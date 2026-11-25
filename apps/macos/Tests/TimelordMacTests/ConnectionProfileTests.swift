@@ -277,4 +277,49 @@ final class ConnectionProfileTests: XCTestCase {
         XCTAssertFalse(model.hasUnsavedSettings)
     }
 
+    func testRemovingTheLastProfileDoesNotReuseItsSavedRPCForANewDraft() {
+        var savedNode = NodeConfiguration()
+        savedNode.host = "saved.fixture"
+        savedNode.certificate = "/fixture/cert"
+        savedNode.privateKey = "/fixture/key"
+        savedNode.caCertificate = "/fixture/ca"
+        savedNode.rpc = NodeRPCConfiguration(
+            host: "rpc.saved.fixture", certificate: "/fixture/rpc.crt",
+            privateKey: "/fixture/rpc.key", caCertificate: "/fixture/rpc-ca.crt")
+        var profiles = ConnectionProfiles(); profiles.activeId = "only"
+        profiles.profiles = [ConnectionProfile(id: "only", name: "Only", node: savedNode)]
+        var saved = AppConfiguration(); saved.connections = profiles
+        let model = TimelordModel(initialConfiguration: saved, monitoringEnabled: false)
+
+        model.removeConnectionProfile("only")
+        var setupNode = model.configuration.node
+        setupNode.rpc = NodeRPCConfiguration(host: "rpc.new.fixture")
+        model.configuration.node = setupNode
+
+        let resolved = model.configuration.resolvedForPersistence(against: saved)
+        XCTAssertNil(resolved.node.rpc,
+            "A single-node draft must not inherit the removed profile's saved RPC")
+        var finished = model.configuration
+        XCTAssertTrue(finished.resolveActiveIncompleteRPC(against: saved))
+        XCTAssertNil(finished.node.rpc)
+    }
+
+    func testSingleNodeDraftMigratesToTheHelperCreatedActiveProfile() {
+        var active = NodeConfiguration()
+        active.host = "migrated.fixture"
+        active.certificate = "/fixture/cert"
+        active.privateKey = "/fixture/key"
+        active.caCertificate = "/fixture/ca"
+        var profiles = ConnectionProfiles(); profiles.activeId = "connection-1"
+        profiles.profiles = [ConnectionProfile(id: "connection-1", name: "Migrated", node: active)]
+        var persisted = AppConfiguration(); persisted.connections = profiles
+        var draft = AppConfiguration(); draft.node = active
+        draft.node.rpc = NodeRPCConfiguration(host: "rpc.draft.fixture")
+
+        let restored = persisted.restoringIncompleteRPCDrafts(from: draft)
+
+        XCTAssertEqual(restored.node.rpc, draft.node.rpc)
+        XCTAssertEqual(restored.connections?.profiles[0].node.rpc, draft.node.rpc)
+    }
+
 }
