@@ -1,21 +1,22 @@
-use super::super::SHUTDOWN_CONFIRMED;
 use super::*;
+use crate::hardware::SHUTDOWN_CONFIRMED;
 
-pub(crate) struct ClientLog {
-    pub(crate) lines: crate::bounded_lines::Lines<BufReader<tokio::process::ChildStderr>>,
+pub(in crate::hardware) struct ClientLog {
+    pub(in crate::hardware) lines:
+        crate::bounded_lines::Lines<BufReader<tokio::process::ChildStderr>>,
     /// All engine sockets have connected to their listener.
-    pub(crate) connected: bool,
-    pub(crate) initialization: Option<tokio::sync::MutexGuard<'static, ()>>,
-    pub(crate) preparing: Option<timelord_supervisor::progress::Guard>,
-    pub(crate) last_temperature: tokio::time::Instant,
+    pub(in crate::hardware) connected: bool,
+    pub(in crate::hardware) initialization: Option<tokio::sync::MutexGuard<'static, ()>>,
+    pub(in crate::hardware) preparing: Option<timelord_supervisor::progress::Guard>,
+    pub(in crate::hardware) last_temperature: tokio::time::Instant,
     /// Last raw-speed, temperature or heartbeat record from the event loop.
-    pub(crate) last_liveness: tokio::time::Instant,
+    pub(in crate::hardware) last_liveness: tokio::time::Instant,
     /// The native client's own reason for stopping, when it reported one.
-    pub(crate) stop_reason: Option<String>,
+    pub(in crate::hardware) stop_reason: Option<String>,
     /// The native client could not open its USB device: busy (for example
     /// still released by a previous owner) or gone. Not a board failure.
-    pub(crate) open_failed: bool,
-    pub(crate) recent: std::collections::VecDeque<String>,
+    pub(in crate::hardware) open_failed: bool,
+    pub(in crate::hardware) recent: std::collections::VecDeque<String>,
     pub(super) shutdown_confirmed: bool,
 }
 /// Routine per-second native output. Kept at debug so the worker log retains
@@ -40,7 +41,7 @@ fn routine(line: &str) -> bool {
     let payload = line.split_once(' ').map_or(line, |(_, rest)| rest).trim();
     payload.is_empty() || ROUTINE.iter().any(|marker| line.contains(marker))
 }
-pub(crate) fn record_thermal_stop(
+pub(in crate::hardware) fn record_thermal_stop(
     state: &mut crate::runtime::RuntimeState,
     shared: &Shared,
     board: &BoardConfig,
@@ -68,7 +69,7 @@ pub(crate) fn record_thermal_stop(
     }
 }
 impl ClientLog {
-    pub(crate) fn new(stderr: tokio::process::ChildStderr) -> Self {
+    pub(in crate::hardware) fn new(stderr: tokio::process::ChildStderr) -> Self {
         Self {
             lines: crate::bounded_lines::Lines::new(BufReader::new(stderr)),
             connected: false,
@@ -82,9 +83,31 @@ impl ClientLog {
             shutdown_confirmed: false,
         }
     }
+    /// Shared record bookkeeping. Returns whether the line was routine.
+    fn note(&mut self, board: &BoardConfig, line: &str) -> bool {
+        // The latch needs a newline-terminated record, so a truncated tail never confirms.
+        if self.lines.terminated() && line.ends_with(SHUTDOWN_CONFIRMED) {
+            self.shutdown_confirmed = true;
+        }
+        if let Some((_, reason)) = line.split_once("VDF client stopped: ") {
+            self.stop_reason = Some(reason.trim().chars().take(120).collect());
+        }
+        if line.contains("Failed to open device") {
+            self.open_failed = true;
+        }
+        let routine = routine(line);
+        if !routine {
+            tracing::info!(board=%board.id, "{line}");
+            self.recent.push_back(line.chars().take(512).collect());
+            if self.recent.len() > 8 {
+                self.recent.pop_front();
+            }
+        }
+        routine
+    }
     /// Read what a stopped client still had to say (bounded), so its last
     /// records decide the outcome rather than which pipe closed first.
-    pub(crate) async fn drain(&mut self, board: &BoardConfig, limit: Duration) {
+    pub(in crate::hardware) async fn drain(&mut self, board: &BoardConfig, limit: Duration) {
         let deadline = tokio::time::Instant::now() + limit;
         while let Ok(Ok(Some(line))) =
             tokio::time::timeout_at(deadline, self.lines.next_line()).await
@@ -94,25 +117,10 @@ impl ClientLog {
             };
             // These bytes never reach the retirement reader, so a clean
             // shutdown recorded here must count as confirmation now.
-            if self.lines.terminated() && line.ends_with(SHUTDOWN_CONFIRMED) {
-                self.shutdown_confirmed = true;
-            }
-            if let Some((_, reason)) = line.split_once("VDF client stopped: ") {
-                self.stop_reason = Some(reason.trim().chars().take(120).collect());
-            }
-            if line.contains("Failed to open device") {
-                self.open_failed = true;
-            }
-            if !routine(&line) {
-                tracing::info!(board=%board.id, "{line}");
-                self.recent.push_back(line.chars().take(512).collect());
-                if self.recent.len() > 8 {
-                    self.recent.pop_front();
-                }
-            }
+            self.note(board, &line);
         }
     }
-    pub(crate) async fn read(
+    pub(in crate::hardware) async fn read(
         &mut self,
         shared: &Shared,
         board: &BoardConfig,
@@ -134,26 +142,11 @@ impl ClientLog {
                 return Ok(None);
             }
         };
-        if self.lines.terminated() && line.ends_with(SHUTDOWN_CONFIRMED) {
-            self.shutdown_confirmed = true;
-        }
-        if let Some((_, reason)) = line.split_once("VDF client stopped: ") {
-            self.stop_reason = Some(reason.trim().chars().take(120).collect());
-        }
-        if line.contains("Failed to open device") {
-            self.open_failed = true;
+        if self.note(board, &line) {
+            tracing::debug!(board=%board.id, "{line}");
         }
         if line.contains("TLHB ") {
             self.last_liveness = tokio::time::Instant::now();
-        }
-        if routine(&line) {
-            tracing::debug!(board=%board.id, "{line}");
-        } else {
-            self.recent.push_back(line.chars().take(512).collect());
-            if self.recent.len() > 8 {
-                self.recent.pop_front();
-            }
-            tracing::info!(board=%board.id, "{line}");
         }
         let mut state = shared.runtime.lock().expect("runtime");
         if let Some((engine, ips, activity)) = raw_speed(&line) {

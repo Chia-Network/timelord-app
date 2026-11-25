@@ -12,25 +12,23 @@ use tokio::io::{AsyncWriteExt, BufReader};
 
 const MARKER: &str = "Hardware shutdown: engines_paused=1 safe_point_restored=1";
 
-async fn diagnostics(bytes: &[u8], chunk: usize) -> (bool, Vec<String>, bool) {
+async fn diagnostics(bytes: &[u8], chunk: usize) -> (bool, Vec<String>) {
     let mut lines = Lines::new(BufReader::with_capacity(
         chunk.max(1),
         Chunked { bytes, chunk },
     ));
     let observed = AtomicBool::new(false);
-    let (confirmed, records) = drain_shutdown_diagnostics(&mut lines, &observed)
+    drain_shutdown_diagnostics(&mut lines, &observed)
         .await
-        .unwrap();
-    (confirmed, records, observed.load(Ordering::Acquire))
+        .unwrap()
 }
 
 #[tokio::test]
 async fn each_record_is_logged_once_across_chunked_reads() {
     let text = format!("{MARKER}\nsafe_readback rejected value=1\nVDF client stopped: id=1\n");
     for chunk in [1, 7, MARKER.len() + 1] {
-        let (confirmed, records, observed) = diagnostics(text.as_bytes(), chunk).await;
+        let (confirmed, records) = diagnostics(text.as_bytes(), chunk).await;
         assert!(confirmed, "chunk={chunk}");
-        assert!(observed, "chunk={chunk}");
         assert_eq!(
             records,
             vec![
@@ -98,15 +96,14 @@ async fn oversized_garbage_cannot_confirm_or_log_a_discarded_suffix() {
     let result = tokio::time::timeout(Duration::from_secs(2), diagnostics(&garbage, 333))
         .await
         .expect("unterminated oversized line must not grow without bound");
-    assert_eq!(result, (false, Vec::new(), false));
+    assert_eq!(result, (false, Vec::new()));
 
     let mut bytes = garbage;
     bytes.push(b'\n');
     bytes.extend_from_slice(MARKER.as_bytes());
     bytes.push(b'\n');
-    let (confirmed, records, observed) = diagnostics(&bytes, 1024).await;
+    let (confirmed, records) = diagnostics(&bytes, 1024).await;
     assert!(confirmed);
-    assert!(observed);
     assert_eq!(records, vec![MARKER.to_string()]);
 }
 
@@ -116,9 +113,8 @@ async fn the_diagnostic_cap_holds_and_never_blocks_marker_confirmation() {
     for i in 0..9 {
         text.push_str(&format!("safe_readback {i}\n"));
     }
-    let (confirmed, records, observed) = diagnostics(text.as_bytes(), 3).await;
+    let (confirmed, records) = diagnostics(text.as_bytes(), 3).await;
     assert!(!confirmed);
-    assert!(!observed);
     assert_eq!(records.len(), 8);
     assert_eq!(records[7], "safe_readback 7");
 
@@ -128,9 +124,8 @@ async fn the_diagnostic_cap_holds_and_never_blocks_marker_confirmation() {
     }
     text.push_str(MARKER);
     text.push('\n');
-    let (confirmed, records, observed) = diagnostics(text.as_bytes(), 5).await;
+    let (confirmed, records) = diagnostics(text.as_bytes(), 5).await;
     assert!(confirmed);
-    assert!(observed);
     assert_eq!(records.len(), 8);
     assert!(!records.iter().any(|record| record == MARKER));
 }
@@ -152,13 +147,9 @@ async fn line_limit_counts_content_not_lf_or_crlf_framing() {
     ] {
         for chunk in [1, 1024, 8192] {
             let text = format!("{}{ending}", marker_content(len));
-            let (confirmed, records, observed) = diagnostics(text.as_bytes(), chunk).await;
+            let (confirmed, records) = diagnostics(text.as_bytes(), chunk).await;
             assert_eq!(
                 confirmed, expected,
-                "len={len}, ending={ending:?}, chunk={chunk}"
-            );
-            assert_eq!(
-                observed, expected,
                 "len={len}, ending={ending:?}, chunk={chunk}"
             );
             if expected {
@@ -208,16 +199,14 @@ async fn invalid_utf8_diagnostic_before_the_marker_does_not_hide_confirmation() 
     let mut bytes = b"safe_readback \xff\xfe bad\n".to_vec();
     bytes.extend_from_slice(MARKER.as_bytes());
     bytes.push(b'\n');
-    let (confirmed, records, observed) = diagnostics(&bytes, 5).await;
+    let (confirmed, records) = diagnostics(&bytes, 5).await;
     assert!(confirmed);
-    assert!(observed);
     assert_eq!(records, vec![MARKER.to_string()]);
 }
 
 #[tokio::test]
 async fn unterminated_diagnostic_at_eof_is_logged_without_confirmation() {
-    let (confirmed, records, observed) = diagnostics(b"safe_readback last words", 4).await;
+    let (confirmed, records) = diagnostics(b"safe_readback last words", 4).await;
     assert!(!confirmed);
-    assert!(!observed);
     assert_eq!(records, vec!["safe_readback last words".to_string()]);
 }

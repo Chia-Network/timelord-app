@@ -71,24 +71,22 @@ impl Pool {
                 };
                 (found, pruned)
             };
+            #[cfg(test)]
+            {
+                let hook = self
+                    .0
+                    .interleave
+                    .lock()
+                    .expect("ASIC pool interleave")
+                    .take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
             drop(pruned); // releases stale client claims outside the lock
             match found {
                 Some(lease) => return lease,
-                None => {
-                    #[cfg(test)]
-                    {
-                        let hook = self
-                            .0
-                            .interleave
-                            .lock()
-                            .expect("ASIC pool interleave")
-                            .take();
-                        if let Some(hook) = hook {
-                            hook();
-                        }
-                    }
-                    notified.await
-                }
+                None => notified.await,
             }
         }
     }

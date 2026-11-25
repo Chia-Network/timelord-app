@@ -702,6 +702,7 @@ async fn oversized_or_invalid_native_diagnostic_does_not_retire_the_owner_or_hid
 }
 
 mod chunked;
+mod continuous;
 mod faults;
 #[cfg(test)]
 mod retirement;

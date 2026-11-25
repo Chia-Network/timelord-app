@@ -26,8 +26,8 @@ use tokio_tungstenite::{
 
 pub type Socket = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 mod state;
-pub(crate) use state::RuntimeScope;
 pub use state::{Event, HardwareState, Observation, RawSpeed, RawState, RuntimeState};
+pub(crate) use state::{NodeContext, RuntimeScope};
 
 pub async fn connect(config: &Config) -> Result<Socket> {
     crate::connection::validate_peer_identity(&config.node)?;
@@ -155,7 +155,14 @@ fn admission_outcome(admission: Admission) -> UnfinishedOutcome {
         Admission::Ignored => UnfinishedOutcome::Ignored,
     }
 }
-fn log_admission(admission: Admission, proof_version: Option<u8>, source: &'static str) {
+fn log_admission(
+    admission: Admission,
+    proof_version: Option<u8>,
+    source: UnfinishedSource,
+    hash: Option<dg_xch_core::blockchain::sized_bytes::Bytes32>,
+) {
+    let source = source.label();
+    let hash = hash.map(tracing::field::display);
     match admission {
         Admission::Admitted(hash) => match proof_version {
             Some(proof_version) => {
@@ -170,10 +177,11 @@ fn log_admission(admission: Admission, proof_version: Option<u8>, source: &'stat
             )
         }
         Admission::DeferredQueueFull => {
-            tracing::warn!(source, "Deferred unfinished block queue is full")
+            tracing::warn!(source, hash, "Deferred unfinished block queue is full")
         }
         Admission::CandidatesFull => tracing::warn!(
             source,
+            hash,
             "Unfinished block matches the current peak but the scheduled-candidate set is full"
         ),
         Admission::Duplicate => tracing::debug!(source, "Ignored duplicate unfinished block"),
@@ -186,22 +194,39 @@ fn log_admission(admission: Admission, proof_version: Option<u8>, source: &'stat
         }
     }
 }
-fn handle_retry_outcome(
-    (hash, outcome): (
-        dg_xch_core::blockchain::sized_bytes::Bytes32,
-        Result<Admission, String>,
-    ),
+fn record(
+    result: Result<Admission, impl std::fmt::Display>,
+    source: UnfinishedSource,
+    proof_version: Option<u8>,
+    hash: Option<dg_xch_core::blockchain::sized_bytes::Bytes32>,
     metrics: &crate::observability::Metrics,
 ) {
-    match outcome {
+    match result {
         Ok(admission) => {
-            log_admission(admission, None, "retry");
-            metrics.unfinished_candidate(admission_outcome(admission), UnfinishedSource::Retry);
+            log_admission(admission, proof_version, source, hash);
+            metrics.unfinished_candidate(admission_outcome(admission), source);
         }
         Err(error) => {
-            metrics.unfinished_candidate(UnfinishedOutcome::Rejected, UnfinishedSource::Retry);
-            tracing::warn!(%hash,%error,"Rejected unfinished block");
+            metrics.unfinished_candidate(UnfinishedOutcome::Rejected, source);
+            tracing::warn!(
+                hash = hash.map(tracing::field::display),
+                %error,
+                "Rejected unfinished block"
+            );
         }
+    }
+}
+fn record_retry_outcomes(
+    outcomes: impl IntoIterator<
+        Item = (
+            dg_xch_core::blockchain::sized_bytes::Bytes32,
+            Result<Admission, String>,
+        ),
+    >,
+    metrics: &crate::observability::Metrics,
+) {
+    for (hash, outcome) in outcomes {
+        record(outcome, UnfinishedSource::Retry, None, Some(hash), metrics);
     }
 }
 // Candidate decoding, commitment hashing and admission share a recoverable boundary.
@@ -217,18 +242,14 @@ fn handle_unfinished(
         let version = candidate.reward_chain_block.proof_of_space.version;
         Ok((version, scheduler.admit_unfinished(candidate)?))
     })();
-    match result {
-        Ok((proof_version, admission)) => {
-            log_admission(admission, Some(proof_version), "node");
-            metrics.unfinished_candidate(admission_outcome(admission), UnfinishedSource::Node);
-            Ok(admission)
-        }
-        Err(error) => {
-            metrics.unfinished_candidate(UnfinishedOutcome::Rejected, UnfinishedSource::Node);
-            tracing::warn!(%error,"Rejected unfinished block");
-            Err(error)
-        }
-    }
+    record(
+        result.as_ref().map(|&(_, admission)| admission),
+        UnfinishedSource::Node,
+        result.as_ref().ok().map(|&(version, _)| version),
+        None,
+        metrics,
+    );
+    result.map(|(_, admission)| admission)
 }
 
 async fn send(socket: &mut Socket, message: Message) -> Result<()> {
@@ -581,9 +602,10 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
                                     Err(_) => PeakResult::Rejected,
                                 });
                                 let accepted = result?;
-                                for outcome in scheduler.take_retry_outcomes() {
-                                    handle_retry_outcome(outcome, metrics);
-                                }
+                                record_retry_outcomes(
+                                    scheduler.take_retry_outcomes(),
+                                    metrics,
+                                );
                                 if accepted {
                                     {
                                         let mut state=shared.runtime.lock().expect("runtime");

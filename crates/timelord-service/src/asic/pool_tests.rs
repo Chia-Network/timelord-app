@@ -377,13 +377,11 @@ async fn clear_keeps_waiters_waiting_and_delivers_only_post_clear_leases() {
 #[tokio::test]
 async fn a_matching_lease_offered_after_the_first_poll_is_not_lost() {
     let (offers, pool) = pair();
-    let offers = Arc::new(SyncMutex::new(offers));
+    let offers = Arc::new(offers);
     let (socket, _peer) = socket_pair().await;
-    // Interleave right between the empty recheck and `notified.await`, the only
-    // window a whole-future poll cannot reach. The `Notified` was created before
-    // the recheck, so `notify_waiters` must wake the pending receive.
+    // Interleave right after the recheck's lock is released, before `drop(pruned)` and `notified.await`.
     let offered = offers.clone();
-    pool.on_wait(move || offered.lock().expect("offers").offer(lease(socket, 0, 1)));
+    pool.on_wait(move || offered.offer(lease(socket, 0, 1)));
     let acquired = tokio::time::timeout(Duration::from_millis(500), pool.receive(Some(0), 1))
         .await
         .expect("the matching lease offered before the await did not wake receive")

@@ -116,19 +116,16 @@ impl Run {
             .context("Proof backend unavailable")?;
         self.node.stop().await;
         backend.stop_all().await;
-        let new_context = self.store.retarget(&config)?;
-        {
-            let mut state = self.shared.runtime.lock().expect("runtime");
-            state.reset_node_context();
-            if new_context {
-                // Restored history belongs to the previous node context.
-                state.archive = None;
-                // Chain measurements from another node never join this chart.
-                state.observations = Default::default();
-                state.estimated_observations = Default::default();
-            }
-            state.event(None, "node_profile_change");
-        }
+        let context = if self.store.retarget(&config)? {
+            runtime::NodeContext::New
+        } else {
+            runtime::NodeContext::Same
+        };
+        self.shared
+            .runtime
+            .lock()
+            .expect("runtime")
+            .reset_node_context(context);
         self.shared
             .process
             .metrics

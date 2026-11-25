@@ -448,7 +448,14 @@ fn candidates_full_admission_maps_to_its_own_outcome() {
 
 #[test]
 fn candidates_full_logs_a_distinct_warning() {
-    let logs = capture_logs(|| log_admission(Admission::CandidatesFull, None, "retry"));
+    let logs = capture_logs(|| {
+        log_admission(
+            Admission::CandidatesFull,
+            None,
+            UnfinishedSource::Retry,
+            None,
+        )
+    });
     assert!(
         logs.lines().any(|line| line.contains(" WARN ")
             && line.contains(
@@ -462,7 +469,8 @@ fn candidates_full_logs_a_distinct_warning() {
 fn retry_candidates_full_counts_only_its_outcome() {
     let metrics = crate::observability::Metrics::new(timelord_core::Network::Mainnet).unwrap();
     let hash = dg_xch_core::blockchain::sized_bytes::Bytes32::const_new([9; 32]);
-    handle_retry_outcome((hash, Ok(Admission::CandidatesFull)), &metrics);
+    let outcome: Result<Admission, String> = Ok(Admission::CandidatesFull);
+    record(outcome, UnfinishedSource::Retry, None, Some(hash), &metrics);
     assert_eq!(
         metrics.counter("unfinished_candidates_total", &["candidates_full", "retry"]),
         1
@@ -473,6 +481,64 @@ fn retry_candidates_full_counts_only_its_outcome() {
     );
     assert_eq!(
         metrics.counter("unfinished_candidates_total", &["duplicate", "retry"]),
+        0
+    );
+}
+
+#[test]
+fn retry_candidates_full_warning_includes_the_block_hash() {
+    let metrics = crate::observability::Metrics::new(timelord_core::Network::Mainnet).unwrap();
+    let hash = dg_xch_core::blockchain::sized_bytes::Bytes32::const_new([9; 32]);
+    let outcome: Result<Admission, String> = Ok(Admission::CandidatesFull);
+    let logs =
+        capture_logs(|| record(outcome, UnfinishedSource::Retry, None, Some(hash), &metrics));
+    assert!(
+        logs.lines().any(|line| line.contains(" WARN ")
+            && line.contains(
+                "Unfinished block matches the current peak but the scheduled-candidate set is full"
+            )
+            && line.contains(&hash.to_string())),
+        "{logs}"
+    );
+}
+
+#[test]
+fn retry_outcomes_are_recorded_with_their_hash_and_source() {
+    let metrics = crate::observability::Metrics::new(timelord_core::Network::Mainnet).unwrap();
+    let hash = dg_xch_core::blockchain::sized_bytes::Bytes32::const_new([11; 32]);
+    let outcome: Result<Admission, String> = Ok(Admission::CandidatesFull);
+    let logs = capture_logs(|| record_retry_outcomes([(hash, outcome)], &metrics));
+    assert!(
+        logs.lines().any(|line| line.contains(" WARN ")
+            && line.contains(
+                "Unfinished block matches the current peak but the scheduled-candidate set is full"
+            )
+            && line.contains(&hash.to_string())),
+        "{logs}"
+    );
+    assert_eq!(
+        metrics.counter("unfinished_candidates_total", &["candidates_full", "retry"]),
+        1
+    );
+}
+
+#[test]
+fn retry_rejection_counts_as_rejected_not_ignored() {
+    let metrics = crate::observability::Metrics::new(timelord_core::Network::Mainnet).unwrap();
+    let hash = dg_xch_core::blockchain::sized_bytes::Bytes32::const_new([12; 32]);
+    record(
+        Err("fixture rejection"),
+        UnfinishedSource::Retry,
+        None,
+        Some(hash),
+        &metrics,
+    );
+    assert_eq!(
+        metrics.counter("unfinished_candidates_total", &["rejected", "retry"]),
+        1
+    );
+    assert_eq!(
+        metrics.counter("unfinished_candidates_total", &["ignored", "retry"]),
         0
     );
 }

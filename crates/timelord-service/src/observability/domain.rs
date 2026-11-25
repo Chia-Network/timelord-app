@@ -157,7 +157,7 @@ pub enum UnfinishedSource {
 }
 impl UnfinishedSource {
     pub(super) const ALL: [Self; 2] = [Self::Node, Self::Retry];
-    pub(super) fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Node => "node",
             Self::Retry => "retry",
