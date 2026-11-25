@@ -42,9 +42,11 @@ HELPER="$APP/Contents/Helpers/timelord-supervisor"
 run_as_owner() {
   if [[ "$EUID" == "$SERVICE_UID" ]]; then "$@"; else sudo -H -u "$SERVICE_USER" "$@"; fi
 }
-CONFIG_JSON="$(run_as_owner "$APP/Contents/Helpers/timelord-service" configuration --config "$CONFIG")" || exit 1
-MONITOR="$(printf '%s' "$CONFIG_JSON" | plutil -extract service.supervisor_observability_listen raw -o - -)" || exit 1
-NETWORK="$(printf '%s' "$CONFIG_JSON" | plutil -extract node.network raw -o - -)" || exit 1
+# launchd-values uses the same load path as the service, so the network is
+# config.node().network after profile selection and single-node migration.
+LAUNCHD_VALUES="$(run_as_owner "$APP/Contents/Helpers/timelord-service" launchd-values --config "$CONFIG")" || exit 1
+MONITOR="$(printf '%s' "$LAUNCHD_VALUES" | plutil -extract supervisor_observability_listen raw -o - -)" || exit 1
+NETWORK="$(printf '%s' "$LAUNCHD_VALUES" | plutil -extract network raw -o - -)" || exit 1
 if [[ "$MODE" == plan ]]; then
   run_as_owner "$HELPER" launchd-plist --app "$APP" --config "$CONFIG" --user "$SERVICE_USER" --monitor-listen "$MONITOR" --network "$NETWORK" || exit $?
   exit 0
@@ -73,7 +75,7 @@ cleanup() {
 trap cleanup EXIT
 run_as_owner "$HELPER" launchd-plist --app "$APP" --config "$CONFIG" --user "$SERVICE_USER" --monitor-listen "$MONITOR" --network "$NETWORK" > "$STAGE/new.plist" || exit 1
 plutil -lint "$STAGE/new.plist" || exit 1
-LISTEN="$(run_as_owner "$APP/Contents/Helpers/timelord-service" configuration --config "$CONFIG" | plutil -extract service.status_listen raw -o - -)"
+LISTEN="$(printf '%s' "$LAUNCHD_VALUES" | plutil -extract status_listen raw -o - -)" || exit 1
 PORT="${LISTEN##*:}"
 [[ "$PORT" =~ ^[0-9]+$ && "$PORT" -gt 0 && "$PORT" -le 65535 ]] || { echo 'Invalid status port.' >&2; exit 1; }
 LOG="$(dirname "$CONFIG")/supervisor.log"

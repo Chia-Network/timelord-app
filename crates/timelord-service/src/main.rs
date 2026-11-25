@@ -92,6 +92,11 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Print the network and listen addresses used to register a system job.
+    LaunchdValues {
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Validate and atomically replace configuration from a JSON file.
     Configure {
         #[arg(long)]
@@ -297,6 +302,17 @@ async fn main() -> Result<()> {
         }
         Command::Configuration { config } => {
             println!("{}", serde_json::to_string(&load(&config)?)?)
+        }
+        Command::LaunchdValues { config } => {
+            let value = load(&config)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "network": value.node().network,
+                    "supervisor_observability_listen": value.service.supervisor_observability_listen,
+                    "status_listen": value.service.status_listen,
+                })
+            );
         }
         Command::Configure { config, input } => {
             let updated: Config = serde_json::from_slice(&std::fs::read(input)?)?;
