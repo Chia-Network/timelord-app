@@ -52,7 +52,7 @@ assert_job "$STAGE/profiles.plist" "$STAGE/profiles.toml" testnet11
 cat > "$STAGE/legacy-node.toml" <<'TOML'
 schema_version = 1
 [node]
-host = "10.75.1.228"
+host = "192.0.2.10"
 port = 8444
 network = "testnet11"
 certificate = "client.crt"
