@@ -2,7 +2,7 @@
   "schema_version": 1,
   "network_id": "testnet10",
   "exported_at": "2024-01-01T00:00:00+00:00",
-  "chia_version": "2.1.4",
+  "chia_version": "2.1.0",
   "constants": {
     "AGG_SIG_ME_ADDITIONAL_DATA": "ae83525ba8d1dd3f09b277de18ca3e43fc0af20d20c4b3e92ef2a48bd291ccb2",
     "DIFFICULTY_CONSTANT_FACTOR": 10052721566054,
@@ -14,6 +14,7 @@
     "MEMPOOL_BLOCK_BUFFER": 10,
     "MIN_PLOT_SIZE": 18,
     "SOFT_FORK2_HEIGHT": 3000000,
+    "SOFT_FORK3_HEIGHT": 2997292,
     "HARD_FORK_HEIGHT": 2997292,
     "HARD_FORK_FIX_HEIGHT": 3426000,
     "PLOT_FILTER_128_HEIGHT": 3061804,
