@@ -461,12 +461,55 @@ fn serial_identity_survives_owner_change_and_obsolete_gauges_disappear() {
     assert!(body.contains("chia_timelord_asic_recoveries_total{"));
 }
 #[test]
-fn process_totals_survive_history_pruning_and_runtime_replacement() {
+fn process_totals_and_label_less_metrics_keep_their_exposition() {
+    type Recorder = fn(&Metrics);
     let (shared, metrics, _) = fixture();
+    let label_less: [(&str, Recorder, f64); 3] = [
+        ("chia_timelord_chain_moves_total", |m| m.chains_moved(2), 2.),
+        (
+            "chia_timelord_topology_changes_total",
+            Metrics::topology_changed,
+            1.,
+        ),
+        (
+            "chia_timelord_node_reconnects_total",
+            |m| {
+                m.connected();
+                m.connected();
+            },
+            1.,
+        ),
+    ];
+    let initial = metrics.render(&shared, crate::unix_now()).unwrap();
+    for (name, _, _) in label_less {
+        assert!(
+            initial
+                .lines()
+                .any(|line| line.starts_with(&format!("# HELP {name} "))),
+            "{name} initial HELP"
+        );
+        assert!(
+            initial.contains(&format!("# TYPE {name} counter\n")),
+            "{name} initial TYPE"
+        );
+        assert_eq!(
+            value(&initial, name, &["network=\"mainnet\""]),
+            Some(0.),
+            "{name} initial"
+        );
+    }
+    for name in [
+        "chia_timelord_last_verified_proof_timestamp_seconds",
+        "chia_timelord_last_submission_timestamp_seconds",
+        "chia_timelord_last_node_message_timestamp_seconds",
+        "chia_timelord_last_peak_received_timestamp_seconds",
+    ] {
+        assert_eq!(value(&initial, name, &[]), None, "{name} initial");
+    }
+    for (_, record, _) in label_less {
+        record(&metrics);
+    }
     metrics.asic_recovered("SERIAL-A", 1);
-    metrics.topology_changed();
-    metrics.connected();
-    metrics.connected();
     metrics.submitted(SubmissionKind::Infusion, Duration::from_millis(2));
     metrics.unfinished_candidate(UnfinishedOutcome::Deferred, UnfinishedSource::Retry);
     metrics.duration(
@@ -476,6 +519,12 @@ fn process_totals_survive_history_pruning_and_runtime_replacement() {
     );
     metrics.client_started("SERIAL-A", RestartReason::Topology);
     metrics.client_started("SERIAL-A", RestartReason::Usb);
+    let node_message_before = crate::unix_now();
+    metrics.node_message_received();
+    let node_message_after = crate::unix_now();
+    let peak_before = crate::unix_now();
+    metrics.peak_received();
+    let peak_after = crate::unix_now();
     assert_eq!(
         metrics.counter("client_restarts_total", &["SERIAL-A", "usb"]),
         1
@@ -489,6 +538,31 @@ fn process_totals_survive_history_pruning_and_runtime_replacement() {
         1
     );
     let before = metrics.render(&shared, crate::unix_now()).unwrap();
+    for (name, _, expected) in label_less {
+        assert_eq!(
+            value(&before, name, &["network=\"mainnet\""]),
+            Some(expected),
+            "{name} after"
+        );
+    }
+    for (name, start, end) in [
+        (
+            "chia_timelord_last_node_message_timestamp_seconds",
+            node_message_before,
+            node_message_after,
+        ),
+        (
+            "chia_timelord_last_peak_received_timestamp_seconds",
+            peak_before,
+            peak_after,
+        ),
+    ] {
+        let timestamp = value(&before, name, &["network=\"mainnet\""]).unwrap();
+        assert!(
+            timestamp >= start as f64 && timestamp <= end as f64,
+            "{name} after: {timestamp} not in {start}..={end}"
+        );
+    }
     let mut state = shared.runtime.lock().unwrap();
     *state = {
         let mut fixture = RuntimeState::new(false);
@@ -499,9 +573,12 @@ fn process_totals_survive_history_pruning_and_runtime_replacement() {
     let after = metrics.render(&shared, crate::unix_now()).unwrap();
     for name in [
         "chia_timelord_asic_recoveries_total",
-        "chia_timelord_topology_changes_total",
+        "chia_timelord_chain_moves_total",
+        "chia_timelord_last_node_message_timestamp_seconds",
+        "chia_timelord_last_peak_received_timestamp_seconds",
         "chia_timelord_node_reconnects_total",
         "chia_timelord_submissions_total",
+        "chia_timelord_topology_changes_total",
     ] {
         assert_eq!(value(&before, name, &[]), value(&after, name, &[]));
     }
@@ -530,6 +607,7 @@ fn process_totals_survive_history_pruning_and_runtime_replacement() {
         Some(0.)
     );
 }
+
 #[test]
 fn pending_activity_counts_cancellation_but_not_completed_work() {
     let (shared, metrics, _) = fixture();
