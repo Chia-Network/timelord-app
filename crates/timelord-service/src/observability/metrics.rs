@@ -9,6 +9,7 @@ use anyhow::Result;
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
     Registry, TextEncoder,
+    core::{Collector, Desc},
 };
 use std::{
     collections::BTreeSet,
@@ -42,10 +43,10 @@ pub struct Metrics {
     work_cancelled_total: IntCounterVec,
     vdf_sessions_started_total: IntCounterVec,
     operating_point_changes_total: IntCounterVec,
-    last_verified_proof_timestamp_seconds: IntGaugeVec,
-    last_submission_timestamp_seconds: IntGaugeVec,
-    last_node_message_timestamp_seconds: IntGaugeVec,
-    last_peak_received_timestamp_seconds: IntGaugeVec,
+    last_verified_proof_timestamp_seconds: EventTimestamp,
+    last_submission_timestamp_seconds: EventTimestamp,
+    last_node_message_timestamp_seconds: EventTimestamp,
+    last_peak_received_timestamp_seconds: EventTimestamp,
     proof_duration: HistogramVec,
     submission_duration: HistogramVec,
     last: Mutex<Last>,
@@ -59,224 +60,250 @@ pub struct Metrics {
     /// relabels the exposition without rebuilding counters.
     network: Mutex<String>,
 }
-fn plain_counter(registry: &Registry, name: &str, help: &str) -> Result<IntCounter> {
-    let metric = IntCounter::new(name, help)?;
+fn registered<M: Collector + Clone + 'static>(registry: &Registry, metric: M) -> Result<M> {
     registry.register(Box::new(metric.clone()))?;
     Ok(metric)
 }
-fn plain_gauge(registry: &Registry, name: &str, help: &str) -> Result<IntGauge> {
-    let metric = IntGauge::new(name, help)?;
-    registry.register(Box::new(metric.clone()))?;
-    Ok(metric)
+#[derive(Clone)]
+struct EventTimestamp(IntGaugeVec);
+impl EventTimestamp {
+    fn new(name: &str, help: &str, labels: &[&str]) -> Result<Self> {
+        Ok(Self(IntGaugeVec::new(Opts::new(name, help), labels)?))
+    }
+    /// Timestamp gauges stay absent until their first observation. An untouched
+    /// gauge vector has no series, which is deliberate: exporting 0 would claim
+    /// the event happened at the Unix epoch.
+    fn record(&self, labels: &[&str]) {
+        self.0
+            .with_label_values(labels)
+            .set(crate::unix_now() as i64);
+    }
+}
+impl Collector for EventTimestamp {
+    fn desc(&self) -> Vec<&Desc> {
+        self.0.desc()
+    }
+    fn collect(&self) -> Vec<prometheus::proto::MetricFamily> {
+        self.0.collect()
+    }
 }
 impl Metrics {
     pub fn new(network: Network) -> Result<Arc<Self>> {
         let network = network.label().to_owned();
         let registry = Registry::new_custom(Some("chia_timelord".into()), None)?;
-        let board_failures_total = IntCounterVec::new(
-            Opts::new(
-                "board_failures_total",
-                "Native owner failures counted against board reliability",
-            ),
-            &["board"],
-        )?;
-        registry.register(Box::new(board_failures_total.clone()))?;
-        let safety_journal_resets_total = IntCounterVec::new(
-            Opts::new(
-                "safety_journal_resets_total",
-                "Processes that found a previously written but now absent or unreadable board safety journal and started from cautious defaults; at most 1 per process, exported only by the process that reported the reset, so use the raw value, not increase()",
-            ),
-            &["reason"],
-        )?;
-        registry.register(Box::new(safety_journal_resets_total.clone()))?;
-        let chain_moves_total = plain_counter(
-            &registry,
-            "chain_moves_total",
-            "Chains moved between boards",
-        )?;
-        let delayed_bundles_total = IntCounterVec::new(
-            Opts::new(
-                "delayed_bundles_total",
-                "Verified chain proofs that waited over 10 seconds for their bundle partner",
-            ),
-            &["chain"],
-        )?;
-        registry.register(Box::new(delayed_bundles_total.clone()))?;
-        let proofs_verified_total = IntCounterVec::new(
-            Opts::new("proofs_verified_total", "proofs verified total"),
-            &["chain"],
-        )?;
-        registry.register(Box::new(proofs_verified_total.clone()))?;
-        let proof_verification_failures_total = IntCounterVec::new(
-            Opts::new(
-                "proof_verification_failures_total",
-                "proof verification failures total",
-            ),
-            &["chain"],
-        )?;
-        registry.register(Box::new(proof_verification_failures_total.clone()))?;
-        let submissions_total = IntCounterVec::new(
-            Opts::new("submissions_total", "submissions total"),
-            &["kind"],
-        )?;
-        registry.register(Box::new(submissions_total.clone()))?;
-        let unfinished_candidates_total = IntCounterVec::new(
-            Opts::new(
-                "unfinished_candidates_total",
-                "unfinished candidate admission outcomes total",
-            ),
-            &["outcome", "source"],
-        )?;
-        registry.register(Box::new(unfinished_candidates_total.clone()))?;
-        let topology_changes_total = plain_counter(
-            &registry,
-            "topology_changes_total",
-            "topology changes total",
-        )?;
-        let asic_recoveries_total = IntCounterVec::new(
-            Opts::new("asic_recoveries_total", "asic recoveries total"),
-            &["board", "engine"],
-        )?;
-        registry.register(Box::new(asic_recoveries_total.clone()))?;
-        let client_restarts_total = IntCounterVec::new(
-            Opts::new("client_restarts_total", "client restarts total"),
-            &["board", "reason"],
-        )?;
-        registry.register(Box::new(client_restarts_total.clone()))?;
-        let thermal_stops_total = IntCounterVec::new(
-            Opts::new("thermal_stops_total", "thermal stops total"),
-            &["board"],
-        )?;
-        registry.register(Box::new(thermal_stops_total.clone()))?;
-        let node_reconnects_total =
-            plain_counter(&registry, "node_reconnects_total", "node reconnects total")?;
-        let peak_updates_total = IntCounterVec::new(
-            Opts::new("peak_updates_total", "peak updates total"),
-            &["result"],
-        )?;
-        registry.register(Box::new(peak_updates_total.clone()))?;
-        let work_cancelled_total = IntCounterVec::new(
-            Opts::new("work_cancelled_total", "work cancelled total"),
-            &["chain"],
-        )?;
-        registry.register(Box::new(work_cancelled_total.clone()))?;
-        let vdf_sessions_started_total = IntCounterVec::new(
-            Opts::new("vdf_sessions_started_total", "vdf sessions started total"),
-            &["chain", "reason"],
-        )?;
-        registry.register(Box::new(vdf_sessions_started_total.clone()))?;
-        let operating_point_changes_total = IntCounterVec::new(
-            Opts::new(
-                "operating_point_changes_total",
-                "operating point changes total",
-            ),
-            &["board", "reason"],
-        )?;
-        registry.register(Box::new(operating_point_changes_total.clone()))?;
-        let last_verified_proof_timestamp_seconds = IntGaugeVec::new(
-            Opts::new(
-                "last_verified_proof_timestamp_seconds",
-                "last verified proof timestamp seconds",
-            ),
-            &["chain"],
-        )?;
-        registry.register(Box::new(last_verified_proof_timestamp_seconds.clone()))?;
-        let last_submission_timestamp_seconds = IntGaugeVec::new(
-            Opts::new(
-                "last_submission_timestamp_seconds",
-                "last submission timestamp seconds",
-            ),
-            &["kind"],
-        )?;
-        registry.register(Box::new(last_submission_timestamp_seconds.clone()))?;
-        let last_node_message_timestamp_seconds = IntGaugeVec::new(
-            Opts::new(
-                "last_node_message_timestamp_seconds",
-                "last node message timestamp seconds",
-            ),
-            &[],
-        )?;
-        registry.register(Box::new(last_node_message_timestamp_seconds.clone()))?;
-        let last_peak_received_timestamp_seconds = IntGaugeVec::new(
-            Opts::new(
-                "last_peak_received_timestamp_seconds",
-                "last peak received timestamp seconds",
-            ),
-            &[],
-        )?;
-        registry.register(Box::new(last_peak_received_timestamp_seconds.clone()))?;
         for name in ["version", "build_info"] {
             let labels = if name == "version" {
                 vec!["version"]
             } else {
                 vec!["version", "revision"]
             };
-            let metric =
-                IntGaugeVec::new(Opts::new(name, "Running timelord-service build"), &labels)?;
+            let metric = registered(
+                &registry,
+                IntGaugeVec::new(Opts::new(name, "Running timelord-service build"), &labels)?,
+            )?;
             let mut values = vec![env!("CARGO_PKG_VERSION")];
             if name == "build_info" {
                 values.push(option_env!("TIMELORD_BUILD_REVISION").unwrap_or("unknown"));
             }
             metric.with_label_values(&values).set(1);
-            registry.register(Box::new(metric))?;
         }
-        let started = plain_gauge(
+        let started = registered(
             &registry,
-            "process_start_time_seconds",
-            "Service process start time",
+            IntGauge::new("process_start_time_seconds", "Service process start time")?,
         )?;
         started.set(crate::unix_now() as i64);
         let buckets = vec![
             0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1., 5., 15., 60., 300.,
         ];
-        let proof_duration = HistogramVec::new(
-            HistogramOpts::new(
-                "proof_duration_seconds",
-                "Observed proof pipeline stage duration; stages can overlap",
-            )
-            .buckets(buckets.clone()),
-            &["chain", "stage"],
-        )?;
-        let submission_duration = HistogramVec::new(
-            HistogramOpts::new(
-                "submission_duration_seconds",
-                "Time to write a verified bundle to the node",
-            )
-            .buckets(buckets),
-            &["kind"],
-        )?;
-        registry.register(Box::new(proof_duration.clone()))?;
-        registry.register(Box::new(submission_duration.clone()))?;
         let metrics = Arc::new(Self {
-            registry,
             current: Default::default(),
-            proofs_verified_total,
-            proof_verification_failures_total,
-            submissions_total,
-            unfinished_candidates_total,
-            topology_changes_total,
-            asic_recoveries_total,
-            client_restarts_total,
-            thermal_stops_total,
-            node_reconnects_total,
-            peak_updates_total,
-            work_cancelled_total,
-            vdf_sessions_started_total,
-            operating_point_changes_total,
-            last_verified_proof_timestamp_seconds,
-            last_submission_timestamp_seconds,
-            last_node_message_timestamp_seconds,
-            last_peak_received_timestamp_seconds,
-            proof_duration,
-            submission_duration,
+            proofs_verified_total: registered(
+                &registry,
+                IntCounterVec::new(
+                    Opts::new("proofs_verified_total", "proofs verified total"),
+                    &["chain"],
+                )?,
+            )?,
+            proof_verification_failures_total: registered(
+                &registry,
+                IntCounterVec::new(
+                    Opts::new(
+                        "proof_verification_failures_total",
+                        "proof verification failures total",
+                    ),
+                    &["chain"],
+                )?,
+            )?,
+            submissions_total: registered(
+                &registry,
+                IntCounterVec::new(
+                    Opts::new("submissions_total", "submissions total"),
+                    &["kind"],
+                )?,
+            )?,
+            unfinished_candidates_total: registered(
+                &registry,
+                IntCounterVec::new(
+                    Opts::new(
+                        "unfinished_candidates_total",
+                        "unfinished candidate admission outcomes total",
+                    ),
+                    &["outcome", "source"],
+                )?,
+            )?,
+            topology_changes_total: registered(
+                &registry,
+                IntCounter::new("topology_changes_total", "topology changes total")?,
+            )?,
+            asic_recoveries_total: registered(
+                &registry,
+                IntCounterVec::new(
+                    Opts::new("asic_recoveries_total", "asic recoveries total"),
+                    &["board", "engine"],
+                )?,
+            )?,
+            client_restarts_total: registered(
+                &registry,
+                IntCounterVec::new(
+                    Opts::new("client_restarts_total", "client restarts total"),
+                    &["board", "reason"],
+                )?,
+            )?,
+            thermal_stops_total: registered(
+                &registry,
+                IntCounterVec::new(
+                    Opts::new("thermal_stops_total", "thermal stops total"),
+                    &["board"],
+                )?,
+            )?,
+            node_reconnects_total: registered(
+                &registry,
+                IntCounter::new("node_reconnects_total", "node reconnects total")?,
+            )?,
+            peak_updates_total: registered(
+                &registry,
+                IntCounterVec::new(
+                    Opts::new("peak_updates_total", "peak updates total"),
+                    &["result"],
+                )?,
+            )?,
+            work_cancelled_total: registered(
+                &registry,
+                IntCounterVec::new(
+                    Opts::new("work_cancelled_total", "work cancelled total"),
+                    &["chain"],
+                )?,
+            )?,
+            vdf_sessions_started_total: registered(
+                &registry,
+                IntCounterVec::new(
+                    Opts::new("vdf_sessions_started_total", "vdf sessions started total"),
+                    &["chain", "reason"],
+                )?,
+            )?,
+            operating_point_changes_total: registered(
+                &registry,
+                IntCounterVec::new(
+                    Opts::new(
+                        "operating_point_changes_total",
+                        "operating point changes total",
+                    ),
+                    &["board", "reason"],
+                )?,
+            )?,
+            last_verified_proof_timestamp_seconds: registered(
+                &registry,
+                EventTimestamp::new(
+                    "last_verified_proof_timestamp_seconds",
+                    "last verified proof timestamp seconds",
+                    &["chain"],
+                )?,
+            )?,
+            last_submission_timestamp_seconds: registered(
+                &registry,
+                EventTimestamp::new(
+                    "last_submission_timestamp_seconds",
+                    "last submission timestamp seconds",
+                    &["kind"],
+                )?,
+            )?,
+            last_node_message_timestamp_seconds: registered(
+                &registry,
+                EventTimestamp::new(
+                    "last_node_message_timestamp_seconds",
+                    "last node message timestamp seconds",
+                    &[],
+                )?,
+            )?,
+            last_peak_received_timestamp_seconds: registered(
+                &registry,
+                EventTimestamp::new(
+                    "last_peak_received_timestamp_seconds",
+                    "last peak received timestamp seconds",
+                    &[],
+                )?,
+            )?,
+            proof_duration: registered(
+                &registry,
+                HistogramVec::new(
+                    HistogramOpts::new(
+                        "proof_duration_seconds",
+                        "Observed proof pipeline stage duration; stages can overlap",
+                    )
+                    .buckets(buckets.clone()),
+                    &["chain", "stage"],
+                )?,
+            )?,
+            submission_duration: registered(
+                &registry,
+                HistogramVec::new(
+                    HistogramOpts::new(
+                        "submission_duration_seconds",
+                        "Time to write a verified bundle to the node",
+                    )
+                    .buckets(buckets),
+                    &["kind"],
+                )?,
+            )?,
             last: Mutex::new(Last::default()),
             ever_connected: AtomicBool::new(false),
             clients_started: Mutex::new(BTreeSet::new()),
-            board_failures_total,
-            safety_journal_resets_total,
-            chain_moves_total,
-            delayed_bundles_total,
+            board_failures_total: registered(
+                &registry,
+                IntCounterVec::new(
+                    Opts::new(
+                        "board_failures_total",
+                        "Native owner failures counted against board reliability",
+                    ),
+                    &["board"],
+                )?,
+            )?,
+            safety_journal_resets_total: registered(
+                &registry,
+                IntCounterVec::new(
+                    Opts::new(
+                        "safety_journal_resets_total",
+                        "Processes that found a previously written but now absent or unreadable board safety journal and started from cautious defaults; at most 1 per process, exported only by the process that reported the reset, so use the raw value, not increase()",
+                    ),
+                    &["reason"],
+                )?,
+            )?,
+            chain_moves_total: registered(
+                &registry,
+                IntCounter::new("chain_moves_total", "Chains moved between boards")?,
+            )?,
+            delayed_bundles_total: registered(
+                &registry,
+                IntCounterVec::new(
+                    Opts::new(
+                        "delayed_bundles_total",
+                        "Verified chain proofs that waited over 10 seconds for their bundle partner",
+                    ),
+                    &["chain"],
+                )?,
+            )?,
             network: Mutex::new(network),
+            registry,
         });
         for c in Chain::ALL {
             metrics.delayed_bundles_total.with_label_values(&[chain(c)]);
@@ -321,11 +348,17 @@ impl Metrics {
                 .unfinished_candidates_total
                 .with_label_values(labels)
                 .get(),
-            "topology_changes_total" => self.topology_changes_total.get(),
+            "topology_changes_total" => {
+                debug_assert!(labels.is_empty());
+                self.topology_changes_total.get()
+            }
             "asic_recoveries_total" => self.asic_recoveries_total.with_label_values(labels).get(),
             "client_restarts_total" => self.client_restarts_total.with_label_values(labels).get(),
             "thermal_stops_total" => self.thermal_stops_total.with_label_values(labels).get(),
-            "node_reconnects_total" => self.node_reconnects_total.get(),
+            "node_reconnects_total" => {
+                debug_assert!(labels.is_empty());
+                self.node_reconnects_total.get()
+            }
             "peak_updates_total" => self.peak_updates_total.with_label_values(labels).get(),
             "work_cancelled_total" => self.work_cancelled_total.with_label_values(labels).get(),
             "vdf_sessions_started_total" => self
@@ -333,7 +366,10 @@ impl Metrics {
                 .with_label_values(labels)
                 .get(),
             "board_failures_total" => self.board_failures_total.with_label_values(labels).get(),
-            "chain_moves_total" => self.chain_moves_total.get(),
+            "chain_moves_total" => {
+                debug_assert!(labels.is_empty());
+                self.chain_moves_total.get()
+            }
             "operating_point_changes_total" => self
                 .operating_point_changes_total
                 .with_label_values(labels)
@@ -423,14 +459,10 @@ impl Metrics {
             .inc();
     }
     pub fn node_message_received(&self) {
-        self.last_node_message_timestamp_seconds
-            .with_label_values(&[] as &[&str])
-            .set(crate::unix_now() as i64);
+        self.last_node_message_timestamp_seconds.record(&[]);
     }
     pub fn peak_received(&self) {
-        self.last_peak_received_timestamp_seconds
-            .with_label_values(&[] as &[&str])
-            .set(crate::unix_now() as i64);
+        self.last_peak_received_timestamp_seconds.record(&[]);
     }
     pub fn begin_session(&self) -> u64 {
         let mut last = self.last.lock().expect("metrics");
@@ -456,8 +488,7 @@ impl Metrics {
             .with_label_values(&[chain(c)])
             .inc();
         self.last_verified_proof_timestamp_seconds
-            .with_label_values(&[chain(c)])
-            .set(crate::unix_now() as i64);
+            .record(&[chain(c)]);
         let mut last = self.last.lock().expect("metrics");
         if last.epoch == epoch {
             last.ips = Some(ips);
@@ -479,8 +510,7 @@ impl Metrics {
             .with_label_values(&[kind.label()])
             .inc();
         self.last_submission_timestamp_seconds
-            .with_label_values(&[kind.label()])
-            .set(crate::unix_now() as i64);
+            .record(&[kind.label()]);
         self.submission_duration
             .with_label_values(&[kind.label()])
             .observe(elapsed.as_secs_f64());
