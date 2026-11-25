@@ -1,5 +1,9 @@
 //! One native supervision attempt: the initialize, establish, serve and retire phases.
 use super::*;
+use crate::hardware::{
+    board::{BoardAbsent, OperatorHold, Timing},
+    recovery,
+};
 
 /// How often an unrouted serving board proves itself with a private proof.
 pub(in crate::hardware) const CANARY_SECONDS: u64 = 60;
@@ -12,7 +16,7 @@ pub(in crate::hardware) struct NativeSupervision {
     pub(in crate::hardware) backend: Arc<crate::asic::AsicBackend>,
     pub(in crate::hardware) board: BoardConfig,
     pub(in crate::hardware) shutdown: watch::Receiver<bool>,
-    pub(in crate::hardware) timing: super::board::Timing,
+    pub(in crate::hardware) timing: Timing,
 }
 impl NativeSupervision {
     pub(in crate::hardware) async fn run(
@@ -104,7 +108,7 @@ impl NativeSupervision {
         resume: Option<Point>,
     ) -> Result<bool> {
         let initialized = if matches!(initialized, Ok(true)) {
-            super::recovery::establish(
+            recovery::establish(
                 &self.shared,
                 &self.board,
                 owner,
@@ -122,10 +126,10 @@ impl NativeSupervision {
             log.drain(&self.board, Duration::from_millis(500)).await;
         }
         let initialized = match initialized {
-            Err(error) if log.open_failed => Err(anyhow::Error::new(super::board::BoardAbsent(
-                self.board.name.clone(),
-            ))
-            .context(format!("{error:#}"))),
+            Err(error) if log.open_failed => {
+                Err(anyhow::Error::new(BoardAbsent(self.board.name.clone()))
+                    .context(format!("{error:#}")))
+            }
             other => other,
         };
         if let Err(error) = &initialized {
@@ -158,9 +162,6 @@ impl NativeSupervision {
         maintenance: &mut Maintenance,
         initialized: Result<bool>,
     ) -> Result<()> {
-        // Successful setup starts a fresh readiness budget; time spent obtaining
-        // the first ACK cannot starve engine/socket initialization of its window.
-        let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let mut watchdog = tokio::time::interval(
             Duration::from_secs(5)
                 .min(self.timing.liveness / 3)
@@ -170,19 +171,14 @@ impl NativeSupervision {
             Err(error) => Err(error),
             Ok(false) => Ok(()),
             Ok(true) => loop {
+                debug_assert!(log.connected);
                 if *self.shutdown.borrow() {
                     break Ok(());
                 }
                 tokio::select! {
-                    // Deterministic precedence: shutdown, then the readiness
-                    // deadline, then periodic checks, then native output.
+                    // Deterministic precedence: shutdown, then periodic checks, then native output.
                     biased;
                     _ = self.shutdown.changed() => break Ok(()),
-                    // Temperatures do not certify engine/socket initialization.
-                    // Hold the lease through confirmed retirement on this deadline.
-                    _ = tokio::time::sleep_until(readiness_deadline), if !log.connected => {
-                        break Err(anyhow::anyhow!("ASIC initialization timed out: the native client never connected its engines"));
-                    }
                     _ = watchdog.tick() => {
                         if let Some(hardware) = self.shared.runtime.lock().expect("runtime").boards.get(&self.board.id)
                             && hardware.lifecycle.needs_retirement() {
@@ -296,7 +292,7 @@ impl Maintenance {
         if let Some((store, serial)) = &journal
             && store.health(serial).disabled(now)
         {
-            return Err(super::board::OperatorHold.into());
+            return Err(OperatorHold.into());
         }
         if !serving {
             return Ok(());

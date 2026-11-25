@@ -429,7 +429,7 @@ mod tests {
         import(&config_path, &manifest).unwrap();
         let config = crate::load(&config_path).unwrap();
         assert_eq!(config.node().host, "fixture.invalid");
-        let mainnet_id = config.connections.active_id.clone().unwrap();
+        let mainnet_id = config.connections().active_id().unwrap().to_owned();
         let mainnet_node = config.node().clone();
         assert!(
             config
@@ -503,8 +503,8 @@ mod tests {
             imported.node().network_definition,
             custom.network_definition
         );
-        assert_eq!(imported.connections.profiles.len(), 2);
-        let custom_id = imported.connections.active_id.clone().unwrap();
+        assert_eq!(imported.connections().profiles().len(), 2);
+        let custom_id = imported.connections().active_id().unwrap().to_owned();
         let custom_node = imported.node().clone();
         fs::remove_dir_all(&source).unwrap();
         let imported = crate::load(&config_path).unwrap();
