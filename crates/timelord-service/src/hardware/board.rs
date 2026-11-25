@@ -358,17 +358,14 @@ impl BoardSupervisor {
                 self.previous_failure,
             );
         }
-        let result = supervise_with(
-            self.shared.clone(),
-            self.backend.clone(),
-            self.board.clone(),
-            child,
-            self.shutdown.clone(),
-            initialization,
-            Some(preparing),
-            startup,
-            self.timing,
-        )
+        let result = NativeSupervision {
+            shared: self.shared.clone(),
+            backend: self.backend.clone(),
+            board: self.board.clone(),
+            shutdown: self.shutdown.clone(),
+            timing: self.timing,
+        }
+        .run(child, initialization, Some(preparing), startup)
         .await;
         let checkpoint = checkpoint_retired(&self.shared, &self.board, &self.safety, &serial);
         if let (Err(error), Err(saved)) = (&result, &checkpoint) {

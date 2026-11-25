@@ -30,34 +30,34 @@ pub use state::{Event, HardwareState, Observation, RawSpeed, RawState, RuntimeSt
 pub(crate) use state::{NodeContext, RuntimeScope};
 
 pub async fn connect(config: &Config) -> Result<Socket> {
-    crate::connection::validate_peer_identity(&config.node)?;
+    crate::connection::validate_peer_identity(config.node())?;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let identity = TlsIdentity {
         certificate: config
-            .node
+            .node()
             .certificate
             .clone()
             .context("Choose a client certificate")?,
         private_key: config
-            .node
+            .node()
             .private_key
             .clone()
             .context("Choose a client private key")?,
         ca_certificate: config
-            .node
+            .node()
             .ca_certificate
             .clone()
             .context("Choose the node CA certificate")?,
     };
     let tls = identity.client().context("Loading node credentials")?;
-    let network = config.node.network.label().to_owned();
+    let network = config.node().network.label().to_owned();
     let server_name = config
-        .node
+        .node()
         .server_name
         .clone()
         .unwrap_or_else(|| "chia.net".into());
     let mut socket = tokio::time::timeout(Duration::from_secs(15), async {
-        let tcp = TcpStream::connect((config.node.host.as_str(), config.node.port)).await?;
+        let tcp = TcpStream::connect((config.node().host.as_str(), config.node().port)).await?;
         let tls = TlsConnector::from(tls)
             .connect(
                 rustls::pki_types::ServerName::try_from(server_name.clone())?,
@@ -65,7 +65,7 @@ pub async fn connect(config: &Config) -> Result<Socket> {
             )
             .await?;
         let (socket, _) = tokio_tungstenite::client_async_with_config(
-            format!("wss://{server_name}:{}/ws", config.node.port),
+            format!("wss://{server_name}:{}/ws", config.node().port),
             tls,
             Some(
                 WebSocketConfig::default()
@@ -432,7 +432,7 @@ async fn session(shared: Arc<Shared>, backend: Arc<AsicBackend>) -> Result<()> {
         "connecting",
         "Connecting to your full node…",
     );
-    let resolved = crate::network::resolve(&shared.config.node)?;
+    let resolved = crate::network::resolve(shared.config.node())?;
     let minimum_deficit = resolved.constants.min_blocks_per_challenge_block;
     let bits = resolved.constants.discriminant_size_bits as usize;
     let mut scheduler = Scheduler::new(resolved.constants, resolved.allows_bootstrap, None)?;

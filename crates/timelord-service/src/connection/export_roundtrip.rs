@@ -163,12 +163,12 @@ fn exported_bundle_imports_with_matching_network_credentials_and_provenance() {
     crate::connection::import(&config_path, &bundle.join("connection.toml")).unwrap();
     let config = crate::load(&config_path).unwrap();
 
-    assert_eq!(config.node.network.label(), NETWORK);
-    assert_eq!(config.node.host, "node.example.test");
-    assert_eq!(config.node.port, 58445);
-    let certificate = config.node.certificate.as_ref().unwrap();
-    let private_key = config.node.private_key.as_ref().unwrap();
-    let ca_certificate = config.node.ca_certificate.as_ref().unwrap();
+    assert_eq!(config.node().network.label(), NETWORK);
+    assert_eq!(config.node().host, "node.example.test");
+    assert_eq!(config.node().port, 58445);
+    let certificate = config.node().certificate.as_ref().unwrap();
+    let private_key = config.node().private_key.as_ref().unwrap();
+    let ca_certificate = config.node().ca_certificate.as_ref().unwrap();
     let identities = config_path.parent().unwrap().join("identities");
     assert!(certificate.starts_with(&identities));
     assert_eq!(certificate.file_name().unwrap(), "client.crt");
@@ -178,7 +178,7 @@ fn exported_bundle_imports_with_matching_network_credentials_and_provenance() {
     assert_eq!(fs::read(private_key).unwrap(), peer_leaf_key);
     assert_eq!(fs::read(ca_certificate).unwrap(), peer_ca);
 
-    let rpc = config.node.rpc.as_ref().unwrap();
+    let rpc = config.node().rpc.as_ref().unwrap();
     assert_eq!(rpc.host, "rpc.example.test");
     assert_eq!(rpc.port, 8555);
     assert_eq!(rpc.certificate.file_name().unwrap(), "rpc.crt");
@@ -197,7 +197,7 @@ fn exported_bundle_imports_with_matching_network_credentials_and_provenance() {
     .client()
     .expect("imported RPC identity must be usable");
 
-    let definition = config.node.network_definition.as_ref().unwrap();
+    let definition = config.node().network_definition.as_ref().unwrap();
     assert_eq!(definition.schema_version, 1);
     assert_eq!(definition.network_id, NETWORK);
     assert_eq!(definition.chia_version, "2.5.0-test");
@@ -218,7 +218,7 @@ fn exported_bundle_imports_with_matching_network_credentials_and_provenance() {
             .unwrap(),
         250
     );
-    let resolved = crate::network::resolve(&config.node).unwrap();
+    let resolved = crate::network::resolve(config.node()).unwrap();
     assert_eq!(resolved.network_id, NETWORK);
     assert_eq!(resolved.constants.difficulty_starting, 250);
 }

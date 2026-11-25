@@ -135,7 +135,7 @@ cat >/dev/null
             )
             .unwrap(),
         );
-        let metrics = crate::observability::Metrics::new(config.node.network.clone()).unwrap();
+        let metrics = crate::observability::Metrics::new(config.node().network.clone()).unwrap();
         let shared = Arc::new(
             crate::Shared::new(
                 if config
@@ -175,16 +175,14 @@ cat >/dev/null
             .begin_attempt(crate::unix_now());
         let child = launch(&shared, &board, &startup).await.unwrap();
         let (stop, rx) = watch::channel(false);
-        let supervising = supervise(
-            shared.clone(),
-            crate::hardware::fixture_backend(&shared),
-            board.clone(),
-            child,
-            rx,
-            INITIALIZATION.lock().await,
-            None,
-            startup,
-        );
+        let supervising = NativeSupervision {
+            shared: shared.clone(),
+            backend: crate::hardware::fixture_backend(&shared),
+            board: board.clone(),
+            shutdown: rx,
+            timing: Timing::default(),
+        }
+        .run(child, INITIALIZATION.lock().await, None, startup);
         tokio::pin!(supervising);
         tokio::time::timeout(Duration::from_secs(5), async {
             if rejected {

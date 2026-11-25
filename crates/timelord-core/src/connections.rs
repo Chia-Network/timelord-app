@@ -50,11 +50,41 @@ pub fn select_profile<'a, T: ProfileId>(
     Ok(select_index(active_id, profiles)?.map(|index| &profiles[index]))
 }
 
+/// Unboxed membership iterator for stored nodes: profiles own the nodes once
+/// they exist, otherwise the single-node store is the only stored node.
+enum StoredNodes<'a> {
+    Single(std::iter::Once<&'a NodeConfig>),
+    Profiles(std::slice::Iter<'a, ConnectionProfile>),
+}
+impl<'a> Iterator for StoredNodes<'a> {
+    type Item = &'a NodeConfig;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Single(nodes) => nodes.next(),
+            Self::Profiles(profiles) => profiles.next().map(|profile| &profile.node),
+        }
+    }
+}
+
+/// Mutable counterpart of [`StoredNodes`].
+enum StoredNodesMut<'a> {
+    Single(std::iter::Once<&'a mut NodeConfig>),
+    Profiles(std::slice::IterMut<'a, ConnectionProfile>),
+}
+impl<'a> Iterator for StoredNodesMut<'a> {
+    type Item = &'a mut NodeConfig;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Single(nodes) => nodes.next(),
+            Self::Profiles(profiles) => profiles.next().map(|profile| &mut profile.node),
+        }
+    }
+}
+
 impl ConnectionProfiles {
-    /// Structural validation plus the runtime projection invariant. The runtime
-    /// node is derived from the active profile, so a legacy `[node]` table either
-    /// matches it or is rejected during deserialization.
-    pub fn validate(&self, active_node: &NodeConfig) -> Result<(), String> {
+    /// Structural validation. The runtime node is the active profile itself, so
+    /// there is no second copy to compare against.
+    pub fn validate(&self) -> Result<(), String> {
         let mut ids = std::collections::HashSet::new();
         for profile in &self.profiles {
             if profile.id.is_empty() || profile.name.trim().is_empty() || !ids.insert(&profile.id) {
@@ -64,11 +94,8 @@ impl ConnectionProfiles {
             }
             profile.node.validate()?;
         }
-        match self.selected()? {
-            Some(profile) if profile.node == *active_node => Ok(()),
-            None => Ok(()),
-            Some(_) => Err("The active connection profile must match [node]".into()),
-        }
+        self.selected()?;
+        Ok(())
     }
     /// The selected profile, or `Ok(None)` for a single-node configuration.
     pub fn selected(&self) -> Result<Option<&ConnectionProfile>, String> {
@@ -77,15 +104,14 @@ impl ConnectionProfiles {
     pub fn active(&self) -> Option<&ConnectionProfile> {
         self.selected().ok().flatten()
     }
-    fn active_mut(&mut self) -> Result<Option<&mut ConnectionProfile>, String> {
-        let index = select_index(self.active_id.as_deref(), &self.profiles)?;
-        Ok(index.map(|index| &mut self.profiles[index]))
+    fn selected_index(&self) -> Result<Option<usize>, String> {
+        select_index(self.active_id.as_deref(), &self.profiles)
     }
     /// `[connections]` is the persisted source of truth. A `[node]` table that
     /// equals the active profile is accepted as legacy input; a diverging one is
     /// rejected instead of silently overriding or dropping operator edits. With
     /// no profiles, `[node]` is the runtime node.
-    pub fn resolve_node(&self, node: Option<NodeConfig>) -> Result<NodeConfig, String> {
+    pub fn resolve_node(&self, node: Option<NodeConfig>) -> Result<Option<NodeConfig>, String> {
         match self.selected()? {
             Some(profile) => {
                 if let Some(node) = node
@@ -93,9 +119,9 @@ impl ConnectionProfiles {
                 {
                     return Err(STRAY_NODE.into());
                 }
-                Ok(profile.node.clone())
+                Ok(None)
             }
-            None => Ok(node.unwrap_or_default()),
+            None => Ok(Some(node.unwrap_or_default())),
         }
     }
     fn insert(&mut self, node: NodeConfig) -> String {
@@ -124,19 +150,64 @@ impl ConnectionProfiles {
     }
 }
 impl Config {
-    /// Persist a credentialed single-node runtime as its first profile.
-    fn migrate_single_node(&mut self) -> Result<(), String> {
-        if self.connections.profiles.is_empty() && self.node.certificate.is_some() {
-            self.node.validate()?;
-            self.connections.active_id = Some(self.connections.insert(self.node.clone()));
+    /// A single-node configuration with no profiles yet.
+    pub fn from_node(node: NodeConfig) -> Self {
+        Self {
+            single_node: node,
+            ..Self::default()
         }
-        Ok(())
     }
-    /// Switching or adding a connection commits the runtime node to the profile
-    /// that currently owns it; the runtime node is never copied between profiles.
-    fn commit_node(&mut self) -> Result<(), String> {
-        if let Some(profile) = self.connections.active_mut()? {
-            profile.node = self.node.clone();
+    /// The runtime node: the active profile when profiles exist, otherwise the
+    /// private single-node store. Once profiles exist `single_node` has no
+    /// meaning; an invalid selection is a programming error here because load,
+    /// save and `Config::validate` are the canonical error points.
+    pub fn node(&self) -> &NodeConfig {
+        match self.connections.selected_index() {
+            Ok(Some(index)) => &self.connections.profiles[index].node,
+            Ok(None) => &self.single_node,
+            Err(error) => panic!("{error}"),
+        }
+    }
+    /// Write-through accessor. Editing the runtime node edits the active profile
+    /// in place; there is no staged copy and no commit step. As with [`Self::node`],
+    /// once profiles exist `single_node` has no meaning and an invalid selection
+    /// panics rather than mutating the hidden store.
+    pub fn node_mut(&mut self) -> &mut NodeConfig {
+        match self.connections.selected_index() {
+            Ok(Some(index)) => &mut self.connections.profiles[index].node,
+            Ok(None) => &mut self.single_node,
+            Err(error) => panic!("{error}"),
+        }
+    }
+    /// Every stored node exactly once: the single-node store only when there are
+    /// no profiles, otherwise each profile node. Never the runtime projection
+    /// plus its source.
+    pub fn stored_nodes(&self) -> impl Iterator<Item = &NodeConfig> {
+        let profiles = &self.connections.profiles;
+        let single = &self.single_node;
+        if profiles.is_empty() {
+            StoredNodes::Single(std::iter::once(single))
+        } else {
+            StoredNodes::Profiles(profiles.iter())
+        }
+    }
+    /// Mutable counterpart of [`Self::stored_nodes`].
+    pub fn stored_nodes_mut(&mut self) -> impl Iterator<Item = &mut NodeConfig> {
+        let profiles = &mut self.connections.profiles;
+        let single = &mut self.single_node;
+        if profiles.is_empty() {
+            StoredNodesMut::Single(std::iter::once(single))
+        } else {
+            StoredNodesMut::Profiles(profiles.iter_mut())
+        }
+    }
+    /// Persist a credentialed single-node runtime as its first profile. The
+    /// private store is left default; the stale copy does not need to survive.
+    fn migrate_single_node(&mut self) -> Result<(), String> {
+        if self.connections.profiles.is_empty() && self.single_node.certificate.is_some() {
+            self.single_node.validate()?;
+            let node = std::mem::take(&mut self.single_node);
+            self.connections.active_id = Some(self.connections.insert(node));
         }
         Ok(())
     }
@@ -152,25 +223,18 @@ impl Config {
     pub fn add_connection(&mut self, node: NodeConfig) -> Result<(), String> {
         node.validate()?;
         self.migrate_single_node()?;
-        self.commit_node()?;
-        self.connections.active_id = Some(self.connections.insert(node.clone()));
-        self.node = node;
+        self.connections.active_id = Some(self.connections.insert(node));
         Ok(())
     }
     pub fn select_connection(&mut self, id: &str) -> Result<(), String> {
-        if self.connections.active_id.as_deref() == Some(id) {
-            return Ok(());
-        }
-        let node = self
+        if !self
             .connections
             .profiles
             .iter()
-            .find(|p| p.id == id)
-            .ok_or("Connection profile does not exist")?
-            .node
-            .clone();
-        self.commit_node()?;
-        self.node = node;
+            .any(|profile| profile.id == id)
+        {
+            return Err("Connection profile does not exist".into());
+        }
         self.connections.active_id = Some(id.into());
         Ok(())
     }
@@ -243,7 +307,7 @@ mod tests {
         hardware: &'a crate::HardwareConfig,
     }
     fn legacy_text(config: &Config) -> String {
-        legacy_text_with(config, &config.node)
+        legacy_text_with(config, config.node())
     }
     fn legacy_text_with(config: &Config, node: &NodeConfig) -> String {
         toml::to_string(&Legacy {
@@ -258,14 +322,11 @@ mod tests {
 
     #[test]
     fn single_node_configuration_keeps_node_and_never_invents_profiles() {
-        let config = Config {
-            node: complete("mainnet.fixture", Network::Mainnet),
-            ..Default::default()
-        };
+        let config = Config::from_node(complete("mainnet.fixture", Network::Mainnet));
         let text = toml::to_string(&config).unwrap();
         assert!(text.contains("[node]"));
         let restored: Config = toml::from_str(&text).unwrap();
-        assert_eq!(restored.node, config.node);
+        assert_eq!(restored.node(), config.node());
         assert!(restored.connections.profiles.is_empty());
         assert_eq!(restored.connections.active_id, None);
         restored.validate().unwrap();
@@ -273,29 +334,26 @@ mod tests {
 
     #[test]
     fn profiles_are_the_persisted_truth_and_node_is_derived() {
-        let mut config = Config {
-            node: complete("mainnet.fixture", Network::Mainnet),
-            ..Default::default()
-        };
+        let mut config = Config::from_node(complete("mainnet.fixture", Network::Mainnet));
         let mut other = complete("testnet.fixture", Network::Testnet11);
         other.port = 58444;
         other.rpc = None;
         config.add_connection(other.clone()).unwrap();
         let selected = config.connections.active_id.clone().unwrap();
         let first = config.connections.profiles[0].id.clone();
-        assert_eq!(config.node, other);
+        assert_eq!(config.node(), &other);
 
         let text = toml::to_string(&config).unwrap();
         assert!(!text.contains("[node]"), "{text}");
         let restored: Config = toml::from_str(&text).unwrap();
-        assert_eq!(restored.node, other);
+        assert_eq!(restored.node(), &other);
         assert_eq!(restored.connections, config.connections);
         restored.validate().unwrap();
 
         config.select_connection(&first).unwrap();
-        assert_eq!(config.node.host, "mainnet.fixture");
+        assert_eq!(config.node().host, "mainnet.fixture");
         config.select_connection(&selected).unwrap();
-        assert_eq!(config.node, other);
+        assert_eq!(config.node(), &other);
         let before = toml::to_string(&config).unwrap();
         assert!(config.select_connection("missing").is_err());
         assert_eq!(toml::to_string(&config).unwrap(), before);
@@ -303,38 +361,33 @@ mod tests {
 
     #[test]
     fn matching_legacy_node_table_migrates_and_is_omitted_on_save() {
-        let mut config = Config {
-            node: complete("mainnet.fixture", Network::Mainnet),
-            ..Default::default()
-        };
+        let mut config = Config::from_node(complete("mainnet.fixture", Network::Mainnet));
         config
             .add_connection(complete("testnet.fixture", Network::Testnet11))
             .unwrap();
         let text = legacy_text(&config);
         assert!(text.contains("[node]") && text.contains("[connections]"));
         let restored: Config = toml::from_str(&text).unwrap();
-        assert_eq!(restored.node, config.node);
-        assert_eq!(restored.connections.active().unwrap().node, config.node);
+        assert_eq!(restored.node(), config.node());
+        assert_eq!(restored.connections.active().unwrap().node, *config.node());
         restored.validate().unwrap();
         let saved = toml::to_string(&restored).unwrap();
         assert!(!saved.contains("[node]"));
         assert_eq!(
-            toml::from_str::<Config>(&saved).unwrap().node,
-            restored.node
+            toml::from_str::<Config>(&saved).unwrap().node(),
+            restored.node()
         );
     }
 
     #[test]
     fn diverging_stray_node_tables_are_rejected_loudly() {
-        let mut config = Config {
-            node: complete("mainnet.fixture", Network::Mainnet),
-            ..Default::default()
-        };
+        let mut config = Config::from_node(complete("mainnet.fixture", Network::Mainnet));
         config
             .add_connection(complete("testnet.fixture", Network::Testnet11))
             .unwrap();
-        config.node.host = "edited.fixture".into();
-        let error = toml::from_str::<Config>(&legacy_text(&config))
+        let mut stray = config.node().clone();
+        stray.host = "edited.fixture".into();
+        let error = toml::from_str::<Config>(&legacy_text_with(&config, &stray))
             .unwrap_err()
             .to_string();
         assert!(error.contains("edit the active profile"), "{error}");
@@ -351,20 +404,65 @@ mod tests {
     }
 
     #[test]
-    fn diverging_projection_is_rejected_instead_of_silently_dropped() {
-        let mut config = Config {
-            node: complete("mainnet.fixture", Network::Mainnet),
-            ..Default::default()
-        };
+    fn runtime_node_writes_through_to_the_active_profile() {
+        let mut config = Config::from_node(complete("mainnet.fixture", Network::Mainnet));
         config
             .add_connection(complete("testnet.fixture", Network::Testnet11))
             .unwrap();
-        config.node.host = "unsaved.fixture".into();
-        assert!(config.validate().is_err());
-        // Saving without going through add/select must not quietly fold the
-        // runtime node into a different profile.
+        config.node_mut().host = "edited.fixture".into();
+        assert_eq!(
+            config.connections.active().unwrap().node.host,
+            "edited.fixture"
+        );
+        config.validate().unwrap();
         config.remember_connection().unwrap();
-        assert!(config.validate().is_err());
+        assert_eq!(config.node().host, "edited.fixture");
+    }
+
+    #[test]
+    fn runtime_node_edits_round_trip_through_toml_without_a_node_table() {
+        let mut config = Config::from_node(complete("mainnet.fixture", Network::Mainnet));
+        config
+            .add_connection(complete("testnet.fixture", Network::Testnet11))
+            .unwrap();
+        config.node_mut().host = "edited.fixture".into();
+        let text = toml::to_string(&config).unwrap();
+        assert!(!text.contains("[node]"), "{text}");
+        let restored: Config = toml::from_str(&text).unwrap();
+        assert_eq!(restored.node().host, "edited.fixture");
+        assert_eq!(
+            restored.connections.active().unwrap().node.host,
+            "edited.fixture"
+        );
+        restored.validate().unwrap();
+        let again = toml::to_string(&restored).unwrap();
+        assert_eq!(again, text);
+        assert_eq!(
+            toml::from_str::<Config>(&again).unwrap().node().host,
+            "edited.fixture"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Selected connection profile does not exist")]
+    fn runtime_node_accessor_rejects_an_invalid_selection() {
+        let mut config = Config::from_node(complete("a.fixture", Network::Mainnet));
+        config
+            .add_connection(complete("b.fixture", Network::Testnet11))
+            .unwrap();
+        config.connections.active_id = Some("missing".into());
+        let _ = config.node();
+    }
+
+    #[test]
+    #[should_panic(expected = "Selected connection profile does not exist")]
+    fn mutable_runtime_node_accessor_rejects_an_invalid_selection() {
+        let mut config = Config::from_node(complete("a.fixture", Network::Mainnet));
+        config
+            .add_connection(complete("b.fixture", Network::Testnet11))
+            .unwrap();
+        config.connections.active_id = Some("missing".into());
+        let _ = config.node_mut();
     }
 
     #[test]
@@ -375,11 +473,16 @@ mod tests {
             name: "A".into(),
             node: NodeConfig::default(),
         }];
-        assert!(config.validate().is_err());
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "Connection profiles require one selected profile"
+        );
         config.connections.active_id = Some("missing".into());
-        assert!(config.validate().is_err());
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "Selected connection profile does not exist"
+        );
         config.connections.active_id = Some("a".into());
-        config.node = NodeConfig::default();
         config.validate().unwrap();
 
         let mut empty = Config::default();
@@ -405,11 +508,8 @@ mod tests {
 
     #[test]
     fn first_import_preserves_legacy_and_switches_complete_connections() {
-        let mut config = Config {
-            node: complete("mainnet.fixture", Network::Mainnet),
-            ..Default::default()
-        };
-        let original = config.node.clone();
+        let mut config = Config::from_node(complete("mainnet.fixture", Network::Mainnet));
+        let original = config.node().clone();
         let mut other = complete("testnet.fixture", Network::Testnet11);
         other.port = 58444;
         other.rpc = None;
@@ -417,28 +517,26 @@ mod tests {
         let selected = config.connections.active_id.clone().unwrap();
         let first = config.connections.profiles[0].id.clone();
         assert_eq!(config.connections.profiles.len(), 2);
-        assert_eq!(config.node, other);
+        assert_eq!(config.node(), &other);
         config.select_connection(&first).unwrap();
-        assert_eq!(config.node, original);
-        config.node.host = "edited-mainnet.fixture".into();
+        assert_eq!(config.node(), &original);
+        config.node_mut().host = "edited-mainnet.fixture".into();
         config.select_connection(&selected).unwrap();
-        assert_eq!(config.node, other);
+        assert_eq!(config.node(), &other);
         config.select_connection(&first).unwrap();
-        assert_eq!(config.node.host, "edited-mainnet.fixture");
+        assert_eq!(config.node().host, "edited-mainnet.fixture");
         config.validate().unwrap();
         let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
-        assert_eq!(restored.node, config.node);
+        assert_eq!(restored.node(), config.node());
         assert_eq!(restored.connections.profiles.len(), 2);
     }
 
     #[test]
     fn repeated_imports_create_distinct_profiles_and_names() {
-        let mut config = Config {
-            node: complete("mainnet.fixture", Network::Mainnet),
-            ..Default::default()
-        };
-        config.add_connection(config.node.clone()).unwrap();
-        config.add_connection(config.node.clone()).unwrap();
+        let mut config = Config::from_node(complete("mainnet.fixture", Network::Mainnet));
+        let node = config.node().clone();
+        config.add_connection(node.clone()).unwrap();
+        config.add_connection(node).unwrap();
         assert_eq!(config.connections.profiles.len(), 3);
         let names: std::collections::HashSet<_> = config
             .connections
@@ -447,6 +545,40 @@ mod tests {
             .map(|p| &p.name)
             .collect();
         assert_eq!(names.len(), 3);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn adding_a_connection_preserves_an_edited_active_profile() {
+        let mut config = Config::from_node(complete("a.fixture", Network::Mainnet));
+        config
+            .add_connection(complete("b.fixture", Network::Testnet11))
+            .unwrap();
+        let a = config.connections.profiles[0].id.clone();
+        config.select_connection(&a).unwrap();
+        config.node_mut().host = "edited-a.fixture".into();
+
+        config
+            .add_connection(complete("c.fixture", Network::Testnet11))
+            .unwrap();
+        config.select_connection(&a).unwrap();
+
+        assert_eq!(config.node().host, "edited-a.fixture");
+        let b = config
+            .connections
+            .profiles
+            .iter()
+            .find(|profile| profile.node.host == "b.fixture")
+            .unwrap();
+        let c = config
+            .connections
+            .profiles
+            .iter()
+            .find(|profile| profile.node.host == "c.fixture")
+            .unwrap();
+        assert_eq!(b.node.host, "b.fixture");
+        assert_eq!(c.node.host, "c.fixture");
+        assert_ne!(c.node.host, "edited-a.fixture");
         config.validate().unwrap();
     }
 }

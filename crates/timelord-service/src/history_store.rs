@@ -46,10 +46,13 @@ pub struct Store {
 /// The node context of a chart. Observations carry their board and engine, so
 /// routing changes stay within one history; a different node does not.
 pub fn scope(config: &Config) -> Result<String> {
-    let mut bytes =
-        serde_json::to_vec(&(&config.node.network, &config.node.host, config.node.port))?;
-    if config.node.network_definition.is_some() {
-        let identity = config.node.chain_identity().map_err(anyhow::Error::msg)?;
+    let mut bytes = serde_json::to_vec(&(
+        &config.node().network,
+        &config.node().host,
+        config.node().port,
+    ))?;
+    if config.node().network_definition.is_some() {
+        let identity = config.node().chain_identity().map_err(anyhow::Error::msg)?;
         bytes.extend(serde_json::to_vec(&identity)?);
     }
     Ok(dg_xch_core::utils::hash_256(bytes)
@@ -486,13 +489,13 @@ mod tests {
             .save(&store.capture(&first, 1000, 1050).pruned(1050))
             .unwrap();
         let mut config = Config::default();
-        config.node.host = "other-node".into();
+        config.node_mut().host = "other-node".into();
         let other = Store::new(store.path.clone(), &config).unwrap();
         let mut state = RuntimeState::default();
         other.restore(&mut state, 1100).unwrap();
         assert!(state.archive.is_none());
-        config.node.host = "localhost".into();
-        config.node.network = timelord_core::Network::Testnet11;
+        config.node_mut().host = "localhost".into();
+        config.node_mut().network = timelord_core::Network::Testnet11;
         Store::new(store.path.clone(), &config)
             .unwrap()
             .restore(&mut state, 1100)
@@ -503,12 +506,9 @@ mod tests {
 
     #[test]
     fn custom_genesis_or_constants_changes_start_a_new_history_scope() {
-        let mut config = Config {
-            node: crate::network::tests::node(),
-            ..Default::default()
-        };
+        let mut config = Config::from_node(crate::network::tests::node());
         let original = scope(&config).unwrap();
-        let definition = config.node.network_definition.as_mut().unwrap();
+        let definition = config.node_mut().network_definition.as_mut().unwrap();
         definition.exported_at = "another export".into();
         definition.chia_version = "another version".into();
         definition
@@ -516,16 +516,16 @@ mod tests {
             .insert("address_prefix".into(), "another-prefix".to_owned().into());
         assert_eq!(scope(&config).unwrap(), original);
         config
-            .node
+            .node_mut()
             .network_definition
             .as_mut()
             .unwrap()
             .constants
             .insert("GENESIS_CHALLENGE".into(), "cd".repeat(32).into());
         assert_ne!(scope(&config).unwrap(), original);
-        config.node = crate::network::tests::node();
+        *config.node_mut() = crate::network::tests::node();
         config
-            .node
+            .node_mut()
             .network_definition
             .as_mut()
             .unwrap()

@@ -10,7 +10,7 @@ const SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub schema_version: u32,
-    pub node: NodeConfig,
+    single_node: NodeConfig,
     pub connections: ConnectionProfiles,
     pub service: ServiceConfig,
     pub hardware: HardwareConfig,
@@ -32,7 +32,11 @@ impl Serialize for Config {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         ConfigOut {
             schema_version: self.schema_version,
-            node: self.connections.profiles.is_empty().then_some(&self.node),
+            node: self
+                .connections
+                .profiles
+                .is_empty()
+                .then_some(&self.single_node),
             connections: &self.connections,
             service: &self.service,
             hardware: &self.hardware,
@@ -67,13 +71,16 @@ impl Default for ConfigIn {
 impl<'de> Deserialize<'de> for Config {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = ConfigIn::deserialize(deserializer)?;
-        let node = wire
+        // With profiles the runtime node is the active profile, so there is no
+        // single-node value and the private store stays default.
+        let single_node = wire
             .connections
             .resolve_node(wire.node)
-            .map_err(serde::de::Error::custom)?;
+            .map_err(serde::de::Error::custom)?
+            .unwrap_or_default();
         Ok(Self {
             schema_version: wire.schema_version,
-            node,
+            single_node,
             connections: wire.connections,
             service: wire.service,
             hardware: wire.hardware,
@@ -85,7 +92,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
-            node: NodeConfig::default(),
+            single_node: NodeConfig::default(),
             connections: ConnectionProfiles::default(),
             service: ServiceConfig::default(),
             hardware: HardwareConfig::default(),
@@ -362,8 +369,12 @@ impl Config {
         if self.schema_version != SCHEMA_VERSION {
             return Err("Unsupported schema_version; expected 1".into());
         }
-        self.node.validate()?;
-        self.connections.validate(&self.node)?;
+        // Selection errors must surface before any hidden single-node complaint;
+        // profile nodes are validated by the connection layer.
+        self.connections.validate()?;
+        if self.connections.profiles.is_empty() {
+            self.node().validate()?;
+        }
         if !self.service.status_listen.ip().is_loopback() || self.service.status_listen.port() == 0
         {
             return Err("The status endpoint must use a loopback address and nonzero port".into());
@@ -728,7 +739,7 @@ mod tests {
         c.service.status_listen = "0.0.0.0:9257".parse().unwrap();
         assert!(c.validate().is_err());
         c.service = ServiceConfig::default();
-        c.node.private_key = Some("secret.key".into());
+        c.node_mut().private_key = Some("secret.key".into());
         assert!(c.validate().is_err());
     }
     #[test]

@@ -240,23 +240,23 @@ async fn fixture(server_name: &str, board_fault: bool, custom: bool) -> Result<(
         )?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let mut config = Config::default();
-    config.node.host = "127.0.0.1".into();
-    config.node.port = listener.local_addr()?.port();
-    config.node.server_name = Some(server_name.into());
+    config.node_mut().host = "127.0.0.1".into();
+    config.node_mut().port = listener.local_addr()?.port();
+    config.node_mut().server_name = Some(server_name.into());
     let network_id = if custom {
         "ephemeral-fixture"
     } else {
         "testnet11"
     };
     if custom {
-        config.node.network = crate::network::tests::node().network;
-        config.node.network_definition = crate::network::tests::node().network_definition;
+        config.node_mut().network = crate::network::tests::node().network;
+        config.node_mut().network_definition = crate::network::tests::node().network_definition;
     } else {
-        config.node.network = timelord_core::Network::Testnet11;
+        config.node_mut().network = timelord_core::Network::Testnet11;
     }
-    config.node.certificate = Some(directory.join("client.crt"));
-    config.node.private_key = Some(directory.join("client.key"));
-    config.node.ca_certificate = Some(directory.join("ca.crt"));
+    config.node_mut().certificate = Some(directory.join("client.crt"));
+    config.node_mut().private_key = Some(directory.join("client.key"));
+    config.node_mut().ca_certificate = Some(directory.join("ca.crt"));
     let task = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await?;
         let tls = tokio_rustls::TlsAcceptor::from(Arc::new(server_tls))

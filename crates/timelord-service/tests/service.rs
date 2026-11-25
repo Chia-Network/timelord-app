@@ -173,9 +173,9 @@ fn helper_reports_real_socket_state_without_claiming_productivity() {
         toml::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
     // The chart scope is the node context; samples carry their own board.
     let scope = serde_json::to_vec(&(
-        configured.node.network.clone(),
-        &configured.node.host,
-        configured.node.port,
+        configured.node().network.clone(),
+        &configured.node().host,
+        configured.node().port,
     ))
     .unwrap();
     let scope: String = dg_xch_core::utils::hash_256(scope)

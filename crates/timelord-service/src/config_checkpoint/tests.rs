@@ -6,14 +6,14 @@ fn invalid_edits_use_only_private_validated_saved_configuration_and_do_not_overw
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("config.toml");
     let mut config = Config::default();
-    config.node.host = "saved.example".into();
+    config.node_mut().host = "saved.example".into();
     crate::save(&path, &config).unwrap();
     let saved = saved_path(&path).unwrap();
     crate::save(&saved, &config).unwrap();
     std::fs::write(&path, "schema_version = 999").unwrap();
     let (loaded, fallback) = load_running(&path).unwrap();
     assert!(fallback);
-    assert_eq!(loaded.node.host, "saved.example");
+    assert_eq!(loaded.node().host, "saved.example");
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
         "schema_version = 999"
@@ -54,15 +54,12 @@ fn fallback_never_crosses_custom_chain_definitions_with_the_same_name() {
     let dir = std::env::temp_dir().join(format!("tl-lkg-custom-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("config.toml");
-    let mut config = Config {
-        node: crate::network::tests::node(),
-        ..Default::default()
-    };
+    let mut config = Config::from_node(crate::network::tests::node());
     crate::save(&saved_path(&path).unwrap(), &config).unwrap();
     config.schema_version = 999;
     std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
     assert!(load_running(&path).unwrap().1);
-    let definition = config.node.network_definition.as_mut().unwrap();
+    let definition = config.node_mut().network_definition.as_mut().unwrap();
     definition.exported_at = "re-exported later".into();
     definition.chia_version = "another version".into();
     definition.config_overrides.insert(
@@ -72,7 +69,7 @@ fn fallback_never_crosses_custom_chain_definitions_with_the_same_name() {
     std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
     assert!(load_running(&path).unwrap().1);
     config
-        .node
+        .node_mut()
         .network_definition
         .as_mut()
         .unwrap()
@@ -93,10 +90,7 @@ fn fallback_uses_the_active_profile_network_and_refuses_unknown_intent() {
             network: network.parse().unwrap(),
             ..Default::default()
         };
-        let mut config = Config {
-            node: node.clone(),
-            ..Default::default()
-        };
+        let mut config = Config::from_node(node.clone());
         config.connections.profiles = vec![ConnectionProfile {
             id: "active".into(),
             name: "Active".into(),
@@ -131,7 +125,7 @@ fn fallback_uses_the_active_profile_network_and_refuses_unknown_intent() {
         .unwrap();
     let (loaded, fallback) = load_running(&path).unwrap();
     assert!(fallback);
-    assert_eq!(loaded.node.network, "testnet11".parse().unwrap());
+    assert_eq!(loaded.node().network, "testnet11".parse().unwrap());
 
     // A diverging (including empty or partial) [node] table fails loudly and
     // cannot silently select mainnet.
@@ -285,9 +279,9 @@ fn relative_config_checkpoint_keeps_original_profile_and_credential_paths() {
         // Relative checkpoint fields also belong to the original config,
         // including when the operator has removed that file altogether.
         candidate.hardware.automatic_state = Some("learned/profiles.json".into());
-        candidate.node.certificate = Some("credentials/node.crt".into());
-        candidate.node.private_key = Some("credentials/node.key".into());
-        candidate.node.ca_certificate = Some("credentials/ca.crt".into());
+        candidate.node_mut().certificate = Some("credentials/node.crt".into());
+        candidate.node_mut().private_key = Some("credentials/node.key".into());
+        candidate.node_mut().ca_certificate = Some("credentials/ca.crt".into());
         crate::save(&saved, &candidate).unwrap();
         std::fs::remove_file(&path).unwrap();
         let (fallback, used_saved) = load_running(&path).unwrap();
@@ -297,7 +291,7 @@ fn relative_config_checkpoint_keeps_original_profile_and_credential_paths() {
             Some(parent.join("learned/profiles.json"))
         );
         assert_eq!(
-            fallback.node.certificate,
+            fallback.node().certificate,
             Some(parent.join("credentials/node.crt"))
         );
     }
@@ -310,9 +304,9 @@ async fn checkpoint_preserves_proven_work_despite_observer_failure_but_rejects_p
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("config.toml");
     let mut config = Config::default();
-    config.node.certificate = Some(dir.join("fixture.crt"));
-    config.node.private_key = Some(dir.join("fixture.key"));
-    config.node.ca_certificate = Some(dir.join("fixture-ca.crt"));
+    config.node_mut().certificate = Some(dir.join("fixture.crt"));
+    config.node_mut().private_key = Some(dir.join("fixture.key"));
+    config.node_mut().ca_certificate = Some(dir.join("fixture-ca.crt"));
     config.hardware.boards = vec![toml::from_str("id='a'\nname='A'\nclient_port=18110").unwrap()];
     let shared = Arc::new(
         crate::Shared::new(

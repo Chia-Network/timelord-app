@@ -26,15 +26,12 @@ fn with_constants(constants: serde_json::Value) -> NodeConfig {
 #[test]
 fn custom_id_and_exact_constants_round_trip_without_dgx_derivation() {
     let node = node();
-    let config = timelord_core::Config {
-        node: node.clone(),
-        ..Default::default()
-    };
+    let config = timelord_core::Config::from_node(node.clone());
     config.validate().unwrap();
     let text = toml::to_string_pretty(&config).unwrap();
     let restored: timelord_core::Config = toml::from_str(&text).unwrap();
-    assert_eq!(restored.node.network_definition, node.network_definition);
-    let resolved = resolve(&restored.node).unwrap();
+    assert_eq!(restored.node().network_definition, node.network_definition);
+    let resolved = resolve(restored.node()).unwrap();
     assert_eq!(resolved.handshake_network_id, node.network.label());
     assert_eq!(
         resolved
@@ -371,22 +368,24 @@ fn unknown_misspelled_and_aliased_constants_fail_loudly() {
 
 #[test]
 fn definitions_must_match_and_known_constants_must_have_correct_types() {
-    let mut config = timelord_core::Config {
-        node: node(),
-        ..Default::default()
-    };
-    config.node.network_definition.as_mut().unwrap().network_id = "different".into();
-    assert!(config.validate().is_err());
-    config.node = node();
+    let mut config = timelord_core::Config::from_node(node());
     config
-        .node
+        .node_mut()
+        .network_definition
+        .as_mut()
+        .unwrap()
+        .network_id = "different".into();
+    assert!(config.validate().is_err());
+    *config.node_mut() = node();
+    config
+        .node_mut()
         .network_definition
         .as_mut()
         .unwrap()
         .constants
         .insert("DIFFICULTY_STARTING".into(), "250".to_owned().into());
-    assert!(resolve(&config.node).is_err());
-    config.node.network_definition = None;
+    assert!(resolve(config.node()).is_err());
+    config.node_mut().network_definition = None;
     assert!(config.validate().is_err());
     assert!("bad\"network".parse::<Network>().is_err());
 }
@@ -412,16 +411,13 @@ fn full_u128_constants_survive_json_toml_and_helper_json() {
         // Simulate raw numeric JSON produced by the exporter, not tagged config.
         json["network_definition"]["constants"]["DIFFICULTY_CONSTANT_FACTOR"] =
             serde_json::from_str(&expected.to_string()).unwrap();
-        let config = timelord_core::Config {
-            node: serde_json::from_value(json).unwrap(),
-            ..Default::default()
-        };
+        let config = timelord_core::Config::from_node(serde_json::from_value(json).unwrap());
         let restored: timelord_core::Config =
             toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
         let restored: timelord_core::Config =
             serde_json::from_str(&serde_json::to_string(&restored).unwrap()).unwrap();
         assert_eq!(
-            resolve(&restored.node)
+            resolve(restored.node())
                 .unwrap()
                 .constants
                 .difficulty_constant_factor,
@@ -446,10 +442,7 @@ fn invalid_scheduler_parameters_cannot_replace_a_saved_config() {
     let directory = std::env::temp_dir().join(format!("tl-invalid-network-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();
     let path = directory.join("config.toml");
-    let mut config = timelord_core::Config {
-        node: node(),
-        ..Default::default()
-    };
+    let mut config = timelord_core::Config::from_node(node());
     crate::save(&path, &config).unwrap();
     let saved = std::fs::read(&path).unwrap();
     for (name, value) in [
@@ -458,9 +451,9 @@ fn invalid_scheduler_parameters_cannot_replace_a_saved_config() {
         ("SUB_SLOT_ITERS_STARTING", 0),
         ("DISCRIMINANT_SIZE_BITS", 17),
     ] {
-        config.node = node();
+        *config.node_mut() = node();
         config
-            .node
+            .node_mut()
             .network_definition
             .as_mut()
             .unwrap()

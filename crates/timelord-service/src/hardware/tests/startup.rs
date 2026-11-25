@@ -42,16 +42,16 @@ printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2"#,
         Box::leak(Box::new(tokio::sync::Mutex::new(())));
     let (_stop, rx) = watch::channel(false);
     let startup = startup(&shared, &board).await.unwrap();
-    let owner = tokio::spawn(supervise(
-        shared.clone(),
-        crate::hardware::fixture_backend(&shared),
-        board.clone(),
-        child,
-        rx,
-        initialization.lock().await,
-        None,
-        startup,
-    ));
+    let owner = tokio::spawn(
+        NativeSupervision {
+            shared: shared.clone(),
+            backend: crate::hardware::fixture_backend(&shared),
+            board: board.clone(),
+            shutdown: rx,
+            timing: Timing::default(),
+        }
+        .run(child, initialization.lock().await, None, startup),
+    );
     tokio::time::timeout(Duration::from_secs(3), async {
         while !shared
             .runtime
@@ -162,16 +162,16 @@ printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2
         Box::leak(Box::new(tokio::sync::Mutex::new(())));
     let (stop, rx) = watch::channel(false);
     let startup = startup(&shared, &board).await.unwrap();
-    let owner = tokio::spawn(supervise(
-        shared.clone(),
-        crate::hardware::fixture_backend(&shared),
-        board.clone(),
-        child,
-        rx,
-        initialization.lock().await,
-        Some(preparing),
-        startup,
-    ));
+    let owner = tokio::spawn(
+        NativeSupervision {
+            shared: shared.clone(),
+            backend: crate::hardware::fixture_backend(&shared),
+            board: board.clone(),
+            shutdown: rx,
+            timing: Timing::default(),
+        }
+        .run(child, initialization.lock().await, Some(preparing), startup),
+    );
     tokio::time::timeout(Duration::from_secs(3), async {
         while !dir.join("started").exists() {
             tokio::task::yield_now().await;
@@ -331,16 +331,14 @@ printf '%s\n' 'Hardware shutdown: engines_paused=1 safe_point_restored=1' >&2"#,
         Box::leak(Box::new(tokio::sync::Mutex::new(())));
     let error = tokio::time::timeout(
         Duration::from_secs(5),
-        supervise(
-            shared.clone(),
-            crate::hardware::fixture_backend(&shared),
-            board.clone(),
-            child,
-            rx,
-            initialization.lock().await,
-            None,
-            startup,
-        ),
+        NativeSupervision {
+            shared: shared.clone(),
+            backend: crate::hardware::fixture_backend(&shared),
+            board: board.clone(),
+            shutdown: rx,
+            timing: Timing::default(),
+        }
+        .run(child, initialization.lock().await, None, startup),
     )
     .await
     .expect("thermal initialization did not retire the native owner")

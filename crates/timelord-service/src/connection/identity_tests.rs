@@ -240,7 +240,7 @@ fn local_root_keeps_only_a_valid_rpc_identity() {
     let root = fixture.0.join("chia");
     let mut config = Config::default();
     local(&mut config, &root).unwrap();
-    assert!(config.node.rpc.is_some());
+    assert!(config.node().rpc.is_some());
 
     let (_, unrelated_ca_pem, _) = test_pki::ca("unrelated-ca");
     fixture.write_under(
@@ -249,8 +249,8 @@ fn local_root_keeps_only_a_valid_rpc_identity() {
     );
     let mut config = Config::default();
     local(&mut config, &root).unwrap();
-    assert!(config.node.rpc.is_none());
-    assert!(config.node.certificate.is_some());
+    assert!(config.node().rpc.is_none());
+    assert!(config.node().certificate.is_some());
 }
 
 #[test]
