@@ -239,7 +239,7 @@ final class ConnectionProfileTests: XCTestCase {
         let draft = NodeRPCConfiguration(host: model.configuration.node.host)
         model.configuration.node.rpc = draft
         XCTAssertNotNil(model.configuration.node.rpc)
-        XCTAssertTrue(model.hasUnsavedSettings, "The draft is unsaved UI state, not a persisted RPC profile")
+        XCTAssertFalse(model.hasUnsavedSettings, "The draft is UI state, not a persisted setting")
         model.selectConnectionProfile("second")
         let switched = await model.saveConfiguration()
         XCTAssertTrue(switched, "An incomplete RPC draft must not block a profile switch")
@@ -249,7 +249,8 @@ final class ConnectionProfileTests: XCTestCase {
         XCTAssertEqual(switchedConfig.connections?.activeId, "second")
         XCTAssertEqual(model.configuration.connections?.profiles[0].node.rpc, draft,
             "The saved configuration strips the draft, but the form keeps it")
-        XCTAssertTrue(model.hasUnsavedSettings)
+        XCTAssertFalse(model.hasUnsavedSettings,
+            "A retained RPC draft is UI state, not an unsaved persisted setting")
 
         // Turning the draft off persists the absence of RPC settings.
         model.configuration.connections?.profiles[0].node.rpc = nil

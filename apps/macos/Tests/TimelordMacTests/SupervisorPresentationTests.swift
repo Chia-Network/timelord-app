@@ -332,7 +332,8 @@ final class SupervisorPresentationTests: XCTestCase {
             "Saving for a connection test must not clear the half-filled RPC form")
         XCTAssertNil(model.errorMessage, "An implicit save must not report dropping the draft")
         XCTAssertNil(model.notice, "An implicit save must not report dropping the draft")
-        XCTAssertTrue(model.hasUnsavedSettings)
+        XCTAssertFalse(model.hasUnsavedSettings,
+            "An incomplete RPC draft alone is not an unsaved persisted setting")
 
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
         let persisted = try decoder.decode(AppConfiguration.self, from: Data(contentsOf: fixture.configurationURL))
@@ -508,6 +509,7 @@ final class SupervisorPresentationTests: XCTestCase {
         try fixture.writeConfiguration(configuration)
         let model = fixture.model(configuration)
         model.sheet = .node
+        model.configuration.node.host = "edited.first.fixture"
         model.configuration.connections?.profiles[1].node.rpc =
             NodeRPCConfiguration(host: "rpc.inactive.fixture")
 
@@ -518,6 +520,14 @@ final class SupervisorPresentationTests: XCTestCase {
         XCTAssertEqual(model.configuration.connections?.profiles[1].node.rpc,
             NodeRPCConfiguration(host: "rpc.inactive.fixture"),
             "An inactive draft stays editable")
+        XCTAssertFalse(model.hasUnsavedSettings,
+            "A retained inactive draft is not an unsaved persisted setting")
+        let configures = try fixture.loggedCommands().filter { $0.hasPrefix("configure ") }.count
+        XCTAssertEqual(configures, 1)
+        let later = await model.finishSettings()
+        XCTAssertTrue(later)
+        XCTAssertEqual(try fixture.loggedCommands().filter { $0.hasPrefix("configure ") }.count,
+            configures, "A later Done must not save when only a retained draft differs")
     }
 
     func testFinishingSettingsFromASheetWithoutRPCFieldsReportsNoNotice() async throws {
@@ -527,6 +537,7 @@ final class SupervisorPresentationTests: XCTestCase {
         try fixture.writeConfiguration(configuration)
         let model = fixture.model(configuration)
         model.sheet = .boards
+        model.configuration.node.host = "edited.done.fixture"
         model.configuration.node.rpc = NodeRPCConfiguration(host: "rpc.draft.fixture")
 
         let finished = await model.finishSettings()
@@ -536,6 +547,14 @@ final class SupervisorPresentationTests: XCTestCase {
         XCTAssertEqual(model.configuration.node.rpc,
             NodeRPCConfiguration(host: "rpc.draft.fixture"),
             "Done from a sheet without RPC fields leaves the draft editable")
+        XCTAssertFalse(model.hasUnsavedSettings,
+            "A retained RPC draft is not an unsaved persisted setting")
+        let configures = try fixture.loggedCommands().filter { $0.hasPrefix("configure ") }.count
+        XCTAssertEqual(configures, 1)
+        let later = await model.finishSettings()
+        XCTAssertTrue(later)
+        XCTAssertEqual(try fixture.loggedCommands().filter { $0.hasPrefix("configure ") }.count,
+            configures, "A later Done must not save when only a retained draft differs")
     }
 
     func testFinishingSettingsDoesNotHideAStartupError() async throws {
@@ -572,8 +591,31 @@ final class SupervisorPresentationTests: XCTestCase {
         let finished = await model.finishSettings()
         XCTAssertTrue(finished)
         XCTAssertNotNil(model.notice)
-        try await Task.sleep(for: .milliseconds(80))
+        let deadline = Date().addingTimeInterval(2)
+        while model.notice != nil && Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
         XCTAssertNil(model.notice)
+    }
+
+    func testNoticeTimerDoesNotRetainTheModel() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        let configuration = runnableConfiguration(host: "done.fixture")
+        try fixture.writeConfiguration(configuration)
+        var model: TimelordModel? = TimelordModel(
+            controller: fixture.controller, initialConfiguration: configuration,
+            monitoringEnabled: false, noticeDuration: .seconds(60))
+        model?.sheet = .node
+        model?.configuration.node.rpc = NodeRPCConfiguration(host: "rpc.draft.fixture")
+
+        let finished = await model?.finishSettings()
+        XCTAssertEqual(finished, true)
+        XCTAssertNotNil(model?.notice)
+        try await Task.sleep(for: .milliseconds(10))
+        weak var weakModel = model
+        model = nil
+        XCTAssertNil(weakModel, "The notice timer must not keep the model alive")
     }
 
     func testFinishingSettingsReportsDiscardedIncompleteProfileRPCDraft() async throws {

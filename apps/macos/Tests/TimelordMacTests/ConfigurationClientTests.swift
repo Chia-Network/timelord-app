@@ -131,24 +131,20 @@ final class ConfigurationClientTests: XCTestCase {
         schema_version = 1
 
         [node]
-        host = "migration.fixture.invalid"
+        host = "localhost"
         port = 8444
         network = "mainnet"
-        certificate = "/fixture/cert"
-        private_key = "/fixture/key"
-        ca_certificate = "/fixture/ca"
         """.utf8).write(to: config)
-        var initial = AppConfiguration()
-        initial.node.host = "migration.fixture.invalid"
-        initial.node.certificate = "/fixture/cert"
-        initial.node.privateKey = "/fixture/key"
-        initial.node.caCertificate = "/fixture/ca"
+        let initial = AppConfiguration()
         let controller = ServiceController(
             configURL: config, logsURL: directory.appendingPathComponent("service.log"),
             helperURL: helper)
         let model = TimelordModel(
             controller: controller, initialConfiguration: initial, monitoringEnabled: false)
         model.sheet = .node
+        model.configuration.node.certificate = "/fixture/cert"
+        model.configuration.node.privateKey = "/fixture/key"
+        model.configuration.node.caCertificate = "/fixture/ca"
         model.configuration.node.rpc = NodeRPCConfiguration(host: "rpc.draft.fixture")
 
         let finished = await model.finishSettings()

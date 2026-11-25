@@ -30,11 +30,11 @@ final class TimelordModel: ObservableObject {
     private func showNotice(_ message: String) {
         noticeTask?.cancel()
         notice = message
+        let duration = noticeDuration
         noticeTask = Task { [weak self] in
-            guard let self else { return }
-            try? await Task.sleep(for: self.noticeDuration)
+            try? await Task.sleep(for: duration)
             guard !Task.isCancelled else { return }
-            self.notice = nil
+            self?.notice = nil
         }
     }
     private func clearNotice() {
@@ -343,7 +343,9 @@ final class TimelordModel: ObservableObject {
         do { try await controller.install(); await refresh() }
         catch { reportActionError(error.localizedDescription) }
     }
-    var hasUnsavedSettings: Bool { configuration != savedConfiguration }
+    /// True when the next save would persist a change. Incomplete RPC drafts
+    /// are UI state and do not count.
+    var hasUnsavedSettings: Bool { resolvedConfiguration != savedConfiguration }
     /// Only the node profile differs between two configurations.
     private static func onlyNodeDiffers(_ old: AppConfiguration, _ new: AppConfiguration) -> Bool {
         var adjusted = new
@@ -390,7 +392,7 @@ final class TimelordModel: ObservableObject {
     /// A settings sheet only dismisses after validation and persistence succeed.
     func finishSettings() async -> Bool {
         guard canFinishSettings else { return false }
-        if hasUnsavedSettings || (!canControlService && liveStatus == nil) {
+        if hasUnsavedSettings {
             guard await saveConfiguration() else { return false }
         }
         if configurationNeedsRestart && canControlService {
