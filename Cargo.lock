@@ -686,7 +686,7 @@ dependencies = [
 [[package]]
 name = "dg_parser_macro"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=c70154e518e3642a8226bd07d977459c8b9ac631#c70154e518e3642a8226bd07d977459c8b9ac631"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=d71e119cfe0566eb6d253f6819f137d3bbc2dae5#d71e119cfe0566eb6d253f6819f137d3bbc2dae5"
 dependencies = [
  "bytes",
  "dg_xch_serialize",
@@ -700,7 +700,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_clients"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=c70154e518e3642a8226bd07d977459c8b9ac631#c70154e518e3642a8226bd07d977459c8b9ac631"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=d71e119cfe0566eb6d253f6819f137d3bbc2dae5#d71e119cfe0566eb6d253f6819f137d3bbc2dae5"
 dependencies = [
  "async-trait",
  "blst",
@@ -716,7 +716,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tokio-tungstenite 0.28.0",
+ "tokio-tungstenite",
  "urlencoding",
  "uuid",
  "zeroize",
@@ -725,7 +725,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_core"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=c70154e518e3642a8226bd07d977459c8b9ac631#c70154e518e3642a8226bd07d977459c8b9ac631"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=d71e119cfe0566eb6d253f6819f137d3bbc2dae5#d71e119cfe0566eb6d253f6819f137d3bbc2dae5"
 dependencies = [
  "async-trait",
  "blst",
@@ -760,7 +760,7 @@ dependencies = [
  "sha2 0.10.9",
  "time",
  "tokio",
- "tokio-tungstenite 0.28.0",
+ "tokio-tungstenite",
  "uuid",
  "x509-cert",
 ]
@@ -768,7 +768,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_keys"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=c70154e518e3642a8226bd07d977459c8b9ac631#c70154e518e3642a8226bd07d977459c8b9ac631"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=d71e119cfe0566eb6d253f6819f137d3bbc2dae5#d71e119cfe0566eb6d253f6819f137d3bbc2dae5"
 dependencies = [
  "bech32",
  "bip39",
@@ -784,7 +784,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_macros"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=c70154e518e3642a8226bd07d977459c8b9ac631#c70154e518e3642a8226bd07d977459c8b9ac631"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=d71e119cfe0566eb6d253f6819f137d3bbc2dae5#d71e119cfe0566eb6d253f6819f137d3bbc2dae5"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -795,7 +795,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_pos"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=c70154e518e3642a8226bd07d977459c8b9ac631#c70154e518e3642a8226bd07d977459c8b9ac631"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=d71e119cfe0566eb6d253f6819f137d3bbc2dae5#d71e119cfe0566eb6d253f6819f137d3bbc2dae5"
 dependencies = [
  "dg_xch_core",
  "dg_xch_pos1",
@@ -807,7 +807,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_pos1"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=c70154e518e3642a8226bd07d977459c8b9ac631#c70154e518e3642a8226bd07d977459c8b9ac631"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=d71e119cfe0566eb6d253f6819f137d3bbc2dae5#d71e119cfe0566eb6d253f6819f137d3bbc2dae5"
 dependencies = [
  "async-trait",
  "blake3",
@@ -832,7 +832,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_pos2"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=c70154e518e3642a8226bd07d977459c8b9ac631#c70154e518e3642a8226bd07d977459c8b9ac631"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=d71e119cfe0566eb6d253f6819f137d3bbc2dae5#d71e119cfe0566eb6d253f6819f137d3bbc2dae5"
 dependencies = [
  "aes",
  "blake3",
@@ -843,12 +843,12 @@ dependencies = [
 [[package]]
 name = "dg_xch_pos_common"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=c70154e518e3642a8226bd07d977459c8b9ac631#c70154e518e3642a8226bd07d977459c8b9ac631"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=d71e119cfe0566eb6d253f6819f137d3bbc2dae5#d71e119cfe0566eb6d253f6819f137d3bbc2dae5"
 
 [[package]]
 name = "dg_xch_puzzles"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=c70154e518e3642a8226bd07d977459c8b9ac631#c70154e518e3642a8226bd07d977459c8b9ac631"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=d71e119cfe0566eb6d253f6819f137d3bbc2dae5#d71e119cfe0566eb6d253f6819f137d3bbc2dae5"
 dependencies = [
  "blst",
  "dg_parser_macro",
@@ -866,7 +866,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_serialize"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=c70154e518e3642a8226bd07d977459c8b9ac631#c70154e518e3642a8226bd07d977459c8b9ac631"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=d71e119cfe0566eb6d253f6819f137d3bbc2dae5#d71e119cfe0566eb6d253f6819f137d3bbc2dae5"
 dependencies = [
  "log",
  "serde",
@@ -876,7 +876,7 @@ dependencies = [
 [[package]]
 name = "dg_xch_servers"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=c70154e518e3642a8226bd07d977459c8b9ac631#c70154e518e3642a8226bd07d977459c8b9ac631"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=d71e119cfe0566eb6d253f6819f137d3bbc2dae5#d71e119cfe0566eb6d253f6819f137d3bbc2dae5"
 dependencies = [
  "async-trait",
  "blst",
@@ -898,14 +898,14 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
- "tokio-tungstenite 0.28.0",
+ "tokio-tungstenite",
  "uuid",
 ]
 
 [[package]]
 name = "dg_xch_timelord"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=c70154e518e3642a8226bd07d977459c8b9ac631#c70154e518e3642a8226bd07d977459c8b9ac631"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=d71e119cfe0566eb6d253f6819f137d3bbc2dae5#d71e119cfe0566eb6d253f6819f137d3bbc2dae5"
 dependencies = [
  "dg_xch_core",
  "dg_xch_pos",
@@ -917,13 +917,13 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-rustls",
- "tokio-tungstenite 0.28.0",
+ "tokio-tungstenite",
 ]
 
 [[package]]
 name = "dg_xch_vdf"
 version = "3.0.0"
-source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=c70154e518e3642a8226bd07d977459c8b9ac631#c70154e518e3642a8226bd07d977459c8b9ac631"
+source = "git+https://github.com/Chia-Network/dg_xch_utils?rev=d71e119cfe0566eb6d253f6819f137d3bbc2dae5#d71e119cfe0566eb6d253f6819f137d3bbc2dae5"
 dependencies = [
  "dg_xch_core",
  "gmp-mpfr-sys",
@@ -1150,18 +1150,6 @@ dependencies = [
 
 [[package]]
 name = "getrandom"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
-dependencies = [
- "cfg-if",
- "libc",
- "r-efi 5.3.0",
- "wasip2",
-]
-
-[[package]]
-name = "getrandom"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
@@ -1169,7 +1157,7 @@ dependencies = [
  "cfg-if",
  "js-sys",
  "libc",
- "r-efi 6.0.0",
+ "r-efi",
  "rand_core 0.10.1",
  "wasm-bindgen",
 ]
@@ -1375,17 +1363,17 @@ dependencies = [
 
 [[package]]
 name = "hyper-tungstenite"
-version = "0.19.0"
+version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc778da281a749ed28d2be73a9f2cd13030680a1574bc729debd1195e44f00e9"
+checksum = "aee7ba11c4933715ee2c2fea1d8932f19356d31648c0a1bb65223ef5d7962c4c"
 dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
  "pin-project-lite",
  "tokio",
- "tokio-tungstenite 0.28.0",
- "tungstenite 0.28.0",
+ "tokio-tungstenite",
+ "tungstenite",
 ]
 
 [[package]]
@@ -2001,12 +1989,6 @@ dependencies = [
 
 [[package]]
 name = "r-efi"
-version = "5.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
-
-[[package]]
-name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
@@ -2018,18 +2000,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e058c7de0b26af77780c769414d6257830bb240f3c38477dbc2c16e5f54d6d4c"
 dependencies = [
  "libc",
- "rand_chacha 0.3.1",
+ "rand_chacha",
  "rand_core 0.6.4",
-]
-
-[[package]]
-name = "rand"
-version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9ef1d0d795eb7d84685bca4f72f3649f064e6641543d3a8c415898726a57b41"
-dependencies = [
- "rand_chacha 0.9.0",
- "rand_core 0.9.5",
 ]
 
 [[package]]
@@ -2054,31 +2026,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "rand_chacha"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
-dependencies = [
- "ppv-lite86",
- "rand_core 0.9.5",
-]
-
-[[package]]
 name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
  "getrandom 0.2.17",
-]
-
-[[package]]
-name = "rand_core"
-version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
-dependencies = [
- "getrandom 0.3.4",
 ]
 
 [[package]]
@@ -2470,17 +2423,6 @@ dependencies = [
 
 [[package]]
 name = "sha1"
-version = "0.10.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.17",
- "digest 0.10.7",
-]
-
-[[package]]
-name = "sha1"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
@@ -2797,7 +2739,7 @@ dependencies = [
  "timelord-supervisor",
  "tokio",
  "tokio-rustls",
- "tokio-tungstenite 0.30.0",
+ "tokio-tungstenite",
  "toml",
  "tower",
  "tracing",
@@ -2898,9 +2840,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-tungstenite"
-version = "0.28.0"
+version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d25a406cddcc431a75d3d9afc6a7c0f7428d4891dd973e4d54c56b46127bf857"
+checksum = "17a073bfed563fa236697a068031408a93cd9522e08abf9933ead3e73411bd71"
 dependencies = [
  "futures-util",
  "log",
@@ -2908,20 +2850,8 @@ dependencies = [
  "rustls-pki-types",
  "tokio",
  "tokio-rustls",
- "tungstenite 0.28.0",
+ "tungstenite",
  "webpki-roots 0.26.11",
-]
-
-[[package]]
-name = "tokio-tungstenite"
-version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17a073bfed563fa236697a068031408a93cd9522e08abf9933ead3e73411bd71"
-dependencies = [
- "futures-util",
- "log",
- "tokio",
- "tungstenite 0.30.0",
 ]
 
 [[package]]
@@ -3105,25 +3035,6 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tungstenite"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8628dcc84e5a09eb3d8423d6cb682965dea9133204e8fb3efee74c2a0c259442"
-dependencies = [
- "bytes",
- "data-encoding",
- "http",
- "httparse",
- "log",
- "rand 0.9.5",
- "rustls",
- "rustls-pki-types",
- "sha1 0.10.7",
- "thiserror",
- "utf-8",
-]
-
-[[package]]
-name = "tungstenite"
 version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e48ac77174b19c110a50ab2128b24215ac9cb40e0e12e093fb602d175c569d22"
@@ -3134,7 +3045,9 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.10.4",
- "sha1 0.11.0",
+ "rustls",
+ "rustls-pki-types",
+ "sha1",
  "thiserror",
 ]
 
@@ -3188,12 +3101,6 @@ name = "urlencoding"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
-
-[[package]]
-name = "utf-8"
-version = "0.7.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
 
 [[package]]
 name = "utf8_iter"
@@ -3251,15 +3158,6 @@ name = "wasi"
 version = "0.11.1+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
-
-[[package]]
-name = "wasip2"
-version = "1.0.4+wasi-0.2.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
-dependencies = [
- "wit-bindgen",
-]
 
 [[package]]
 name = "wasm-bindgen"
@@ -3481,12 +3379,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wit-bindgen"
-version = "0.57.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
-
-[[package]]
 name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3500,7 +3392,7 @@ checksum = "e9f58ad685a2945c7c063f5d69b5c27105d75bb85c740380d8fc64e79a098417"
 dependencies = [
  "const-oid 0.10.3",
  "der",
- "sha1 0.11.0",
+ "sha1",
  "signature",
  "spki",
  "tls_codec",
