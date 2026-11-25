@@ -1,5 +1,4 @@
 use super::*;
-use std::os::unix::fs::PermissionsExt;
 
 struct Fixture(std::path::PathBuf);
 impl Fixture {
@@ -17,8 +16,7 @@ impl Fixture {
     }
     fn helper(&self, name: &str, body: &str) -> std::path::PathBuf {
         let path = self.0.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_scripts::write_executable_script(&path, &format!("#!/bin/sh\n{body}\n"));
         path
     }
 }

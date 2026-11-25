@@ -127,6 +127,14 @@ fn invalid_candidate_does_not_reset_the_scheduler_or_discard_later_work() {
         rejected.is_err(),
         "invalid candidate must be rejected, not deferred"
     );
+    assert_eq!(
+        metrics.counter("unfinished_candidates_total", &["rejected", "node"]),
+        1
+    );
+    assert_eq!(
+        metrics.counter("unfinished_candidates_total", &["rejected", "retry"]),
+        0
+    );
     assert!(scheduler.initialized());
     assert_eq!(scheduler.generation(), generation);
     let expected_hash = decode_exact::<NewUnfinishedBlockTimelord>(&raw)
@@ -136,6 +144,14 @@ fn invalid_candidate_does_not_reset_the_scheduler_or_discard_later_work() {
         .unwrap();
     let admitted = handle_unfinished(&mut scheduler, &raw, &metrics).unwrap();
     assert_eq!(admitted, Admission::Admitted(expected_hash));
+    assert_eq!(
+        metrics.counter("unfinished_candidates_total", &["admitted", "node"]),
+        1
+    );
+    assert_eq!(
+        metrics.counter("unfinished_candidates_total", &["admitted", "retry"]),
+        0
+    );
     assert!(scheduler.initialized());
     assert_eq!(scheduler.generation(), generation);
     assert!(
@@ -503,6 +519,21 @@ fn retry_candidates_full_warning_includes_the_block_hash() {
 }
 
 #[test]
+fn retry_deferred_queue_full_warning_includes_the_block_hash() {
+    let metrics = crate::observability::Metrics::new(timelord_core::Network::Mainnet).unwrap();
+    let hash = dg_xch_core::blockchain::sized_bytes::Bytes32::const_new([10; 32]);
+    let outcome: Result<Admission, String> = Ok(Admission::DeferredQueueFull);
+    let logs =
+        capture_logs(|| record(outcome, UnfinishedSource::Retry, None, Some(hash), &metrics));
+    assert!(
+        logs.lines().any(|line| line.contains(" WARN ")
+            && line.contains("Deferred unfinished block queue is full")
+            && line.contains(&hash.to_string())),
+        "{logs}"
+    );
+}
+
+#[test]
 fn retry_outcomes_are_recorded_with_their_hash_and_source() {
     let metrics = crate::observability::Metrics::new(timelord_core::Network::Mainnet).unwrap();
     let hash = dg_xch_core::blockchain::sized_bytes::Bytes32::const_new([11; 32]);
@@ -526,12 +557,20 @@ fn retry_outcomes_are_recorded_with_their_hash_and_source() {
 fn retry_rejection_counts_as_rejected_not_ignored() {
     let metrics = crate::observability::Metrics::new(timelord_core::Network::Mainnet).unwrap();
     let hash = dg_xch_core::blockchain::sized_bytes::Bytes32::const_new([12; 32]);
-    record(
-        Err("fixture rejection"),
-        UnfinishedSource::Retry,
-        None,
-        Some(hash),
-        &metrics,
+    let logs = capture_logs(|| {
+        record(
+            Err("fixture rejection"),
+            UnfinishedSource::Retry,
+            None,
+            Some(hash),
+            &metrics,
+        )
+    });
+    assert!(
+        logs.lines().any(|line| line.contains(" WARN ")
+            && line.contains("Rejected unfinished block")
+            && line.contains(&hash.to_string())),
+        "{logs}"
     );
     assert_eq!(
         metrics.counter("unfinished_candidates_total", &["rejected", "retry"]),

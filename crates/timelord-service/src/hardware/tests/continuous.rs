@@ -6,7 +6,7 @@ use crate::{
     runtime::{HardwareState, RuntimeState},
     safety,
 };
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 use timelord_core::{BoardConfig, Chain, Config};
 use tokio::{net::TcpListener, sync::watch};
 
@@ -228,116 +228,103 @@ async fn an_owner_group_that_exits_fails_the_continuous_loop() {
 }
 
 #[tokio::test]
-async fn a_retired_group_that_already_exited_reports_the_inner_failure() {
-    // `run` binds the port itself, so a port handed out by `free_port` can be
-    // stolen by a parallel test before `run` gets to it. A busy port alone is
-    // not proof of ownership: the bind-failure path leaves a retry marker. Retry
-    // the setup with a fresh port until this `run` really owns a listener.
-    //
-    // Freeze time before polling `run`. The interval's first tick is not
-    // guaranteed to be ready on the first poll (the timer wheel rounds to the
-    // next millisecond), and a tick left pending across `pause()` can later win
-    // the unbiased `select!` before the retirement update. Pausing first keeps
-    // any such pending tick from firing. The keepalive stops `pause()` from
-    // auto-advancing to it while the setup is polled.
-    tokio::time::pause();
-    let keep_alive = tokio::spawn(std::future::pending::<()>());
-
-    let mut attempt = 0;
-    let (shared, updates, board, _stop, mut run) = loop {
-        attempt += 1;
-        assert!(
-            attempt <= 20,
-            "could not start the owner group: every client port was stolen"
-        );
-        let board = board("retire-exit", free_port());
-        let mut config = Config::default();
-        config.hardware.boards = vec![board.clone()];
-        let (shared, updates, receiver) = fixture(config, None);
-        let backend = backend_fixture(&shared);
-        let (_stop, shutdown) = watch::channel(false);
-        let mut run = Box::pin(continuous::run(shared.clone(), backend, receiver, shutdown));
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let retried = loop {
-            // Poll only until the owner has attempted the bind and parked in
-            // its unbiased `select!` waiting for shutdown, updates or a tick.
-            tokio::select! {
-                biased;
-                result = &mut run => {
-                    panic!("continuous loop exited before the owner started: {result:?}")
-                }
-                _ = std::future::ready(()) => {}
-            }
-            let retried = {
-                let state = shared.runtime.lock().unwrap();
-                state.boards.get(&board.id).is_some_and(|hardware| {
-                    hardware.retry_after_unix.is_some()
-                        || hardware
-                            .recovery_reason
-                            .as_deref()
-                            .is_some_and(|reason| reason.contains("Waiting for ASIC client port"))
-                })
-            };
-            if retried {
-                break true;
-            }
-            if !port_available(board.client_port) {
-                break false;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the owner group never attempted to bind its port"
-            );
-            tokio::task::yield_now().await;
-        };
-        if retried {
-            continue;
-        }
-        assert!(
-            !port_available(board.client_port),
-            "the owner group did not bind its port"
-        );
-        break (shared, updates, board, _stop, run);
-    };
-    let waiting = std::time::Instant::now();
-    while !port_available(board.client_port) {
-        assert!(
-            waiting.elapsed() < Duration::from_secs(5),
-            "the owner group never exited on its own"
-        );
+async fn retire_stale_groups_surfaces_a_failed_owners_inner_failure() {
+    let (shared, _updates, _receiver) = fixture(Config::default(), None);
+    let backend = backend_fixture(&shared);
+    let task = tokio::spawn(async {
+        Err::<(), anyhow::Error>(anyhow::anyhow!("Board owner group exited unexpectedly"))
+    });
+    while !task.is_finished() {
         tokio::task::yield_now().await;
     }
-
-    // Retire the already-finished group while `run` is still parked and time is
-    // paused, so only the already-ready watch update can wake `select!`. The
-    // next iteration takes the retire path and `ensure!(stopping)` fails.
-    updates.send_replace(with_boards(&shared, Vec::new()));
-    let waiting = std::time::Instant::now();
-    let result = loop {
-        tokio::select! {
-            biased;
-            result = &mut run => break result,
-            _ = std::future::ready(()) => {
-                assert!(
-                    waiting.elapsed() < Duration::from_secs(5),
-                    "continuous loop hung after the owner group exited"
-                );
-                tokio::task::yield_now().await;
-            }
-        }
-    };
-    keep_alive.abort();
-    let error = result.expect_err("a retired finished group must fail the loop");
+    let board = board("retire-failure", 0);
+    let (stop, _receiver) = watch::channel(false);
+    let mut groups = HashMap::from([(board.id.clone(), continuous::Group { board, stop, task })]);
+    let error = continuous::retire_stale_groups(&mut groups, &[], &backend)
+        .await
+        .expect_err("a failed retired owner must surface its inner failure");
     let chain = format!("{error:#}");
     assert!(
         chain.contains("Board owner group exited unexpectedly"),
         "{chain}"
     );
+    assert!(groups.is_empty());
+}
+
+#[tokio::test]
+async fn own_group_reports_the_first_task_join_failure() {
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async {
+        panic!("fixture owner task failed");
+    });
+    let (stop, _receiver) = watch::channel(false);
+    let error = continuous::own_group(tasks, stop)
+        .await
+        .expect_err("a panicking owner task must fail the group");
+    let chain = format!("{error:#}");
+    assert!(chain.contains("Board group failed"), "{chain}");
+}
+
+#[tokio::test]
+async fn own_group_fails_when_a_task_exits_without_a_stop_request() {
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async {});
+    let (stop, _receiver) = watch::channel(false);
+    let error = continuous::own_group(tasks, stop)
+        .await
+        .expect_err("an unexpected owner exit must fail the group");
+    let chain = format!("{error:#}");
     assert!(
-        !chain.contains("A persistent board owner exited unexpectedly"),
+        chain.contains("Board owner group exited unexpectedly"),
         "{chain}"
     );
+}
+
+#[tokio::test]
+async fn own_group_accepts_a_finished_task_after_a_stop_request() {
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async {});
+    let (stop, _receiver) = watch::channel(false);
+    stop.send(true).unwrap();
+    continuous::own_group(tasks, stop)
+        .await
+        .expect("a stop request explains the owner exit");
+}
+
+#[tokio::test]
+async fn a_retired_owner_reports_the_inner_group_failure() {
+    let task = tokio::spawn(async {
+        Err::<(), anyhow::Error>(anyhow::anyhow!("Board owner group exited unexpectedly"))
+    });
+    while !task.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    let error = continuous::join_retired_owner(task)
+        .await
+        .expect_err("the retired owner's inner failure must surface");
+    let chain = format!("{error:#}");
+    assert!(
+        chain.contains("Board owner group exited unexpectedly"),
+        "{chain}"
+    );
+}
+
+#[tokio::test]
+async fn a_retired_owner_reports_a_join_failure() {
+    let task: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    task.abort();
+    while !task.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    let error = continuous::join_retired_owner(task)
+        .await
+        .expect_err("a cancelled owner task must fail the retire path");
+    let chain = format!("{error:#}");
+    assert!(chain.contains("Board owner group failed"), "{chain}");
 }
 
 fn reconcile_fixture(dir: &Dir) -> (Shared, Arc<safety::Store>) {

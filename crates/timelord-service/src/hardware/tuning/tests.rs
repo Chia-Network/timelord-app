@@ -7,11 +7,12 @@ use tokio::process::Command;
 
 #[tokio::test]
 async fn native_control_requires_matching_acknowledgements_and_keeps_hard_limits() {
-    use std::os::unix::fs::PermissionsExt;
     let directory = std::env::temp_dir().join(format!("tl-ack-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();
     let binary = directory.join("fake-client");
-    std::fs::write(&binary, r#"#!/bin/sh
+    crate::test_scripts::write_executable_script(
+        &binary,
+        r#"#!/bin/sh
 if [ "$1" = --control-frequencies ]; then echo '[1450,1460,1470,1480,1490]'; exit 0; fi
 while read command version id frequency voltage; do
   if [ "$id" = 4 ]; then printf '%0600d\n' 0; continue; fi
@@ -20,8 +21,8 @@ while read command version id frequency voltage; do
   if [ "$id" = 8 ]; then printf 'TLERR 1 8 temperature_guard temperature=58\n'; continue; fi
   printf 'TLACK 1 %s %s %s\n' "$id" "$frequency" "$voltage"
 done
-"#).unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+"#,
+    );
     let mut config:Config=toml::from_str("[[hardware.boards]]\nid='a'\nname='A'\nclient_port=18110\ndevice_location=4113\nserial='a'\nprofile='automatic'").unwrap();
     config.hardware.client_binary = Some(binary.clone());
     config.hardware.automatic_state = Some(directory.join("cache.json"));
@@ -42,13 +43,13 @@ done
         crate::unix_now(),
     )
     .routed_by_config();
-    let mut child = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
+        .kill_on_drop(true);
+    let mut child = command.spawn().unwrap();
     shared
         .runtime
         .lock()

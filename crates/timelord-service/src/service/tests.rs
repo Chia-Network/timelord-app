@@ -1,5 +1,4 @@
 use super::*;
-use std::os::unix::fs::PermissionsExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 use timelord_core::Network;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -494,8 +493,7 @@ async fn a_control_socket_file_leaves_a_lost_safety_journal_absent() {
 async fn shutdown_during_prepare_leaves_a_lost_safety_journal_absent() {
     let (dir, config_path, history_path, mut config) = lost_journal("lost-shutdown");
     let script = dir.join("slow-client");
-    std::fs::write(&script, b"#!/bin/sh\nexec sleep 2\n").unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_scripts::write_executable_script(&script, "#!/bin/sh\nexec sleep 2\n");
     config.hardware.client_binary = Some(script);
     config.hardware.boards.push(automatic_board());
     serve(

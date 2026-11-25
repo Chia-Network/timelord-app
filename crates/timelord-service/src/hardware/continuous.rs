@@ -5,10 +5,57 @@ use std::collections::HashMap;
 use timelord_core::Assignment;
 use tokio::task::JoinSet;
 
-struct Group {
-    board: BoardConfig,
-    stop: watch::Sender<bool>,
-    task: tokio::task::JoinHandle<Result<()>>,
+pub(super) struct Group {
+    pub(super) board: BoardConfig,
+    pub(super) stop: watch::Sender<bool>,
+    pub(super) task: tokio::task::JoinHandle<Result<()>>,
+}
+
+pub(crate) async fn own_group(
+    mut tasks: JoinSet<()>,
+    owner_stop: watch::Sender<bool>,
+) -> Result<()> {
+    let first = tasks.join_next().await;
+    let stopping = *owner_stop.borrow();
+    let _ = owner_stop.send(true);
+    while let Some(result) = tasks.join_next().await {
+        result.context("Board group cleanup failed")?;
+    }
+    if let Some(result) = first {
+        result.context("Board group failed")?;
+    }
+    anyhow::ensure!(stopping, "Board owner group exited unexpectedly");
+    Ok(())
+}
+
+pub(crate) async fn join_retired_owner(task: tokio::task::JoinHandle<Result<()>>) -> Result<()> {
+    task.await.context("Board owner group failed")?
+}
+
+pub(super) async fn retire_stale_groups(
+    groups: &mut HashMap<String, Group>,
+    desired: &[BoardConfig],
+    backend: &crate::asic::AsicBackend,
+) -> Result<()> {
+    let retiring: Vec<_> = groups
+        .iter()
+        .filter(|(_, group)| {
+            !desired.iter().any(|b| {
+                b.id == group.board.id
+                    && b.serial == group.board.serial
+                    && b.client_port == group.board.client_port
+            })
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in retiring {
+        if let Some(group) = groups.remove(&id) {
+            let _ = group.stop.send(true);
+            join_retired_owner(group.task).await?;
+            backend.remove_board(&id).await;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn known_configuration(mut config: Config) -> Config {
@@ -37,24 +84,7 @@ pub(crate) async fn run(
                 break Ok(());
             }
             let desired = &shared.config.hardware.boards;
-            let retiring: Vec<_> = groups
-                .iter()
-                .filter(|(_, group)| {
-                    !desired.iter().any(|b| {
-                        b.id == group.board.id
-                            && b.serial == group.board.serial
-                            && b.client_port == group.board.client_port
-                    })
-                })
-                .map(|(id, _)| id.clone())
-                .collect();
-            for id in retiring {
-                if let Some(group) = groups.remove(&id) {
-                    let _ = group.stop.send(true);
-                    group.task.await.context("Board owner group failed")??;
-                    backend.remove_board(&id).await;
-                }
-            }
+            retire_stale_groups(&mut groups, desired, &backend).await?;
             for board in desired {
                 if groups.contains_key(&board.id) {
                     continue;
@@ -94,17 +124,7 @@ pub(crate) async fn run(
                             tracing::error!(error=%format!("{error:#}"), "ASIC listener failed");
                         }
                     });
-                    let first = tasks.join_next().await;
-                    let stopping = *owner_stop.borrow();
-                    let _ = owner_stop.send(true);
-                    while let Some(result) = tasks.join_next().await {
-                        result.context("Board group cleanup failed")?;
-                    }
-                    if let Some(result) = first {
-                        result.context("Board group failed")?;
-                    }
-                    anyhow::ensure!(stopping, "Board owner group exited unexpectedly");
-                    Ok(())
+                    own_group(tasks, owner_stop).await
                 });
                 groups.insert(
                     configured.id.clone(),
