@@ -73,9 +73,11 @@ All names below have the prefix `chia_timelord_`:
 
 | Metrics | Type / extra labels | Meaning |
 | --- | --- | --- |
-| `version`, `build_info` | gauge; `version`, plus `revision` on build info | Actual service package version / build revision, value 1 |
+| `version` | gauge; `version` | Actual service package version, value 1 |
+| `build_info` | gauge; `version`, `revision` | Actual service build revision, value 1 |
 | `process_start_time_seconds` | gauge | Start of this service process |
-| `healthy`, `ready` | gauge | Probe state, 0 or 1 |
+| `healthy` | gauge | Probe state, 0 or 1 |
+| `ready` | gauge | Probe state, 0 or 1 |
 | `topology_changes_total` | counter | Applied chain-route changes |
 | `chain_moves_total` | counter | Chains moved between boards by route changes |
 | `board_failures_total{board}` | counter | Native owner failures counted against board reliability (absence is not counted) |
@@ -83,32 +85,42 @@ All names below have the prefix `chia_timelord_`:
 | `delayed_bundles_total{chain}` | counter | Verified chain proofs that waited over 10 seconds for their bundle partner |
 | `estimated_ips` | gauge | Latest validated completion from any chain in this node session |
 | `chain_estimated_ips` | gauge; `chain` | Latest validated completion for each chain in this session |
-| `proofs_verified_total`, `proof_verification_failures_total` | counter; `chain` | Native verifier outcomes for scheduled work; failures include priming checks |
+| `proofs_verified_total` | counter; `chain` | Native verifier successes for scheduled work |
+| `proof_verification_failures_total` | counter; `chain` | Native verifier failures for scheduled work, including priming checks |
 | `last_verified_proof_timestamp_seconds` | gauge; `chain` | Wall-clock time of the most recent verified scheduled completion |
-| `submissions_total`, `last_submission_timestamp_seconds` | counter / gauge; `kind` | Successful node writes of signage, infusion or end-of-sub-slot bundles |
+| `submissions_total` | counter; `kind` | Successful node writes of signage, infusion or end-of-sub-slot bundles |
+| `last_submission_timestamp_seconds` | gauge; `kind` | Wall-clock time of the most recent successful node write of signage, infusion or end-of-sub-slot bundles |
 | `board_up` | gauge; `board` | Board passes managed/unmanaged readiness checks |
 | `board_state` | gauge; `board,state` | Current state as a one-hot value 1 |
-| `board_temperature_celsius`, `board_frequency_hertz`, `board_voltage_volts` | gauge; `board` | Observed operating measurements; omitted without current telemetry |
-| `raw_ips`, `raw_sample_timestamp_seconds` | gauge; `board,engine` | Running engine's native rate and observation time; expire after six seconds |
+| `board_temperature_celsius` | gauge; `board` | Observed board temperature; omitted without current telemetry |
+| `board_frequency_hertz` | gauge; `board` | Observed board frequency; omitted without current telemetry |
+| `board_voltage_volts` | gauge; `board` | Observed board voltage; omitted without current telemetry |
+| `raw_ips` | gauge; `board,engine` | Running engine's native rate; expires after six seconds |
+| `raw_sample_timestamp_seconds` | gauge; `board,engine` | Running engine's observation time; expires after six seconds |
 | `chain_assignment` | gauge; `board,chain` | Current assignment, value 1 |
 | `asic_recoveries_total` | counter; `board,engine` | Native recovery log events |
 | `client_restarts_total` | counter; `board,reason` | Replacement native processes actually launched |
 | `thermal_stops_total` | counter; `board` | New thermal guard stops, counted once per latch |
-| `node_connected`, `node_reconnects_total` | gauge / counter | Authenticated link and reconnections after the first authenticated connection |
-| `last_node_message_timestamp_seconds`, `last_peak_received_timestamp_seconds` | gauge | Last observed node frame / decoded peak |
+| `node_connected` | gauge | Authenticated node link |
+| `node_reconnects_total` | counter | Reconnections after the first authenticated connection |
+| `last_node_message_timestamp_seconds` | gauge | Wall-clock time of the last observed node frame |
+| `last_peak_received_timestamp_seconds` | gauge | Wall-clock time of the last observed decoded peak |
 | `peak_updates_total` | counter; `result` | Scheduler accepted, ignored or rejected peak updates |
 | `unfinished_candidates_total` | counter; `outcome,source` | Unfinished-block admission outcomes from node frames or peak retries |
-| `scheduler_peak_height`, `deficit` | gauge | Accepted peak values, absent before a peak or after session replacement |
+| `scheduler_peak_height` | gauge | Accepted peak height, absent before a peak or after session replacement |
+| `deficit` | gauge | Accepted peak deficit, absent before a peak or after session replacement |
 | `work_pending` | gauge; `chain` | Adapter has an unfinished scheduled request, 0 or 1 |
 | `work_cancelled_total` | counter; `chain` | Adapter requests dropped without completion |
 | `vdf_sessions_started_total` | counter; `chain,reason` | Native challenge initialization acknowledged; initial, input change or reconnect |
-| `clients_configured`, `clients_connected` | gauge | Assigned client capacity and observed sockets (not proof readiness) |
-| `chain_required`, `chain_available` | gauge; `chain` | Required work roles and usable assigned capacity, for alerts |
+| `clients_configured` | gauge | Assigned client capacity |
+| `clients_connected` | gauge | Observed client sockets (not proof readiness) |
+| `chain_required` | gauge; `chain` | Required work roles, for alerts |
+| `chain_available` | gauge; `chain` | Usable assigned capacity, for alerts |
 | `tuning_paused` | gauge | Automatic tuning paused, not proof service paused |
 | `tuning_state` | gauge; `board,state` | Current bounded tuning state |
 | `operating_point_changes_total` | counter; `board,reason` | Acknowledged trial, backoff or restore writes |
-| `proof_duration_seconds` | histogram; `chain,stage` | Observed proof pipeline boundaries below |
-| `submission_duration_seconds` | histogram; `kind` | Successful bundle write duration |
+| `proof_duration_seconds` | histogram; `chain,stage` | Observed proof pipeline stage duration; stages can overlap |
+| `submission_duration_seconds` | histogram; `kind` | Time to write a verified bundle to the node |
 
 Alert on the raw `safety_journal_resets_total` value being greater than zero for
 either `reason="unreadable"` or `reason="missing"`; both are unexpected after a host

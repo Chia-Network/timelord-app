@@ -1,5 +1,7 @@
+use super::metrics::{REVISION, VERSION};
 use super::*;
 use crate::runtime::{HardwareState, RuntimeState};
+use crate::safety::JournalReset;
 use crate::{Shared, runtime::RawState};
 use axum::http::{StatusCode, header};
 use axum::{
@@ -7,6 +9,7 @@ use axum::{
     http::Request,
 };
 use std::{
+    collections::BTreeMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -72,6 +75,20 @@ fn value(body: &str, name: &str, labels: &[&str]) -> Option<f64> {
         })
         .and_then(|line| line.rsplit_once(' '))
         .and_then(|(_, v)| v.parse().ok())
+}
+fn labels<'a>(body: &'a str, name: &str) -> BTreeMap<&'a str, &'a str> {
+    let line = body
+        .lines()
+        .find(|line| line.starts_with(&format!("{name}{{")))
+        .unwrap();
+    let labels = line.split_once('{').unwrap().1.split_once('}').unwrap().0;
+    labels
+        .split(',')
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap();
+            (key, value.trim_matches('"'))
+        })
+        .collect()
 }
 async fn response(http: HttpState, path: &str) -> (StatusCode, String, String) {
     let response = routes()
@@ -609,6 +626,106 @@ fn process_totals_and_label_less_metrics_keep_their_exposition() {
 }
 
 #[test]
+fn build_info_series_have_version_and_revision_labels() {
+    let (shared, metrics, _) = fixture();
+    let body = metrics.render(&shared, crate::unix_now()).unwrap();
+    assert_eq!(
+        labels(&body, "chia_timelord_version"),
+        BTreeMap::from([("network", "mainnet"), ("version", VERSION)])
+    );
+    assert_eq!(value(&body, "chia_timelord_version", &[]), Some(1.));
+    assert_eq!(
+        labels(&body, "chia_timelord_build_info"),
+        BTreeMap::from([
+            ("network", "mainnet"),
+            ("revision", REVISION),
+            ("version", VERSION),
+        ])
+    );
+    assert_eq!(value(&body, "chia_timelord_build_info", &[]), Some(1.));
+}
+
+#[test]
+fn documented_metric_help_matches_exposition() {
+    let (shared, metrics, _) = fixture();
+    let now = crate::unix_now();
+    let epoch = shared.runtime.lock().unwrap().metric_epoch;
+    {
+        let mut state = shared.runtime.lock().unwrap();
+        state.scheduler_height = Some(1_000);
+        state.scheduler_deficit = Some(0);
+        state
+            .boards
+            .get_mut("a")
+            .unwrap()
+            .raw_sample(1, 1_200_000., RawState::Running, now);
+    }
+    metrics.verified(epoch, Chain::Challenge, 1_000_000.);
+    metrics.submitted(SubmissionKind::Signage, Duration::from_millis(1));
+    metrics.duration(
+        Chain::Challenge,
+        ProofStage::Discriminant,
+        Duration::from_millis(1),
+    );
+    metrics.safety_journal_reset(JournalReset::Missing);
+    metrics.node_message_received();
+    metrics.peak_received();
+    let body = metrics.render(&shared, now).unwrap();
+
+    let docs = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/observability.md"
+    ))
+    .unwrap();
+    let table = docs
+        .split_once("| Metrics | Type / extra labels | Meaning |")
+        .unwrap()
+        .1;
+    let mut documented = BTreeMap::new();
+    for line in table.lines().skip(1) {
+        if !line.starts_with('|') {
+            break;
+        }
+        if line.starts_with("| ---") {
+            continue;
+        }
+        let cells = line.split('|').map(str::trim).collect::<Vec<_>>();
+        assert_eq!(cells.len(), 5, "unexpected docs row: {line}");
+        let metric = cells[1]
+            .strip_prefix('`')
+            .and_then(|cell| cell.split_once('`'))
+            .map(|(metric, _)| metric)
+            .unwrap();
+        let name = metric.split_once('{').map_or(metric, |(name, _)| name);
+        assert!(
+            documented
+                .insert(name.to_owned(), cells[3].to_owned())
+                .is_none(),
+            "duplicate docs row for {name}"
+        );
+    }
+    let mut exported = BTreeMap::new();
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("# HELP chia_timelord_") {
+            let (name, help) = rest.split_once(' ').unwrap();
+            assert!(
+                exported.insert(name.to_owned(), help.to_owned()).is_none(),
+                "duplicate HELP for {name}"
+            );
+        }
+    }
+    for (name, help) in &exported {
+        assert_eq!(documented.get(name), Some(help), "HELP drift for {name}");
+    }
+    for name in documented.keys() {
+        assert!(
+            exported.contains_key(name),
+            "documented metric {name} is not exported"
+        );
+    }
+}
+
+#[test]
 fn pending_activity_counts_cancellation_but_not_completed_work() {
     let (shared, metrics, _) = fixture();
     let activity = Activity::new(&shared.runtime, Chain::Challenge, Some(&metrics));
@@ -757,51 +874,6 @@ fn admission_activity_counts_pending_work_without_a_metric_handle() {
     drop(Activity::new(&runtime, Chain::Challenge, None));
     assert_eq!(runtime.lock().unwrap().pending[0], 0);
 }
-#[test]
-fn build_info_series_and_documented_help_are_exported() {
-    let (shared, metrics, _) = fixture();
-    let body = metrics.render(&shared, crate::unix_now()).unwrap();
-    let version = env!("CARGO_PKG_VERSION");
-    let revision = option_env!("TIMELORD_BUILD_REVISION").unwrap_or("unknown");
-    assert_eq!(
-        value(
-            &body,
-            "chia_timelord_version",
-            &[&format!("version=\"{version}\"")]
-        ),
-        Some(1.)
-    );
-    let version_line = body
-        .lines()
-        .find(|line| line.starts_with("chia_timelord_version{"))
-        .unwrap();
-    assert!(!version_line.contains("revision="));
-    assert_eq!(
-        value(
-            &body,
-            "chia_timelord_build_info",
-            &[
-                &format!("version=\"{version}\""),
-                &format!("revision=\"{revision}\""),
-            ]
-        ),
-        Some(1.)
-    );
-    for (name, help) in [
-        (
-            "node_reconnects_total",
-            "Reconnections after the first authenticated connection",
-        ),
-        ("topology_changes_total", "Applied chain-route changes"),
-    ] {
-        assert!(
-            body.lines()
-                .any(|line| line == format!("# HELP chia_timelord_{name} {help}")),
-            "{name}"
-        );
-    }
-}
-
 #[test]
 fn candidates_full_is_exported_at_zero_before_any_event() {
     let (shared, _, _) = fixture();

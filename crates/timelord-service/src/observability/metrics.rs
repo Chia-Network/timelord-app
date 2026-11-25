@@ -21,6 +21,12 @@ use std::{
 };
 use timelord_core::{Chain, Config, Network};
 
+pub(super) const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(super) const REVISION: &str = match option_env!("TIMELORD_BUILD_REVISION") {
+    Some(revision) => revision,
+    None => "unknown",
+};
+
 #[derive(Default)]
 struct Last {
     epoch: u64,
@@ -72,6 +78,13 @@ fn counter_vec(
 ) -> Result<IntCounterVec> {
     registered(registry, IntCounterVec::new(Opts::new(name, help), labels)?)
 }
+fn build_gauge(registry: &Registry, name: &str, help: &str, labels: &[(&str, &str)]) -> Result<()> {
+    let keys = labels.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+    let values = labels.iter().map(|(_, value)| *value).collect::<Vec<_>>();
+    let gauge = registered(registry, IntGaugeVec::new(Opts::new(name, help), &keys)?)?;
+    gauge.with_label_values(&values).set(1);
+    Ok(())
+}
 /// Timestamp gauges stay absent until their first observation. An untouched
 /// gauge vector has no series, which is deliberate: exporting 0 would claim
 /// the event happened at the Unix epoch.
@@ -99,32 +112,24 @@ impl Metrics {
     pub fn new(network: Network) -> Result<Arc<Self>> {
         let network = network.label().to_owned();
         let registry = Registry::new_custom(Some("chia_timelord".into()), None)?;
-        let version = registered(
+        build_gauge(
             &registry,
-            IntGaugeVec::new(
-                Opts::new("version", "Running timelord-service build"),
-                &["version"],
-            )?,
+            "version",
+            "Actual service package version, value 1",
+            &[("version", VERSION)],
         )?;
-        version
-            .with_label_values(&[env!("CARGO_PKG_VERSION")])
-            .set(1);
-        let build_info = registered(
+        build_gauge(
             &registry,
-            IntGaugeVec::new(
-                Opts::new("build_info", "Running timelord-service build"),
-                &["version", "revision"],
-            )?,
+            "build_info",
+            "Actual service build revision, value 1",
+            &[("version", VERSION), ("revision", REVISION)],
         )?;
-        build_info
-            .with_label_values(&[
-                env!("CARGO_PKG_VERSION"),
-                option_env!("TIMELORD_BUILD_REVISION").unwrap_or("unknown"),
-            ])
-            .set(1);
         let started = registered(
             &registry,
-            IntGauge::new("process_start_time_seconds", "Service process start time")?,
+            IntGauge::new(
+                "process_start_time_seconds",
+                "Start of this service process",
+            )?,
         )?;
         started.set(crate::unix_now() as i64);
         let buckets = vec![
@@ -135,13 +140,13 @@ impl Metrics {
             proofs_verified_total: counter_vec(
                 &registry,
                 "proofs_verified_total",
-                "Native verifier outcomes for scheduled work; failures include priming checks",
+                "Native verifier successes for scheduled work",
                 &["chain"],
             )?,
             proof_verification_failures_total: counter_vec(
                 &registry,
                 "proof_verification_failures_total",
-                "Native verifier outcomes for scheduled work; failures include priming checks",
+                "Native verifier failures for scheduled work, including priming checks",
                 &["chain"],
             )?,
             submissions_total: counter_vec(
@@ -229,7 +234,7 @@ impl Metrics {
                 &registry,
                 EventTimestamp::new(
                     "last_node_message_timestamp_seconds",
-                    "Last observed node frame",
+                    "Wall-clock time of the last observed node frame",
                     &[],
                 )?,
             )?,
@@ -237,7 +242,7 @@ impl Metrics {
                 &registry,
                 EventTimestamp::new(
                     "last_peak_received_timestamp_seconds",
-                    "Last observed decoded peak",
+                    "Wall-clock time of the last observed decoded peak",
                     &[],
                 )?,
             )?,
@@ -269,18 +274,21 @@ impl Metrics {
             board_failures_total: counter_vec(
                 &registry,
                 "board_failures_total",
-                "Native owner failures counted against board reliability",
+                "Native owner failures counted against board reliability (absence is not counted)",
                 &["board"],
             )?,
             safety_journal_resets_total: counter_vec(
                 &registry,
                 "safety_journal_resets_total",
-                "Processes that found a previously written but now absent or unreadable board safety journal and started from cautious defaults; at most 1 per process, exported only by the process that reported the reset, so use the raw value, not increase()",
+                "Processes that found a previously written but now absent or unreadable board safety journal and started from cautious defaults; at most 1 per process and exported only by the process that reported the reset, so use the raw value, not `increase()`; first-start journal creation is not counted",
                 &["reason"],
             )?,
             chain_moves_total: registered(
                 &registry,
-                IntCounter::new("chain_moves_total", "Chains moved between boards")?,
+                IntCounter::new(
+                    "chain_moves_total",
+                    "Chains moved between boards by route changes",
+                )?,
             )?,
             delayed_bundles_total: counter_vec(
                 &registry,
