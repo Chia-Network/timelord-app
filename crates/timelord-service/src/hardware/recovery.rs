@@ -178,16 +178,16 @@ mod tests {
         let (stop, rx) = watch::channel(false);
         let initialization: &'static tokio::sync::Mutex<()> =
             Box::leak(Box::new(tokio::sync::Mutex::new(())));
-        let task = tokio::spawn(supervise(
-            shared.clone(),
-            crate::hardware::fixture_backend(&shared),
-            board.clone(),
-            child,
-            rx,
-            initialization.lock().await,
-            None,
-            startup,
-        ));
+        let task = tokio::spawn(
+            NativeSupervision {
+                shared: shared.clone(),
+                backend: crate::hardware::fixture_backend(&shared),
+                board: board.clone(),
+                shutdown: rx,
+                timing: Timing::default(),
+            }
+            .run(child, initialization.lock().await, None, startup),
+        );
         if temperature >= 55 {
             let result = tokio::time::timeout(Duration::from_secs(8), task)
                 .await

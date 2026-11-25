@@ -194,7 +194,7 @@ fn load_saved(
     })?;
     if let Some(intent) = network {
         let requested_identity = intent.chain_identity().map_err(anyhow::Error::msg)?;
-        let saved_identity = config.node.chain_identity().map_err(anyhow::Error::msg)?;
+        let saved_identity = config.node().chain_identity().map_err(anyhow::Error::msg)?;
         ensure!(
             requested_identity == saved_identity,
             "Requested network differs from last-good checkpoint; fallback refused: {requested:#}"

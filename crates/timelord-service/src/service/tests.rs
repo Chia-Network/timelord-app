@@ -85,10 +85,9 @@ async fn owners_and_routes_survive_inventory_updates_and_a_node_profile_switch()
         config.clone(),
         None,
         dir.join("history.json"),
-        &HashMap::new(),
+        safety,
         unix_now(),
         process.clone(),
-        safety,
         node_requests,
     )
     .await
@@ -140,8 +139,8 @@ async fn owners_and_routes_survive_inventory_updates_and_a_node_profile_switch()
     assert!(!run.tasks.is_empty());
     // A node profile switch keeps board state, restrictions and routes.
     let mut testnet = run.shared.config.clone();
-    testnet.node.network = Network::Testnet11;
-    testnet.node.port = 58444;
+    testnet.node_mut().network = Network::Testnet11;
+    testnet.node_mut().port = 58444;
     run.replace_node(testnet, &current).await.unwrap();
     {
         let state = run.shared.runtime.lock().unwrap();
@@ -153,7 +152,7 @@ async fn owners_and_routes_survive_inventory_updates_and_a_node_profile_switch()
         // Proofs sent to the previous node never count for the new one.
         assert_eq!((state.proofs_delivered, state.failed_proofs), (0, 0));
     }
-    assert_eq!(run.shared.config.node.network, Network::Testnet11);
+    assert_eq!(run.shared.config.node().network, Network::Testnet11);
     let exposition = metrics.render(&run.shared, unix_now()).unwrap();
     assert!(exposition.contains("network=\"testnet11\""));
     assert!(!exposition.contains("network=\"mainnet\""));
@@ -178,10 +177,9 @@ async fn same_scope_node_reload_keeps_the_restored_chart_archive() {
         config,
         None,
         history,
-        &HashMap::new(),
+        Arc::new(safety::Store::open(&dir.join("config.toml")).unwrap()),
         unix_now(),
         operational::State::fixture(),
-        Arc::new(safety::Store::open(&dir.join("config.toml")).unwrap()),
         node_requests,
     )
     .await
@@ -190,13 +188,13 @@ async fn same_scope_node_reload_keeps_the_restored_chart_archive() {
     assert!(run.shared.runtime.lock().unwrap().archive.is_some());
     // Certificate-only reloads stay in the same history scope.
     let mut reloaded = run.shared.config.clone();
-    reloaded.node.certificate = Some(dir.join("new.cert"));
-    reloaded.node.ca_certificate = Some(dir.join("new.ca"));
+    reloaded.node_mut().certificate = Some(dir.join("new.cert"));
+    reloaded.node_mut().ca_certificate = Some(dir.join("new.ca"));
     run.replace_node(reloaded, &current).await.unwrap();
     assert!(run.shared.runtime.lock().unwrap().archive.is_some());
     // A different node is a new context: the old archive must not join it.
     let mut moved = run.shared.config.clone();
-    moved.node.host = "other-node".into();
+    moved.node_mut().host = "other-node".into();
     run.replace_node(moved, &current).await.unwrap();
     assert!(run.shared.runtime.lock().unwrap().archive.is_none());
     run.stop().await.unwrap();
@@ -380,10 +378,9 @@ async fn no_boards_wait_for_hardware_without_claiming_node_failure() {
             config,
             None,
             dir.join("history.json"),
-            &HashMap::new(),
+            Arc::new(safety::Store::open(&dir.join("config.toml")).unwrap()),
             unix_now(),
             operational::State::fixture(),
-            Arc::new(safety::Store::open(&dir.join("config.toml")).unwrap()),
             node_requests,
         )
         .await
@@ -557,10 +554,9 @@ async fn reload_node_accepts_only_saved_node_changes_from_the_real_config_file()
         hardware::continuous::known_configuration(running),
         None,
         dir.join("history.json"),
-        &HashMap::new(),
+        Arc::new(safety::Store::open(&path).unwrap()),
         unix_now(),
         operational::State::fixture(),
-        Arc::new(safety::Store::open(&path).unwrap()),
         node_requests,
     )
     .await
@@ -576,7 +572,7 @@ async fn reload_node_accepts_only_saved_node_changes_from_the_real_config_file()
     // A node-only edit switches the session in place, even when the app-only
     // launch preference changed with it.
     let mut edited = crate::load(&path).unwrap();
-    edited.node.port = 58444;
+    edited.node_mut().port = 58444;
     edited.service.start_automatically = !edited.service.start_automatically;
     crate::save(&path, &edited).unwrap();
     assert!(
@@ -585,7 +581,7 @@ async fn reload_node_accepts_only_saved_node_changes_from_the_real_config_file()
             .unwrap()
             .is_some()
     );
-    assert_eq!(run.shared.config.node.port, 58444);
+    assert_eq!(run.shared.config.node().port, 58444);
     // Board edits still need a supervised restart.
     let mut edited = crate::load(&path).unwrap();
     edited.hardware.boards[0].frequency_mhz = 1500.;

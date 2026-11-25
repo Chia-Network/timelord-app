@@ -500,193 +500,239 @@ impl NativeControl {
 /// How often an unrouted serving board proves itself with a private proof.
 pub(super) const CANARY_SECONDS: u64 = 60;
 
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-pub(super) async fn supervise(
-    shared: Arc<Shared>,
-    backend: Arc<crate::asic::AsicBackend>,
-    board: BoardConfig,
-    child: Child,
-    shutdown: watch::Receiver<bool>,
-    initialization: tokio::sync::MutexGuard<'static, ()>,
-    preparing: Option<timelord_supervisor::progress::Guard>,
-    startup: Startup,
-) -> Result<()> {
-    supervise_with(
-        shared,
-        backend,
-        board,
-        child,
-        shutdown,
-        initialization,
-        preparing,
-        startup,
-        super::board::Timing::default(),
-    )
-    .await
+/// The long-lived context of one native supervision attempt: shared runtime,
+/// backend, board, shutdown signal and timing. It owns the initialize,
+/// establish, serve_loop and retire phases used by production and fixtures.
+pub(super) struct NativeSupervision {
+    pub(super) shared: Arc<Shared>,
+    pub(super) backend: Arc<crate::asic::AsicBackend>,
+    pub(super) board: BoardConfig,
+    pub(super) shutdown: watch::Receiver<bool>,
+    pub(super) timing: super::board::Timing,
 }
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn supervise_with(
-    shared: Arc<Shared>,
-    backend: Arc<crate::asic::AsicBackend>,
-    board: BoardConfig,
-    mut child: Child,
-    mut shutdown: watch::Receiver<bool>,
-    initialization: tokio::sync::MutexGuard<'static, ()>,
-    preparing: Option<timelord_supervisor::progress::Guard>,
-    startup: Startup,
-    timing: super::board::Timing,
-) -> Result<()> {
-    let setup_deadline = tokio::time::Instant::now() + Duration::from_secs(45);
-    {
-        let mut state = shared.runtime.lock().expect("runtime");
-        let hardware = state.boards.entry(board.id.clone()).or_default();
-        hardware.native_pid = child.id();
-        hardware.lifecycle.checking();
+impl NativeSupervision {
+    pub(super) async fn run(
+        mut self,
+        mut child: Child,
+        initialization: tokio::sync::MutexGuard<'static, ()>,
+        preparing: Option<timelord_supervisor::progress::Guard>,
+        startup: Startup,
+    ) -> Result<()> {
+        let resume = startup.resume;
+        let (mut owner, mut log, mut maintenance, initialized) = self
+            .initialize(&mut child, initialization, preparing, startup)
+            .await?;
+        // `establish` carries a failed initialization as the returned result so
+        // retirement still runs; only the setup phases above can abort early.
+        let initialized = self
+            .establish(&mut owner, &mut log, initialized, resume)
+            .await;
+        let result = self
+            .serve_loop(
+                &mut child,
+                &mut owner,
+                &mut log,
+                &mut maintenance,
+                initialized,
+            )
+            .await;
+        self.retire(&mut child, owner, log, result).await
     }
 
-    // Attach the pipes before polling initialization: cancellation must leave EOF
-    // shutdown and its confirmation available to the same owner as normal exit.
-    let resume = startup.resume;
-    let mut maintenance = Maintenance {
-        ramp: startup.ramp,
-        cautious: startup.cautious,
-        last_canary: tokio::time::Instant::now(),
-        canary: timing.canary,
-    };
-    let mut owner = NativeOwner::attach(&board, &mut child)?;
-    let output = child.stderr.take().context("ASIC client log unavailable")?;
-    let mut log = ClientLog::new(output);
-    log.initialization = Some(initialization);
-    log.preparing = preparing;
-    if let Some(preparing) = &log.preparing {
-        preparing.stage(timelord_supervisor::progress::Stage::BoardSetup);
-    }
-    let initialized = if *shutdown.borrow() {
-        Ok(false)
-    } else {
-        tokio::select! {
-            result = tokio::time::timeout_at(setup_deadline, owner.initialize(&shared, &board, &mut log, &startup)) => result.context("ASIC initialization timed out").and_then(|r| r).map(|()| true),
-            _ = shutdown.changed() => Ok(false),
+    async fn initialize(
+        &mut self,
+        child: &mut Child,
+        initialization: tokio::sync::MutexGuard<'static, ()>,
+        preparing: Option<timelord_supervisor::progress::Guard>,
+        startup: Startup,
+    ) -> Result<(NativeOwner, ClientLog, Maintenance, Result<bool>)> {
+        let setup_deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+        {
+            let mut state = self.shared.runtime.lock().expect("runtime");
+            let hardware = state.boards.entry(self.board.id.clone()).or_default();
+            hardware.native_pid = child.id();
+            hardware.lifecycle.checking();
         }
-    };
-    if matches!(initialized, Ok(true)) {
-        // The acknowledged setting confirms native hardware setup. Release USB
-        // initialization before waiting for recovery evidence so other boards
-        // can start meanwhile; network readiness keeps its own deadline.
-        if board.profile == ProfileMode::Automatic {
-            log.initialization.take();
-        }
+
+        // Attach the pipes before polling initialization: cancellation must leave EOF
+        // shutdown and its confirmation available to the same owner as normal exit.
+        let maintenance = Maintenance {
+            ramp: startup.ramp,
+            cautious: startup.cautious,
+            last_canary: tokio::time::Instant::now(),
+            canary: self.timing.canary,
+        };
+        let mut owner = NativeOwner::attach(&self.board, child)?;
+        let output = child.stderr.take().context("ASIC client log unavailable")?;
+        let mut log = ClientLog::new(output);
+        log.initialization = Some(initialization);
+        log.preparing = preparing;
         if let Some(preparing) = &log.preparing {
-            preparing.stage(timelord_supervisor::progress::Stage::BoardReadiness);
+            preparing.stage(timelord_supervisor::progress::Stage::BoardSetup);
         }
-    }
-    let initialized = if matches!(initialized, Ok(true)) {
-        super::recovery::establish(&shared, &board, &mut owner, &mut log, &mut shutdown, resume)
-            .await
-    } else {
-        initialized
-    };
-    // A device that could not be opened is busy or absent, not failing. The
-    // control pipe can close before stderr is read, so read its last words.
-    if initialized.is_err() && !log.open_failed {
-        log.drain(&board, Duration::from_millis(500)).await;
-    }
-    let initialized = match initialized {
-        Err(error) if log.open_failed => Err(anyhow::Error::new(super::board::BoardAbsent(
-            board.name.clone(),
-        ))
-        .context(format!("{error:#}"))),
-        other => other,
-    };
-    if let Err(error) = &initialized {
-        let fault = classify(error);
-        let mut state = shared.runtime.lock().expect("runtime");
-        if fault == crate::board_lifecycle::Fault::Thermal {
-            record_thermal_stop(&mut state, &shared, &board, format!("{error:#}"));
+        let initialized = if *self.shutdown.borrow() {
+            Ok(false)
         } else {
+            tokio::select! {
+                result = tokio::time::timeout_at(setup_deadline, owner.initialize(&self.shared, &self.board, &mut log, &startup)) => result.context("ASIC initialization timed out").and_then(|r| r).map(|()| true),
+                _ = self.shutdown.changed() => Ok(false),
+            }
+        };
+        if matches!(initialized, Ok(true)) {
+            // The acknowledged setting confirms native hardware setup. Release USB
+            // initialization before waiting for recovery evidence so other boards
+            // can start meanwhile; network readiness keeps its own deadline.
+            if self.board.profile == ProfileMode::Automatic {
+                log.initialization.take();
+            }
+            if let Some(preparing) = &log.preparing {
+                preparing.stage(timelord_supervisor::progress::Stage::BoardReadiness);
+            }
+        }
+        Ok((owner, log, maintenance, initialized))
+    }
+
+    async fn establish(
+        &mut self,
+        owner: &mut NativeOwner,
+        log: &mut ClientLog,
+        initialized: Result<bool>,
+        resume: Option<Point>,
+    ) -> Result<bool> {
+        let initialized = if matches!(initialized, Ok(true)) {
+            super::recovery::establish(
+                &self.shared,
+                &self.board,
+                owner,
+                log,
+                &mut self.shutdown,
+                resume,
+            )
+            .await
+        } else {
+            initialized
+        };
+        // A device that could not be opened is busy or absent, not failing. The
+        // control pipe can close before stderr is read, so read its last words.
+        if initialized.is_err() && !log.open_failed {
+            log.drain(&self.board, Duration::from_millis(500)).await;
+        }
+        let initialized = match initialized {
+            Err(error) if log.open_failed => Err(anyhow::Error::new(super::board::BoardAbsent(
+                self.board.name.clone(),
+            ))
+            .context(format!("{error:#}"))),
+            other => other,
+        };
+        if let Err(error) = &initialized {
+            let fault = classify(error);
+            let mut state = self.shared.runtime.lock().expect("runtime");
+            if fault == crate::board_lifecycle::Fault::Thermal {
+                record_thermal_stop(&mut state, &self.shared, &self.board, format!("{error:#}"));
+            } else {
+                state
+                    .boards
+                    .entry(self.board.id.clone())
+                    .or_default()
+                    .lifecycle
+                    .fault(fault, format!("{error:#}"), crate::unix_now());
+            }
             state
                 .boards
-                .entry(board.id.clone())
+                .entry(self.board.id.clone())
                 .or_default()
-                .lifecycle
-                .fault(fault, format!("{error:#}"), crate::unix_now());
+                .fault(error);
         }
-        state
-            .boards
-            .entry(board.id.clone())
-            .or_default()
-            .fault(error);
+        initialized
     }
-    // Successful setup starts a fresh readiness budget; time spent obtaining
-    // the first ACK cannot starve engine/socket initialization of its window.
-    let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let mut watchdog = tokio::time::interval(
-        Duration::from_secs(5)
-            .min(timing.liveness / 3)
-            .max(Duration::from_millis(50)),
-    );
-    let result: Result<()> = match initialized {
-        Err(error) => Err(error),
-        Ok(false) => Ok(()),
-        Ok(true) => loop {
-            if *shutdown.borrow() {
-                break Ok(());
-            }
-            tokio::select! {
-                // Deterministic precedence: shutdown, then the readiness
-                // deadline, then periodic checks, then native output.
-                biased;
-                _ = shutdown.changed() => break Ok(()),
-                // Temperatures do not certify engine/socket initialization.
-                // Hold the lease through confirmed retirement on this deadline.
-                _ = tokio::time::sleep_until(readiness_deadline), if !log.connected => {
-                    break Err(anyhow::anyhow!("ASIC initialization timed out: the native client never connected its engines"));
+
+    async fn serve_loop(
+        &mut self,
+        child: &mut Child,
+        owner: &mut NativeOwner,
+        log: &mut ClientLog,
+        maintenance: &mut Maintenance,
+        initialized: Result<bool>,
+    ) -> Result<()> {
+        // Successful setup starts a fresh readiness budget; time spent obtaining
+        // the first ACK cannot starve engine/socket initialization of its window.
+        let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut watchdog = tokio::time::interval(
+            Duration::from_secs(5)
+                .min(self.timing.liveness / 3)
+                .max(Duration::from_millis(50)),
+        );
+        match initialized {
+            Err(error) => Err(error),
+            Ok(false) => Ok(()),
+            Ok(true) => loop {
+                if *self.shutdown.borrow() {
+                    break Ok(());
                 }
-                _ = watchdog.tick() => {
-                    if let Some(hardware) = shared.runtime.lock().expect("runtime").boards.get(&board.id)
-                        && hardware.lifecycle.needs_retirement() {
-                        let status = hardware.lifecycle.status();
-                        let reason = status.fault_reason.unwrap_or("ASIC needs attention").to_owned();
-                        break Err(match status.fault {
-                            Some(crate::board_lifecycle::Fault::InvalidProof) => crate::asic::AsicFailure { board_id: board.id.clone(), verification: true, message: reason }.into(),
-                            _ => anyhow::anyhow!(reason),
-                        });
+                tokio::select! {
+                    // Deterministic precedence: shutdown, then the readiness
+                    // deadline, then periodic checks, then native output.
+                    biased;
+                    _ = self.shutdown.changed() => break Ok(()),
+                    // Temperatures do not certify engine/socket initialization.
+                    // Hold the lease through confirmed retirement on this deadline.
+                    _ = tokio::time::sleep_until(readiness_deadline), if !log.connected => {
+                        break Err(anyhow::anyhow!("ASIC initialization timed out: the native client never connected its engines"));
                     }
-                    if log.last_liveness.elapsed() > timing.liveness {
-                        break Err(NativeFailure::new(NativeFailureKind::Stalled, format!(
-                            "Native client stopped reporting for {} seconds; its USB event loop appears stuck",
-                            timing.liveness.as_secs()
-                        )).into());
+                    _ = watchdog.tick() => {
+                        if let Some(hardware) = self.shared.runtime.lock().expect("runtime").boards.get(&self.board.id)
+                            && hardware.lifecycle.needs_retirement() {
+                            let status = hardware.lifecycle.status();
+                            let reason = status.fault_reason.unwrap_or("ASIC needs attention").to_owned();
+                            break Err(match status.fault {
+                                Some(crate::board_lifecycle::Fault::InvalidProof) => crate::asic::AsicFailure { board_id: self.board.id.clone(), verification: true, message: reason }.into(),
+                                _ => anyhow::anyhow!(reason),
+                            });
+                        }
+                        if log.last_liveness.elapsed() > self.timing.liveness {
+                            break Err(NativeFailure::new(NativeFailureKind::Stalled, format!(
+                                "Native client stopped reporting for {} seconds; its USB event loop appears stuck",
+                                self.timing.liveness.as_secs()
+                            )).into());
+                        }
+                        if log.last_temperature.elapsed() > Duration::from_secs(TEMPERATURE_TIMEOUT_SECONDS) {
+                            break Err(NativeFailure::new(NativeFailureKind::SensorUnavailable, "ASIC temperature telemetry stopped").into());
+                        }
+                        match child.try_wait() {
+                            Ok(Some(exit)) => break Err(exited(exit, log)),
+                            Err(error) => break Err(error.into()),
+                            Ok(None) => {}
+                        }
+                        if let Err(error) = maintenance.run(&self.shared, &self.backend, &self.board, owner, log, &mut self.shutdown).await { break Err(error); }
+                        if let Err(error)=owner.tick(&self.shared,&self.board,log,&mut self.shutdown).await {break Err(error);}
                     }
-                    if log.last_temperature.elapsed() > Duration::from_secs(TEMPERATURE_TIMEOUT_SECONDS) {
-                        break Err(NativeFailure::new(NativeFailureKind::SensorUnavailable, "ASIC temperature telemetry stopped").into());
+                    result = log.read(&self.shared, &self.board) => {
+                        let recovery = match result { Ok(recovery) => recovery, Err(error) => break Err(match child.try_wait() { Ok(Some(exit)) => exited(exit, log), _ => error }) };
+                        if recovery.is_some() && let Err(error)=owner.tick(&self.shared,&self.board,log,&mut self.shutdown).await {break Err(error);}
                     }
-                    match child.try_wait() {
-                        Ok(Some(exit)) => break Err(exited(exit, &log)),
-                        Err(error) => break Err(error.into()),
-                        Ok(None) => {}
-                    }
-                    if let Err(error) = maintenance.run(&shared, &backend, &board, &mut owner, &mut log, &mut shutdown).await { break Err(error); }
-                    if let Err(error)=owner.tick(&shared,&board,&mut log,&mut shutdown).await {break Err(error);}
                 }
-                result = log.read(&shared, &board) => {
-                    let recovery = match result { Ok(recovery) => recovery, Err(error) => break Err(match child.try_wait() { Ok(Some(exit)) => exited(exit, &log), _ => error }) };
-                    if recovery.is_some() && let Err(error)=owner.tick(&shared,&board,&mut log,&mut shutdown).await {break Err(error);}
-                }
-            }
-        },
-    };
-    shared.runtime.lock().expect("runtime").disturb(
-        crate::unix_now(),
-        crate::hardware::continuous::DISTURBANCE_SECONDS,
-    );
-    let quiesced = owner.stop(&mut child, log).await;
-    if !quiesced {
-        tracing::warn!(board=%board.name,"Native shutdown lacked confirmed quiescence; next start is cautious");
+            },
+        }
     }
-    record_retirement(&shared, &board, quiesced, result.as_ref().err());
-    result
+
+    async fn retire(
+        &mut self,
+        child: &mut Child,
+        owner: NativeOwner,
+        log: ClientLog,
+        result: Result<()>,
+    ) -> Result<()> {
+        self.shared.runtime.lock().expect("runtime").disturb(
+            crate::unix_now(),
+            crate::hardware::continuous::DISTURBANCE_SECONDS,
+        );
+        let quiesced = owner.stop(child, log).await;
+        if !quiesced {
+            tracing::warn!(board=%self.board.name,"Native shutdown lacked confirmed quiescence; next start is cautious");
+        }
+        record_retirement(&self.shared, &self.board, quiesced, result.as_ref().err());
+        result
+    }
 }
 
 /// The native client's exit, with its own stop reason when it reported one.

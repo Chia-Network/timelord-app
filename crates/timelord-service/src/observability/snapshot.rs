@@ -339,7 +339,7 @@ pub(super) fn snapshot(shared: &Shared, now: u64) -> Snapshot {
             }
         }
     }
-    let reason = if shared.config.node.certificate.is_none() {
+    let reason = if shared.config.node().certificate.is_none() {
         "setup_required"
     } else if assignments.is_empty() {
         "waiting_for_clients"

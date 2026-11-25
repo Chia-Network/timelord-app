@@ -18,9 +18,9 @@ use tokio::sync::watch;
 use tower::ServiceExt;
 fn fixture() -> (Arc<Shared>, Arc<Metrics>, HttpState) {
     let mut config = Config::default();
-    config.node.certificate = Some("/fixture/no-io.crt".into());
-    config.node.private_key = Some("/fixture/no-io.key".into());
-    config.node.ca_certificate = Some("/fixture/no-io-ca.crt".into());
+    config.node_mut().certificate = Some("/fixture/no-io.crt".into());
+    config.node_mut().private_key = Some("/fixture/no-io.key".into());
+    config.node_mut().ca_certificate = Some("/fixture/no-io-ca.crt".into());
     config.hardware.client_binary = Some("/fixture/no-io-client".into());
     config.hardware.boards=vec![toml::from_str("id='a'\nname='A'\nserial='SERIAL-A'\nclient_port=18110\ndevice_location=1\nprofile='manual'").unwrap()];
     let metrics = Metrics::new(Network::Mainnet).unwrap();

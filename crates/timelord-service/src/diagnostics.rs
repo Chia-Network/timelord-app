@@ -54,7 +54,7 @@ pub async fn check(mut config: Config, config_path: &Path) -> Result<Vec<Checked
         }
     }
     let process = crate::operational::State::new(crate::observability::Metrics::new(
-        config.node.network.clone(),
+        config.node().network.clone(),
     )?);
     // Owner epochs and safety restrictions are physical facts the next
     // production start must see; reliability health is not changed. The worker

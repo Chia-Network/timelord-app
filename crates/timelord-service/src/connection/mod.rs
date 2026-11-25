@@ -15,7 +15,7 @@ pub fn local(config: &mut Config, root: &Path) -> Result<()> {
     // Chia's full-node peer port uses its public TLS context. A timelord is
     // a public client; the installation's private CA belongs to private services.
     let ssl = root.join("config/ssl");
-    let mut node = config.node.clone();
+    let mut node = config.node().clone();
     node.host = "localhost".into();
     node.network_definition = None;
     node.server_name = Some("chia.net".into());
@@ -120,7 +120,7 @@ pub fn local(config: &mut Config, root: &Path) -> Result<()> {
     let mut candidate = config.clone();
     candidate.add_connection(node).map_err(anyhow::Error::msg)?;
     candidate.validate().map_err(anyhow::Error::msg)?;
-    crate::network::resolve(&candidate.node)?;
+    crate::network::resolve(candidate.node())?;
     *config = candidate;
     Ok(())
 }
@@ -388,19 +388,21 @@ mod tests {
         local(&mut local_config, &chia_root).unwrap();
         assert!(
             local_config
-                .node
+                .node()
                 .certificate
+                .as_ref()
                 .unwrap()
                 .ends_with("public_timelord.crt")
         );
         assert!(
             local_config
-                .node
+                .node()
                 .ca_certificate
+                .as_ref()
                 .unwrap()
                 .ends_with("chia_ca.crt")
         );
-        let rpc = local_config.node.rpc.unwrap();
+        let rpc = local_config.node().rpc.as_ref().unwrap();
         assert_eq!(rpc.port, 8556);
         assert!(rpc.certificate.ends_with("full_node/private_full_node.crt"));
         assert!(rpc.ca_certificate.ends_with("ca/private_ca.crt"));
@@ -410,10 +412,10 @@ mod tests {
         )).unwrap();
         let mut custom_local = Config::default();
         local(&mut custom_local, &chia_root).unwrap();
-        assert_eq!(custom_local.node.network.label(), "ephemeral-fixture");
-        assert_eq!(custom_local.node.port, 58445);
+        assert_eq!(custom_local.node().network.label(), "ephemeral-fixture");
+        assert_eq!(custom_local.node().port, 58445);
         assert_eq!(
-            crate::network::resolve(&custom_local.node)
+            crate::network::resolve(custom_local.node())
                 .unwrap()
                 .constants
                 .difficulty_starting,
@@ -426,13 +428,14 @@ mod tests {
         crate::save(&config_path, &Config::default()).unwrap();
         import(&config_path, &manifest).unwrap();
         let config = crate::load(&config_path).unwrap();
-        assert_eq!(config.node.host, "fixture.invalid");
+        assert_eq!(config.node().host, "fixture.invalid");
         let mainnet_id = config.connections.active_id.clone().unwrap();
-        let mainnet_node = config.node.clone();
+        let mainnet_node = config.node().clone();
         assert!(
             config
-                .node
+                .node()
                 .private_key
+                .as_ref()
                 .unwrap()
                 .starts_with(directory.join("identities"))
         );
@@ -494,17 +497,20 @@ mod tests {
         .unwrap();
         import(&config_path, &manifest).unwrap();
         let imported = crate::load(&config_path).unwrap();
-        assert_eq!(imported.node.network, custom.network);
-        assert_eq!(imported.node.port, 58445);
-        assert_eq!(imported.node.network_definition, custom.network_definition);
+        assert_eq!(imported.node().network, custom.network);
+        assert_eq!(imported.node().port, 58445);
+        assert_eq!(
+            imported.node().network_definition,
+            custom.network_definition
+        );
         assert_eq!(imported.connections.profiles.len(), 2);
         let custom_id = imported.connections.active_id.clone().unwrap();
-        let custom_node = imported.node.clone();
+        let custom_node = imported.node().clone();
         fs::remove_dir_all(&source).unwrap();
         let imported = crate::load(&config_path).unwrap();
-        assert!(imported.node.certificate.as_ref().unwrap().is_file());
+        assert!(imported.node().certificate.as_ref().unwrap().is_file());
         assert_eq!(
-            crate::network::resolve(&imported.node)
+            crate::network::resolve(imported.node())
                 .unwrap()
                 .constants
                 .difficulty_starting,
@@ -514,10 +520,10 @@ mod tests {
         switched.select_connection(&mainnet_id).unwrap();
         crate::save(&config_path, &switched).unwrap();
         let mut switched = crate::load(&config_path).unwrap();
-        assert_eq!(switched.node, mainnet_node);
+        assert_eq!(switched.node(), &mainnet_node);
         switched.select_connection(&custom_id).unwrap();
         crate::save(&config_path, &switched).unwrap();
-        assert_eq!(crate::load(&config_path).unwrap().node, custom_node);
+        assert_eq!(crate::load(&config_path).unwrap().node(), &custom_node);
         fs::remove_dir_all(directory).unwrap();
     }
 }

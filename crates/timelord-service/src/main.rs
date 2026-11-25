@@ -182,9 +182,7 @@ fn parse_config(path: &Path, text: &str) -> Result<Config> {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
         .canonicalize()?;
-    for node in std::iter::once(&mut config.node)
-        .chain(config.connections.profiles.iter_mut().map(|p| &mut p.node))
-    {
+    for node in config.stored_nodes_mut() {
         for path in [
             &mut node.certificate,
             &mut node.private_key,
@@ -224,9 +222,8 @@ fn parse_config(path: &Path, text: &str) -> Result<Config> {
     }
     config.remember_connection().map_err(anyhow::Error::msg)?;
     config.validate().map_err(anyhow::Error::msg)?;
-    network::resolve(&config.node)?;
-    for profile in &config.connections.profiles {
-        network::resolve(&profile.node)?;
+    for node in config.stored_nodes() {
+        network::resolve(node)?;
     }
     Ok(config)
 }
@@ -247,9 +244,8 @@ pub(crate) fn save(path: &Path, config: &Config) -> Result<()> {
     let mut config = config.clone();
     config.remember_connection().map_err(anyhow::Error::msg)?;
     config.validate().map_err(anyhow::Error::msg)?;
-    network::resolve(&config.node)?;
-    for profile in &config.connections.profiles {
-        network::resolve(&profile.node)?;
+    for node in config.stored_nodes() {
+        network::resolve(node)?;
     }
     let parent = path
         .parent()
@@ -330,7 +326,7 @@ async fn main() -> Result<()> {
         Command::NodeState { config } => {
             let config = load(&config)?;
             let rpc = config
-                .node
+                .node()
                 .rpc
                 .as_ref()
                 .context("Full-node status RPC is not configured")?;
@@ -565,17 +561,17 @@ mod configuration_tests {
         std::fs::create_dir(&folder).unwrap();
         let path = folder.join("config.toml");
         let mut valid = Config::default();
-        valid.node.certificate = Some("identity/client.crt".into());
-        valid.node.private_key = Some("identity/client.key".into());
-        valid.node.ca_certificate = Some("identity/ca.crt".into());
+        valid.node_mut().certificate = Some("identity/client.crt".into());
+        valid.node_mut().private_key = Some("identity/client.key".into());
+        valid.node_mut().ca_certificate = Some("identity/ca.crt".into());
         save(&path, &valid).unwrap();
         let original = std::fs::read(&path).unwrap();
         let loaded = load(&path).unwrap();
         assert_eq!(
-            loaded.node.private_key,
+            loaded.node().private_key,
             Some(folder.canonicalize().unwrap().join("identity/client.key"))
         );
-        valid.node.private_key = None;
+        valid.node_mut().private_key = None;
         assert!(save(&path, &valid).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), original);
         #[cfg(unix)]

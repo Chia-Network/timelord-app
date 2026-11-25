@@ -6,7 +6,6 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use std::{
-    collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
@@ -35,7 +34,7 @@ struct NodeSession {
 impl NodeSession {
     fn start(shared: &Arc<Shared>, backend: &Arc<asic::AsicBackend>) -> Self {
         let (stop, receiver) = watch::channel(false);
-        let task = shared.config.node.certificate.is_some().then(|| {
+        let task = shared.config.node().certificate.is_some().then(|| {
             let shared = shared.clone();
             let backend = backend.clone();
             tokio::spawn(async move { crate::runtime::run(shared, backend, receiver).await })
@@ -129,22 +128,20 @@ impl Run {
         self.shared
             .process
             .metrics
-            .set_network(&config.node.network);
+            .set_network(&config.node().network);
         self.publish(config, current);
         self.node = NodeSession::start(&self.shared, &backend);
         Ok(())
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn start_run(
     config: Config,
     native: Option<Arc<hardware::Facts>>,
     history_path: PathBuf,
-    board_states: &HashMap<String, runtime::HardwareState>,
+    safety: Arc<safety::Store>,
     service_started_unix: u64,
     process: Arc<operational::State>,
-    safety: Arc<safety::Store>,
     node_requests: tokio::sync::mpsc::Sender<private_control::NodeReload>,
 ) -> Result<Run> {
     let control = config
@@ -166,7 +163,6 @@ async fn start_run(
             false
         }
     };
-    runtime.boards = board_states.clone();
     hardware::restore_lifecycles(&config, &mut runtime.boards, &safety);
     if let Some(reset) = safety.journal_reset() {
         process.metrics.safety_journal_reset(reset);
@@ -275,7 +271,7 @@ pub(crate) async fn serve(
     let requested_config = config.clone();
     let service_started_unix = unix_now();
     let process =
-        operational::State::new(observability::Metrics::new(config.node.network.clone())?);
+        operational::State::new(observability::Metrics::new(config.node().network.clone())?);
     process.progress.configuration(fallback);
     // Start reporting before discovery or native initialization can wait.
     let initial = Arc::new(Shared::new(
@@ -325,10 +321,9 @@ pub(crate) async fn serve(
             config,
             native,
             history_path.clone(),
-            &HashMap::new(),
+            safety,
             service_started_unix,
             process.clone(),
-            safety,
             node_requests.clone(),
         )
         .await?;
@@ -488,11 +483,11 @@ async fn node_reload(
         settings(&candidate)? == settings(running)?,
         "Board or service settings changed; use Save & Restart"
     );
-    crate::network::resolve(&candidate.node)?;
-    if serde_json::to_value(&candidate.node)? == serde_json::to_value(&running.node)? {
+    crate::network::resolve(candidate.node())?;
+    if serde_json::to_value(candidate.node())? == serde_json::to_value(running.node())? {
         return Ok(None);
     }
-    tracing::info!(network=%candidate.node.network, host=%candidate.node.host, "Switching full-node profile; native owners retained");
+    tracing::info!(network=%candidate.node().network, host=%candidate.node().host, "Switching full-node profile; native owners retained");
     run.replace_node(candidate, current).await?;
     Ok(Some(requested))
 }

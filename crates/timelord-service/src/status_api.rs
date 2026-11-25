@@ -89,7 +89,7 @@ struct BoardStatus {
 async fn health(State(http): State<observability::HttpState>) -> Json<serde_json::Value> {
     let shared = http.current.borrow().clone();
     Json(
-        serde_json::json!({"service":"timelord-service","api_version":1,"production_enabled":shared.config.node.certificate.is_some()}),
+        serde_json::json!({"service":"timelord-service","api_version":1,"production_enabled":shared.config.node().certificate.is_some()}),
     )
 }
 
@@ -106,15 +106,15 @@ async fn status(State(http): State<observability::HttpState>) -> Json<Status> {
         service_state: "ready",
         timelord_state: runtime.phase.clone(),
         message: runtime.message.clone(),
-        production_enabled: shared.config.node.certificate.is_some(),
+        production_enabled: shared.config.node().certificate.is_some(),
         started_unix: shared.started_unix,
         service_started_unix: shared.service_started_unix,
         timestamp_unix: unix_now(),
         full_node: NodeStatus {
-            host: shared.config.node.host.clone(),
-            port: shared.config.node.port,
-            network: shared.config.node.network.clone(),
-            state: if shared.config.node.certificate.is_none() {
+            host: shared.config.node().host.clone(),
+            port: shared.config.node().port,
+            network: shared.config.node().network.clone(),
+            state: if shared.config.node().certificate.is_none() {
                 "not_connected".into()
             } else {
                 runtime.node.clone()
