@@ -81,23 +81,16 @@ fn fallback_never_crosses_custom_chain_definitions_with_the_same_name() {
 }
 #[test]
 fn fallback_uses_the_active_profile_network_and_refuses_unknown_intent() {
-    use timelord_core::{ConnectionProfile, NodeConfig};
     let directory = std::env::temp_dir().join(format!("tl-lkg-profile-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();
     let path = directory.join("config.toml");
     let profile_config = |network: &str| {
-        let node = NodeConfig {
-            network: network.parse().unwrap(),
-            ..Default::default()
-        };
-        let mut config = Config::from_node(node.clone());
-        config.connections.profiles = vec![ConnectionProfile {
-            id: "active".into(),
-            name: "Active".into(),
-            node,
-        }];
-        config.connections.active_id = Some("active".into());
-        config
+        let text = format!(
+            "schema_version = 1\n[connections]\nactive_id = \"active\"\n\n\
+             [[connections.profiles]]\nid = \"active\"\nname = \"Active\"\n\
+             [connections.profiles.node]\nnetwork = \"{network}\"\n"
+        );
+        toml::from_str::<Config>(&text).unwrap()
     };
     crate::save(&saved_path(&path).unwrap(), &profile_config("testnet11")).unwrap();
     // The runtime projection is gone from saved files and intent comes from

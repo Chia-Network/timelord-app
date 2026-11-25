@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ConnectionProfiles {
-    pub active_id: Option<String>,
-    pub profiles: Vec<ConnectionProfile>,
+    active_id: Option<String>,
+    profiles: Vec<ConnectionProfile>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -82,6 +82,12 @@ impl<'a> Iterator for StoredNodesMut<'a> {
 }
 
 impl ConnectionProfiles {
+    pub fn active_id(&self) -> Option<&str> {
+        self.active_id.as_deref()
+    }
+    pub fn profiles(&self) -> &[ConnectionProfile] {
+        &self.profiles
+    }
     /// Structural validation. The runtime node is the active profile itself, so
     /// there is no second copy to compare against.
     pub fn validate(&self) -> Result<(), String> {
@@ -150,6 +156,10 @@ impl ConnectionProfiles {
     }
 }
 impl Config {
+    /// The configured connection profiles.
+    pub fn connections(&self) -> &ConnectionProfiles {
+        &self.connections
+    }
     /// A single-node configuration with no profiles yet.
     pub fn from_node(node: NodeConfig) -> Self {
         Self {

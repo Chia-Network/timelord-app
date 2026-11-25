@@ -11,7 +11,7 @@ const SCHEMA_VERSION: u32 = 1;
 pub struct Config {
     pub schema_version: u32,
     single_node: NodeConfig,
-    pub connections: ConnectionProfiles,
+    connections: ConnectionProfiles,
     pub service: ServiceConfig,
     pub hardware: HardwareConfig,
 }
@@ -34,7 +34,7 @@ impl Serialize for Config {
             schema_version: self.schema_version,
             node: self
                 .connections
-                .profiles
+                .profiles()
                 .is_empty()
                 .then_some(&self.single_node),
             connections: &self.connections,
@@ -372,7 +372,7 @@ impl Config {
         // Selection errors must surface before any hidden single-node complaint;
         // profile nodes are validated by the connection layer.
         self.connections.validate()?;
-        if self.connections.profiles.is_empty() {
+        if self.connections.profiles().is_empty() {
             self.node().validate()?;
         }
         if !self.service.status_listen.ip().is_loopback() || self.service.status_listen.port() == 0
