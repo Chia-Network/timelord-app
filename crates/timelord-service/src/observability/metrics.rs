@@ -99,22 +99,29 @@ impl Metrics {
     pub fn new(network: Network) -> Result<Arc<Self>> {
         let network = network.label().to_owned();
         let registry = Registry::new_custom(Some("chia_timelord".into()), None)?;
-        for name in ["version", "build_info"] {
-            let labels = if name == "version" {
-                vec!["version"]
-            } else {
-                vec!["version", "revision"]
-            };
-            let metric = registered(
-                &registry,
-                IntGaugeVec::new(Opts::new(name, "Running timelord-service build"), &labels)?,
-            )?;
-            let mut values = vec![env!("CARGO_PKG_VERSION")];
-            if name == "build_info" {
-                values.push(option_env!("TIMELORD_BUILD_REVISION").unwrap_or("unknown"));
-            }
-            metric.with_label_values(&values).set(1);
-        }
+        let version = registered(
+            &registry,
+            IntGaugeVec::new(
+                Opts::new("version", "Running timelord-service build"),
+                &["version"],
+            )?,
+        )?;
+        version
+            .with_label_values(&[env!("CARGO_PKG_VERSION")])
+            .set(1);
+        let build_info = registered(
+            &registry,
+            IntGaugeVec::new(
+                Opts::new("build_info", "Running timelord-service build"),
+                &["version", "revision"],
+            )?,
+        )?;
+        build_info
+            .with_label_values(&[
+                env!("CARGO_PKG_VERSION"),
+                option_env!("TIMELORD_BUILD_REVISION").unwrap_or("unknown"),
+            ])
+            .set(1);
         let started = registered(
             &registry,
             IntGauge::new("process_start_time_seconds", "Service process start time")?,
@@ -128,82 +135,85 @@ impl Metrics {
             proofs_verified_total: counter_vec(
                 &registry,
                 "proofs_verified_total",
-                "proofs verified total",
+                "Native verifier outcomes for scheduled work; failures include priming checks",
                 &["chain"],
             )?,
             proof_verification_failures_total: counter_vec(
                 &registry,
                 "proof_verification_failures_total",
-                "proof verification failures total",
+                "Native verifier outcomes for scheduled work; failures include priming checks",
                 &["chain"],
             )?,
             submissions_total: counter_vec(
                 &registry,
                 "submissions_total",
-                "submissions total",
+                "Successful node writes of signage, infusion or end-of-sub-slot bundles",
                 &["kind"],
             )?,
             unfinished_candidates_total: counter_vec(
                 &registry,
                 "unfinished_candidates_total",
-                "unfinished candidate admission outcomes total",
+                "Unfinished-block admission outcomes from node frames or peak retries",
                 &["outcome", "source"],
             )?,
             topology_changes_total: registered(
                 &registry,
-                IntCounter::new("topology_changes_total", "topology changes total")?,
+                IntCounter::new("topology_changes_total", "Applied chain-route changes")?,
             )?,
             asic_recoveries_total: counter_vec(
                 &registry,
                 "asic_recoveries_total",
-                "asic recoveries total",
+                "Native recovery log events",
                 &["board", "engine"],
             )?,
             client_restarts_total: counter_vec(
                 &registry,
                 "client_restarts_total",
-                "client restarts total",
+                "Replacement native processes actually launched",
                 &["board", "reason"],
             )?,
             thermal_stops_total: counter_vec(
                 &registry,
                 "thermal_stops_total",
-                "thermal stops total",
+                "New thermal guard stops, counted once per latch",
                 &["board"],
             )?,
             node_reconnects_total: registered(
                 &registry,
-                IntCounter::new("node_reconnects_total", "node reconnects total")?,
+                IntCounter::new(
+                    "node_reconnects_total",
+                    "Reconnections after the first authenticated connection",
+                )?,
             )?,
             peak_updates_total: counter_vec(
                 &registry,
                 "peak_updates_total",
-                "peak updates total",
+                "Scheduler accepted, ignored or rejected peak updates",
                 &["result"],
             )?,
             work_cancelled_total: counter_vec(
                 &registry,
                 "work_cancelled_total",
-                "work cancelled total",
+                "Adapter requests dropped without completion",
                 &["chain"],
             )?,
             vdf_sessions_started_total: counter_vec(
                 &registry,
                 "vdf_sessions_started_total",
-                "vdf sessions started total",
+                "Native challenge initialization acknowledged; initial, input change or reconnect",
                 &["chain", "reason"],
             )?,
             operating_point_changes_total: counter_vec(
                 &registry,
                 "operating_point_changes_total",
-                "operating point changes total",
+                "Acknowledged trial, backoff or restore writes",
                 &["board", "reason"],
             )?,
             last_verified_proof_timestamp_seconds: registered(
                 &registry,
                 EventTimestamp::new(
                     "last_verified_proof_timestamp_seconds",
-                    "last verified proof timestamp seconds",
+                    "Wall-clock time of the most recent verified scheduled completion",
                     &["chain"],
                 )?,
             )?,
@@ -211,7 +221,7 @@ impl Metrics {
                 &registry,
                 EventTimestamp::new(
                     "last_submission_timestamp_seconds",
-                    "last submission timestamp seconds",
+                    "Wall-clock time of the most recent successful node write of signage, infusion or end-of-sub-slot bundles",
                     &["kind"],
                 )?,
             )?,
@@ -219,7 +229,7 @@ impl Metrics {
                 &registry,
                 EventTimestamp::new(
                     "last_node_message_timestamp_seconds",
-                    "last node message timestamp seconds",
+                    "Last observed node frame",
                     &[],
                 )?,
             )?,
@@ -227,7 +237,7 @@ impl Metrics {
                 &registry,
                 EventTimestamp::new(
                     "last_peak_received_timestamp_seconds",
-                    "last peak received timestamp seconds",
+                    "Last observed decoded peak",
                     &[],
                 )?,
             )?,

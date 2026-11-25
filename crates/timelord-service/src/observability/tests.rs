@@ -758,6 +758,51 @@ fn admission_activity_counts_pending_work_without_a_metric_handle() {
     assert_eq!(runtime.lock().unwrap().pending[0], 0);
 }
 #[test]
+fn build_info_series_and_documented_help_are_exported() {
+    let (shared, metrics, _) = fixture();
+    let body = metrics.render(&shared, crate::unix_now()).unwrap();
+    let version = env!("CARGO_PKG_VERSION");
+    let revision = option_env!("TIMELORD_BUILD_REVISION").unwrap_or("unknown");
+    assert_eq!(
+        value(
+            &body,
+            "chia_timelord_version",
+            &[&format!("version=\"{version}\"")]
+        ),
+        Some(1.)
+    );
+    let version_line = body
+        .lines()
+        .find(|line| line.starts_with("chia_timelord_version{"))
+        .unwrap();
+    assert!(!version_line.contains("revision="));
+    assert_eq!(
+        value(
+            &body,
+            "chia_timelord_build_info",
+            &[
+                &format!("version=\"{version}\""),
+                &format!("revision=\"{revision}\""),
+            ]
+        ),
+        Some(1.)
+    );
+    for (name, help) in [
+        (
+            "node_reconnects_total",
+            "Reconnections after the first authenticated connection",
+        ),
+        ("topology_changes_total", "Applied chain-route changes"),
+    ] {
+        assert!(
+            body.lines()
+                .any(|line| line == format!("# HELP chia_timelord_{name} {help}")),
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn candidates_full_is_exported_at_zero_before_any_event() {
     let (shared, _, _) = fixture();
     let body = Metrics::new(Network::Mainnet)
