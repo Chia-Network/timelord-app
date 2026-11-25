@@ -531,6 +531,87 @@ fn process_totals_survive_history_pruning_and_runtime_replacement() {
     );
 }
 #[test]
+fn label_less_metrics_are_exported_at_zero_and_after_recording() {
+    let (shared, metrics, _) = fixture();
+    let initial = metrics.render(&shared, crate::unix_now()).unwrap();
+    let expected = [
+        (
+            "chain_moves_total",
+            "counter",
+            "Chains moved between boards",
+        ),
+        (
+            "topology_changes_total",
+            "counter",
+            "topology changes total",
+        ),
+        ("node_reconnects_total", "counter", "node reconnects total"),
+        (
+            "last_node_message_timestamp_seconds",
+            "gauge",
+            "last node message timestamp seconds",
+        ),
+        (
+            "last_peak_received_timestamp_seconds",
+            "gauge",
+            "last peak received timestamp seconds",
+        ),
+    ];
+    for (name, kind, help) in expected {
+        let name = format!("chia_timelord_{name}");
+        assert!(
+            initial.contains(&format!("# HELP {name} {help}\n")),
+            "{name} initial HELP"
+        );
+        assert!(
+            initial.contains(&format!("# TYPE {name} {kind}\n")),
+            "{name} initial TYPE"
+        );
+        assert_eq!(value(&initial, &name, &[]), Some(0.), "{name} initial");
+    }
+    metrics.chains_moved(1);
+    metrics.topology_changed();
+    metrics.connected();
+    metrics.connected();
+    let node_message_before = crate::unix_now();
+    metrics.node_message_received();
+    let node_message_after = crate::unix_now();
+    let peak_before = crate::unix_now();
+    metrics.peak_received();
+    let peak_after = crate::unix_now();
+    let body = metrics.render(&shared, crate::unix_now()).unwrap();
+    for (name, expected) in [
+        ("chia_timelord_chain_moves_total", 1.),
+        ("chia_timelord_topology_changes_total", 1.),
+        ("chia_timelord_node_reconnects_total", 1.),
+    ] {
+        assert_eq!(value(&body, name, &[]), Some(expected), "{name} after");
+    }
+    for (name, before, after) in [
+        (
+            "chia_timelord_last_node_message_timestamp_seconds",
+            node_message_before,
+            node_message_after,
+        ),
+        (
+            "chia_timelord_last_peak_received_timestamp_seconds",
+            peak_before,
+            peak_after,
+        ),
+    ] {
+        let timestamp = value(&body, name, &[]).unwrap();
+        assert!(
+            timestamp >= before as f64 && timestamp <= after as f64,
+            "{name} after: {timestamp} not in {before}..={after}"
+        );
+    }
+    if let Ok(path) = std::env::var("TIMELORD_TEST_LABEL_LESS_EXPOSITION") {
+        std::fs::write(format!("{path}.initial"), initial).unwrap();
+        std::fs::write(format!("{path}.after"), body).unwrap();
+    }
+}
+
+#[test]
 fn pending_activity_counts_cancellation_but_not_completed_work() {
     let (shared, metrics, _) = fixture();
     let activity = Activity::new(&shared.runtime, Chain::Challenge, Some(&metrics));

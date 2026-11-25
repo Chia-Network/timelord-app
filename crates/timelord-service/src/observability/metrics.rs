@@ -7,7 +7,8 @@ use crate::Shared;
 use crate::safety::JournalReset;
 use anyhow::Result;
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder,
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 use std::{
     collections::BTreeSet,
@@ -32,19 +33,19 @@ pub struct Metrics {
     proof_verification_failures_total: IntCounterVec,
     submissions_total: IntCounterVec,
     unfinished_candidates_total: IntCounterVec,
-    topology_changes_total: IntCounterVec,
+    topology_changes_total: IntCounter,
     asic_recoveries_total: IntCounterVec,
     client_restarts_total: IntCounterVec,
     thermal_stops_total: IntCounterVec,
-    node_reconnects_total: IntCounterVec,
+    node_reconnects_total: IntCounter,
     peak_updates_total: IntCounterVec,
     work_cancelled_total: IntCounterVec,
     vdf_sessions_started_total: IntCounterVec,
     operating_point_changes_total: IntCounterVec,
     last_verified_proof_timestamp_seconds: IntGaugeVec,
     last_submission_timestamp_seconds: IntGaugeVec,
-    last_node_message_timestamp_seconds: IntGaugeVec,
-    last_peak_received_timestamp_seconds: IntGaugeVec,
+    last_node_message_timestamp_seconds: IntGauge,
+    last_peak_received_timestamp_seconds: IntGauge,
     proof_duration: HistogramVec,
     submission_duration: HistogramVec,
     last: Mutex<Last>,
@@ -52,11 +53,21 @@ pub struct Metrics {
     clients_started: Mutex<BTreeSet<String>>,
     board_failures_total: IntCounterVec,
     safety_journal_resets_total: IntCounterVec,
-    chain_moves_total: IntCounterVec,
+    chain_moves_total: IntCounter,
     delayed_bundles_total: IntCounterVec,
     /// Applied to every family at encode time, so a live node-profile switch
     /// relabels the exposition without rebuilding counters.
     network: Mutex<String>,
+}
+fn plain_counter(registry: &Registry, name: &str, help: &str) -> Result<IntCounter> {
+    let metric = IntCounter::new(name, help)?;
+    registry.register(Box::new(metric.clone()))?;
+    Ok(metric)
+}
+fn plain_gauge(registry: &Registry, name: &str, help: &str) -> Result<IntGauge> {
+    let metric = IntGauge::new(name, help)?;
+    registry.register(Box::new(metric.clone()))?;
+    Ok(metric)
 }
 impl Metrics {
     pub fn new(network: Network) -> Result<Arc<Self>> {
@@ -78,12 +89,11 @@ impl Metrics {
             &["reason"],
         )?;
         registry.register(Box::new(safety_journal_resets_total.clone()))?;
-        let chain_moves_total = IntCounterVec::new(
-            Opts::new("chain_moves_total", "Chains moved between boards"),
-            &[],
+        let chain_moves_total = plain_counter(
+            &registry,
+            "chain_moves_total",
+            "Chains moved between boards",
         )?;
-        registry.register(Box::new(chain_moves_total.clone()))?;
-        chain_moves_total.with_label_values(&[] as &[&str]);
         let delayed_bundles_total = IntCounterVec::new(
             Opts::new(
                 "delayed_bundles_total",
@@ -118,12 +128,11 @@ impl Metrics {
             &["outcome", "source"],
         )?;
         registry.register(Box::new(unfinished_candidates_total.clone()))?;
-        let topology_changes_total = IntCounterVec::new(
-            Opts::new("topology_changes_total", "topology changes total"),
-            &[],
+        let topology_changes_total = plain_counter(
+            &registry,
+            "topology_changes_total",
+            "topology changes total",
         )?;
-        registry.register(Box::new(topology_changes_total.clone()))?;
-        topology_changes_total.with_label_values(&[] as &[&str]);
         let asic_recoveries_total = IntCounterVec::new(
             Opts::new("asic_recoveries_total", "asic recoveries total"),
             &["board", "engine"],
@@ -139,12 +148,8 @@ impl Metrics {
             &["board"],
         )?;
         registry.register(Box::new(thermal_stops_total.clone()))?;
-        let node_reconnects_total = IntCounterVec::new(
-            Opts::new("node_reconnects_total", "node reconnects total"),
-            &[],
-        )?;
-        registry.register(Box::new(node_reconnects_total.clone()))?;
-        node_reconnects_total.with_label_values(&[] as &[&str]);
+        let node_reconnects_total =
+            plain_counter(&registry, "node_reconnects_total", "node reconnects total")?;
         let peak_updates_total = IntCounterVec::new(
             Opts::new("peak_updates_total", "peak updates total"),
             &["result"],
@@ -184,22 +189,16 @@ impl Metrics {
             &["kind"],
         )?;
         registry.register(Box::new(last_submission_timestamp_seconds.clone()))?;
-        let last_node_message_timestamp_seconds = IntGaugeVec::new(
-            Opts::new(
-                "last_node_message_timestamp_seconds",
-                "last node message timestamp seconds",
-            ),
-            &[],
+        let last_node_message_timestamp_seconds = plain_gauge(
+            &registry,
+            "last_node_message_timestamp_seconds",
+            "last node message timestamp seconds",
         )?;
-        registry.register(Box::new(last_node_message_timestamp_seconds.clone()))?;
-        let last_peak_received_timestamp_seconds = IntGaugeVec::new(
-            Opts::new(
-                "last_peak_received_timestamp_seconds",
-                "last peak received timestamp seconds",
-            ),
-            &[],
+        let last_peak_received_timestamp_seconds = plain_gauge(
+            &registry,
+            "last_peak_received_timestamp_seconds",
+            "last peak received timestamp seconds",
         )?;
-        registry.register(Box::new(last_peak_received_timestamp_seconds.clone()))?;
         for name in ["version", "build_info"] {
             let labels = if name == "version" {
                 vec!["version"]
@@ -314,11 +313,11 @@ impl Metrics {
                 .unfinished_candidates_total
                 .with_label_values(labels)
                 .get(),
-            "topology_changes_total" => self.topology_changes_total.with_label_values(labels).get(),
+            "topology_changes_total" => self.topology_changes_total.get(),
             "asic_recoveries_total" => self.asic_recoveries_total.with_label_values(labels).get(),
             "client_restarts_total" => self.client_restarts_total.with_label_values(labels).get(),
             "thermal_stops_total" => self.thermal_stops_total.with_label_values(labels).get(),
-            "node_reconnects_total" => self.node_reconnects_total.with_label_values(labels).get(),
+            "node_reconnects_total" => self.node_reconnects_total.get(),
             "peak_updates_total" => self.peak_updates_total.with_label_values(labels).get(),
             "work_cancelled_total" => self.work_cancelled_total.with_label_values(labels).get(),
             "vdf_sessions_started_total" => self
@@ -326,7 +325,7 @@ impl Metrics {
                 .with_label_values(labels)
                 .get(),
             "board_failures_total" => self.board_failures_total.with_label_values(labels).get(),
-            "chain_moves_total" => self.chain_moves_total.with_label_values(labels).get(),
+            "chain_moves_total" => self.chain_moves_total.get(),
             "operating_point_changes_total" => self
                 .operating_point_changes_total
                 .with_label_values(labels)
@@ -346,9 +345,7 @@ impl Metrics {
             .inc();
     }
     pub fn chains_moved(&self, count: u64) {
-        self.chain_moves_total
-            .with_label_values(&[] as &[&str])
-            .inc_by(count);
+        self.chain_moves_total.inc_by(count);
     }
     pub fn bundle_delayed(&self, c: Chain) {
         self.delayed_bundles_total
@@ -377,9 +374,7 @@ impl Metrics {
             .sum()
     }
     pub fn topology_changed(&self) {
-        self.topology_changes_total
-            .with_label_values(&[] as &[&str])
-            .inc();
+        self.topology_changes_total.inc();
     }
     pub fn verification_failed(&self, c: Chain) {
         self.proof_verification_failures_total
@@ -421,12 +416,10 @@ impl Metrics {
     }
     pub fn node_message_received(&self) {
         self.last_node_message_timestamp_seconds
-            .with_label_values(&[] as &[&str])
             .set(crate::unix_now() as i64);
     }
     pub fn peak_received(&self) {
         self.last_peak_received_timestamp_seconds
-            .with_label_values(&[] as &[&str])
             .set(crate::unix_now() as i64);
     }
     pub fn begin_session(&self) -> u64 {
@@ -445,9 +438,7 @@ impl Metrics {
     }
     pub fn connected(&self) {
         if self.ever_connected.swap(true, Ordering::Relaxed) {
-            self.node_reconnects_total
-                .with_label_values(&[] as &[&str])
-                .inc();
+            self.node_reconnects_total.inc();
         }
     }
     pub fn verified(&self, epoch: u64, c: Chain, ips: f64) {
