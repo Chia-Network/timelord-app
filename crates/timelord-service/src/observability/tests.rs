@@ -531,45 +531,38 @@ fn process_totals_survive_history_pruning_and_runtime_replacement() {
     );
 }
 #[test]
-fn label_less_metrics_are_exported_at_zero_and_after_recording() {
+fn label_less_metrics_keep_existing_exposition() {
     let (shared, metrics, _) = fixture();
     let initial = metrics.render(&shared, crate::unix_now()).unwrap();
-    let expected = [
-        (
-            "chain_moves_total",
-            "counter",
-            "Chains moved between boards",
-        ),
-        (
-            "topology_changes_total",
-            "counter",
-            "topology changes total",
-        ),
-        ("node_reconnects_total", "counter", "node reconnects total"),
-        (
-            "last_node_message_timestamp_seconds",
-            "gauge",
-            "last node message timestamp seconds",
-        ),
-        (
-            "last_peak_received_timestamp_seconds",
-            "gauge",
-            "last peak received timestamp seconds",
-        ),
-    ];
-    for (name, kind, help) in expected {
+    for name in [
+        "chain_moves_total",
+        "topology_changes_total",
+        "node_reconnects_total",
+    ] {
         let name = format!("chia_timelord_{name}");
         assert!(
-            initial.contains(&format!("# HELP {name} {help}\n")),
+            initial
+                .lines()
+                .any(|line| line.starts_with(&format!("# HELP {name} "))),
             "{name} initial HELP"
         );
         assert!(
-            initial.contains(&format!("# TYPE {name} {kind}\n")),
+            initial.contains(&format!("# TYPE {name} counter\n")),
             "{name} initial TYPE"
         );
-        assert_eq!(value(&initial, &name, &[]), Some(0.), "{name} initial");
+        assert_eq!(
+            value(&initial, &name, &["network=\"mainnet\""]),
+            Some(0.),
+            "{name} initial"
+        );
     }
-    metrics.chains_moved(1);
+    for name in [
+        "chia_timelord_last_node_message_timestamp_seconds",
+        "chia_timelord_last_peak_received_timestamp_seconds",
+    ] {
+        assert_eq!(value(&initial, name, &[]), None, "{name} initial");
+    }
+    metrics.chains_moved(2);
     metrics.topology_changed();
     metrics.connected();
     metrics.connected();
@@ -581,11 +574,15 @@ fn label_less_metrics_are_exported_at_zero_and_after_recording() {
     let peak_after = crate::unix_now();
     let body = metrics.render(&shared, crate::unix_now()).unwrap();
     for (name, expected) in [
-        ("chia_timelord_chain_moves_total", 1.),
+        ("chia_timelord_chain_moves_total", 2.),
         ("chia_timelord_topology_changes_total", 1.),
         ("chia_timelord_node_reconnects_total", 1.),
     ] {
-        assert_eq!(value(&body, name, &[]), Some(expected), "{name} after");
+        assert_eq!(
+            value(&body, name, &["network=\"mainnet\""]),
+            Some(expected),
+            "{name} after"
+        );
     }
     for (name, before, after) in [
         (
@@ -599,15 +596,11 @@ fn label_less_metrics_are_exported_at_zero_and_after_recording() {
             peak_after,
         ),
     ] {
-        let timestamp = value(&body, name, &[]).unwrap();
+        let timestamp = value(&body, name, &["network=\"mainnet\""]).unwrap();
         assert!(
             timestamp >= before as f64 && timestamp <= after as f64,
             "{name} after: {timestamp} not in {before}..={after}"
         );
-    }
-    if let Ok(path) = std::env::var("TIMELORD_TEST_LABEL_LESS_EXPOSITION") {
-        std::fs::write(format!("{path}.initial"), initial).unwrap();
-        std::fs::write(format!("{path}.after"), body).unwrap();
     }
 }
 

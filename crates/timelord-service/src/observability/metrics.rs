@@ -44,8 +44,8 @@ pub struct Metrics {
     operating_point_changes_total: IntCounterVec,
     last_verified_proof_timestamp_seconds: IntGaugeVec,
     last_submission_timestamp_seconds: IntGaugeVec,
-    last_node_message_timestamp_seconds: IntGauge,
-    last_peak_received_timestamp_seconds: IntGauge,
+    last_node_message_timestamp_seconds: IntGaugeVec,
+    last_peak_received_timestamp_seconds: IntGaugeVec,
     proof_duration: HistogramVec,
     submission_duration: HistogramVec,
     last: Mutex<Last>,
@@ -189,16 +189,22 @@ impl Metrics {
             &["kind"],
         )?;
         registry.register(Box::new(last_submission_timestamp_seconds.clone()))?;
-        let last_node_message_timestamp_seconds = plain_gauge(
-            &registry,
-            "last_node_message_timestamp_seconds",
-            "last node message timestamp seconds",
+        let last_node_message_timestamp_seconds = IntGaugeVec::new(
+            Opts::new(
+                "last_node_message_timestamp_seconds",
+                "last node message timestamp seconds",
+            ),
+            &[],
         )?;
-        let last_peak_received_timestamp_seconds = plain_gauge(
-            &registry,
-            "last_peak_received_timestamp_seconds",
-            "last peak received timestamp seconds",
+        registry.register(Box::new(last_node_message_timestamp_seconds.clone()))?;
+        let last_peak_received_timestamp_seconds = IntGaugeVec::new(
+            Opts::new(
+                "last_peak_received_timestamp_seconds",
+                "last peak received timestamp seconds",
+            ),
+            &[],
         )?;
+        registry.register(Box::new(last_peak_received_timestamp_seconds.clone()))?;
         for name in ["version", "build_info"] {
             let labels = if name == "version" {
                 vec!["version"]
@@ -214,10 +220,12 @@ impl Metrics {
             metric.with_label_values(&values).set(1);
             registry.register(Box::new(metric))?;
         }
-        let started =
-            prometheus::IntGauge::new("process_start_time_seconds", "Service process start time")?;
+        let started = plain_gauge(
+            &registry,
+            "process_start_time_seconds",
+            "Service process start time",
+        )?;
         started.set(crate::unix_now() as i64);
-        registry.register(Box::new(started))?;
         let buckets = vec![
             0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1., 5., 15., 60., 300.,
         ];
@@ -416,10 +424,12 @@ impl Metrics {
     }
     pub fn node_message_received(&self) {
         self.last_node_message_timestamp_seconds
+            .with_label_values(&[] as &[&str])
             .set(crate::unix_now() as i64);
     }
     pub fn peak_received(&self) {
         self.last_peak_received_timestamp_seconds
+            .with_label_values(&[] as &[&str])
             .set(crate::unix_now() as i64);
     }
     pub fn begin_session(&self) -> u64 {
