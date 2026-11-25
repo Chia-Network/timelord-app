@@ -57,6 +57,13 @@ final class TimelordModel: ObservableObject {
     private let configurationClient: ConfigurationClient
     /// Read-only outside the model so regression tests can assert save rollback.
     private(set) var savedConfiguration = AppConfiguration()
+    /// Effective configuration changes that exist only in memory: the bundled
+    /// client path and discovered boards. Done must flush them to disk even
+    /// when they already appear in `savedConfiguration`.
+    private var savedConfigurationNeedsPersistence = false
+    /// Changes whenever a save or restart begins, so discovery started earlier
+    /// cannot land after a quick apply completes.
+    private var settingsApplyEpoch: UInt64 = 0
     /// What the next save would persist: incomplete RPC drafts fall back to
     /// their last saved settings and do not look like runtime changes.
     private var resolvedConfiguration: AppConfiguration {
@@ -154,6 +161,7 @@ final class TimelordModel: ObservableObject {
                    FileManager.default.isExecutableFile(atPath: packagedClient) {
                     configuration.hardware.clientBinary = packagedClient
                     savedConfiguration.hardware.clientBinary = packagedClient
+                    savedConfigurationNeedsPersistence = true
                 }
                 useSavedStatusEndpoint()
             } catch { reportActionError(error.localizedDescription) }
@@ -333,6 +341,7 @@ final class TimelordModel: ObservableObject {
     }
     func restartService() async {
         guard canControlService, !isBusy else { return }
+        settingsApplyEpoch &+= 1
         controlOperation = .reload; clearActionError(); updateSnapshot()
         await performControl(.reload)
     }
@@ -343,9 +352,12 @@ final class TimelordModel: ObservableObject {
         do { try await controller.install(); await refresh() }
         catch { reportActionError(error.localizedDescription) }
     }
-    /// True when the next save would persist a change. Incomplete RPC drafts
-    /// are UI state and do not count.
-    var hasUnsavedSettings: Bool { resolvedConfiguration != savedConfiguration }
+    /// True when the next save would persist a change, including in-memory
+    /// additions that have not reached disk. Incomplete RPC drafts are UI state
+    /// and do not count.
+    var hasUnsavedSettings: Bool {
+        savedConfigurationNeedsPersistence || resolvedConfiguration != savedConfiguration
+    }
     /// Only the node profile differs between two configurations.
     private static func onlyNodeDiffers(_ old: AppConfiguration, _ new: AppConfiguration) -> Bool {
         var adjusted = new
@@ -401,6 +413,7 @@ final class TimelordModel: ObservableObject {
                 // tuning and reliability history. Fall back to a restart if the
                 // service refuses (for example, a board setting also changed).
                 operationInProgress = true
+                settingsApplyEpoch &+= 1
                 do {
                     try await configurationClient.reloadNode()
                     configurationNeedsRestart = false; pendingChangeIsNodeOnly = true
@@ -442,6 +455,7 @@ final class TimelordModel: ObservableObject {
     func saveConfiguration() async -> Bool {
         guard !operationInProgress else { return false }
         operationInProgress = true; defer { operationInProgress = false }
+        settingsApplyEpoch &+= 1
         clearNotice()
         do {
             let updated = resolvedConfiguration
@@ -457,6 +471,7 @@ final class TimelordModel: ObservableObject {
                 configuration = persisted.restoringIncompleteRPCDrafts(from: configuration)
             }
             savedConfiguration = persisted
+            savedConfigurationNeedsPersistence = false
             nodeSync = nil; lastNodeSyncFetch = .distantPast
             let needsRestart = (canControlService || liveStatus != nil) && runtimeChanged
             if needsRestart { pendingChangeIsNodeOnly = (configurationNeedsRestart ? pendingChangeIsNodeOnly : true) && nodeOnly }
@@ -486,11 +501,16 @@ final class TimelordModel: ObservableObject {
     private func refreshDevices(initiatedByUser: Bool = false) async {
         guard configurationLoaded, savedConfiguration.hardware.clientBinary != nil else { return }
         lastDiscovery=Date()
+        let epoch = settingsApplyEpoch
         do {
             var devices=try await configurationClient.devices()
-            // Background discovery can finish after Save or Apply has started.
-            // Never fold that stale inventory into a configuration being saved.
-            guard initiatedByUser || (!operationInProgress && !isBusy) else { return }
+            // Background discovery can finish after Save or Apply has started,
+            // or after a quick apply already completed. Never fold that stale
+            // inventory into a configuration being saved.
+            guard initiatedByUser || (epoch == settingsApplyEpoch && !operationInProgress && !isBusy) else {
+                lastDiscovery = .distantPast
+                return
+            }
             // Open D2XX interfaces can hide their enumeration metadata. A fresh
             // supervised USB owner remains presence evidence when its chain is idle.
             for status in liveStatus?.boards ?? [] where status.hasLiveOwner {
@@ -502,13 +522,24 @@ final class TimelordModel: ObservableObject {
             }
             discoveredDevices=devices
             if actionError == discoveryError { clearActionError() }; discoveryError = nil
-            savedConfiguration.hardware=BoardDiscovery.reconcile(devices,hardware:savedConfiguration.hardware,service:savedConfiguration.service)
-            configuration.hardware=BoardDiscovery.reconcile(devices,hardware:configuration.hardware,service:configuration.service)
+            let previousHardware = savedConfiguration.hardware
+            let savedHardware = BoardDiscovery.reconcile(devices,hardware:previousHardware,service:savedConfiguration.service)
+            savedConfiguration.hardware = savedHardware
+            if savedHardware != previousHardware { savedConfigurationNeedsPersistence = true }
+            // Reuse the same discovered board IDs unless the form has its own
+            // unsaved hardware or service edits to preserve.
+            configuration.hardware = configuration.hardware == previousHardware
+                && configuration.service == savedConfiguration.service
+                ? savedHardware
+                : BoardDiscovery.reconcile(devices,hardware:configuration.hardware,service:configuration.service)
             // The service owns debounced topology changes, including headless
             // deployments. Discovery must not ask users to restart it manually.
             updateSnapshot()
         } catch {
-            guard initiatedByUser || (!operationInProgress && !isBusy) else { return }
+            guard initiatedByUser || (epoch == settingsApplyEpoch && !operationInProgress && !isBusy) else {
+                lastDiscovery = .distantPast
+                return
+            }
             if liveStatus == nil { discoveredDevices = []; updateSnapshot() }
             discoveryError = error.localizedDescription
             reportActionError(error.localizedDescription)
@@ -530,6 +561,7 @@ final class TimelordModel: ObservableObject {
                 try await configurationClient.importNode(bundle: isDirectory.boolValue ? url.appendingPathComponent("connection.toml").path : url.path)
             }
             configuration = try await configurationClient.load(); savedConfiguration = configuration; configurationLoaded = true; clearActionError()
+            savedConfigurationNeedsPersistence = false
             nodeSync = nil; lastNodeSyncFetch = .distantPast
             configurationNeedsRestart = canControlService || liveStatus != nil
             connectionResult = "Connection profile imported. Save & Restart applies it to a running Timelord."

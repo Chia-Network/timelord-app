@@ -618,6 +618,30 @@ final class SupervisorPresentationTests: XCTestCase {
         XCTAssertNil(weakModel, "The notice timer must not keep the model alive")
     }
 
+    func testDonePersistsBoardsDiscoveredBeforeFirstSave() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        var configuration = AppConfiguration()
+        configuration.hardware.clientBinary = "/fixture/client"
+        try fixture.writeConfiguration(configuration)
+        let model = fixture.model(configuration)
+
+        await model.refresh()
+
+        XCTAssertEqual(model.configuration.hardware.boards.count, 1)
+        XCTAssertEqual(model.savedConfiguration.hardware.boards.count, 1)
+        XCTAssertTrue(model.hasUnsavedSettings,
+            "Discovered boards are not on disk until Done saves them")
+        model.sheet = .boards
+        let finished = await model.finishSettings()
+
+        XCTAssertTrue(finished)
+        XCTAssertFalse(model.hasUnsavedSettings)
+        XCTAssertEqual(try fixture.loggedCommands().filter { $0.hasPrefix("configure ") }.count, 1)
+        let persisted = try decode(fixture.configurationURL)
+        XCTAssertEqual(persisted.hardware.boards.count, 1)
+    }
+
     func testBackgroundDiscoveryCannotCancelSettingsBeingApplied() async throws {
         let fixture = try StatusFixture()
         defer { fixture.close() }
@@ -629,8 +653,8 @@ final class SupervisorPresentationTests: XCTestCase {
         try fixture.setDevicesHold(true)
 
         let refreshing = Task { await model.refresh() }
-        let deadline = Date().addingTimeInterval(3)
-        while Date() < deadline {
+        let discoveryDeadline = Date().addingTimeInterval(3)
+        while Date() < discoveryDeadline {
             let devicesStarted = try fixture.loggedCommands().contains { $0.hasPrefix("devices") }
             if model.canControlService && devicesStarted { break }
             try await Task.sleep(for: .milliseconds(10))
@@ -640,7 +664,8 @@ final class SupervisorPresentationTests: XCTestCase {
         model.configuration.service.statusListen = "127.0.0.1:18190"
 
         let finishing = Task { await model.finishSettings() }
-        while !model.isBusy && Date() < deadline {
+        let restartDeadline = Date().addingTimeInterval(3)
+        while !model.isBusy && Date() < restartDeadline {
             try await Task.sleep(for: .milliseconds(10))
         }
         XCTAssertTrue(model.isBusy, "The fixture restart must be in progress")
@@ -652,6 +677,44 @@ final class SupervisorPresentationTests: XCTestCase {
         XCTAssertNil(model.errorMessage)
         XCTAssertTrue(model.configuration.hardware.boards.isEmpty,
             "A background discovery that started before Apply must not land in the form")
+
+        let scans = try fixture.loggedCommands().filter { $0.hasPrefix("devices") }.count
+        await model.refresh()
+        XCTAssertGreaterThan(try fixture.loggedCommands().filter { $0.hasPrefix("devices") }.count,
+            scans, "A discarded scan must not postpone the next scan for 15 seconds")
+    }
+
+    func testBackgroundDiscoveryStartedBeforeQuickApplyCannotLandAfterIt() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        var configuration = AppConfiguration()
+        configuration.hardware.clientBinary = "/fixture/client"
+        try fixture.writeConfiguration(configuration)
+        try fixture.publish(mode: "running", phase: "worker_started")
+        let model = fixture.model(configuration)
+        try fixture.setDevicesHold(true)
+
+        let refreshing = Task { await model.refresh() }
+        let discoveryDeadline = Date().addingTimeInterval(3)
+        while Date() < discoveryDeadline {
+            let devicesStarted = try fixture.loggedCommands().contains { $0.hasPrefix("devices") }
+            if model.canControlService && devicesStarted { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(model.canControlService)
+        XCTAssertTrue(try fixture.loggedCommands().contains { $0.hasPrefix("devices") })
+        model.configuration.service.statusListen = "127.0.0.1:18190"
+
+        let finished = await model.finishSettings()
+        XCTAssertTrue(finished)
+        try fixture.setDevicesHold(false)
+        await refreshing.value
+
+        XCTAssertTrue(model.configuration.hardware.boards.isEmpty)
+        XCTAssertTrue(model.savedConfiguration.hardware.boards.isEmpty)
+        let persisted = try decode(fixture.configurationURL)
+        XCTAssertTrue(persisted.hardware.boards.isEmpty,
+            "A scan that started before a completed save must not land afterward")
     }
 
     func testFinishingSettingsReportsDiscardedIncompleteProfileRPCDraft() async throws {
