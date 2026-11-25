@@ -1,4 +1,5 @@
 //! Process-owned metric handles and Prometheus encoding.
+use super::snapshot::Gauge;
 use super::{
     OperatingPointReason, PeakResult, ProofStage, RestartReason, SessionReason, SubmissionKind,
     UnfinishedOutcome, UnfinishedSource, board, chain, index, snapshot,
@@ -280,7 +281,7 @@ impl Metrics {
             safety_journal_resets_total: counter_vec(
                 &registry,
                 "safety_journal_resets_total",
-                "Processes that found a previously written but now absent or unreadable board safety journal and started from cautious defaults; at most 1 per process and exported only by the process that reported the reset, so use the raw value, not `increase()`; first-start journal creation is not counted",
+                "Processes that found a previously written but now absent or unreadable board safety journal and started from cautious defaults; at most 1 per process and exported only by the process that reported the reset, so use the raw value, not increase(); first-start journal creation is not counted",
                 &["reason"],
             )?,
             chain_moves_total: registered(
@@ -547,17 +548,17 @@ impl Metrics {
         let last = self.last.lock().expect("metrics");
         if snapshot.epoch == Some(last.epoch) {
             if let Some(ips) = last.ips {
-                samples.add("estimated_ips", &[], &[], ips);
+                samples.add(Gauge::EstimatedIps, &[], &[], ips);
             }
             for c in Chain::ALL {
                 if let Some(ips) = last.chains[index(c)] {
-                    samples.add("chain_estimated_ips", &["chain"], &[chain(c)], ips);
+                    samples.add(Gauge::ChainEstimatedIps, &["chain"], &[chain(c)], ips);
                 }
             }
         }
         drop(last);
-        samples.add("ready", &[], &[], f64::from(snapshot.readiness.ready));
-        samples.add("healthy", &[], &[], f64::from(snapshot.healthy));
+        samples.add(Gauge::Ready, &[], &[], f64::from(snapshot.readiness.ready));
+        samples.add(Gauge::Healthy, &[], &[], f64::from(snapshot.healthy));
         let mut families = self.registry.gather();
         for family in &mut families {
             for metric in family.mut_metric() {

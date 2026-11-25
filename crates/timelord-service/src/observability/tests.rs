@@ -625,28 +625,9 @@ fn process_totals_and_label_less_metrics_keep_their_exposition() {
     );
 }
 
-#[test]
-fn build_info_series_have_version_and_revision_labels() {
-    let (shared, metrics, _) = fixture();
-    let body = metrics.render(&shared, crate::unix_now()).unwrap();
-    assert_eq!(
-        labels(&body, "chia_timelord_version"),
-        BTreeMap::from([("network", "mainnet"), ("version", VERSION)])
-    );
-    assert_eq!(value(&body, "chia_timelord_version", &[]), Some(1.));
-    assert_eq!(
-        labels(&body, "chia_timelord_build_info"),
-        BTreeMap::from([
-            ("network", "mainnet"),
-            ("revision", REVISION),
-            ("version", VERSION),
-        ])
-    );
-    assert_eq!(value(&body, "chia_timelord_build_info", &[]), Some(1.));
-}
-
-#[test]
-fn documented_metric_help_matches_exposition() {
+// Keep this fixture covering every documented metric family, including gauges
+// that only appear in specific runtime states.
+fn fixture_with_every_family() -> (Arc<Shared>, Arc<Metrics>) {
     let (shared, metrics, _) = fixture();
     let now = crate::unix_now();
     let epoch = shared.runtime.lock().unwrap().metric_epoch;
@@ -670,7 +651,33 @@ fn documented_metric_help_matches_exposition() {
     metrics.safety_journal_reset(JournalReset::Missing);
     metrics.node_message_received();
     metrics.peak_received();
-    let body = metrics.render(&shared, now).unwrap();
+    (shared, metrics)
+}
+
+#[test]
+fn build_info_series_have_version_and_revision_labels() {
+    let (shared, metrics, _) = fixture();
+    let body = metrics.render(&shared, crate::unix_now()).unwrap();
+    assert_eq!(
+        labels(&body, "chia_timelord_version"),
+        BTreeMap::from([("network", "mainnet"), ("version", VERSION)])
+    );
+    assert_eq!(value(&body, "chia_timelord_version", &[]), Some(1.));
+    assert_eq!(
+        labels(&body, "chia_timelord_build_info"),
+        BTreeMap::from([
+            ("network", "mainnet"),
+            ("revision", REVISION),
+            ("version", VERSION),
+        ])
+    );
+    assert_eq!(value(&body, "chia_timelord_build_info", &[]), Some(1.));
+}
+
+#[test]
+fn documented_metric_help_matches_exposition() {
+    let (shared, metrics) = fixture_with_every_family();
+    let body = metrics.render(&shared, crate::unix_now()).unwrap();
 
     let docs = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -691,15 +698,10 @@ fn documented_metric_help_matches_exposition() {
         }
         let cells = line.split('|').map(str::trim).collect::<Vec<_>>();
         assert_eq!(cells.len(), 5, "unexpected docs row: {line}");
-        let metric = cells[1]
-            .strip_prefix('`')
-            .and_then(|cell| cell.split_once('`'))
-            .map(|(metric, _)| metric)
-            .unwrap();
-        let name = metric.split_once('{').map_or(metric, |(name, _)| name);
+        let name = cells[1].trim_matches('`');
         assert!(
             documented
-                .insert(name.to_owned(), cells[3].to_owned())
+                .insert(name.to_owned(), cells[3].replace('`', ""))
                 .is_none(),
             "duplicate docs row for {name}"
         );

@@ -80,9 +80,9 @@ All names below have the prefix `chia_timelord_`:
 | `ready` | gauge | Probe state, 0 or 1 |
 | `topology_changes_total` | counter | Applied chain-route changes |
 | `chain_moves_total` | counter | Chains moved between boards by route changes |
-| `board_failures_total{board}` | counter | Native owner failures counted against board reliability (absence is not counted) |
-| `safety_journal_resets_total{reason}` | counter; `reason` (`missing` or `unreadable`) | Processes that found a previously written but now absent or unreadable board safety journal and started from cautious defaults; at most 1 per process and exported only by the process that reported the reset, so use the raw value, not `increase()`; first-start journal creation is not counted |
-| `delayed_bundles_total{chain}` | counter | Verified chain proofs that waited over 10 seconds for their bundle partner |
+| `board_failures_total` | counter; `board` | Native owner failures counted against board reliability (absence is not counted) |
+| `safety_journal_resets_total` | counter; `reason` (`missing` or `unreadable`) | Processes that found a previously written but now absent or unreadable board safety journal and started from cautious defaults; at most 1 per process and exported only by the process that reported the reset, so use the raw value, not `increase()`; first-start journal creation is not counted |
+| `delayed_bundles_total` | counter; `chain` | Verified chain proofs that waited over 10 seconds for their bundle partner |
 | `estimated_ips` | gauge | Latest validated completion from any chain in this node session |
 | `chain_estimated_ips` | gauge; `chain` | Latest validated completion for each chain in this session |
 | `proofs_verified_total` | counter; `chain` | Native verifier successes for scheduled work |
