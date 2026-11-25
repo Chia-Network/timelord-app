@@ -42,9 +42,32 @@ HELPER="$APP/Contents/Helpers/timelord-supervisor"
 run_as_owner() {
   if [[ "$EUID" == "$SERVICE_UID" ]]; then "$@"; else sudo -H -u "$SERVICE_USER" "$@"; fi
 }
+# configuration JSON omits top-level node after a credentialed connection is
+# moved into connections.profiles; prefer the active profile, then node.network.
+network_from_configuration() {
+  local active_id id network i=0
+  if active_id="$(printf '%s' "$1" | plutil -extract connections.active_id raw -o - - 2>/dev/null)" && [[ -n "$active_id" ]]; then
+    while id="$(printf '%s' "$1" | plutil -extract "connections.profiles.$i.id" raw -o - - 2>/dev/null)"; do
+      if [[ "$id" == "$active_id" ]]; then
+        if network="$(printf '%s' "$1" | plutil -extract "connections.profiles.$i.node.network" raw -o - - 2>/dev/null)" && [[ -n "$network" ]]; then
+          printf '%s' "$network"
+          return 0
+        fi
+        break
+      fi
+      i=$((i + 1))
+    done
+  fi
+  if network="$(printf '%s' "$1" | plutil -extract node.network raw -o - - 2>/dev/null)" && [[ -n "$network" ]]; then
+    printf '%s' "$network"
+    return 0
+  fi
+  echo 'The configuration has no network on the active connection profile or at node.network.' >&2
+  return 1
+}
 CONFIG_JSON="$(run_as_owner "$APP/Contents/Helpers/timelord-service" configuration --config "$CONFIG")" || exit 1
 MONITOR="$(printf '%s' "$CONFIG_JSON" | plutil -extract service.supervisor_observability_listen raw -o - -)" || exit 1
-NETWORK="$(printf '%s' "$CONFIG_JSON" | plutil -extract node.network raw -o - -)" || exit 1
+NETWORK="$(network_from_configuration "$CONFIG_JSON")" || exit 1
 if [[ "$MODE" == plan ]]; then
   run_as_owner "$HELPER" launchd-plist --app "$APP" --config "$CONFIG" --user "$SERVICE_USER" --monitor-listen "$MONITOR" --network "$NETWORK" || exit $?
   exit 0
