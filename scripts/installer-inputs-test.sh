@@ -62,21 +62,21 @@ TOML
 plan "$STAGE/legacy-node.toml" > "$STAGE/legacy.plist"
 assert_job "$STAGE/legacy.plist" "$STAGE/legacy-node.toml" testnet11
 
-# Missing network: configuration output has an active profile but no network.
-STUB="$STAGE/Stub.app"
-mkdir -p "$STUB/Contents/Helpers"
-ln -s "$ROOT/build/rust/debug/timelord-supervisor" "$STUB/Contents/Helpers/timelord-supervisor"
-cat > "$STUB/Contents/Helpers/timelord-service" <<'SH'
-#!/bin/bash
-printf '%s' '{"schema_version":1,"connections":{"active_id":"connection-1","profiles":[{"id":"connection-1","name":"Mainnet","node":{"host":"localhost","port":8444}}]},"service":{"status_listen":"127.0.0.1:9257","supervisor_observability_listen":"127.0.0.1:9259"},"hardware":{}}'
-SH
-chmod +x "$STUB/Contents/Helpers/timelord-service"
-printf 'schema_version=1\n' > "$STAGE/missing.toml"
-if bash "$ROOT/scripts/install-service.sh" plan --app "$STUB" --config "$STAGE/missing.toml" --user "$USER_NAME" >"$STAGE/missing.plist" 2>"$STAGE/missing.err"; then
+# A profile list without a selected profile is rejected by the same load path
+# the installer uses; the helper cannot emit a network-less launchd-values
+# object for a valid configuration.
+cat > "$STAGE/unselected.toml" <<'TOML'
+schema_version = 1
+[[connections.profiles]]
+id = "testnet"
+name = "Testnet11"
+node = { host = "127.0.0.1", port = 58444, network = "testnet11" }
+TOML
+if plan "$STAGE/unselected.toml" >"$STAGE/unselected.plist" 2>"$STAGE/unselected.err"; then
   exit 1
 fi
-grep -q 'no network on the active connection profile or at node.network' "$STAGE/missing.err"
-[[ ! -s "$STAGE/missing.plist" ]]
+grep -q 'Connection profiles require one selected profile' "$STAGE/unselected.err"
+[[ ! -s "$STAGE/unselected.plist" ]]
 
 if bash "$ROOT/scripts/install-service.sh" plan --app "$APP" --config "$STAGE/config & settings.toml" --user root >/dev/null 2>&1; then exit 1; fi
 ln -s "$STAGE/config & settings.toml" "$STAGE/link.toml"
