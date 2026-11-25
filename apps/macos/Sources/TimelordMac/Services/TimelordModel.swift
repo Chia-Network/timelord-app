@@ -481,13 +481,16 @@ final class TimelordModel: ObservableObject {
         guard canInspectConnections else { reportActionError("Pause Timelord before scanning USB devices."); return }
         guard await saveConfiguration() else { return }
         operationInProgress = true; defer { operationInProgress = false }
-        await refreshDevices()
+        await refreshDevices(initiatedByUser: true)
     }
-    private func refreshDevices() async {
+    private func refreshDevices(initiatedByUser: Bool = false) async {
         guard configurationLoaded, savedConfiguration.hardware.clientBinary != nil else { return }
         lastDiscovery=Date()
         do {
             var devices=try await configurationClient.devices()
+            // Background discovery can finish after Save or Apply has started.
+            // Never fold that stale inventory into a configuration being saved.
+            guard initiatedByUser || (!operationInProgress && !isBusy) else { return }
             // Open D2XX interfaces can hide their enumeration metadata. A fresh
             // supervised USB owner remains presence evidence when its chain is idle.
             for status in liveStatus?.boards ?? [] where status.hasLiveOwner {
@@ -504,7 +507,12 @@ final class TimelordModel: ObservableObject {
             // The service owns debounced topology changes, including headless
             // deployments. Discovery must not ask users to restart it manually.
             updateSnapshot()
-        } catch { if liveStatus == nil {discoveredDevices=[];updateSnapshot()}; discoveryError=error.localizedDescription;reportActionError(error.localizedDescription) }
+        } catch {
+            guard initiatedByUser || (!operationInProgress && !isBusy) else { return }
+            if liveStatus == nil { discoveredDevices = []; updateSnapshot() }
+            discoveryError = error.localizedDescription
+            reportActionError(error.localizedDescription)
+        }
     }
     func importNode(local: Bool) async {
         guard !operationInProgress else { return }

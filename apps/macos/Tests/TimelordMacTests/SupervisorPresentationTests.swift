@@ -618,6 +618,42 @@ final class SupervisorPresentationTests: XCTestCase {
         XCTAssertNil(weakModel, "The notice timer must not keep the model alive")
     }
 
+    func testBackgroundDiscoveryCannotCancelSettingsBeingApplied() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        var configuration = AppConfiguration()
+        configuration.hardware.clientBinary = "/fixture/client"
+        try fixture.writeConfiguration(configuration)
+        try fixture.publish(mode: "running", phase: "worker_started")
+        let model = fixture.model(configuration)
+        try fixture.setDevicesHold(true)
+
+        let refreshing = Task { await model.refresh() }
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            let devicesStarted = try fixture.loggedCommands().contains { $0.hasPrefix("devices") }
+            if model.canControlService && devicesStarted { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(model.canControlService)
+        XCTAssertTrue(try fixture.loggedCommands().contains { $0.hasPrefix("devices") })
+        model.configuration.service.statusListen = "127.0.0.1:18190"
+
+        let finishing = Task { await model.finishSettings() }
+        while !model.isBusy && Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(model.isBusy, "The fixture restart must be in progress")
+        try fixture.setDevicesHold(false)
+        await refreshing.value
+
+        let finished = await finishing.value
+        XCTAssertTrue(finished)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertTrue(model.configuration.hardware.boards.isEmpty,
+            "A background discovery that started before Apply must not land in the form")
+    }
+
     func testFinishingSettingsReportsDiscardedIncompleteProfileRPCDraft() async throws {
         let fixture = try StatusFixture()
         defer { fixture.close() }
@@ -715,6 +751,7 @@ private final class StatusFixture {
     private let pauseFailure: URL
     private let startupFailure: URL
     private let saveFailure: URL
+    private let devicesGate: URL
 
     init(endpoint: URL = URL(string: "http://127.0.0.1:0/v1/status")!, pauseFails: Bool = false, statusFails: Bool = false) throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent("supervisor-presentation-\(UUID().uuidString)")
@@ -726,6 +763,7 @@ private final class StatusFixture {
         pauseFailure = directory.appendingPathComponent("fail-pause")
         startupFailure = directory.appendingPathComponent("fail-startup")
         saveFailure = directory.appendingPathComponent("fail-save")
+        devicesGate = directory.appendingPathComponent("hold-devices")
         if pauseFails { try Data().write(to: pauseFailure) }
         if statusFails { try Data().write(to: statusFailure) }
         try Self.write(AppConfiguration(), to: configurationURL)
@@ -772,7 +810,9 @@ private final class StatusFixture {
               if [ "$previous" = "--input" ]; then cp "$argument" '\(configurationURL.path)'; break; fi
               previous=$argument
             done ;;
-          devices) printf '%s' '[{"name":"Fixture","location":1}]' ;;
+          devices)
+            while [ -f '\(devicesGate.path)' ]; do sleep 0.02; done
+            printf '%s' '[{"name":"Fixture","location":1}]' ;;
           test-node) printf '%s' '{"authenticated":true,"message":"Authenticated fixture node."}' ;;
           node-state) printf '{"synced":true,"syncing":false,"height":123456,"timestamp_unix":%s}' "$(date +%s)" ;;
           *) printf 'unsupported fixture command: %s\\n' "$*" >&2; exit 1 ;;
@@ -803,6 +843,7 @@ private final class StatusFixture {
     }
     func setStartupFailure(_ enabled: Bool) throws { try setMarker(startupFailure, enabled) }
     func setSaveFailure(_ enabled: Bool) throws { try setMarker(saveFailure, enabled) }
+    func setDevicesHold(_ enabled: Bool) throws { try setMarker(devicesGate, enabled) }
     private func setMarker(_ url: URL, _ enabled: Bool) throws {
         if enabled { try Data().write(to: url) } else { try? FileManager.default.removeItem(at: url) }
     }
