@@ -330,7 +330,10 @@ final class SupervisorPresentationTests: XCTestCase {
         XCTAssertEqual(model.connectionResult, "Authenticated fixture node.")
         XCTAssertEqual(model.configuration.node.rpc, draft,
             "Saving for a connection test must not clear the half-filled RPC form")
-        XCTAssertTrue(model.hasUnsavedSettings)
+        XCTAssertNil(model.errorMessage, "An implicit save must not report dropping the draft")
+        XCTAssertNil(model.notice, "An implicit save must not report dropping the draft")
+        XCTAssertFalse(model.hasUnsavedSettings,
+            "An incomplete RPC draft alone is not an unsaved persisted setting")
 
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
         let persisted = try decoder.decode(AppConfiguration.self, from: Data(contentsOf: fixture.configurationURL))
@@ -340,6 +343,8 @@ final class SupervisorPresentationTests: XCTestCase {
         await model.discoverBoards()
         XCTAssertEqual(model.configuration.node.rpc, draft,
             "Saving for a board refresh must not clear the half-filled RPC form")
+        XCTAssertNil(model.errorMessage, "A board refresh must not report dropping the draft")
+        XCTAssertNil(model.notice, "A board refresh must not report dropping the draft")
     }
 
     func testIncompleteRPCDraftKeepsLastSavedRPCInSingleNodeMode() async throws {
@@ -422,6 +427,7 @@ final class SupervisorPresentationTests: XCTestCase {
         configuration.node.rpc = rpc
         try fixture.writeConfiguration(configuration)
         let model = fixture.model(configuration)
+        model.sheet = .node
         var node = model.configuration.node
         node.rpc?.host = ""
         model.configuration.node = node
@@ -430,9 +436,346 @@ final class SupervisorPresentationTests: XCTestCase {
         XCTAssertTrue(finished)
         XCTAssertEqual(model.configuration.node.rpc, rpc,
             "Done resolves the invalid draft back to the saved RPC settings")
+        XCTAssertEqual(model.notice,
+            "RPC changes not saved: the RPC settings are incomplete.")
+        XCTAssertNil(model.errorMessage)
         XCTAssertFalse(model.hasUnsavedSettings)
         let persisted = try decode(fixture.configurationURL)
         XCTAssertEqual(persisted.node.rpc, rpc)
+    }
+
+    func testFinishingSettingsReportsDiscardedIncompleteRPCDraft() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        let configuration = runnableConfiguration(host: "done.fixture")
+        try fixture.writeConfiguration(configuration)
+        let model = fixture.model(configuration)
+        model.sheet = .node
+        model.configuration.node.rpc = NodeRPCConfiguration(host: "rpc.draft.fixture")
+
+        let finished = await model.finishSettings()
+
+        XCTAssertTrue(finished)
+        XCTAssertEqual(model.notice,
+            "RPC changes not saved: the RPC settings are incomplete.")
+        XCTAssertNil(model.errorMessage)
+        XCTAssertNil(model.configuration.node.rpc)
+        XCTAssertFalse(model.hasUnsavedSettings)
+        let persisted = try decode(fixture.configurationURL)
+        XCTAssertNil(persisted.node.rpc, "Done must not persist the incomplete draft")
+    }
+
+    func testFinishingSettingsWithCompleteProfilesReportsNoNotice() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        var first = runnableConfiguration(host: "first.fixture").node
+        first.rpc = completeRPC(host: "rpc.saved.fixture")
+        var second = runnableConfiguration(host: "second.fixture").node
+        second.certificate = "/fixture/second.crt"
+        var profiles = ConnectionProfiles(); profiles.activeId = "first"
+        profiles.profiles = [
+            ConnectionProfile(id: "first", name: "First", node: first),
+            ConnectionProfile(id: "second", name: "Second", node: second),
+        ]
+        var configuration = AppConfiguration(); configuration.connections = profiles
+        try fixture.writeConfiguration(configuration)
+        let model = fixture.model(configuration)
+        model.sheet = .node
+        let edited = completeRPC(host: "rpc.edited.fixture")
+        model.configuration.node.rpc = edited
+
+        let finished = await model.finishSettings()
+
+        XCTAssertTrue(finished)
+        XCTAssertNil(model.notice)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.configuration.node.rpc, edited)
+        let persisted = try decode(fixture.configurationURL)
+        XCTAssertEqual(persisted.connections?.profiles[0].node.rpc, edited)
+    }
+
+    func testFinishingSettingsDoesNotReportAnInactiveProfileDraft() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        let first = runnableConfiguration(host: "first.fixture").node
+        var second = runnableConfiguration(host: "second.fixture").node
+        second.certificate = "/fixture/second.crt"
+        var profiles = ConnectionProfiles(); profiles.activeId = "first"
+        profiles.profiles = [
+            ConnectionProfile(id: "first", name: "First", node: first),
+            ConnectionProfile(id: "second", name: "Second", node: second),
+        ]
+        var configuration = AppConfiguration(); configuration.connections = profiles
+        try fixture.writeConfiguration(configuration)
+        let model = fixture.model(configuration)
+        model.sheet = .node
+        model.configuration.node.host = "edited.first.fixture"
+        model.configuration.connections?.profiles[1].node.rpc =
+            NodeRPCConfiguration(host: "rpc.inactive.fixture")
+
+        let finished = await model.finishSettings()
+
+        XCTAssertTrue(finished)
+        XCTAssertNil(model.notice, "Only the visible active profile's draft is reported")
+        XCTAssertEqual(model.configuration.connections?.profiles[1].node.rpc,
+            NodeRPCConfiguration(host: "rpc.inactive.fixture"),
+            "An inactive draft stays editable")
+        XCTAssertFalse(model.hasUnsavedSettings,
+            "A retained inactive draft is not an unsaved persisted setting")
+        let configures = try fixture.loggedCommands().filter { $0.hasPrefix("configure ") }.count
+        XCTAssertEqual(configures, 1)
+        let later = await model.finishSettings()
+        XCTAssertTrue(later)
+        XCTAssertEqual(try fixture.loggedCommands().filter { $0.hasPrefix("configure ") }.count,
+            configures, "A later Done must not save when only a retained draft differs")
+    }
+
+    func testFinishingSettingsFromASheetWithoutRPCFieldsReportsNoNotice() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        let configuration = runnableConfiguration(host: "done.fixture")
+        try fixture.writeConfiguration(configuration)
+        let model = fixture.model(configuration)
+        model.sheet = .boards
+        model.configuration.node.host = "edited.done.fixture"
+        model.configuration.node.rpc = NodeRPCConfiguration(host: "rpc.draft.fixture")
+
+        let finished = await model.finishSettings()
+
+        XCTAssertTrue(finished)
+        XCTAssertNil(model.notice, "Boards has no RPC fields to explain a dropped draft")
+        XCTAssertEqual(model.configuration.node.rpc,
+            NodeRPCConfiguration(host: "rpc.draft.fixture"),
+            "Done from a sheet without RPC fields leaves the draft editable")
+        XCTAssertFalse(model.hasUnsavedSettings,
+            "A retained RPC draft is not an unsaved persisted setting")
+        let configures = try fixture.loggedCommands().filter { $0.hasPrefix("configure ") }.count
+        XCTAssertEqual(configures, 1)
+        let later = await model.finishSettings()
+        XCTAssertTrue(later)
+        XCTAssertEqual(try fixture.loggedCommands().filter { $0.hasPrefix("configure ") }.count,
+            configures, "A later Done must not save when only a retained draft differs")
+    }
+
+    func testFinishingSettingsDoesNotHideAStartupError() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        let configuration = runnableConfiguration(host: "done.fixture")
+        try fixture.writeConfiguration(configuration)
+        let model = fixture.model(configuration)
+        try fixture.setStartupFailure(true)
+        await model.restoreStartupIntent()
+        XCTAssertEqual(model.errorMessage, "startup fixture failed")
+        model.sheet = .node
+        model.configuration.node.rpc = NodeRPCConfiguration(host: "rpc.draft.fixture")
+
+        let finished = await model.finishSettings()
+
+        XCTAssertTrue(finished)
+        XCTAssertEqual(model.errorMessage, "startup fixture failed")
+        XCTAssertEqual(model.notice,
+            "RPC changes not saved: the RPC settings are incomplete.")
+    }
+
+    func testRPCDraftNoticeClearsOnItsOwn() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        let configuration = runnableConfiguration(host: "done.fixture")
+        try fixture.writeConfiguration(configuration)
+        let model = TimelordModel(
+            controller: fixture.controller, initialConfiguration: configuration,
+            monitoringEnabled: false, noticeDuration: .milliseconds(20))
+        model.sheet = .node
+        model.configuration.node.rpc = NodeRPCConfiguration(host: "rpc.draft.fixture")
+
+        let finished = await model.finishSettings()
+        XCTAssertTrue(finished)
+        XCTAssertNotNil(model.notice)
+        let deadline = Date().addingTimeInterval(2)
+        while model.notice != nil && Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertNil(model.notice)
+    }
+
+    func testNoticeTimerDoesNotRetainTheModel() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        let configuration = runnableConfiguration(host: "done.fixture")
+        try fixture.writeConfiguration(configuration)
+        var model: TimelordModel? = TimelordModel(
+            controller: fixture.controller, initialConfiguration: configuration,
+            monitoringEnabled: false, noticeDuration: .seconds(60))
+        model?.sheet = .node
+        model?.configuration.node.rpc = NodeRPCConfiguration(host: "rpc.draft.fixture")
+
+        let finished = await model?.finishSettings()
+        XCTAssertEqual(finished, true)
+        XCTAssertNotNil(model?.notice)
+        try await Task.sleep(for: .milliseconds(10))
+        weak var weakModel = model
+        model = nil
+        XCTAssertNil(weakModel, "The notice timer must not keep the model alive")
+    }
+
+    func testDonePersistsBoardsDiscoveredBeforeFirstSave() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        var configuration = AppConfiguration()
+        configuration.hardware.clientBinary = "/fixture/client"
+        try fixture.writeConfiguration(configuration)
+        let model = fixture.model(configuration)
+
+        await model.refresh()
+
+        XCTAssertEqual(model.configuration.hardware.boards.count, 1)
+        XCTAssertEqual(model.savedConfiguration.hardware.boards.count, 1)
+        XCTAssertTrue(model.hasUnsavedSettings,
+            "Discovered boards are not on disk until Done saves them")
+        model.sheet = .boards
+        let finished = await model.finishSettings()
+
+        XCTAssertTrue(finished)
+        XCTAssertFalse(model.hasUnsavedSettings)
+        XCTAssertEqual(try fixture.loggedCommands().filter { $0.hasPrefix("configure ") }.count, 1)
+        let persisted = try decode(fixture.configurationURL)
+        XCTAssertEqual(persisted.hardware.boards.count, 1)
+    }
+
+    func testBackgroundDiscoveryCannotCancelSettingsBeingApplied() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        var configuration = AppConfiguration()
+        configuration.hardware.clientBinary = "/fixture/client"
+        try fixture.writeConfiguration(configuration)
+        try fixture.publish(mode: "running", phase: "worker_started")
+        let model = fixture.model(configuration)
+        try fixture.setDevicesHold(true)
+
+        let refreshing = Task { await model.refresh() }
+        let discoveryDeadline = Date().addingTimeInterval(3)
+        while Date() < discoveryDeadline {
+            let devicesStarted = try fixture.loggedCommands().contains { $0.hasPrefix("devices") }
+            if model.canControlService && devicesStarted { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(model.canControlService)
+        XCTAssertTrue(try fixture.loggedCommands().contains { $0.hasPrefix("devices") })
+        model.configuration.service.statusListen = "127.0.0.1:18190"
+
+        let finishing = Task { await model.finishSettings() }
+        let restartDeadline = Date().addingTimeInterval(3)
+        while !model.isBusy && Date() < restartDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(model.isBusy, "The fixture restart must be in progress")
+        try fixture.setDevicesHold(false)
+        await refreshing.value
+
+        let finished = await finishing.value
+        XCTAssertTrue(finished)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertTrue(model.configuration.hardware.boards.isEmpty,
+            "A background discovery that started before Apply must not land in the form")
+
+        let scans = try fixture.loggedCommands().filter { $0.hasPrefix("devices") }.count
+        await model.refresh()
+        XCTAssertGreaterThan(try fixture.loggedCommands().filter { $0.hasPrefix("devices") }.count,
+            scans, "A discarded scan must not postpone the next scan for 15 seconds")
+    }
+
+    func testBackgroundDiscoveryStartedBeforeQuickApplyCannotLandAfterIt() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        var configuration = AppConfiguration()
+        configuration.hardware.clientBinary = "/fixture/client"
+        try fixture.writeConfiguration(configuration)
+        try fixture.publish(mode: "running", phase: "worker_started")
+        let model = fixture.model(configuration)
+        try fixture.setDevicesHold(true)
+
+        let refreshing = Task { await model.refresh() }
+        let discoveryDeadline = Date().addingTimeInterval(3)
+        while Date() < discoveryDeadline {
+            let devicesStarted = try fixture.loggedCommands().contains { $0.hasPrefix("devices") }
+            if model.canControlService && devicesStarted { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(model.canControlService)
+        XCTAssertTrue(try fixture.loggedCommands().contains { $0.hasPrefix("devices") })
+        model.configuration.service.statusListen = "127.0.0.1:18190"
+
+        let finished = await model.finishSettings()
+        XCTAssertTrue(finished)
+        try fixture.setDevicesHold(false)
+        await refreshing.value
+
+        XCTAssertTrue(model.configuration.hardware.boards.isEmpty)
+        XCTAssertTrue(model.savedConfiguration.hardware.boards.isEmpty)
+        let persisted = try decode(fixture.configurationURL)
+        XCTAssertTrue(persisted.hardware.boards.isEmpty,
+            "A scan that started before a completed save must not land afterward")
+    }
+
+    func testFinishingSettingsReportsDiscardedIncompleteProfileRPCDraft() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        let savedRPC = completeRPC(host: "rpc.first.fixture")
+        var first = runnableConfiguration(host: "first.fixture").node
+        first.rpc = savedRPC
+        var second = runnableConfiguration(host: "second.fixture").node
+        second.certificate = "/fixture/second.crt"
+        var profiles = ConnectionProfiles(); profiles.activeId = "first"
+        profiles.profiles = [
+            ConnectionProfile(id: "first", name: "First", node: first),
+            ConnectionProfile(id: "second", name: "Second", node: second),
+        ]
+        var configuration = AppConfiguration(); configuration.connections = profiles
+        try fixture.writeConfiguration(configuration)
+        let model = fixture.model(configuration)
+        model.sheet = .node
+        var node = model.configuration.node
+        node.rpc?.host = ""
+        model.configuration.node = node
+
+        let finished = await model.finishSettings()
+
+        XCTAssertTrue(finished)
+        XCTAssertEqual(model.notice,
+            "RPC changes not saved: the RPC settings are incomplete.")
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.configuration.node.rpc, savedRPC)
+        let persisted = try decode(fixture.configurationURL)
+        XCTAssertEqual(persisted.connections?.profiles[0].node.rpc, savedRPC)
+    }
+
+    func testEditsMadeDuringRestartKeepTheSheetOpenAndTheEdit() async throws {
+        let fixture = try StatusFixture()
+        defer { fixture.close() }
+        var configuration = runnableConfiguration(host: "restart.fixture")
+        try fixture.writeConfiguration(configuration)
+        try fixture.publish(mode: "running", phase: "worker_started")
+        let model = fixture.model(configuration)
+        await model.refresh()
+        XCTAssertTrue(model.canControlService)
+        model.configuration.service.statusListen = "127.0.0.1:18190"
+
+        let finishing = Task { await model.finishSettings() }
+        let deadline = Date().addingTimeInterval(3)
+        while !model.isBusy && Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(model.isBusy, "The fixture restart must be in progress")
+        model.configuration.node.host = "edited.during.restart"
+        let finished = await finishing.value
+
+        XCTAssertFalse(finished)
+        XCTAssertEqual(model.errorMessage,
+            "Settings changed while applying. Review and save again.")
+        XCTAssertEqual(model.configuration.node.host, "edited.during.restart")
+        let persisted = try decode(fixture.configurationURL)
+        XCTAssertEqual(persisted.node.host, "restart.fixture",
+            "The edit made during the restart was not silently persisted")
     }
 
     private func completeRPC(host: String) -> NodeRPCConfiguration {
@@ -471,6 +814,7 @@ private final class StatusFixture {
     private let pauseFailure: URL
     private let startupFailure: URL
     private let saveFailure: URL
+    private let devicesGate: URL
 
     init(endpoint: URL = URL(string: "http://127.0.0.1:0/v1/status")!, pauseFails: Bool = false, statusFails: Bool = false) throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent("supervisor-presentation-\(UUID().uuidString)")
@@ -482,6 +826,7 @@ private final class StatusFixture {
         pauseFailure = directory.appendingPathComponent("fail-pause")
         startupFailure = directory.appendingPathComponent("fail-startup")
         saveFailure = directory.appendingPathComponent("fail-save")
+        devicesGate = directory.appendingPathComponent("hold-devices")
         if pauseFails { try Data().write(to: pauseFailure) }
         if statusFails { try Data().write(to: statusFailure) }
         try Self.write(AppConfiguration(), to: configurationURL)
@@ -528,7 +873,9 @@ private final class StatusFixture {
               if [ "$previous" = "--input" ]; then cp "$argument" '\(configurationURL.path)'; break; fi
               previous=$argument
             done ;;
-          devices) printf '%s' '[{"name":"Fixture","location":1}]' ;;
+          devices)
+            while [ -f '\(devicesGate.path)' ]; do sleep 0.02; done
+            printf '%s' '[{"name":"Fixture","location":1}]' ;;
           test-node) printf '%s' '{"authenticated":true,"message":"Authenticated fixture node."}' ;;
           node-state) printf '{"synced":true,"syncing":false,"height":123456,"timestamp_unix":%s}' "$(date +%s)" ;;
           *) printf 'unsupported fixture command: %s\\n' "$*" >&2; exit 1 ;;
@@ -559,6 +906,7 @@ private final class StatusFixture {
     }
     func setStartupFailure(_ enabled: Bool) throws { try setMarker(startupFailure, enabled) }
     func setSaveFailure(_ enabled: Bool) throws { try setMarker(saveFailure, enabled) }
+    func setDevicesHold(_ enabled: Bool) throws { try setMarker(devicesGate, enabled) }
     private func setMarker(_ url: URL, _ enabled: Bool) throws {
         if enabled { try Data().write(to: url) } else { try? FileManager.default.removeItem(at: url) }
     }

@@ -25,6 +25,12 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate {
         false
     }
 
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication, hasVisibleWindows flag: Bool
+    ) -> Bool {
+        DashboardWindow.reopen(hasVisibleWindows: flag)
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if readyToTerminate { return .terminateNow }
         guard !terminating else { return .terminateLater }

@@ -4,7 +4,6 @@ import TimelordPresentation
 
 struct MenuStatus: View {
     @ObservedObject var model: TimelordModel
-    @Environment(\.openWindow) private var openWindow
     var body: some View {
         VStack(alignment: .leading, spacing: 15) {
             Label { Text("Timelord") } icon: { Image(nsImage: MenuBarIcon.image(for: .running)).renderingMode(.template) }.font(.headline)
@@ -29,5 +28,5 @@ struct MenuStatus: View {
             Button(model.quitLabel) { model.stopAndQuit() }
         }.padding(20).frame(width: 300)
     }
-    private func openMain() { openWindow(id: "main"); NSApplication.shared.activate(ignoringOtherApps: true) }
+    private func openMain() { DashboardWindow.show() }
 }

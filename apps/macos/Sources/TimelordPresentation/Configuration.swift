@@ -35,23 +35,49 @@ public struct AppConfiguration: Codable, Sendable, Equatable {
             for index in profiles.profiles.indices {
                 let id = profiles.profiles[index].id
                 let savedRPC = saved.connections?.profiles.first { $0.id == id }?.node.rpc
-                profiles.profiles[index].node.resolveIncompleteRPC(using: savedRPC)
+                _ = profiles.profiles[index].node.resolveIncompleteRPC(using: savedRPC)
             }
             resolved.connections = profiles
         } else {
-            resolved.node.resolveIncompleteRPC(using: saved.node.rpc)
+            // A single-node draft is not the same context as any saved profile,
+            // so it must not inherit the removed profile's RPC settings.
+            let savedRPC = (saved.connections?.profiles.isEmpty ?? true) ? saved.node.rpc : nil
+            _ = resolved.node.resolveIncompleteRPC(using: savedRPC)
         }
         return resolved
     }
-    /// Saving strips incomplete RPC drafts. Put the user's still-editable
-    /// drafts back so a connection test or board refresh does not clear the form.
+    /// Done only discards the draft the user can see. Returns true when the
+    /// active profile's incomplete draft was replaced by its saved value.
+    public mutating func resolveActiveIncompleteRPC(against saved: Self) -> Bool {
+        if let index = activeProfileIndex, var profiles = connections {
+            let id = profiles.profiles[index].id
+            let savedRPC = saved.connections?.profiles.first { $0.id == id }?.node.rpc
+            let dropped = profiles.profiles[index].node.resolveIncompleteRPC(using: savedRPC)
+            connections = profiles
+            return dropped
+        }
+        let savedRPC = (saved.connections?.profiles.isEmpty ?? true) ? saved.node.rpc : nil
+        return node.resolveIncompleteRPC(using: savedRPC)
+    }
+    /// `saveConfiguration()` reloads the helper's copy, which has no
+    /// incomplete RPC drafts. Put the user's still-editable drafts back into
+    /// the in-memory form so implicit saves (connection test, board refresh)
+    /// do not clear it. The saved copy stays stripped. A single-node draft is
+    /// applied to the active profile when the helper migrates first-time setup.
     public func restoringIncompleteRPCDrafts(from draft: Self) -> Self {
         var restored = self
         if var profiles = restored.connections, !profiles.profiles.isEmpty {
             for index in profiles.profiles.indices {
                 let id = profiles.profiles[index].id
-                guard let source = draft.connections?.profiles.first(where: { $0.id == id }),
-                      let rpc = source.node.rpc, !rpc.isComplete else { continue }
+                let sourceRPC: NodeRPCConfiguration?
+                if let source = draft.connections?.profiles.first(where: { $0.id == id }) {
+                    sourceRPC = source.node.rpc
+                } else if draft.connections?.profiles.isEmpty ?? true, id == profiles.activeId {
+                    sourceRPC = draft.node.rpc
+                } else {
+                    sourceRPC = nil
+                }
+                guard let rpc = sourceRPC, !rpc.isComplete else { continue }
                 profiles.profiles[index].node.rpc = rpc
             }
             restored.connections = profiles
@@ -137,9 +163,11 @@ public struct NodeConfiguration: Codable, Sendable, Equatable {
     public init() {}
     public var hasIdentity: Bool { certificate != nil && privateKey != nil && caCertificate != nil }
     /// The service accepts RPC only when every endpoint and credential is set.
-    public mutating func resolveIncompleteRPC(using saved: NodeRPCConfiguration?) {
-        guard let rpc, !rpc.isComplete else { return }
+    /// Returns true when an incomplete draft was replaced by `saved`.
+    public mutating func resolveIncompleteRPC(using saved: NodeRPCConfiguration?) -> Bool {
+        guard let rpc, !rpc.isComplete else { return false }
         self.rpc = saved
+        return true
     }
 }
 public struct NetworkDefinition: Codable, Sendable, Equatable {

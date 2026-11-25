@@ -29,6 +29,14 @@ struct StatusBadge: View {
     }
 }
 
+struct NoticeLine: View {
+    let message: String
+    var body: some View {
+        Label(message, systemImage: "info.circle")
+            .font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
+    }
+}
+
 struct MetricTile: View {
     let title: String
     let value: String
