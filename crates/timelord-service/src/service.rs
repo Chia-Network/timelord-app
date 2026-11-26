@@ -81,21 +81,19 @@ impl Run {
 
     /// Publish a configuration whose hardware section is unchanged in meaning
     /// (new locations, remembered boards) or whose node section changed.
-    /// When USB discovery first adds Automatic boards after a start with an
-    /// empty list, prepare capabilities before owners can start clients.
-    async fn publish(
+    /// Automatic boards require already-prepared capabilities; discovery
+    /// prepares those off the serve loop before calling this.
+    fn publish(&mut self, config: Config, current: &watch::Sender<Arc<Shared>>) -> Result<()> {
+        self.publish_native(config, self.shared.native.clone(), current)
+    }
+
+    fn publish_native(
         &mut self,
         config: Config,
+        native: Option<Arc<hardware::Facts>>,
         current: &watch::Sender<Arc<Shared>>,
     ) -> Result<()> {
-        let native = hardware::prepared_native(&config, self.shared.native.clone()).await?;
-        if config
-            .hardware
-            .boards
-            .iter()
-            .any(|board| board.profile == timelord_core::ProfileMode::Automatic)
-            && native.is_none()
-        {
+        if hardware::needs_prepare(&config, native.as_ref()) {
             bail!("Automatic capabilities were not prepared");
         }
         let previous = &self.shared;
@@ -146,7 +144,7 @@ impl Run {
             .process
             .metrics
             .set_network(&config.node().network);
-        self.publish(config, current).await?;
+        self.publish(config, current)?;
         self.node = NodeSession::start(&self.shared, &backend);
         Ok(())
     }
@@ -277,6 +275,23 @@ fn spawn_http(
     })
 }
 
+/// After a failed capability probe for discovered Automatic boards, wait
+/// before probing again so a persistent failure cannot occupy every
+/// inventory cycle.
+pub(crate) const DISCOVERY_PREPARE_RETRY: Duration = Duration::from_secs(30);
+
+type DiscoveryPrepare = tokio::task::JoinHandle<(Config, Result<Option<Arc<hardware::Facts>>>)>;
+
+fn spawn_discovery_prepare(
+    config: Config,
+    current: Option<Arc<hardware::Facts>>,
+) -> DiscoveryPrepare {
+    tokio::spawn(async move {
+        let result = hardware::prepared_native(&config, current).await;
+        (config, result)
+    })
+}
+
 pub(crate) async fn serve(
     config: Config,
     history_path: PathBuf,
@@ -383,6 +398,8 @@ pub(crate) async fn serve(
     let mut poll = tokio::time::interval(Duration::from_secs(5));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut inventory_task: Option<tokio::task::JoinHandle<Result<Config>>> = None;
+    let mut prepare_task: Option<DiscoveryPrepare> = None;
+    let mut prepare_retry_at: Option<tokio::time::Instant> = None;
     let result = loop {
         let candidate = tokio::select! {
             _ = &mut signal => break Ok(()),
@@ -419,6 +436,34 @@ pub(crate) async fn serve(
                 inventory_task.take();
                 result.context("USB reconciliation task failed")?
             }
+            result=async{prepare_task.as_mut().expect("prepare").await}, if prepare_task.is_some()=>{
+                prepare_task.take();
+                match result.context("Automatic capability task failed")? {
+                    (config, Ok(native)) => {
+                        if let Err(error) = run.publish_native(config, native, &current) {
+                            tracing::warn!(
+                                error = %format!("{error:#}"),
+                                "Automatic capabilities could not be prepared for discovered boards; clients not started"
+                            );
+                            prepare_retry_at = Some(
+                                tokio::time::Instant::now() + DISCOVERY_PREPARE_RETRY,
+                            );
+                        } else {
+                            prepare_retry_at = None;
+                        }
+                    }
+                    (_, Err(error)) => {
+                        tracing::warn!(
+                            error = %format!("{error:#}"),
+                            "Automatic capabilities could not be prepared for discovered boards; clients not started"
+                        );
+                        prepare_retry_at = Some(
+                            tokio::time::Instant::now() + DISCOVERY_PREPARE_RETRY,
+                        );
+                    }
+                }
+                continue;
+            }
             _ = poll.tick() => {
                 if inventory_task.is_none() {
                     let shared=run.shared.clone();
@@ -432,12 +477,21 @@ pub(crate) async fn serve(
             let config = hardware::continuous::known_configuration(candidate);
             if serde_json::to_value(&config.hardware.boards)?
                 != serde_json::to_value(&run.shared.config.hardware.boards)?
-                && let Err(error) = run.publish(config, &current).await
             {
-                tracing::warn!(
-                    error = %format!("{error:#}"),
-                    "Automatic capabilities could not be prepared for discovered boards; clients not started"
-                );
+                if hardware::needs_prepare(&config, run.shared.native.as_ref()) {
+                    let idle = prepare_task.is_none();
+                    let ready = prepare_retry_at
+                        .is_none_or(|deadline| tokio::time::Instant::now() >= deadline);
+                    if idle && ready {
+                        prepare_task =
+                            Some(spawn_discovery_prepare(config, run.shared.native.clone()));
+                    }
+                } else if let Err(error) = run.publish(config, &current) {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "Automatic capabilities could not be prepared for discovered boards; clients not started"
+                    );
+                }
             }
         }
     };
@@ -451,6 +505,12 @@ pub(crate) async fn serve(
         // wait for a blocked driver enumeration when stopping the service.
         inventory.abort();
         let _ = inventory.await;
+    }
+    if let Some(prepare) = prepare_task {
+        // Cancelling the capability probe drops its kill-on-drop child so a
+        // stuck native client cannot delay shutdown.
+        prepare.abort();
+        let _ = prepare.await;
     }
     let _ = http_stop.send(true);
     if let Some(mut checkpoint) = checkpoint

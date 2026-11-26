@@ -112,6 +112,17 @@ pub async fn prepare(config: &Config) -> Result<Option<Arc<Facts>>> {
     Ok(Some(facts))
 }
 
+/// True when Automatic boards are present and capabilities have not been
+/// prepared yet. USB discovery uses this to decide whether to probe.
+pub fn needs_prepare(config: &Config, current: Option<&Arc<Facts>>) -> bool {
+    current.is_none()
+        && config
+            .hardware
+            .boards
+            .iter()
+            .any(|board| board.profile == ProfileMode::Automatic)
+}
+
 /// Load Automatic capabilities when the board list first contains Automatic
 /// boards and none have been prepared yet. Startup with an empty board list
 /// leaves capabilities unset; USB discovery must call this before starting
@@ -120,12 +131,7 @@ pub async fn prepared_native(
     config: &Config,
     current: Option<Arc<Facts>>,
 ) -> Result<Option<Arc<Facts>>> {
-    let needs = config
-        .hardware
-        .boards
-        .iter()
-        .any(|board| board.profile == ProfileMode::Automatic);
-    if !needs || current.is_some() {
+    if !needs_prepare(config, current.as_ref()) {
         return Ok(current);
     }
     prepare(config).await

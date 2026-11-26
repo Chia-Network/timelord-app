@@ -134,7 +134,7 @@ async fn owners_and_routes_survive_inventory_updates_and_a_node_profile_switch()
     // A relocated board is the same owner: nothing is retired.
     let mut moved = run.shared.config.clone();
     moved.hardware.boards[1].device_location = Some(9);
-    run.publish(moved, &current).await.unwrap();
+    run.publish(moved, &current).unwrap();
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(!run.tasks.is_empty());
     // A node profile switch keeps board state, restrictions and routes.
@@ -504,6 +504,160 @@ async fn shutdown_during_prepare_leaves_a_lost_safety_journal_absent() {
     .unwrap();
     assert_journal_still_lost(&dir, &config_path);
 }
+async fn loopback_status() -> std::net::SocketAddr {
+    TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap()
+}
+
+fn discovered_devices(count: u32) -> Vec<crate::inventory::Device> {
+    (1..=count)
+        .map(|index| crate::inventory::Device {
+            name: format!("ASIC {index}"),
+            location: index,
+            serial: Some(format!("TL-TEST-{index}")),
+        })
+        .collect()
+}
+
+async fn wait_for(path: &std::path::Path, task: &mut tokio::task::JoinHandle<Result<()>>) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if path.exists() {
+            return true;
+        }
+        if task.is_finished() {
+            task.await
+                .expect("serve task")
+                .expect("serve should keep running until shutdown");
+            return false;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn shutdown_during_discovered_prepare_returns_promptly() {
+    let dir = fixture_dir("discover-shutdown");
+    let binary = dir.join("client");
+    crate::test_scripts::write_executable_script(
+        &binary,
+        r#"#!/bin/sh
+root=$(dirname "$0")
+echo started >> "$root/started"
+exec sleep 30
+"#,
+    );
+    crate::inventory::fixture::set(binary.clone(), discovered_devices(3));
+    let mut config = Config::default();
+    config.service.status_listen = loopback_status().await;
+    config.hardware.client_binary = Some(binary);
+    let (signal, shutdown) = tokio::sync::oneshot::channel::<()>();
+    let mut task = tokio::spawn(serve(
+        config,
+        dir.join("history.json"),
+        dir.join("config.toml"),
+        false,
+        async {
+            let _ = shutdown.await;
+        },
+    ));
+    assert!(
+        wait_for(&dir.join("started"), &mut task).await,
+        "discovered Automatic boards should start a capability probe"
+    );
+    let started = std::time::Instant::now();
+    let _ = signal.send(());
+    tokio::time::timeout(Duration::from_secs(1), &mut task)
+        .await
+        .expect("shutdown must not wait for the capability probe")
+        .unwrap()
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "serve must stay responsive while a discovered prepare is in flight"
+    );
+    assert!(
+        !dir.join("launches-1").exists(),
+        "Automatic clients must not start without prepared capabilities"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn discovered_prepare_failure_backs_off_before_retrying() {
+    let dir = fixture_dir("discover-backoff");
+    let binary = dir.join("client");
+    crate::test_scripts::write_executable_script(
+        &binary,
+        r#"#!/bin/sh
+root=$(dirname "$0")
+echo probe >> "$root/probes"
+exit 1
+"#,
+    );
+    crate::inventory::fixture::set(binary.clone(), discovered_devices(3));
+    let mut config = Config::default();
+    config.service.status_listen = loopback_status().await;
+    config.hardware.client_binary = Some(binary);
+    let (signal, shutdown) = tokio::sync::oneshot::channel::<()>();
+    let mut task = tokio::spawn(serve(
+        config,
+        dir.join("history.json"),
+        dir.join("config.toml"),
+        false,
+        async {
+            let _ = shutdown.await;
+        },
+    ));
+    let probes = dir.join("probes");
+    assert!(
+        wait_for(&probes, &mut task).await,
+        "the first discovered prepare should run"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&probes).unwrap().lines().count(),
+        1,
+        "only one prepare may run at a time"
+    );
+    tokio::time::pause();
+    tokio::time::advance(DISCOVERY_PREPARE_RETRY - Duration::from_secs(1)).await;
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        std::fs::read_to_string(&probes).unwrap().lines().count(),
+        1,
+        "a failed prepare must not re-probe during backoff"
+    );
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::time::resume();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while std::fs::read_to_string(&probes).unwrap().lines().count() < 2
+        && tokio::time::Instant::now() < deadline
+        && !task.is_finished()
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        std::fs::read_to_string(&probes).unwrap().lines().count(),
+        2,
+        "prepare should run again after the backoff"
+    );
+    let _ = signal.send(());
+    tokio::time::timeout(Duration::from_secs(1), &mut task)
+        .await
+        .expect("shutdown after backoff")
+        .unwrap()
+        .unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[tokio::test]
 async fn check_hardware_refuses_after_a_failed_start_on_a_lost_journal() {
     let (dir, config_path, history_path, mut config) = lost_journal("lost-check-hardware");
