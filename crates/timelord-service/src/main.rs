@@ -39,10 +39,7 @@ use std::{
 #[cfg(test)]
 use timelord_core::Assignment;
 use timelord_core::Config;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-};
+use tokio::net::TcpStream;
 
 #[derive(Parser)]
 #[command(
@@ -454,29 +451,7 @@ async fn main() -> Result<()> {
                 .0
                 .service
                 .status_listen;
-            let response = tokio::time::timeout(Duration::from_secs(3), async {
-                let mut socket = TcpStream::connect(address).await?;
-                socket
-                    .write_all(
-                        b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-                    )
-                    .await?;
-                let mut response = String::new();
-                socket
-                    .take(16 * 1024 * 1024)
-                    .read_to_string(&mut response)
-                    .await?;
-                Ok::<_, std::io::Error>(response)
-            })
-            .await
-            .context("Status request timed out")??;
-            let (header, body) = response
-                .split_once("\r\n\r\n")
-                .context("Invalid status response")?;
-            if !header.starts_with("HTTP/1.1 200") {
-                bail!("Service rejected status request");
-            }
-            let value: serde_json::Value = serde_json::from_str(body)?;
+            let value = service::fetch_status(address).await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
         }
     }

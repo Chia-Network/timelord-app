@@ -383,6 +383,8 @@ public enum BoardDiscovery {
         }
         let candidates=hardware.boards+remembered
         var usedIDs=Set(candidates.map(\.id))
+        // This considers only the first three devices; the service keeps every
+        // matched configured board and caps only newly discovered boards at three.
         let liveIDs=Set(devices.prefix(3).compactMap { BoardTopology.matching($0,in:hardware.boards)?.id })
         var selected:[ConfiguredBoard]=[]
         for device in devices.prefix(3) {

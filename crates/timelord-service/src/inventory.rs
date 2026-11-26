@@ -325,6 +325,8 @@ pub(crate) fn connected_plan(mut config: Config, devices: Vec<Device>) -> Result
         {
             continue;
         }
+        // The macOS app selects only from the first three devices; here every
+        // matched configured board is kept and only new boards stop at three.
         if config.hardware.boards.len() == 3 {
             break;
         }
@@ -359,6 +361,7 @@ pub(crate) fn connected_plan(mut config: Config, devices: Vec<Device>) -> Result
             board.device_location = Some(device.location);
         }
         board.serial = device.serial;
+        // Minted identifiers are unique per USB location.
         taken_ids.insert(board.id.clone());
         config.hardware.boards.push(board);
     }

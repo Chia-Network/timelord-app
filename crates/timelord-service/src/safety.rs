@@ -694,8 +694,7 @@ impl Store {
     /// reason per recent-failure entry, so a 1.0.1–1.0.3 streak (routinely
     /// since 1.0.3) that ends in that message loses its earlier real faults and
     /// the probation they earned; trailing-only decrement is impossible. This
-    /// runs once per production
-    /// open, never for a read-only inspection.
+    /// runs once per production open, never for a read-only inspection.
     fn migrate_prepare_state(&self) -> Result<()> {
         self.commit(true, |next| {
             let mut changed = false;
