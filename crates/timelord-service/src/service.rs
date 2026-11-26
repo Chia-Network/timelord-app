@@ -4,7 +4,7 @@ use crate::{
     Shared, asic, config_checkpoint, hardware, history_store, inventory, observability,
     operational, private_control, runtime, safety, status_api, unix_now,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -81,11 +81,27 @@ impl Run {
 
     /// Publish a configuration whose hardware section is unchanged in meaning
     /// (new locations, remembered boards) or whose node section changed.
-    fn publish(&mut self, config: Config, current: &watch::Sender<Arc<Shared>>) {
+    /// When USB discovery first adds Automatic boards after a start with an
+    /// empty list, prepare capabilities before owners can start clients.
+    async fn publish(
+        &mut self,
+        config: Config,
+        current: &watch::Sender<Arc<Shared>>,
+    ) -> Result<()> {
+        let native = hardware::prepared_native(&config, self.shared.native.clone()).await?;
+        if config
+            .hardware
+            .boards
+            .iter()
+            .any(|board| board.profile == timelord_core::ProfileMode::Automatic)
+            && native.is_none()
+        {
+            bail!("Automatic capabilities were not prepared");
+        }
         let previous = &self.shared;
         let updated = Arc::new(Shared {
             config,
-            native: previous.native.clone(),
+            native,
             clients: previous.clients.clone(),
             runtime: previous.runtime.clone(),
             process: previous.process.clone(),
@@ -96,6 +112,7 @@ impl Run {
         self.owner_updates.send_replace(updated.clone());
         self.shared = updated.clone();
         current.send_replace(updated);
+        Ok(())
     }
 
     /// Replace only the node session. Native owners, routes, learned tuning and
@@ -129,7 +146,7 @@ impl Run {
             .process
             .metrics
             .set_network(&config.node().network);
-        self.publish(config, current);
+        self.publish(config, current).await?;
         self.node = NodeSession::start(&self.shared, &backend);
         Ok(())
     }
@@ -415,8 +432,12 @@ pub(crate) async fn serve(
             let config = hardware::continuous::known_configuration(candidate);
             if serde_json::to_value(&config.hardware.boards)?
                 != serde_json::to_value(&run.shared.config.hardware.boards)?
+                && let Err(error) = run.publish(config, &current).await
             {
-                run.publish(config, &current);
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "Automatic capabilities could not be prepared for discovered boards; clients not started"
+                );
             }
         }
     };

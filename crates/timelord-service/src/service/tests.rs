@@ -134,7 +134,7 @@ async fn owners_and_routes_survive_inventory_updates_and_a_node_profile_switch()
     // A relocated board is the same owner: nothing is retired.
     let mut moved = run.shared.config.clone();
     moved.hardware.boards[1].device_location = Some(9);
-    run.publish(moved, &current);
+    run.publish(moved, &current).await.unwrap();
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(!run.tasks.is_empty());
     // A node profile switch keeps board state, restrictions and routes.

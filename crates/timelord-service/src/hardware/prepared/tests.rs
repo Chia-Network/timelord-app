@@ -120,3 +120,54 @@ esac
     assert!(error.to_string().contains("not supported"), "{error}");
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[tokio::test]
+async fn prepare_skips_capabilities_when_the_board_list_is_empty() {
+    let mut config = Config::default();
+    config.hardware.client_binary = Some("/not-present/client".into());
+    assert!(config.hardware.boards.is_empty());
+    assert!(prepare(&config).await.unwrap().is_none());
+    assert!(prepared_native(&config, None).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn prepared_native_loads_capabilities_only_after_automatic_boards_appear() {
+    let directory = std::env::temp_dir().join(format!(
+        "tl-prepared-native-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let binary = directory.join("client");
+    crate::test_scripts::write_executable_script(
+        &binary,
+        r#"#!/bin/sh
+case "$1" in
+ --control-version) echo timelord-live-control-v1; exit 0;;
+ --control-frequencies) echo '[1450,1460]'; exit 0;;
+esac
+exit 1
+"#,
+    );
+    let mut config = Config::default();
+    config.hardware.client_binary = Some(binary);
+    assert!(prepared_native(&config, None).await.unwrap().is_none());
+    config.hardware.boards = (0..3)
+        .map(|index| {
+            toml::from_str(&format!(
+                "id='board-{index}'\nname='Board {index}'\nserial='TL-TEST-{index}'\nclient_port={}\ndevice_location={}\nprofile='automatic'",
+                18110 + index,
+                index + 1
+            ))
+            .unwrap()
+        })
+        .collect();
+    let native = prepared_native(&config, None).await.unwrap();
+    assert!(native.is_some());
+    let reused = prepared_native(&config, native.clone()).await.unwrap();
+    assert!(reused.is_some());
+    std::fs::remove_dir_all(directory).unwrap();
+}

@@ -112,5 +112,24 @@ pub async fn prepare(config: &Config) -> Result<Option<Arc<Facts>>> {
     Ok(Some(facts))
 }
 
+/// Load Automatic capabilities when the board list first contains Automatic
+/// boards and none have been prepared yet. Startup with an empty board list
+/// leaves capabilities unset; USB discovery must call this before starting
+/// those clients.
+pub async fn prepared_native(
+    config: &Config,
+    current: Option<Arc<Facts>>,
+) -> Result<Option<Arc<Facts>>> {
+    let needs = config
+        .hardware
+        .boards
+        .iter()
+        .any(|board| board.profile == ProfileMode::Automatic);
+    if !needs || current.is_some() {
+        return Ok(current);
+    }
+    prepare(config).await
+}
+
 #[cfg(test)]
 mod tests;

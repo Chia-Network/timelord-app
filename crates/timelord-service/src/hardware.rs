@@ -4,7 +4,7 @@ mod failure;
 pub(crate) mod lifecycle;
 use failure::classify;
 pub use failure::{NativeFailure, NativeFailureKind};
-pub use prepared::{Facts, prepare};
+pub use prepared::{Facts, prepare, prepared_native};
 pub(crate) mod continuous;
 pub(crate) mod health;
 mod native;
