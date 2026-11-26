@@ -396,9 +396,8 @@ impl BoardSupervisor {
         if self.board.serial.is_none() {
             return false;
         }
-        let Some(_initialization) = acquire_initialization(&mut self.shutdown).await else {
-            return false;
-        };
+        // Observe right after the exit; waiting behind INITIALIZATION lets a
+        // quick replug read Present and count the unplug.
         let devices = match tokio::time::timeout(
             Duration::from_secs(15),
             crate::inventory::discover(&self.shared.config),

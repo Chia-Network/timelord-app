@@ -180,29 +180,66 @@ async fn probe(helper: &Path, driver: &Path, timeout: Duration) -> Result<Vec<De
 #[cfg(test)]
 pub(crate) mod fixture {
     use super::Device;
-    use std::{collections::HashMap, path::PathBuf, sync::Mutex};
-    static DEVICES: Mutex<Option<HashMap<PathBuf, Vec<Device>>>> = Mutex::new(None);
+    use std::{
+        collections::{HashMap, HashSet},
+        path::PathBuf,
+        sync::Mutex,
+    };
+    #[derive(Default)]
+    struct Fixtures {
+        devices: HashMap<PathBuf, Vec<Device>>,
+        failing: HashSet<PathBuf>,
+        hanging: HashSet<PathBuf>,
+    }
+    static FIXTURES: Mutex<Option<Fixtures>> = Mutex::new(None);
+    fn fixtures() -> std::sync::MutexGuard<'static, Option<Fixtures>> {
+        FIXTURES.lock().unwrap()
+    }
     pub fn set(binary: PathBuf, devices: Vec<Device>) {
-        DEVICES
-            .lock()
-            .unwrap()
-            .get_or_insert_with(HashMap::new)
+        fixtures()
+            .get_or_insert_with(Fixtures::default)
+            .devices
             .insert(binary, devices);
     }
     pub fn get(binary: &PathBuf) -> Option<Vec<Device>> {
-        DEVICES.lock().unwrap().as_ref()?.get(binary).cloned()
+        fixtures().as_ref()?.devices.get(binary).cloned()
+    }
+    pub fn fail(binary: PathBuf) {
+        fixtures()
+            .get_or_insert_with(Fixtures::default)
+            .failing
+            .insert(binary);
+    }
+    pub fn hang(binary: PathBuf) {
+        fixtures()
+            .get_or_insert_with(Fixtures::default)
+            .hanging
+            .insert(binary);
+    }
+    pub fn is_failing(binary: &PathBuf) -> bool {
+        fixtures()
+            .as_ref()
+            .is_some_and(|fixtures| fixtures.failing.contains(binary))
+    }
+    pub fn is_hanging(binary: &PathBuf) -> bool {
+        fixtures()
+            .as_ref()
+            .is_some_and(|fixtures| fixtures.hanging.contains(binary))
     }
 }
 
 pub async fn discover(config: &Config) -> Result<Vec<Device>> {
     #[cfg(test)]
-    if let Some(devices) = config
-        .hardware
-        .client_binary
-        .as_ref()
-        .and_then(fixture::get)
-    {
-        return Ok(devices);
+    if let Some(binary) = config.hardware.client_binary.as_ref() {
+        if fixture::is_failing(binary) {
+            bail!("Fixture USB discovery failed");
+        }
+        if fixture::is_hanging(binary) {
+            std::future::pending::<()>().await;
+        }
+        if let Some(devices) = fixture::get(binary) {
+            return Ok(devices);
+        }
     }
     #[cfg(target_os = "macos")]
     {

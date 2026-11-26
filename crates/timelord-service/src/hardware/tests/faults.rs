@@ -312,7 +312,10 @@ async fn unplugging_a_running_board_is_not_a_reliability_failure() {
         !serving(s, "b2")
     })
     .await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    rig.until(20, "the unplugged board recovery settled", |s| {
+        s.boards["b2"].recovery_reason.is_some() || s.boards["b2"].retry_after_unix.is_some()
+    })
+    .await;
     assert_eq!(rig.store.health(&rig.serial(2)).consecutive_failures, 0);
     rig.remove("die-2");
     crate::inventory::fixture::set(binary, only(2));
