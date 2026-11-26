@@ -442,7 +442,7 @@ extension PresentationTests {
         hardware=BoardDiscovery.reconcile([],hardware:hardware,service:ServiceConfiguration())
         XCTAssertTrue(hardware.boards.isEmpty);XCTAssertEqual(hardware.rememberedBoards.count,1)
         hardware=BoardDiscovery.reconcile([DiscoveredDevice(name:"Chia VDF A",location:9001,serial:"one")],hardware:hardware,service:ServiceConfiguration())
-        XCTAssertEqual(hardware.boards[0].id,first.id)
+        XCTAssertEqual(hardware.boards[0].id, first.id)
         XCTAssertEqual(hardware.boards[0].profileName,"Manual")
         XCTAssertEqual(hardware.boards[0].frequencyMhz,1540)
         XCTAssertEqual(hardware.boards[0].deviceLocation,9001)
@@ -835,6 +835,98 @@ extension PresentationTests {
         XCTAssertFalse(status.boards[0].hasLiveOwner)
         // The snapshot must remain renderable rather than failing to decode.
         XCTAssertEqual(LivePresentation.snapshot(status: status, now: now).phase, .waitingForNode)
+    }
+
+    func testReconcileAssignsServiceBoardIDsWhenConfigIsEmpty() {
+        let devices = (0..<3).map { DiscoveredDevice(name: "ASIC", location: 4113 + $0, serial: "serial-\($0)") }
+        let hardware = BoardDiscovery.reconcile(devices, hardware: HardwareConfiguration(), service: ServiceConfiguration())
+        XCTAssertEqual(hardware.boards.map(\.id), ["usb-4113", "usb-4114", "usb-4115"])
+        XCTAssertEqual(hardware.boards.map(\.name), ["ASIC 1", "ASIC 2", "ASIC 3"])
+        XCTAssertEqual(hardware.boards.map(\.serial), ["serial-0", "serial-1", "serial-2"])
+    }
+
+    func testAdoptingServiceIdentitiesReplacesMintedBoardIDs() {
+        var hardware = HardwareConfiguration()
+        var minted = ConfiguredBoard(id: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE", name: "ASIC 1", port: 18110, location: 4113)
+        minted.serial = "serial-0"
+        hardware.boards = [minted]
+        let adopted = BoardDiscovery.adoptingServiceIdentities(hardware, identities: [
+            ServiceBoardIdentity(id: "usb-4113", name: "ASIC 1", serial: "serial-0", location: 4113)
+        ])
+        XCTAssertEqual(adopted.boards.map(\.id), ["usb-4113"])
+        XCTAssertEqual(adopted.boards.map(\.name), ["ASIC 1"])
+        XCTAssertTrue(adopted.rememberedBoards.isEmpty)
+    }
+
+    func testSnapshotDoesNotShowDuplicateCardsForTheSamePhysicalBoard() throws {
+        func status() throws -> ServiceStatus {
+            let boards: [[String: Any]] = (0..<3).map { index in
+                ["id": "usb-\(4113 + index)", "name": "ASIC \(index + 1)", "serial": "serial-\(index)",
+                 "device_location": 4113 + index, "assigned_chains": [Chain.allCases[index].rawValue],
+                 "connected_clients": 1, "hardware_state": "connected",
+                 "latest_proof_unix": 1_000_000, "profile": "Automatic"]
+            }
+            let data: [String: Any] = ["api_version": 1, "service_pid": 42,
+                "timelord_state": "running", "message": "", "production_enabled": true,
+                "started_unix": 999000, "timestamp_unix": 1_000_000, "latest_proof_unix": 1_000_000,
+                "proofs_delivered": 7, "tuning_paused": false, "connected_client_count": 3,
+                "full_node": ["host": "localhost", "state": "ready"], "boards": boards]
+            let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+            return try decoder.decode(ServiceStatus.self, from: JSONSerialization.data(withJSONObject: data))
+        }
+        var config = AppConfiguration()
+        config.hardware.boards = (0..<3).map { index in
+            var board = ConfiguredBoard(
+                id: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEE\(index)",
+                name: "ASIC \(index + 1)", port: 18110 + index, location: 4113 + index)
+            board.serial = "serial-\(index)"
+            return board
+        }
+        let devices = (0..<3).map { DiscoveredDevice(name: "ASIC", location: 4113 + $0, serial: "serial-\($0)") }
+        let snapshot = LivePresentation.snapshot(
+            status: try status(), configuration: config, detectedDevices: devices, now: now)
+        XCTAssertEqual(snapshot.boards.map(\.id), ["usb-4113", "usb-4114", "usb-4115"])
+        XCTAssertEqual(snapshot.boards.count, 3)
+        XCTAssertEqual(snapshot.boards.map(\.name), ["ASIC 1", "ASIC 2", "ASIC 3"])
+    }
+
+    func testReconcileDoesNotReuseAMovedBoardsServiceIDForANewBoardAtTheOldPort() {
+        var hardware = HardwareConfiguration()
+        hardware = BoardDiscovery.reconcile(
+            [DiscoveredDevice(name: "ASIC", location: 4113, serial: "serial-0")],
+            hardware: hardware, service: ServiceConfiguration())
+        XCTAssertEqual(hardware.boards.map(\.id), ["usb-4113"])
+        hardware.boards[0].profile = "manual"
+        hardware.boards[0].frequencyMhz = 1540
+        hardware = BoardDiscovery.reconcile(
+            [DiscoveredDevice(name: "ASIC", location: 9001, serial: "serial-0"),
+             DiscoveredDevice(name: "ASIC", location: 4113, serial: "serial-1")],
+            hardware: hardware, service: ServiceConfiguration())
+        XCTAssertEqual(hardware.boards.map(\.id), ["usb-4113", "usb-4113-1"])
+        XCTAssertEqual(hardware.boards.map(\.serial), ["serial-0", "serial-1"])
+        XCTAssertEqual(hardware.boards[0].profileName, "Manual")
+        XCTAssertEqual(hardware.boards[0].frequencyMhz, 1540)
+        XCTAssertEqual(hardware.boards[1].profileName, "Automatic")
+        XCTAssertEqual(Set(hardware.boards.map(\.id)).count, 2)
+    }
+
+    func testAdoptingServiceIdentitiesDoesNotRewriteADifferentSerialAtTheSameLocation() {
+        var hardware = HardwareConfiguration()
+        var remembered = ConfiguredBoard(id: "usb-4113", name: "ASIC 1", port: 18110, location: 4113)
+        remembered.serial = "serial-0"
+        hardware.rememberedBoards = [remembered]
+        var live = ConfiguredBoard(id: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE", name: "ASIC 2", port: 18111, location: 4113)
+        live.serial = "serial-1"
+        hardware.boards = [live]
+        let adopted = BoardDiscovery.adoptingServiceIdentities(hardware, identities: [
+            ServiceBoardIdentity(id: "usb-4113", name: "ASIC 2", serial: "serial-1", location: 4113)
+        ])
+        XCTAssertEqual(adopted.boards.map(\.id), ["AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"])
+        XCTAssertEqual(adopted.boards.map(\.serial), ["serial-1"])
+        XCTAssertEqual(adopted.rememberedBoards.map(\.id), ["usb-4113"])
+        XCTAssertEqual(adopted.rememberedBoards.map(\.serial), ["serial-0"])
+        let ids = adopted.boards.map(\.id) + adopted.rememberedBoards.map(\.id)
+        XCTAssertEqual(Set(ids).count, ids.count)
     }
 
 }

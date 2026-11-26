@@ -39,6 +39,16 @@ impl std::fmt::Display for OperatorHold {
     }
 }
 impl std::error::Error for OperatorHold {}
+/// Automatic capabilities were not prepared yet; a software state, not a board
+/// or transport fault.
+#[derive(Debug)]
+pub(crate) struct NotPrepared;
+impl std::fmt::Display for NotPrepared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(crate::hardware::health::Health::PREPARE_STATE_FAILURE)
+    }
+}
+impl std::error::Error for NotPrepared {}
 /// Supervision timing. Production uses the defaults; fixtures scale them down.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Timing {
@@ -46,6 +56,8 @@ pub(crate) struct Timing {
     pub restart: [Duration; 3],
     /// How often an absent board is looked for.
     pub absent: Duration,
+    /// How long to wait before retrying a failed Automatic prepare.
+    pub prepare: Duration,
     /// Native silence that means its event loop is stuck.
     pub liveness: Duration,
     /// Interval between private canary proofs on an unrouted serving board.
@@ -56,6 +68,7 @@ impl Default for Timing {
         Self {
             restart: [1, 5, 30].map(Duration::from_secs),
             absent: Duration::from_secs(5),
+            prepare: Duration::from_secs(30),
             liveness: Duration::from_secs(crate::hardware::LIVENESS_TIMEOUT_SECONDS),
             canary: Duration::from_secs(native::supervision::CANARY_SECONDS),
         }
@@ -159,6 +172,7 @@ enum Stop {
     Absent,
     Held,
     Unplugged,
+    NotPrepared,
     Failed,
 }
 pub(super) async fn supervise_board(
@@ -425,6 +439,8 @@ impl BoardSupervisor {
             Stop::Absent
         } else if error.is::<OperatorHold>() {
             Stop::Held
+        } else if error.is::<NotPrepared>() {
+            Stop::NotPrepared
         } else if fault == crate::board_lifecycle::Fault::Transport && self.unplugged().await {
             Stop::Unplugged
         } else {
@@ -437,9 +453,9 @@ impl BoardSupervisor {
                 // This stop was the unplug; an earlier failure stays counted.
                 self.forgivable = None;
             }
-            Stop::Held | Stop::Failed => {}
+            Stop::Held | Stop::NotPrepared | Stop::Failed => {}
         }
-        let absent = stop != Stop::Failed;
+        let absent = matches!(stop, Stop::Absent | Stop::Held | Stop::Unplugged);
         let shared = &self.shared;
         let board = &self.board;
         let reason = if stop == Stop::Unplugged {
@@ -451,7 +467,10 @@ impl BoardSupervisor {
         let thermal = fault == crate::board_lifecycle::Fault::Thermal;
         // Only failures of a board that was found count against its
         // reliability. Unplugged boards are simply looked for again.
-        let delay = if absent {
+        let delay = if stop == Stop::NotPrepared {
+            // A software prepare state is not a board reliability failure.
+            self.timing.prepare
+        } else if absent {
             self.timing.absent
         } else {
             match board

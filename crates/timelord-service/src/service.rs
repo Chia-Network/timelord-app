@@ -4,7 +4,7 @@ use crate::{
     Shared, asic, config_checkpoint, hardware, history_store, inventory, observability,
     operational, private_control, runtime, safety, status_api, unix_now,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -94,7 +94,7 @@ impl Run {
         current: &watch::Sender<Arc<Shared>>,
     ) -> Result<()> {
         if hardware::needs_prepare(&config, native.as_ref()) {
-            bail!("Automatic capabilities were not prepared");
+            return Err(hardware::NotPrepared.into());
         }
         let previous = &self.shared;
         let updated = Arc::new(Shared {
@@ -122,7 +122,7 @@ impl Run {
         current: &watch::Sender<Arc<Shared>>,
     ) -> Result<()> {
         let Some(native) = native else {
-            bail!("Automatic capabilities were not prepared");
+            return Err(hardware::NotPrepared.into());
         };
         if self.shared.native.is_some() {
             return Ok(());

@@ -530,3 +530,50 @@ fn queued_writer_cannot_replace_the_critical_holders_watchdog() {
     assert!(first.join().unwrap().unwrap());
     assert!(second.join().unwrap().unwrap());
 }
+
+#[test]
+fn open_forgives_stale_prepare_journal_entries_once() {
+    let f = Fixture::new();
+    let journal = {
+        let store = Store::open(&f.config()).unwrap();
+        store
+            .update_health("A", false, |health| {
+                health.consecutive_failures = 6;
+                health.recent_failures = vec![100, 130, 160];
+                health.last_failure_unix = 160;
+                health.last_failure =
+                    Some(crate::hardware::health::Health::PREPARE_STATE_FAILURE.into());
+                health.probation_until_unix = 160 + 7200;
+            })
+            .unwrap();
+        store
+            .update_health("B", false, |health| {
+                health.record_failure(200, "lane timed out");
+            })
+            .unwrap();
+        store.path.clone()
+    };
+    let before = fs::read(&journal).unwrap();
+    let inspected = Store::inspect(&f.config()).unwrap();
+    assert_eq!(inspected.health("A").consecutive_failures, 6);
+    assert_eq!(
+        fs::read(&journal).unwrap(),
+        before,
+        "inspect must not write"
+    );
+    let reopened = Store::open(&f.config()).unwrap();
+    let cleared = reopened.health("A");
+    assert_eq!(cleared.consecutive_failures, 0);
+    assert!(cleared.last_failure.is_none());
+    assert_eq!(cleared.probation_until_unix, 0);
+    let kept = reopened.health("B");
+    assert_eq!(kept.consecutive_failures, 1);
+    assert_eq!(kept.last_failure.as_deref(), Some("lane timed out"));
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+    assert_eq!(saved["boards"]["A"]["health"]["consecutive_failures"], 0);
+    assert_eq!(saved["boards"]["B"]["health"]["consecutive_failures"], 1);
+    // A second open finds nothing left to migrate and leaves the file alone.
+    let after = fs::read(&journal).unwrap();
+    Store::open(&f.config()).unwrap();
+    assert_eq!(fs::read(&journal).unwrap(), after);
+}

@@ -130,7 +130,7 @@ async fn best_known(
     let facts = shared
         .native
         .as_ref()
-        .context("Automatic capabilities were not prepared")?;
+        .ok_or_else(|| anyhow::Error::new(NotPrepared))?;
     let learned = facts.learned(&shared.config, board, engines).await?;
     let point = match &learned {
         Some(entry) => automatic::initial_point(board, Some(entry)),
@@ -144,7 +144,7 @@ async fn best_known(
 
 pub(super) async fn startup(shared: &Shared, board: &BoardConfig) -> Result<Startup> {
     if board.profile == ProfileMode::Automatic && shared.native.is_none() {
-        bail!("Automatic capabilities were not prepared");
+        return Err(NotPrepared.into());
     }
     let engines = shared.engines(&board.id).max(1);
     let policy = shared
@@ -233,7 +233,7 @@ impl NativeOwner {
             let facts = shared
                 .native
                 .as_ref()
-                .context("Automatic capabilities were not prepared")?;
+                .ok_or_else(|| anyhow::Error::new(NotPrepared))?;
             let mut policy = Policy::new(
                 board.automatic.clone(),
                 point,

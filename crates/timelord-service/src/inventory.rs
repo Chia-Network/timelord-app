@@ -238,6 +238,35 @@ pub fn board_location(board: &timelord_core::BoardConfig, devices: &[Device]) ->
 #[cfg(all(test, target_os = "macos"))]
 mod driver_path_tests;
 
+/// Same ASIC, even when a stale location-based identifier was later reused by
+/// a different board at that port. Serial wins; identical IDs only count when
+/// serials do not disagree.
+fn same_physical_board(a: &timelord_core::BoardConfig, b: &timelord_core::BoardConfig) -> bool {
+    if let Some(serial) = &a.serial
+        && b.serial.as_ref() == Some(serial)
+    {
+        return true;
+    }
+    a.id == b.id && (a.serial.is_none() || b.serial.is_none() || a.serial == b.serial)
+}
+
+/// The first identifier of the form `usb-{location}` (then `-1`, `-2`, ...)
+/// that no configured or remembered board already uses.
+fn free_usb_id(location: u32, taken_ids: &std::collections::BTreeSet<String>) -> String {
+    let base = format!("usb-{location}");
+    if !taken_ids.contains(&base) {
+        return base;
+    }
+    let mut n = 1u32;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if !taken_ids.contains(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 pub(crate) fn connected_plan(mut config: Config, devices: Vec<Device>) -> Result<Config> {
     // Preserve each board's identity and settings while it is unplugged. Learned
     // operating points are separately keyed by serial, engine count and mask.
@@ -245,7 +274,7 @@ pub(crate) fn connected_plan(mut config: Config, devices: Vec<Device>) -> Result
         config
             .hardware
             .remembered_boards
-            .retain(|b| b.id != board.id);
+            .retain(|b| !same_physical_board(b, board));
         config.hardware.remembered_boards.push(board.clone());
     }
     let mut identities = std::collections::BTreeSet::new();
@@ -280,6 +309,13 @@ pub(crate) fn connected_plan(mut config: Config, devices: Vec<Device>) -> Result
         }
     });
     // Automatically include newly plugged boards with Automatic tuning.
+    let mut taken_ids: std::collections::BTreeSet<String> = config
+        .hardware
+        .boards
+        .iter()
+        .chain(config.hardware.remembered_boards.iter())
+        .map(|board| board.id.clone())
+        .collect();
     for device in devices {
         if config
             .hardware
@@ -298,9 +334,9 @@ pub(crate) fn connected_plan(mut config: Config, devices: Vec<Device>) -> Result
                 !reserved.contains(p) && !config.hardware.boards.iter().any(|b| b.client_port == *p)
             })
             .context("No board port available")?;
+        let id = free_usb_id(device.location, &taken_ids);
         let mut board: timelord_core::BoardConfig = toml::from_str(&format!(
-            "id='usb-{}'\nname='ASIC {}'\nclient_port={port}\ndevice_location={}\nprofile='automatic'",
-            device.location,
+            "id='{id}'\nname='ASIC {}'\nclient_port={port}\ndevice_location={}\nprofile='automatic'",
             config.hardware.boards.len() + 1,
             device.location
         ))?;
@@ -311,10 +347,19 @@ pub(crate) fn connected_plan(mut config: Config, devices: Vec<Device>) -> Result
             .find(|b| b.serial.is_some() && b.serial == device.serial)
         {
             board = remembered.clone();
+            if config
+                .hardware
+                .boards
+                .iter()
+                .any(|live| live.id == board.id)
+            {
+                board.id = id;
+            }
             board.client_port = port;
             board.device_location = Some(device.location);
         }
         board.serial = device.serial;
+        taken_ids.insert(board.id.clone());
         config.hardware.boards.push(board);
     }
     config.validate().map_err(anyhow::Error::msg)?;
