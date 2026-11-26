@@ -11,7 +11,8 @@
       ],
       "expected_boards": [
         {"id": "usb-4113", "serial": "serial-0", "device_location": 9001}
-      ]
+      ],
+      "expected_remembered_boards": []
     },
     {
       "name": "a move plus a new board at the old port gets a free identifier",
@@ -26,7 +27,8 @@
       "expected_boards": [
         {"id": "usb-4113", "serial": "serial-0", "device_location": 9001},
         {"id": "usb-4113-1", "serial": "serial-1", "device_location": 4113}
-      ]
+      ],
+      "expected_remembered_boards": []
     },
     {
       "name": "two boards swap ports and keep their identifiers",
@@ -42,7 +44,8 @@
       "expected_boards": [
         {"id": "usb-4113", "serial": "serial-0", "device_location": 4114},
         {"id": "usb-4114", "serial": "serial-1", "device_location": 4113}
-      ]
+      ],
+      "expected_remembered_boards": []
     },
     {
       "name": "two boards with no serial stay distinct by location",
@@ -58,7 +61,8 @@
       "expected_boards": [
         {"id": "usb-4113", "device_location": 4113},
         {"id": "usb-4114", "device_location": 4114}
-      ]
+      ],
+      "expected_remembered_boards": []
     },
     {
       "name": "a remembered board and a new board at the same port stay distinct",
@@ -75,6 +79,71 @@
       "expected_remembered_boards": [
         {"id": "usb-4113", "serial": "serial-0", "device_location": 4113}
       ]
+    },
+    {
+      "name": "a restored remembered board gets a free identifier beside its old live owner",
+      "boards": [
+        {"id": "usb-4", "name": "ASIC 1", "client_port": 18110, "device_location": 4, "serial": "serial-1"}
+      ],
+      "remembered_boards": [
+        {"id": "usb-4", "name": "ASIC 2", "client_port": 18111, "device_location": 4, "serial": "serial-0"}
+      ],
+      "devices": [
+        {"name": "ASIC", "location": 4, "serial": "serial-1"},
+        {"name": "ASIC", "location": 5, "serial": "serial-0"}
+      ],
+      "expected_boards": [
+        {"id": "usb-4", "serial": "serial-1", "device_location": 4},
+        {"id": "usb-5", "serial": "serial-0", "device_location": 5}
+      ],
+      "expected_remembered_boards": []
+    },
+    {
+      "name": "a remembered board with no serial is not restored by location",
+      "boards": [],
+      "remembered_boards": [
+        {"id": "usb-4113", "name": "ASIC 1", "client_port": 18110, "device_location": 4113}
+      ],
+      "devices": [
+        {"name": "ASIC", "location": 4113, "serial": "serial-1"}
+      ],
+      "expected_boards": [
+        {"id": "usb-4113-1", "serial": "serial-1", "device_location": 4113}
+      ],
+      "expected_remembered_boards": [
+        {"id": "usb-4113", "device_location": 4113}
+      ]
+    },
+    {
+      "name": "a remembered serial board replugged at a new port keeps its identifier",
+      "boards": [],
+      "remembered_boards": [
+        {"id": "usb-4113", "name": "ASIC 1", "client_port": 18110, "device_location": 4113, "serial": "serial-0"}
+      ],
+      "devices": [
+        {"name": "ASIC", "location": 9001, "serial": "serial-0"}
+      ],
+      "expected_boards": [
+        {"id": "usb-4113", "serial": "serial-0", "device_location": 9001}
+      ],
+      "expected_remembered_boards": []
+    },
+    {
+      "name": "a reordered device list still follows serials",
+      "boards": [
+        {"id": "usb-4113", "name": "ASIC 1", "client_port": 18110, "device_location": 4113, "serial": "serial-0"},
+        {"id": "usb-4114", "name": "ASIC 2", "client_port": 18111, "device_location": 4114, "serial": "serial-1"}
+      ],
+      "remembered_boards": [],
+      "devices": [
+        {"name": "ASIC", "location": 4113, "serial": "serial-1"},
+        {"name": "ASIC", "location": 4114, "serial": "serial-0"}
+      ],
+      "expected_boards": [
+        {"id": "usb-4113", "serial": "serial-0", "device_location": 4114},
+        {"id": "usb-4114", "serial": "serial-1", "device_location": 4113}
+      ],
+      "expected_remembered_boards": []
     }
   ]
 }

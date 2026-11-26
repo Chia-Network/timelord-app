@@ -12,7 +12,7 @@ final class BoardIdentityTests: XCTestCase {
         let rememberedBoards: [Board]
         let devices: [Device]
         let expectedBoards: [Board]
-        let expectedRememberedBoards: [Board]?
+        let expectedRememberedBoards: [Board]
     }
     private struct Board: Decodable {
         let id: String
@@ -51,7 +51,31 @@ final class BoardIdentityTests: XCTestCase {
         result.serial = board.serial
         return result
     }
+    private func boardKey(_ board: ConfiguredBoard) -> (String, String, Int) {
+        (board.serial ?? "", board.id, board.deviceLocation ?? 0)
+    }
+    private func expectedBoardKey(_ board: Board) -> (String, String, Int) {
+        (board.serial ?? "", board.id, board.deviceLocation ?? 0)
+    }
+    private func sortedBoards(_ boards: [ConfiguredBoard]) -> [ConfiguredBoard] {
+        boards.sorted {
+            let a = boardKey($0), b = boardKey($1)
+            if a.0 != b.0 { return a.0 < b.0 }
+            if a.1 != b.1 { return a.1 < b.1 }
+            return a.2 < b.2
+        }
+    }
+    private func sortedExpectedBoards(_ boards: [Board]) -> [Board] {
+        boards.sorted {
+            let a = expectedBoardKey($0), b = expectedBoardKey($1)
+            if a.0 != b.0 { return a.0 < b.0 }
+            if a.1 != b.1 { return a.1 < b.1 }
+            return a.2 < b.2
+        }
+    }
     private func assertBoards(_ actual: [ConfiguredBoard], _ expected: [Board], _ name: String) {
+        let actual = sortedBoards(actual)
+        let expected = sortedExpectedBoards(expected)
         XCTAssertEqual(actual.count, expected.count, name)
         for (board, expected) in zip(actual, expected) {
             XCTAssertEqual(board.id, expected.id, name)
@@ -61,7 +85,9 @@ final class BoardIdentityTests: XCTestCase {
     }
 
     func testSharedBoardIdentityVectorsMatchReconcile() throws {
-        for vector in try vectors() {
+        let vectors = try vectors()
+        XCTAssertGreaterThanOrEqual(vectors.count, 9, "shared board identity vectors are missing")
+        for vector in vectors {
             var hardware = HardwareConfiguration()
             hardware.boards = vector.boards.enumerated().map { configured($0.element, index: $0.offset) }
             hardware.rememberedBoards = vector.rememberedBoards.enumerated().map {
@@ -75,9 +101,10 @@ final class BoardIdentityTests: XCTestCase {
             assertBoards(reconciled.boards, vector.expectedBoards, vector.name)
             let ids = reconciled.boards.map(\.id)
             XCTAssertEqual(Set(ids).count, ids.count, vector.name)
-            if let expected = vector.expectedRememberedBoards {
-                assertBoards(reconciled.rememberedBoards, expected, vector.name)
+            let remembered = reconciled.rememberedBoards.filter { old in
+                !reconciled.boards.contains { BoardDiscovery.samePhysicalBoard($0, old) }
             }
+            assertBoards(remembered, vector.expectedRememberedBoards, vector.name)
         }
     }
 

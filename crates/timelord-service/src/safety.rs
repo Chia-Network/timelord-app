@@ -309,7 +309,9 @@ fn parse(bytes: &[u8], now: u64) -> Result<Saved> {
 impl Store {
     pub fn open(config: &Path) -> Result<Self> {
         let store = Self::load(config, true)?;
-        store.migrate_prepare_state()?;
+        if let Err(error) = store.migrate_prepare_state() {
+            tracing::warn!(error=%format!("{error:#}"), "Board safety prepare-state migration failed; continuing with the un-migrated journal");
+        }
         Ok(store)
     }
     /// Read-only inspection for the explicit hardware check: report a journal
@@ -689,7 +691,7 @@ impl Store {
     }
     /// One-time migration for legacy journals: a streak whose last failure is
     /// only the Automatic prepare-state message is reset. The journal stores no
-    /// reason per recent-failure entry, so a 1.0.2 streak that ends in that
+    /// reason per recent-failure entry, so a 1.0.3 streak that ends in that
     /// message loses its earlier real faults and the probation they earned;
     /// trailing-only decrement is impossible. This runs once per production
     /// open, never for a read-only inspection.

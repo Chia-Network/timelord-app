@@ -195,7 +195,10 @@ async fn a_missing_prepare_state_is_not_a_reliability_failure() {
         started_unix,
         service_started_unix,
     ));
-    rig.start(Rig::fast());
+    let mut timing = Rig::fast();
+    timing.prepare = std::time::Duration::from_secs(1);
+    timing.absent = std::time::Duration::from_secs(30);
+    rig.start(timing);
     rig.until(10, "the prepare-state stop", |s| {
         s.boards["b1"]
             .recovery_reason
@@ -213,6 +216,21 @@ async fn a_missing_prepare_state_is_not_a_reliability_failure() {
             .iter()
             .all(|event| event.kind != "failure")
     );
+    let first_retry = rig.shared.runtime.lock().unwrap().boards["b1"]
+        .retry_after_unix
+        .expect("the prepare-state stop schedules a retry");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
+    loop {
+        let retry = rig.shared.runtime.lock().unwrap().boards["b1"].retry_after_unix;
+        if retry.is_some_and(|retry| retry >= first_retry + 2) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "prepare-state retries did not follow the short prepare cadence"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     rig.shutdown().await;
 }
 

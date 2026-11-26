@@ -152,6 +152,30 @@ fn a_remembered_board_does_not_reclaim_a_port_taken_by_a_new_board() {
     assert_eq!(remembered.voltage_v, b1.voltage_v);
 }
 
+#[test]
+fn a_remembered_board_does_not_reclaim_a_reserved_service_port() {
+    let mut config = Config::default();
+    let reserved = config.service.reserved_ports();
+    let port = config.service.status_listen.port();
+    assert!(reserved.contains(&port));
+    let remembered: BoardConfig = toml::from_str(&format!(
+        "id='b0'\nname='B0'\nserial='serial-0'\nprofile='manual'\ndevice_location=1\nclient_port={port}"
+    ))
+    .unwrap();
+    config.hardware.remembered_boards = vec![remembered.clone()];
+    let config = continuous::known_configuration(config);
+    assert!(
+        config.hardware.boards.iter().all(|board| board.id != "b0"),
+        "a remembered board must not reclaim a reserved service port"
+    );
+    assert_eq!(config.hardware.remembered_boards.len(), 1);
+    assert_eq!(config.hardware.remembered_boards[0].id, remembered.id);
+    assert_eq!(
+        config.hardware.remembered_boards[0].client_port,
+        remembered.client_port
+    );
+}
+
 async fn wait_until(message: &str, condition: impl Fn() -> bool) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while !condition() {

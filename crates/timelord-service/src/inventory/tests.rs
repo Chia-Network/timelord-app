@@ -82,6 +82,31 @@ fn automatic_ports_skip_http_listeners_across_hotplug() {
     }
 }
 #[test]
+fn known_configuration_restores_a_missing_configured_board_after_connected_plan() {
+    let plan = connected_plan(configured(), devices(&[1, 2])).unwrap();
+    assert_eq!(plan.hardware.boards.len(), 2);
+    assert!(plan.hardware.boards.iter().all(|board| board.id != "b0"));
+    assert!(
+        plan.hardware
+            .remembered_boards
+            .iter()
+            .any(|board| board.id == "b0")
+    );
+    let config = crate::hardware::continuous::known_configuration(plan);
+    assert_eq!(config.hardware.boards.len(), 3);
+    let restored = config
+        .hardware
+        .boards
+        .iter()
+        .find(|board| board.id == "b0")
+        .expect("b0 returns from the known configuration");
+    assert_eq!(restored.serial.as_deref(), Some("serial-0"));
+    assert_eq!(restored.name, "B0");
+    assert_eq!(restored.client_port, 18110);
+    assert_eq!(restored.device_location, Some(1));
+}
+
+#[test]
 fn automatic_topology_survives_three_one_zero_two_three_and_remembers_settings() {
     let original = configured();
     let mut config = original.clone();
@@ -397,6 +422,41 @@ fn a_replacement_at_the_old_location_never_overwrites_the_remembered_board() {
     assert_eq!(preserved.frequency_mhz, x.frequency_mhz);
     assert_eq!(preserved.voltage_v, x.voltage_v);
 
+    let replugged = connected_plan(
+        collision,
+        vec![
+            Device {
+                name: "ASIC 2".into(),
+                location: 4,
+                serial: Some("serial-1".into()),
+            },
+            Device {
+                name: "ASIC 1".into(),
+                location: 5,
+                serial: Some("serial-0".into()),
+            },
+        ],
+    )
+    .expect("restoring a remembered board beside a live id owner must not collide");
+    let replacement = replugged
+        .hardware
+        .boards
+        .iter()
+        .find(|board| board.serial.as_deref() == Some("serial-1"))
+        .expect("the replacement board stays live");
+    assert_eq!(replacement.id, "usb-4");
+    let restored = replugged
+        .hardware
+        .boards
+        .iter()
+        .find(|board| board.serial.as_deref() == Some("serial-0"))
+        .expect("the original board returns at a new location");
+    assert_eq!(restored.id, "usb-5");
+    assert_eq!(restored.profile, timelord_core::ProfileMode::Manual);
+    assert_eq!(restored.frequency_mhz, x.frequency_mhz);
+    assert_eq!(restored.voltage_v, x.voltage_v);
+    assert_eq!(restored.device_location, Some(5));
+
     let mut config = Config::default();
     config.hardware.boards = vec![x.clone()];
     let y = Device {
@@ -463,8 +523,7 @@ struct IdentityVector {
     remembered_boards: Vec<VectorBoard>,
     devices: Vec<VectorDevice>,
     expected_boards: Vec<VectorBoard>,
-    #[serde(default)]
-    expected_remembered_boards: Option<Vec<VectorBoard>>,
+    expected_remembered_boards: Vec<VectorBoard>,
 }
 #[derive(serde::Deserialize)]
 struct VectorBoard {
@@ -503,7 +562,25 @@ fn vector_board(board: &VectorBoard, index: usize) -> timelord_core::BoardConfig
     }
     toml::from_str(&toml).unwrap()
 }
+fn board_sort_key(board: &timelord_core::BoardConfig) -> (String, String, u32) {
+    (
+        board.serial.clone().unwrap_or_default(),
+        board.id.clone(),
+        board.device_location.unwrap_or(0),
+    )
+}
+fn expected_board_sort_key(board: &VectorBoard) -> (String, String, u32) {
+    (
+        board.serial.clone().unwrap_or_default(),
+        board.id.clone(),
+        board.device_location.unwrap_or(0),
+    )
+}
 fn assert_boards(actual: &[timelord_core::BoardConfig], expected: &[VectorBoard], name: &str) {
+    let mut actual: Vec<_> = actual.iter().collect();
+    let mut expected: Vec<_> = expected.iter().collect();
+    actual.sort_by_key(|board| board_sort_key(board));
+    expected.sort_by_key(|board| expected_board_sort_key(board));
     assert_eq!(actual.len(), expected.len(), "{name}");
     for (board, expected) in actual.iter().zip(expected) {
         assert_eq!(board.id, expected.id, "{name}");
@@ -517,6 +594,10 @@ fn shared_board_identity_vectors_match_the_service_plan() {
         "../../../../tests/board-identity-vectors.json"
     ))
     .unwrap();
+    assert!(
+        vectors.vectors.len() >= 9,
+        "shared board identity vectors are missing"
+    );
     for vector in vectors.vectors {
         let mut config = Config::default();
         config.hardware.boards = vector
@@ -546,8 +627,18 @@ fn shared_board_identity_vectors_match_the_service_plan() {
         let ids: Vec<_> = plan.hardware.boards.iter().map(|b| &b.id).collect();
         let unique: std::collections::BTreeSet<_> = ids.iter().collect();
         assert_eq!(unique.len(), ids.len(), "{}", vector.name);
-        if let Some(expected) = vector.expected_remembered_boards {
-            assert_boards(&plan.hardware.remembered_boards, &expected, &vector.name);
-        }
+        let live = &plan.hardware.boards;
+        let remembered: Vec<_> = plan
+            .hardware
+            .remembered_boards
+            .iter()
+            .filter(|board| !live.iter().any(|live| same_physical_board(board, live)))
+            .cloned()
+            .collect();
+        assert_boards(
+            &remembered,
+            &vector.expected_remembered_boards,
+            &vector.name,
+        );
     }
 }

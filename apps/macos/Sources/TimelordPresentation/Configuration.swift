@@ -386,7 +386,15 @@ public enum BoardDiscovery {
         var selected:[ConfiguredBoard]=[]
         for device in devices.prefix(3) {
             let port=(18110...65535).first { p in !reservedPorts.contains(p) && !selected.contains {$0.clientPort==p} }!
-            if var board=BoardTopology.matching(device,in:candidates) {
+            let liveMatch=BoardTopology.matching(device,in:hardware.boards)
+            let match=liveMatch ?? remembered.first(where:{ board in
+                guard let serial=board.serial else { return false }
+                return serial==device.serial
+            })
+            if var board=match {
+                if liveMatch==nil && (hardware.boards.contains {$0.id==board.id} || selected.contains {$0.id==board.id}) {
+                    board.id=freeServiceBoardID(location:device.location,usedIDs:usedIDs)
+                }
                 board.deviceLocation=device.location;board.serial=device.serial ?? board.serial
                 if reservedPorts.contains(board.clientPort) || selected.contains(where:{$0.clientPort==board.clientPort}) {board.clientPort=port}
                 usedIDs.insert(board.id)

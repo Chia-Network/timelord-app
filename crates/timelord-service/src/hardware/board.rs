@@ -45,7 +45,7 @@ impl std::error::Error for OperatorHold {}
 pub(crate) struct NotPrepared;
 impl std::fmt::Display for NotPrepared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Automatic capabilities were not prepared")
+        f.write_str(crate::hardware::health::Health::PREPARE_STATE_FAILURE)
     }
 }
 impl std::error::Error for NotPrepared {}

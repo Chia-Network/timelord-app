@@ -347,6 +347,14 @@ pub(crate) fn connected_plan(mut config: Config, devices: Vec<Device>) -> Result
             .find(|b| b.serial.is_some() && b.serial == device.serial)
         {
             board = remembered.clone();
+            if config
+                .hardware
+                .boards
+                .iter()
+                .any(|live| live.id == board.id)
+            {
+                board.id = id;
+            }
             board.client_port = port;
             board.device_location = Some(device.location);
         }
