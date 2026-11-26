@@ -198,9 +198,13 @@ impl Rig {
     /// Discover the fixture USB inventory, prepare Automatic capabilities,
     /// and adopt the resulting board list.
     pub async fn adopt_discovered_boards(&mut self) {
-        let discovered = crate::inventory::live_configuration(&self.shared)
+        let topology = crate::inventory::discover_topology(&self.shared)
             .await
             .expect("USB discovery");
+        let discovered = match topology {
+            Some(topology) => topology.apply(self.shared.config.clone()),
+            None => self.shared.config.clone(),
+        };
         let native = super::prepared_native(&discovered, self.shared.native.clone())
             .await
             .expect("prepare discovered Automatic boards");

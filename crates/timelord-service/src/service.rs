@@ -144,13 +144,44 @@ impl Run {
         Ok(())
     }
 
-    /// Replace only the node session. Native owners, routes, learned tuning and
-    /// board health stay in place: no board depends on the selected network.
+    /// Apply an inventory topology to the live configuration. Inventory owns
+    /// only the board list and remembered registry; every other section comes
+    /// from the live configuration. Automatic boards return a config to prepare
+    /// before anything is published.
+    fn apply_inventory(
+        &mut self,
+        inventory: Option<crate::inventory::Topology>,
+        current: &watch::Sender<Arc<Shared>>,
+    ) -> Result<Option<Config>> {
+        let Some(topology) = inventory else {
+            return Ok(None);
+        };
+        let config = topology.apply(self.shared.config.clone());
+        if serde_json::to_value(&config.hardware.boards)?
+            == serde_json::to_value(&self.shared.config.hardware.boards)?
+            && serde_json::to_value(&config.hardware.remembered_boards)?
+                == serde_json::to_value(&self.shared.config.hardware.remembered_boards)?
+        {
+            return Ok(None);
+        }
+        if hardware::needs_prepare(&config, self.shared.native.as_ref()) {
+            return Ok(Some(config));
+        }
+        self.publish(config, current)?;
+        Ok(None)
+    }
+
+    /// Replace only the node session. Only the node/connection sections of
+    /// `node_profile` are used; hardware and other sections are ignored.
+    /// Native owners, routes, learned tuning and board health stay in place:
+    /// no board depends on the selected network.
     async fn replace_node(
         &mut self,
-        config: Config,
+        node_profile: Config,
         current: &watch::Sender<Arc<Shared>>,
     ) -> Result<()> {
+        let mut config = self.shared.config.clone();
+        config.adopt_node_profile(&node_profile);
         let backend = self
             .shared
             .runtime
@@ -432,7 +463,8 @@ pub(crate) async fn serve(
     });
     let mut poll = tokio::time::interval(Duration::from_secs(5));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut inventory_task: Option<tokio::task::JoinHandle<Result<Config>>> = None;
+    let mut inventory_task: Option<tokio::task::JoinHandle<Result<Option<inventory::Topology>>>> =
+        None;
     let mut prepare_task: Option<DiscoveryPrepare> = None;
     let mut prepare_retry_at: Option<tokio::time::Instant> = None;
     let result = loop {
@@ -491,7 +523,7 @@ pub(crate) async fn serve(
                             prepare_retry_at = None;
                             if inventory_task.is_none() {
                                 let shared=run.shared.clone();
-                                inventory_task=Some(tokio::spawn(async move{inventory::live_configuration(&shared).await}));
+                                inventory_task=Some(tokio::spawn(async move{inventory::discover_topology(&shared).await}));
                             }
                         }
                     }
@@ -510,31 +542,23 @@ pub(crate) async fn serve(
             _ = poll.tick() => {
                 if inventory_task.is_none() {
                     let shared=run.shared.clone();
-                    inventory_task=Some(tokio::spawn(async move{inventory::live_configuration(&shared).await}));
+                    inventory_task=Some(tokio::spawn(async move{inventory::discover_topology(&shared).await}));
                 }
                 continue;
             }
         };
         // Inventory failures are never interpreted as unplugged boards.
-        if let Ok(candidate) = candidate {
-            let config = hardware::continuous::known_configuration(candidate);
-            if serde_json::to_value(&config.hardware.boards)?
-                != serde_json::to_value(&run.shared.config.hardware.boards)?
-            {
-                if hardware::needs_prepare(&config, run.shared.native.as_ref()) {
-                    let idle = prepare_task.is_none();
-                    let ready = prepare_retry_at
-                        .is_none_or(|deadline| tokio::time::Instant::now() >= deadline);
-                    if idle && ready {
-                        prepare_task =
-                            Some(spawn_discovery_prepare(config, run.shared.native.clone()));
-                    }
-                } else if let Err(error) = run.publish(config, &current) {
-                    tracing::warn!(
-                        error = %format!("{error:#}"),
-                        "Automatic capabilities could not be prepared for discovered boards; clients not started"
-                    );
-                }
+        if let Ok(topology) = candidate
+            && let Some(prepare_config) = run.apply_inventory(topology, &current)?
+        {
+            let idle = prepare_task.is_none();
+            let ready =
+                prepare_retry_at.is_none_or(|deadline| tokio::time::Instant::now() >= deadline);
+            if idle && ready {
+                prepare_task = Some(spawn_discovery_prepare(
+                    prepare_config,
+                    run.shared.native.clone(),
+                ));
             }
         }
     };
@@ -681,6 +705,10 @@ pub(crate) async fn shutdown_signal_from(mut term: tokio::signal::unix::Signal) 
 }
 
 #[cfg(test)]
+mod inventory_tests;
+#[cfg(test)]
 mod operations_tests;
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;

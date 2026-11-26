@@ -321,12 +321,37 @@ pub(crate) fn connected_plan(mut config: Config, devices: Vec<Device>) -> Result
     Ok(config)
 }
 
-pub async fn live_configuration(shared: &crate::Shared) -> Result<Config> {
+#[derive(Debug, Clone)]
+pub(crate) struct Topology {
+    pub boards: Vec<timelord_core::BoardConfig>,
+    pub remembered_boards: Vec<timelord_core::BoardConfig>,
+}
+
+impl Topology {
+    /// Apply inventory-owned fields onto a live configuration. Inventory
+    /// owns only the board list and the remembered-board registry.
+    pub(crate) fn apply(self, mut live: Config) -> Config {
+        live.hardware.boards = self.boards;
+        live.hardware.remembered_boards = self.remembered_boards;
+        live
+    }
+}
+
+pub(crate) fn plan_topology(config: Config, devices: Vec<Device>) -> Result<Topology> {
+    let config = connected_plan(config, devices)?;
+    let config = crate::hardware::continuous::known_configuration(config);
+    Ok(Topology {
+        boards: config.hardware.boards,
+        remembered_boards: config.hardware.remembered_boards,
+    })
+}
+
+pub async fn discover_topology(shared: &crate::Shared) -> Result<Option<Topology>> {
     // Explicit administrator mappings retain their fixed chain ownership.
     if shared.config.hardware.client_binary.is_none()
         || shared.config.hardware.chain_assignments.is_some()
     {
-        return Ok(shared.config.clone());
+        return Ok(None);
     }
     let _initialization = crate::hardware::INITIALIZATION.lock().await;
     // Waiting for a native owner is not a stalled enumeration operation.
@@ -344,7 +369,7 @@ pub async fn live_configuration(shared: &crate::Shared) -> Result<Config> {
         &shared.runtime.lock().expect("runtime"),
         crate::unix_now(),
     );
-    connected_plan(shared.config.clone(), devices)
+    plan_topology(shared.config.clone(), devices).map(Some)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -478,6 +478,13 @@ impl Config {
         Ok(())
     }
 
+    /// Copy only the node/connection sections from `source`. Live hardware,
+    /// service and board state are never replaced by a disk snapshot.
+    pub fn adopt_node_profile(&mut self, source: &Config) {
+        self.single_node = source.single_node.clone();
+        self.connections = source.connections.clone();
+    }
+
     /// A configured plan, not a claim about detected hardware or connected clients.
     pub fn assignments(&self) -> Result<Vec<Assignment>, String> {
         self.validate()?;
