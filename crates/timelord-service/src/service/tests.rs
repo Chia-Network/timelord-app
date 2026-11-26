@@ -541,6 +541,42 @@ async fn wait_for(path: &std::path::Path, task: &mut tokio::task::JoinHandle<Res
     }
 }
 
+fn probe_lines(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+/// Wait for `count` probe lines under paused time. Advances virtual time in
+/// 1ms steps so the I/O driver is polled, without sleeping on the wall clock.
+async fn wait_for_probe_lines(
+    path: &std::path::Path,
+    count: usize,
+    task: &mut tokio::task::JoinHandle<Result<()>>,
+    budget: Duration,
+) -> usize {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let have = probe_lines(path);
+        if have >= count {
+            return have;
+        }
+        if task.is_finished() || tokio::time::Instant::now() >= deadline {
+            return have;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+}
+
+async fn yield_paused(steps: usize) {
+    for _ in 0..steps {
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+}
+
 #[tokio::test]
 async fn shutdown_during_discovered_prepare_returns_promptly() {
     let dir = fixture_dir("discover-shutdown");
@@ -589,7 +625,7 @@ exec sleep 30
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn discovered_prepare_failure_backs_off_before_retrying() {
     let dir = fixture_dir("discover-backoff");
     let binary = dir.join("client");
@@ -597,7 +633,8 @@ async fn discovered_prepare_failure_backs_off_before_retrying() {
         &binary,
         r#"#!/bin/sh
 root=$(dirname "$0")
-echo probe >> "$root/probes"
+printf 'probe
+' >> "$root/probes"
 exit 1
 "#,
     );
@@ -616,45 +653,35 @@ exit 1
         },
     ));
     let probes = dir.join("probes");
-    assert!(
-        wait_for(&probes, &mut task).await,
+    assert_eq!(
+        wait_for_probe_lines(&probes, 1, &mut task, Duration::from_secs(1)).await,
+        1,
         "the first discovered prepare should run"
     );
-    assert_eq!(
-        std::fs::read_to_string(&probes).unwrap().lines().count(),
-        1,
-        "only one prepare may run at a time"
-    );
-    tokio::time::pause();
+    // Let the serve loop observe the failure and start the backoff before
+    // virtual time jumps; otherwise retry_at is stamped after the jump.
+    yield_paused(64).await;
     tokio::time::advance(DISCOVERY_PREPARE_RETRY - Duration::from_secs(1)).await;
-    for _ in 0..32 {
-        tokio::task::yield_now().await;
-    }
+    yield_paused(64).await;
     assert_eq!(
-        std::fs::read_to_string(&probes).unwrap().lines().count(),
+        probe_lines(&probes),
         1,
         "a failed prepare must not re-probe during backoff"
     );
     tokio::time::advance(Duration::from_secs(6)).await;
-    tokio::time::resume();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while std::fs::read_to_string(&probes).unwrap().lines().count() < 2
-        && tokio::time::Instant::now() < deadline
-        && !task.is_finished()
-    {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
     assert_eq!(
-        std::fs::read_to_string(&probes).unwrap().lines().count(),
+        wait_for_probe_lines(&probes, 2, &mut task, Duration::from_secs(2)).await,
         2,
         "prepare should run again after the backoff"
     );
     let _ = signal.send(());
-    tokio::time::timeout(Duration::from_secs(1), &mut task)
+    yield_paused(32).await;
+    tokio::time::advance(Duration::from_secs(3)).await;
+    yield_paused(32).await;
+    let result = tokio::time::timeout(Duration::from_secs(1), &mut task)
         .await
-        .expect("shutdown after backoff")
-        .unwrap()
-        .unwrap();
+        .expect("shutdown after backoff");
+    result.unwrap().unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
 
