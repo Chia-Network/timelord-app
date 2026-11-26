@@ -38,9 +38,9 @@ pub struct Health {
 }
 
 impl Health {
-    /// Software prepare state, not a hardware or transport fault. 1.0.3
-    /// recorded this in the safety journal; it must not count toward
-    /// probation or a failure streak.
+    /// Software prepare state, not a hardware or transport fault. Journals from
+    /// 1.0.1–1.0.3 (routinely since 1.0.3) may contain it; it must not count
+    /// toward probation or a failure streak.
     pub const PREPARE_STATE_FAILURE: &'static str = "Automatic capabilities were not prepared";
 
     pub fn is_prepare_state(reason: &str) -> bool {
@@ -122,8 +122,8 @@ impl Health {
     }
 
     /// Drop a streak whose last recorded failure was only the Automatic
-    /// prepare state, including journal entries written by 1.0.3. A last
-    /// failure that names real hardware stays untouched.
+    /// prepare state, including journal entries from 1.0.1–1.0.3 (routinely
+    /// since 1.0.3). A last failure that names real hardware stays untouched.
     pub fn forgive_prepare_state(&mut self) -> bool {
         if !self
             .last_failure
@@ -231,7 +231,8 @@ mod tests {
             Some("context: Automatic capabilities were not prepared")
         );
         assert_eq!(health.tier(110), Tier::Probation);
-        // Legacy 1.0.3 journals are cleared once when the store opens.
+        // Legacy 1.0.1–1.0.3 journals (routinely since 1.0.3) are cleared once
+        // when the store opens.
         assert!(health.forgive_prepare_state());
         assert_eq!(health.consecutive_failures, 0);
         assert!(health.recent_failures.is_empty());
@@ -241,7 +242,8 @@ mod tests {
 
     #[test]
     fn successful_prepare_forgives_a_stale_prepare_journal_streak() {
-        // Simulate a 1.0.3 journal that already stored this software fault.
+        // Simulate a 1.0.1–1.0.3 journal (routinely since 1.0.3) that already
+        // stored this software fault.
         let mut health = Health {
             consecutive_failures: 6,
             recent_failures: vec![100, 130, 160],

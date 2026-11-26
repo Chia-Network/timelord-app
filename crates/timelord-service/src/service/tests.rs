@@ -862,3 +862,5 @@ async fn reload_node_accepts_only_saved_node_changes_from_the_real_config_file()
     run.stop().await.unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+mod discovery;
