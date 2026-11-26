@@ -320,6 +320,9 @@ impl BoardLifecycle {
     pub(crate) fn testing(&mut self) -> FixtureOwner<'_> {
         FixtureOwner(self)
     }
+    pub(crate) fn inventory_present(&self) -> Option<bool> {
+        self.usb_present
+    }
 }
 #[cfg(test)]
 impl FixtureOwner<'_> {
