@@ -180,9 +180,11 @@ impl Run {
     /// board health stay in place: no board depends on the selected network.
     async fn replace_node(
         &mut self,
-        config: Config,
+        node_profile: Config,
         current: &watch::Sender<Arc<Shared>>,
     ) -> Result<()> {
+        let mut config = self.shared.config.clone();
+        config.adopt_node_profile(&node_profile);
         let backend = self
             .shared
             .runtime
