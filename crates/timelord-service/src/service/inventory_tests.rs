@@ -88,3 +88,57 @@ async fn replace_node_keeps_the_live_hardware_profile() {
     run.stop().await.unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn replace_node_adopts_the_disk_connection_profile() {
+    let dir = fixture_dir("inventory-replace-connection-profile");
+    let mut live: Config = toml::from_str(
+        r#"
+schema_version = 1
+[connections]
+active_id = "mainnet"
+[[connections.profiles]]
+id = "mainnet"
+name = "Mainnet"
+node = { host = "127.0.0.1", port = 8444, network = "mainnet" }
+[[connections.profiles]]
+id = "testnet"
+name = "Testnet11"
+node = { host = "127.0.0.1", port = 58444, network = "testnet11" }
+"#,
+    )
+    .unwrap();
+    let live_board = board("manual");
+    live.hardware.boards = vec![live_board.clone()];
+    live.hardware.remembered_boards = vec![live_board];
+    let (mut run, current) = run_from(&dir, live).await;
+    let hardware = serde_json::to_value(&run.shared.config.hardware).unwrap();
+    let mut disk: Config = toml::from_str(
+        r#"
+schema_version = 1
+[connections]
+active_id = "testnet"
+[[connections.profiles]]
+id = "mainnet"
+name = "Mainnet"
+node = { host = "127.0.0.1", port = 8444, network = "mainnet" }
+[[connections.profiles]]
+id = "testnet"
+name = "Testnet11"
+node = { host = "127.0.0.1", port = 58444, network = "testnet11" }
+"#,
+    )
+    .unwrap();
+    let mut disk_board = board("manual");
+    disk_board.device_location = None;
+    disk.hardware.boards = vec![disk_board];
+    let expected_node = disk.node().clone();
+    run.replace_node(disk, &current).await.unwrap();
+    assert_eq!(run.shared.config.node(), &expected_node);
+    assert_eq!(
+        serde_json::to_value(&run.shared.config.hardware).unwrap(),
+        hardware
+    );
+    run.stop().await.unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
