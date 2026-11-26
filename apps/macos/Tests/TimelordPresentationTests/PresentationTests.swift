@@ -442,7 +442,7 @@ extension PresentationTests {
         hardware=BoardDiscovery.reconcile([],hardware:hardware,service:ServiceConfiguration())
         XCTAssertTrue(hardware.boards.isEmpty);XCTAssertEqual(hardware.rememberedBoards.count,1)
         hardware=BoardDiscovery.reconcile([DiscoveredDevice(name:"Chia VDF A",location:9001,serial:"one")],hardware:hardware,service:ServiceConfiguration())
-        XCTAssertEqual(hardware.boards[0].id, BoardDiscovery.serviceBoardID(location: 9001))
+        XCTAssertEqual(hardware.boards[0].id, first.id)
         XCTAssertEqual(hardware.boards[0].profileName,"Manual")
         XCTAssertEqual(hardware.boards[0].frequencyMhz,1540)
         XCTAssertEqual(hardware.boards[0].deviceLocation,9001)
