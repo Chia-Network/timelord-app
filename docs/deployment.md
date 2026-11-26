@@ -30,6 +30,15 @@ It executes the bundled supervisor directly; no shell or Python is in the servic
 runtime. Administrative installation writes the registration; proof work is never
 run as root.
 
+The first GUI login as that service account can trigger macOS Local Network
+privacy for the account. Until Local Network access is granted to Timelord in
+that session, the LaunchDaemon's LAN TCP connections can fail with
+`EHOSTUNREACH` (os error 65) even when the node is reachable from other
+accounts on the same Mac and ICMP still works. Grant Local Network access to
+Timelord in System Settings > Privacy & Security > Local Network while logged
+in as the service account. The supervisor retries the node connection and does
+not need a restart once the grant is in place.
+
 For SSH installation (substitute actual paths/account):
 
 ```sh

@@ -311,7 +311,21 @@ public enum BoardTopology {
     }
 }
 
+/// Identity the running service publishes for a discovered board.
+public struct ServiceBoardIdentity: Sendable {
+    public let id: String
+    public let name: String
+    public let serial: String?
+    public let location: Int?
+    public init(id: String, name: String, serial: String?, location: Int?) {
+        self.id = id; self.name = name; self.serial = serial; self.location = location
+    }
+}
 public enum BoardDiscovery {
+    /// The identifier the service assigns when it discovers a board at a USB
+    /// location and config has no existing owner for it.
+    public static func serviceBoardID(location: Int) -> String { "usb-\(location)" }
+
     /// Enrich a metadata-hidden USB row rather than creating another device
     /// with the same location ID. Fresh conflicting inventory wins over status.
     public static func includingManagedOwner(_ owner: DiscoveredDevice, in devices: [DiscoveredDevice]) -> [DiscoveredDevice] {
@@ -353,13 +367,31 @@ public enum BoardDiscovery {
         var selected:[ConfiguredBoard]=[]
         for device in devices.prefix(3) {
             let port=(18110...65535).first { p in !reservedPorts.contains(p) && !selected.contains {$0.clientPort==p} }!
-            var board=BoardTopology.matching(device,in:candidates) ?? ConfiguredBoard(id:UUID().uuidString,name:"ASIC \(selected.count+1)",port:port,location:device.location)
+            var board=BoardTopology.matching(device,in:candidates) ?? ConfiguredBoard(id:serviceBoardID(location:device.location),name:"ASIC \(selected.count+1)",port:port,location:device.location)
             board.deviceLocation=device.location;board.serial=device.serial ?? board.serial
             if reservedPorts.contains(board.clientPort) || selected.contains(where:{$0.clientPort==board.clientPort}) {board.clientPort=port}
             selected.append(board)
         }
         result.boards=selected
         result.rememberedBoards=remembered.filter { old in !selected.contains {$0.id==old.id} }
+        return result
+    }
+
+    /// Prefer the running service's board IDs and names when the same physical
+    /// board is already present in configuration under a different identifier.
+    public static func adoptingServiceIdentities(_ hardware: HardwareConfiguration, identities: [ServiceBoardIdentity]) -> HardwareConfiguration {
+        var result = hardware
+        func adopt(_ board: inout ConfiguredBoard) {
+            guard let match = identities.first(where: { identity in
+                if let serial = identity.serial, board.serial == serial { return true }
+                if let location = identity.location, board.deviceLocation == location { return true }
+                return false
+            }) else { return }
+            board.id = match.id
+            if board.name.hasPrefix("ASIC ") { board.name = match.name }
+        }
+        for index in result.boards.indices { adopt(&result.boards[index]) }
+        for index in result.rememberedBoards.indices { adopt(&result.rememberedBoards[index]) }
         return result
     }
 }

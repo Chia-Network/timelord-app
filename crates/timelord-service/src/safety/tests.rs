@@ -530,3 +530,41 @@ fn queued_writer_cannot_replace_the_critical_holders_watchdog() {
     assert!(first.join().unwrap().unwrap());
     assert!(second.join().unwrap().unwrap());
 }
+
+#[test]
+fn successful_prepare_forgives_stale_prepare_journal_entries() {
+    let f = Fixture::new();
+    let store = Store::open(&f.config()).unwrap();
+    store
+        .update_health("A", false, |health| {
+            health.consecutive_failures = 6;
+            health.recent_failures = vec![100, 130, 160];
+            health.last_failure_unix = 160;
+            health.last_failure =
+                Some(crate::hardware::health::Health::PREPARE_STATE_FAILURE.into());
+            health.probation_until_unix = 160 + 7200;
+        })
+        .unwrap();
+    store
+        .update_health("B", false, |health| {
+            health.record_failure(200, "lane timed out");
+        })
+        .unwrap();
+    assert_eq!(store.forgive_prepare_state().unwrap(), 1);
+    let cleared = store.health("A");
+    assert_eq!(cleared.consecutive_failures, 0);
+    assert!(cleared.last_failure.is_none());
+    assert_eq!(cleared.probation_until_unix, 0);
+    let kept = store.health("B");
+    assert_eq!(kept.consecutive_failures, 1);
+    assert_eq!(kept.last_failure.as_deref(), Some("lane timed out"));
+    assert_eq!(store.forgive_prepare_state().unwrap(), 0);
+    // New prepare-state errors are not written as reliability failures.
+    let before = store.health("B");
+    let recorded = store
+        .record_failure("B", crate::hardware::health::Health::PREPARE_STATE_FAILURE)
+        .unwrap();
+    assert_eq!(recorded.0, before);
+    assert_eq!(recorded.1, before);
+    assert_eq!(store.health("B").consecutive_failures, 1);
+}

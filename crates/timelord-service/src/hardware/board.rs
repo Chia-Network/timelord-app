@@ -453,6 +453,9 @@ impl BoardSupervisor {
         // reliability. Unplugged boards are simply looked for again.
         let delay = if absent {
             self.timing.absent
+        } else if crate::hardware::health::Health::is_prepare_state(&reason) {
+            // A software prepare state is not a board reliability failure.
+            Duration::from_secs(30)
         } else {
             match board
                 .serial

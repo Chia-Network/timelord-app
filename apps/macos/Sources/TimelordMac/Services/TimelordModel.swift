@@ -523,7 +523,11 @@ final class TimelordModel: ObservableObject {
             discoveredDevices=devices
             if actionError == discoveryError { clearActionError() }; discoveryError = nil
             let previousHardware = savedConfiguration.hardware
-            let savedHardware = BoardDiscovery.reconcile(devices,hardware:previousHardware,service:savedConfiguration.service)
+            let identities = (liveStatus?.boards ?? []).map {
+                ServiceBoardIdentity(id: $0.id, name: $0.name, serial: $0.serial, location: $0.deviceLocation)
+            }
+            var savedHardware = BoardDiscovery.reconcile(devices,hardware:previousHardware,service:savedConfiguration.service)
+            savedHardware = BoardDiscovery.adoptingServiceIdentities(savedHardware, identities: identities)
             savedConfiguration.hardware = savedHardware
             if savedHardware != previousHardware { savedConfigurationNeedsPersistence = true }
             // Reuse the same discovered board IDs unless the form has its own
@@ -531,7 +535,9 @@ final class TimelordModel: ObservableObject {
             configuration.hardware = configuration.hardware == previousHardware
                 && configuration.service == savedConfiguration.service
                 ? savedHardware
-                : BoardDiscovery.reconcile(devices,hardware:configuration.hardware,service:configuration.service)
+                : BoardDiscovery.adoptingServiceIdentities(
+                    BoardDiscovery.reconcile(devices,hardware:configuration.hardware,service:configuration.service),
+                    identities: identities)
             // The service owns debounced topology changes, including headless
             // deployments. Discovery must not ask users to restart it manually.
             updateSnapshot()

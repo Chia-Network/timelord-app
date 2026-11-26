@@ -38,6 +38,15 @@ pub struct Health {
 }
 
 impl Health {
+    /// Software prepare state, not a hardware or transport fault. 1.0.2
+    /// recorded this in the safety journal; it must not count toward
+    /// probation or a failure streak.
+    pub const PREPARE_STATE_FAILURE: &'static str = "Automatic capabilities were not prepared";
+
+    pub fn is_prepare_state(reason: &str) -> bool {
+        reason.contains(Self::PREPARE_STATE_FAILURE)
+    }
+
     pub fn validate(&self) -> bool {
         self.recent_failures.len() <= RECENT_LIMIT
             && self
@@ -55,6 +64,9 @@ impl Health {
         }
     }
     pub fn record_failure(&mut self, now: u64, reason: &str) {
+        if Self::is_prepare_state(reason) {
+            return;
+        }
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.recent_failures
             .retain(|&t| now.saturating_sub(t) < RECENT_WINDOW && t <= now);
@@ -110,6 +122,25 @@ impl Health {
     }
     pub fn enable(&mut self) {
         self.disabled_until_unix = None;
+    }
+
+    /// Drop a streak whose last recorded failure was only the Automatic
+    /// prepare state, including journal entries written by 1.0.2. A last
+    /// failure that names real hardware stays untouched.
+    pub fn forgive_prepare_state(&mut self) -> bool {
+        if !self
+            .last_failure
+            .as_deref()
+            .is_some_and(Self::is_prepare_state)
+        {
+            return false;
+        }
+        self.consecutive_failures = 0;
+        self.recent_failures.clear();
+        self.last_failure = None;
+        self.last_failure_unix = 0;
+        self.probation_until_unix = 0;
+        true
     }
 }
 
@@ -188,5 +219,42 @@ mod tests {
         // Records older than a day expire on the next failure.
         health.record_failure(1000 + 2 * RECENT_WINDOW, "late");
         assert_eq!(health.recent_failures.len(), 1);
+    }
+
+    #[test]
+    fn automatic_prepare_state_is_not_a_hardware_failure() {
+        let mut health = Health::default();
+        health.record_failure(100, Health::PREPARE_STATE_FAILURE);
+        health.record_failure(110, "context: Automatic capabilities were not prepared");
+        assert_eq!(health.consecutive_failures, 0);
+        assert!(health.recent_failures.is_empty());
+        assert!(health.last_failure.is_none());
+        assert_eq!(health.tier(110), Tier::Trusted);
+        health.record_failure(200, "lane timed out");
+        assert_eq!(health.consecutive_failures, 1);
+        assert_eq!(health.last_failure.as_deref(), Some("lane timed out"));
+        assert!(!health.forgive_prepare_state());
+        assert_eq!(health.consecutive_failures, 1);
+    }
+
+    #[test]
+    fn successful_prepare_forgives_a_stale_prepare_journal_streak() {
+        // Simulate a 1.0.2 journal that already stored this software fault.
+        let mut health = Health {
+            consecutive_failures: 6,
+            recent_failures: vec![100, 130, 160],
+            last_failure_unix: 160,
+            last_failure: Some(Health::PREPARE_STATE_FAILURE.into()),
+            probation_until_unix: 160 + 7200,
+            ..Default::default()
+        };
+        assert!(health.forgive_prepare_state());
+        assert_eq!(health.consecutive_failures, 0);
+        assert!(health.recent_failures.is_empty());
+        assert!(health.last_failure.is_none());
+        assert_eq!(health.last_failure_unix, 0);
+        assert_eq!(health.probation_until_unix, 0);
+        assert_eq!(health.tier(200), Tier::Trusted);
+        assert!(!health.forgive_prepare_state());
     }
 }

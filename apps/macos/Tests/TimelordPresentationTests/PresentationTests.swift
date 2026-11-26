@@ -837,4 +837,82 @@ extension PresentationTests {
         XCTAssertEqual(LivePresentation.snapshot(status: status, now: now).phase, .waitingForNode)
     }
 
+    func testReconcileAssignsServiceBoardIDsWhenConfigIsEmpty() {
+        let devices = (0..<3).map { DiscoveredDevice(name: "ASIC", location: 4113 + $0, serial: "serial-\($0)") }
+        let hardware = BoardDiscovery.reconcile(devices, hardware: HardwareConfiguration(), service: ServiceConfiguration())
+        XCTAssertEqual(hardware.boards.map(\.id), ["usb-4113", "usb-4114", "usb-4115"])
+        XCTAssertEqual(hardware.boards.map(\.name), ["ASIC 1", "ASIC 2", "ASIC 3"])
+        XCTAssertEqual(hardware.boards.map(\.serial), ["serial-0", "serial-1", "serial-2"])
+    }
+
+    func testAdoptingServiceIdentitiesReplacesMintedBoardIDs() {
+        var hardware = HardwareConfiguration()
+        var minted = ConfiguredBoard(id: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE", name: "ASIC 1", port: 18110, location: 4113)
+        minted.serial = "serial-0"
+        hardware.boards = [minted]
+        hardware.rememberedBoards = [minted]
+        let adopted = BoardDiscovery.adoptingServiceIdentities(hardware, identities: [
+            ServiceBoardIdentity(id: "usb-4113", name: "ASIC 1", serial: "serial-0", location: 4113)
+        ])
+        XCTAssertEqual(adopted.boards.map(\.id), ["usb-4113"])
+        XCTAssertEqual(adopted.boards.map(\.name), ["ASIC 1"])
+        XCTAssertEqual(adopted.rememberedBoards.map(\.id), ["usb-4113"])
+    }
+
+    func testSnapshotDoesNotShowDuplicateCardsForTheSamePhysicalBoard() throws {
+        func status() throws -> ServiceStatus {
+            let boards: [[String: Any]] = (0..<3).map { index in
+                ["id": "usb-\(4113 + index)", "name": "ASIC \(index + 1)", "serial": "serial-\(index)",
+                 "device_location": 4113 + index, "assigned_chains": [Chain.allCases[index].rawValue],
+                 "connected_clients": 1, "hardware_state": "connected",
+                 "latest_proof_unix": 1_000_000, "profile": "Automatic"]
+            }
+            let data: [String: Any] = ["api_version": 1, "service_pid": 42,
+                "timelord_state": "running", "message": "", "production_enabled": true,
+                "started_unix": 999000, "timestamp_unix": 1_000_000, "latest_proof_unix": 1_000_000,
+                "proofs_delivered": 7, "tuning_paused": false, "connected_client_count": 3,
+                "full_node": ["host": "localhost", "state": "ready"], "boards": boards]
+            let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+            return try decoder.decode(ServiceStatus.self, from: JSONSerialization.data(withJSONObject: data))
+        }
+        var config = AppConfiguration()
+        config.hardware.boards = (0..<3).map { index in
+            var board = ConfiguredBoard(
+                id: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEE\(index)",
+                name: "ASIC \(index + 1)", port: 18110 + index, location: 4113 + index)
+            board.serial = "serial-\(index)"
+            return board
+        }
+        let devices = (0..<3).map { DiscoveredDevice(name: "ASIC", location: 4113 + $0, serial: "serial-\($0)") }
+        let snapshot = LivePresentation.snapshot(
+            status: try status(), configuration: config, detectedDevices: devices, now: now)
+        XCTAssertEqual(snapshot.boards.map(\.id), ["usb-4113", "usb-4114", "usb-4115"])
+        XCTAssertEqual(snapshot.boards.count, 3)
+        XCTAssertEqual(snapshot.boards.map(\.name), ["ASIC 1", "ASIC 2", "ASIC 3"])
+    }
+
+    func testPrepareStateFailureDoesNotAdviseCheckingTheCable() throws {
+        let board: [String: Any] = ["id": "usb-4113", "name": "ASIC 1", "assigned_chains": ["challenge"],
+            "connected_clients": 1, "hardware_state": "connected", "profile": "Automatic",
+            "routing_state": "probation", "consecutive_failures": 6, "failures_last_hour": 0,
+            "serial": "serial-0", "last_failure": "Automatic capabilities were not prepared",
+            "latest_proof_unix": 1_000_000]
+        let object: [String: Any] = ["api_version": 2, "service_pid": 42, "timestamp_unix": 1_000_000,
+            "started_unix": 999000, "timelord_state": "running", "message": "Producing proofs",
+            "production_enabled": true, "proofs_delivered": 7, "tuning_paused": false,
+            "latest_proof_unix": 1_000_000,
+            "full_node": ["host": "localhost", "port": 8444, "network": "mainnet", "state": "ready"],
+            "boards": [board]]
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let view = LivePresentation.snapshot(
+            status: try decoder.decode(ServiceStatus.self, from: JSONSerialization.data(withJSONObject: object)),
+            now: now)
+        XCTAssertEqual(view.boards.first?.state, .needsAttention)
+        let text = view.boards.first?.rotationText(at: now)
+        XCTAssertEqual(text, "Still working, but 6 failures in a row (0 in the last hour). Last: Automatic capabilities were not prepared.")
+        XCTAssertFalse(text?.contains("cable") == true)
+        XCTAssertTrue(BoardSnapshot.isPrepareStateFailure("context: Automatic capabilities were not prepared"))
+        XCTAssertFalse(BoardSnapshot.isPrepareStateFailure("Waiting for ASIC client timed out"))
+    }
+
 }

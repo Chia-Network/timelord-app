@@ -153,7 +153,8 @@ public struct BoardSnapshot: Identifiable, Sendable {
                 + (lastFailure.map { ". Last: \($0)" } ?? "")
         case .needsAttention where consecutiveFailures >= 6:
             return "Still working, but \(consecutiveFailures) failures in a row (\(failuresLastHour) in the last hour)"
-                + (lastFailure.map { ". Last: \($0)" } ?? "") + ". Check its cable, hub and power."
+                + (lastFailure.map { ". Last: \($0)" } ?? "")
+                + (BoardSnapshot.isPrepareStateFailure(lastFailure) ? "." : ". Check its cable, hub and power.")
         case .disabled:
             return disabledUntilUnix.map {
                 _ in "Kept out of rotation for about \(remaining(disabledUntilUnix) ?? 0) more min"
@@ -198,6 +199,10 @@ public struct BoardSnapshot: Identifiable, Sendable {
         }
     }
     public var temperatureText: String { temperatureC.map { String(format: "%.1f°C", $0) } ?? "—" }
+    /// Software Automatic prepare state, not a cable or power fault.
+    public static func isPrepareStateFailure(_ reason: String?) -> Bool {
+        reason?.contains("Automatic capabilities were not prepared") == true
+    }
 }
 
 public struct AppSnapshot: Sendable {
@@ -688,7 +693,7 @@ public enum LivePresentation {
         if live != nil {
             for device in detectedDevices ?? [] {
                 guard let board = BoardTopology.matching(device, in: configuration?.hardware.boards ?? []),
-                      !boards.contains(where: { $0.id == board.id }) else { continue }
+                      !boards.contains(where: { Self.samePhysicalBoard($0, configured: board, device: device) }) else { continue }
                 boards.append(BoardSnapshot(
                     id: board.id, name: board.name, state: .waiting, temperatureC: nil,
                     temperatureLimitC: board.temperatureLimitC, profile: board.profileName,
@@ -742,6 +747,15 @@ public enum LivePresentation {
                 ? live.map { max(0, now.timeIntervalSince1970 - $0.startedUnix) }
                 : nil,
             headlineHistory: historyCache.headline(projection: validHistory, boards: boards, now: now))
+    }
+
+    /// Live service boards and configured rows for the same ASIC must not both
+    /// appear, even when the config still holds a minted identifier.
+    static func samePhysicalBoard(_ existing: BoardSnapshot, configured: ConfiguredBoard, device: DiscoveredDevice) -> Bool {
+        if existing.id == configured.id { return true }
+        if let serial = configured.serial ?? device.serial, existing.serial == serial { return true }
+        let location = configured.deviceLocation ?? device.location
+        return existing.id == BoardDiscovery.serviceBoardID(location: location)
     }
 
     /// A fault outranks every phase message except an in-progress Pause.
