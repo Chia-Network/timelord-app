@@ -181,6 +181,18 @@ impl Run {
     }
 }
 
+/// Build the configuration inventory may publish: only the discovered
+/// board list comes from the inventory snapshot. Every other section
+/// (the node profile included) comes from the live configuration so a
+/// replace_node that landed while inventory ran is kept.
+fn config_from_inventory(live: &Config, inventory: Config) -> Config {
+    let mut config = live.clone();
+    config.hardware.boards = hardware::continuous::known_configuration(inventory)
+        .hardware
+        .boards;
+    config
+}
+
 async fn start_run(
     config: Config,
     native: Option<Arc<hardware::Facts>>,
@@ -517,7 +529,7 @@ pub(crate) async fn serve(
         };
         // Inventory failures are never interpreted as unplugged boards.
         if let Ok(candidate) = candidate {
-            let config = hardware::continuous::known_configuration(candidate);
+            let config = config_from_inventory(&run.shared.config, candidate);
             if serde_json::to_value(&config.hardware.boards)?
                 != serde_json::to_value(&run.shared.config.hardware.boards)?
             {
