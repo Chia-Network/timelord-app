@@ -143,6 +143,9 @@ async fn best_known(
 }
 
 pub(super) async fn startup(shared: &Shared, board: &BoardConfig) -> Result<Startup> {
+    if board.profile == ProfileMode::Automatic && shared.native.is_none() {
+        bail!("Automatic capabilities were not prepared");
+    }
     let engines = shared.engines(&board.id).max(1);
     let policy = shared
         .runtime

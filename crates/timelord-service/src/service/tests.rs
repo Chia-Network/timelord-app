@@ -134,7 +134,7 @@ async fn owners_and_routes_survive_inventory_updates_and_a_node_profile_switch()
     // A relocated board is the same owner: nothing is retired.
     let mut moved = run.shared.config.clone();
     moved.hardware.boards[1].device_location = Some(9);
-    run.publish(moved, &current);
+    run.publish(moved, &current).unwrap();
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(!run.tasks.is_empty());
     // A node profile switch keeps board state, restrictions and routes.
@@ -504,6 +504,306 @@ async fn shutdown_during_prepare_leaves_a_lost_safety_journal_absent() {
     .unwrap();
     assert_journal_still_lost(&dir, &config_path);
 }
+async fn loopback_status() -> std::net::SocketAddr {
+    TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap()
+}
+
+fn discovered_devices(count: u32) -> Vec<crate::inventory::Device> {
+    (1..=count)
+        .map(|index| crate::inventory::Device {
+            name: format!("ASIC {index}"),
+            location: index,
+            serial: Some(format!("TL-TEST-{index}")),
+        })
+        .collect()
+}
+
+async fn wait_for(path: &std::path::Path, task: &mut tokio::task::JoinHandle<Result<()>>) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if path.exists() {
+            return true;
+        }
+        if task.is_finished() {
+            task.await
+                .expect("serve task")
+                .expect("serve should keep running until shutdown");
+            return false;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn probe_lines(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+/// Wait for `count` probe lines under paused time. Advances virtual time in
+/// 1ms steps so the I/O driver is polled, without sleeping on the wall clock.
+async fn wait_for_probe_lines(
+    path: &std::path::Path,
+    count: usize,
+    task: &mut tokio::task::JoinHandle<Result<()>>,
+    budget: Duration,
+) -> usize {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let have = probe_lines(path);
+        if have >= count {
+            return have;
+        }
+        if task.is_finished() || tokio::time::Instant::now() >= deadline {
+            return have;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+}
+
+async fn yield_paused(steps: usize) {
+    for _ in 0..steps {
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+}
+
+#[tokio::test]
+async fn shutdown_during_discovered_prepare_returns_promptly() {
+    let dir = fixture_dir("discover-shutdown");
+    let binary = dir.join("client");
+    crate::test_scripts::write_executable_script(
+        &binary,
+        r#"#!/bin/sh
+root=$(dirname "$0")
+echo started >> "$root/started"
+exec sleep 30
+"#,
+    );
+    crate::inventory::fixture::set(binary.clone(), discovered_devices(3));
+    let mut config = Config::default();
+    config.service.status_listen = loopback_status().await;
+    config.hardware.client_binary = Some(binary);
+    let (signal, shutdown) = tokio::sync::oneshot::channel::<()>();
+    let mut task = tokio::spawn(serve(
+        config,
+        dir.join("history.json"),
+        dir.join("config.toml"),
+        false,
+        async {
+            let _ = shutdown.await;
+        },
+    ));
+    assert!(
+        wait_for(&dir.join("started"), &mut task).await,
+        "discovered Automatic boards should start a capability probe"
+    );
+    let started = std::time::Instant::now();
+    let _ = signal.send(());
+    tokio::time::timeout(Duration::from_secs(1), &mut task)
+        .await
+        .expect("shutdown must not wait for the capability probe")
+        .unwrap()
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "serve must stay responsive while a discovered prepare is in flight"
+    );
+    assert!(
+        !dir.join("launches-1").exists(),
+        "Automatic clients must not start without prepared capabilities"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn discovered_prepare_failure_backs_off_before_retrying() {
+    let dir = fixture_dir("discover-backoff");
+    let binary = dir.join("client");
+    crate::test_scripts::write_executable_script(
+        &binary,
+        r#"#!/bin/sh
+root=$(dirname "$0")
+printf 'probe
+' >> "$root/probes"
+exit 1
+"#,
+    );
+    crate::inventory::fixture::set(binary.clone(), discovered_devices(3));
+    let mut config = Config::default();
+    config.service.status_listen = loopback_status().await;
+    config.hardware.client_binary = Some(binary);
+    let (signal, shutdown) = tokio::sync::oneshot::channel::<()>();
+    let mut task = tokio::spawn(serve(
+        config,
+        dir.join("history.json"),
+        dir.join("config.toml"),
+        false,
+        async {
+            let _ = shutdown.await;
+        },
+    ));
+    let probes = dir.join("probes");
+    assert_eq!(
+        wait_for_probe_lines(&probes, 1, &mut task, Duration::from_secs(1)).await,
+        1,
+        "the first discovered prepare should run"
+    );
+    // Let the serve loop observe the failure and start the backoff before
+    // virtual time jumps; otherwise retry_at is stamped after the jump.
+    yield_paused(64).await;
+    tokio::time::advance(DISCOVERY_PREPARE_RETRY - Duration::from_secs(1)).await;
+    yield_paused(64).await;
+    assert_eq!(
+        probe_lines(&probes),
+        1,
+        "a failed prepare must not re-probe during backoff"
+    );
+    tokio::time::advance(Duration::from_secs(6)).await;
+    assert_eq!(
+        wait_for_probe_lines(&probes, 2, &mut task, Duration::from_secs(2)).await,
+        2,
+        "prepare should run again after the backoff"
+    );
+    let _ = signal.send(());
+    yield_paused(32).await;
+    tokio::time::advance(Duration::from_secs(3)).await;
+    yield_paused(32).await;
+    let result = tokio::time::timeout(Duration::from_secs(1), &mut task)
+        .await
+        .expect("shutdown after backoff");
+    result.unwrap().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+async fn automatic_facts(dir: &std::path::Path) -> (Config, Arc<hardware::Facts>) {
+    let binary = dir.join("client");
+    crate::test_scripts::write_executable_script(
+        &binary,
+        r#"#!/bin/sh
+case "$1" in
+ --control-version) echo timelord-live-control-v1; exit 0;;
+ --control-frequencies) echo '[1450,1460]'; exit 0;;
+esac
+exit 1
+"#,
+    );
+    let mut config = Config::default();
+    config.hardware.client_binary = Some(binary);
+    config.hardware.boards = (1..=3)
+        .map(|index| {
+            toml::from_str(&format!(
+                "id='usb-{index}'
+name='ASIC {index}'
+serial='TL-TEST-{index}'
+client_port={}
+device_location={index}
+profile='automatic'",
+                18110 + index
+            ))
+            .unwrap()
+        })
+        .collect();
+    let native = hardware::prepare(&config)
+        .await
+        .unwrap()
+        .expect("prepared capabilities");
+    (config, native)
+}
+
+async fn run_from(dir: &std::path::Path, config: Config) -> (Run, watch::Sender<Arc<Shared>>) {
+    let (node_requests, _node_reloads) = tokio::sync::mpsc::channel(1);
+    let run = start_run(
+        config,
+        None,
+        dir.join("history.json"),
+        Arc::new(safety::Store::open(&dir.join("config.toml")).unwrap()),
+        unix_now(),
+        operational::State::fixture(),
+        node_requests,
+    )
+    .await
+    .unwrap();
+    let (current, _state) = watch::channel(run.shared.clone());
+    (run, current)
+}
+
+fn set_live(
+    run: &mut Run,
+    config: Config,
+    native: Option<Arc<hardware::Facts>>,
+    current: &watch::Sender<Arc<Shared>>,
+) {
+    let previous = &run.shared;
+    let updated = Arc::new(Shared {
+        config,
+        native,
+        clients: previous.clients.clone(),
+        runtime: previous.runtime.clone(),
+        process: previous.process.clone(),
+        scope: previous.scope,
+        started_unix: previous.started_unix,
+        service_started_unix: previous.service_started_unix,
+    });
+    run.owner_updates.send_replace(updated.clone());
+    run.shared = updated.clone();
+    current.send_replace(updated);
+}
+
+#[tokio::test]
+async fn replace_node_during_prepare_keeps_the_new_node() {
+    let dir = fixture_dir("prepare-keeps-node");
+    let (discovered, native) = automatic_facts(&dir).await;
+    let mut config = Config::default();
+    config.hardware.client_binary = discovered.hardware.client_binary.clone();
+    let (mut run, current) = run_from(&dir, config).await;
+    let mut testnet = run.shared.config.clone();
+    testnet.node_mut().network = Network::Testnet11;
+    testnet.node_mut().port = 58444;
+    run.replace_node(testnet, &current).await.unwrap();
+    // A prepare started against the original mainnet + board snapshot completes.
+    run.adopt_prepared_native(Some(native), &current).unwrap();
+    assert_eq!(run.shared.config.node().network, Network::Testnet11);
+    assert_eq!(run.shared.config.node().port, 58444);
+    assert!(
+        run.shared.config.hardware.boards.is_empty(),
+        "prepared snapshot boards must not be published"
+    );
+    assert!(run.shared.native.is_some());
+    run.stop().await.unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn boards_unpublished_during_prepare_stay_unpublished() {
+    let dir = fixture_dir("prepare-keeps-unpub");
+    let (discovered, native) = automatic_facts(&dir).await;
+    let mut empty = Config::default();
+    empty.hardware.client_binary = discovered.hardware.client_binary.clone();
+    let (mut run, current) = run_from(&dir, empty.clone()).await;
+    set_live(&mut run, discovered, None, &current);
+    assert_eq!(run.shared.config.hardware.boards.len(), 3);
+    run.publish(empty, &current).unwrap();
+    assert!(run.shared.config.hardware.boards.is_empty());
+    run.adopt_prepared_native(Some(native), &current).unwrap();
+    assert!(
+        run.shared.config.hardware.boards.is_empty(),
+        "completing prepare must not re-add unpublished boards"
+    );
+    assert!(run.shared.native.is_some());
+    run.stop().await.unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[tokio::test]
 async fn check_hardware_refuses_after_a_failed_start_on_a_lost_journal() {
     let (dir, config_path, history_path, mut config) = lost_journal("lost-check-hardware");

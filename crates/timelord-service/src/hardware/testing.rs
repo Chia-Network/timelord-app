@@ -171,6 +171,59 @@ impl Rig {
             tasks: vec![],
         }
     }
+    /// Visible USB devices, but no configured boards and no prepared
+    /// Automatic capabilities. This is a first start from an empty hardware
+    /// list.
+    pub async fn unconfigured(name: &str, count: u32) -> Self {
+        let mut rig = Self::new(name, count, "automatic", false).await;
+        let mut config = rig.shared.config.clone();
+        config.hardware.boards.clear();
+        let process = rig.shared.process.clone();
+        let runtime = rig.shared.runtime.clone();
+        {
+            let mut state = runtime.lock().expect("runtime");
+            state.boards.clear();
+        }
+        rig.shared = std::sync::Arc::new(crate::Shared::new(
+            None,
+            config,
+            runtime,
+            process,
+            rig.shared.started_unix,
+            rig.shared.service_started_unix,
+        ));
+        rig
+    }
+
+    /// Discover the fixture USB inventory, prepare Automatic capabilities,
+    /// and adopt the resulting board list.
+    pub async fn adopt_discovered_boards(&mut self) {
+        let discovered = crate::inventory::live_configuration(&self.shared)
+            .await
+            .expect("USB discovery");
+        let native = super::prepared_native(&discovered, self.shared.native.clone())
+            .await
+            .expect("prepare discovered Automatic boards");
+        assert!(
+            native.is_some(),
+            "discovered Automatic boards must have prepared capabilities"
+        );
+        {
+            let mut state = self.shared.runtime.lock().expect("runtime");
+            super::restore_lifecycles(&discovered, &mut state.boards, &self.store);
+        }
+        let process = self.shared.process.clone();
+        let runtime = self.shared.runtime.clone();
+        self.shared = std::sync::Arc::new(crate::Shared::new(
+            native,
+            discovered,
+            runtime,
+            process,
+            self.shared.started_unix,
+            self.shared.service_started_unix,
+        ));
+    }
+
     pub fn fast() -> super::board::Timing {
         super::board::Timing {
             restart: [Duration::from_millis(50); 3],
