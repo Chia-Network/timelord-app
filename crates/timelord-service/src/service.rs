@@ -113,6 +113,37 @@ impl Run {
         Ok(())
     }
 
+    /// Install Automatic capabilities on the live configuration. The config
+    /// used to probe is never published here, so a node-profile change or a
+    /// later inventory cannot be overwritten by a snapshot taken at spawn.
+    fn adopt_prepared_native(
+        &mut self,
+        native: Option<Arc<hardware::Facts>>,
+        current: &watch::Sender<Arc<Shared>>,
+    ) -> Result<()> {
+        let Some(native) = native else {
+            bail!("Automatic capabilities were not prepared");
+        };
+        if self.shared.native.is_some() {
+            return Ok(());
+        }
+        let previous = &self.shared;
+        let updated = Arc::new(Shared {
+            config: previous.config.clone(),
+            native: Some(native),
+            clients: previous.clients.clone(),
+            runtime: previous.runtime.clone(),
+            process: previous.process.clone(),
+            scope: previous.scope,
+            started_unix: previous.started_unix,
+            service_started_unix: previous.service_started_unix,
+        });
+        self.owner_updates.send_replace(updated.clone());
+        self.shared = updated.clone();
+        current.send_replace(updated);
+        Ok(())
+    }
+
     /// Replace only the node session. Native owners, routes, learned tuning and
     /// board health stay in place: no board depends on the selected network.
     async fn replace_node(
@@ -280,15 +311,19 @@ fn spawn_http(
 /// inventory cycle.
 pub(crate) const DISCOVERY_PREPARE_RETRY: Duration = Duration::from_secs(30);
 
-type DiscoveryPrepare = tokio::task::JoinHandle<(Config, Result<Option<Arc<hardware::Facts>>>)>;
+type DiscoveryPrepare = tokio::task::JoinHandle<(
+    Option<std::path::PathBuf>,
+    Result<Option<Arc<hardware::Facts>>>,
+)>;
 
 fn spawn_discovery_prepare(
     config: Config,
     current: Option<Arc<hardware::Facts>>,
 ) -> DiscoveryPrepare {
     tokio::spawn(async move {
+        let binary = config.hardware.client_binary.clone();
         let result = hardware::prepared_native(&config, current).await;
-        (config, result)
+        (binary, result)
     })
 }
 
@@ -439,8 +474,12 @@ pub(crate) async fn serve(
             result=async{prepare_task.as_mut().expect("prepare").await}, if prepare_task.is_some()=>{
                 prepare_task.take();
                 match result.context("Automatic capability task failed")? {
-                    (config, Ok(native)) => {
-                        if let Err(error) = run.publish_native(config, native, &current) {
+                    (binary, Ok(native)) => {
+                        if binary != run.shared.config.hardware.client_binary {
+                            tracing::warn!(
+                                "Ignoring Automatic capabilities prepared for a superseded native client"
+                            );
+                        } else if let Err(error) = run.adopt_prepared_native(native, &current) {
                             tracing::warn!(
                                 error = %format!("{error:#}"),
                                 "Automatic capabilities could not be prepared for discovered boards; clients not started"
@@ -450,6 +489,10 @@ pub(crate) async fn serve(
                             );
                         } else {
                             prepare_retry_at = None;
+                            if inventory_task.is_none() {
+                                let shared=run.shared.clone();
+                                inventory_task=Some(tokio::spawn(async move{inventory::live_configuration(&shared).await}));
+                            }
                         }
                     }
                     (_, Err(error)) => {
