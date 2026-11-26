@@ -684,6 +684,14 @@ impl Store {
             return Ok(0);
         }
         let _order = self.update_order.lock().expect("safety writer");
+        let _stage = self.progress.as_ref().map(|p| {
+            p.begin(
+                timelord_supervisor::progress::Resource::Persistence,
+                0,
+                0,
+                timelord_supervisor::progress::Stage::Persistence,
+            )
+        });
         let mut next = self.state.lock().expect("safety").clone();
         let mut changed = 0usize;
         for board in next.boards.values_mut() {

@@ -752,8 +752,10 @@ public enum LivePresentation {
     /// Live service boards and configured rows for the same ASIC must not both
     /// appear, even when the config still holds a minted identifier.
     static func samePhysicalBoard(_ existing: BoardSnapshot, configured: ConfiguredBoard, device: DiscoveredDevice) -> Bool {
+        if let serial = configured.serial ?? device.serial, let live = existing.serial {
+            return live == serial
+        }
         if existing.id == configured.id { return true }
-        if let serial = configured.serial ?? device.serial, existing.serial == serial { return true }
         let location = configured.deviceLocation ?? device.location
         return existing.id == BoardDiscovery.serviceBoardID(location: location)
     }

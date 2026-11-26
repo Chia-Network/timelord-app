@@ -442,7 +442,7 @@ extension PresentationTests {
         hardware=BoardDiscovery.reconcile([],hardware:hardware,service:ServiceConfiguration())
         XCTAssertTrue(hardware.boards.isEmpty);XCTAssertEqual(hardware.rememberedBoards.count,1)
         hardware=BoardDiscovery.reconcile([DiscoveredDevice(name:"Chia VDF A",location:9001,serial:"one")],hardware:hardware,service:ServiceConfiguration())
-        XCTAssertEqual(hardware.boards[0].id,first.id)
+        XCTAssertEqual(hardware.boards[0].id, BoardDiscovery.serviceBoardID(location: 9001))
         XCTAssertEqual(hardware.boards[0].profileName,"Manual")
         XCTAssertEqual(hardware.boards[0].frequencyMhz,1540)
         XCTAssertEqual(hardware.boards[0].deviceLocation,9001)
@@ -913,6 +913,43 @@ extension PresentationTests {
         XCTAssertFalse(text?.contains("cable") == true)
         XCTAssertTrue(BoardSnapshot.isPrepareStateFailure("context: Automatic capabilities were not prepared"))
         XCTAssertFalse(BoardSnapshot.isPrepareStateFailure("Waiting for ASIC client timed out"))
+    }
+
+    func testReconcileDoesNotReuseAMovedBoardsServiceIDForANewBoardAtTheOldPort() {
+        var hardware = HardwareConfiguration()
+        hardware = BoardDiscovery.reconcile(
+            [DiscoveredDevice(name: "ASIC", location: 4113, serial: "serial-0")],
+            hardware: hardware, service: ServiceConfiguration())
+        XCTAssertEqual(hardware.boards.map(\.id), ["usb-4113"])
+        hardware.boards[0].profile = "manual"
+        hardware.boards[0].frequencyMhz = 1540
+        hardware = BoardDiscovery.reconcile(
+            [DiscoveredDevice(name: "ASIC", location: 9001, serial: "serial-0"),
+             DiscoveredDevice(name: "ASIC", location: 4113, serial: "serial-1")],
+            hardware: hardware, service: ServiceConfiguration())
+        XCTAssertEqual(hardware.boards.map(\.id), ["usb-9001", "usb-4113"])
+        XCTAssertEqual(hardware.boards.map(\.serial), ["serial-0", "serial-1"])
+        XCTAssertEqual(hardware.boards[0].profileName, "Manual")
+        XCTAssertEqual(hardware.boards[0].frequencyMhz, 1540)
+        XCTAssertEqual(hardware.boards[1].profileName, "Automatic")
+        XCTAssertEqual(Set(hardware.boards.map(\.id)).count, 2)
+    }
+
+    func testAdoptingServiceIdentitiesDoesNotRewriteADifferentSerialAtTheSameLocation() {
+        var hardware = HardwareConfiguration()
+        var remembered = ConfiguredBoard(id: "usb-4113", name: "ASIC 1", port: 18110, location: 4113)
+        remembered.serial = "serial-0"
+        hardware.rememberedBoards = [remembered]
+        var live = ConfiguredBoard(id: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE", name: "ASIC 2", port: 18111, location: 4113)
+        live.serial = "serial-1"
+        hardware.boards = [live]
+        let adopted = BoardDiscovery.adoptingServiceIdentities(hardware, identities: [
+            ServiceBoardIdentity(id: "usb-4113", name: "ASIC 2", serial: "serial-1", location: 4113)
+        ])
+        XCTAssertEqual(adopted.boards.map(\.id), ["usb-4113"])
+        XCTAssertEqual(adopted.boards.map(\.serial), ["serial-1"])
+        XCTAssertEqual(adopted.rememberedBoards.map(\.id), ["usb-4113"])
+        XCTAssertEqual(adopted.rememberedBoards.map(\.serial), ["serial-0"])
     }
 
 }

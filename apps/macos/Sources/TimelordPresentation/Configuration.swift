@@ -326,6 +326,14 @@ public enum BoardDiscovery {
     /// location and config has no existing owner for it.
     public static func serviceBoardID(location: Int) -> String { "usb-\(location)" }
 
+    /// Same ASIC, even when a stale location-based identifier was later reused
+    /// by a different board at that port. Serial wins; identical IDs only
+    /// count when serials do not disagree.
+    public static func samePhysicalBoard(_ a: ConfiguredBoard, _ b: ConfiguredBoard) -> Bool {
+        if let serial = a.serial, serial == b.serial { return true }
+        return a.id == b.id && (a.serial == nil || b.serial == nil || a.serial == b.serial)
+    }
+
     /// Enrich a metadata-hidden USB row rather than creating another device
     /// with the same location ID. Fresh conflicting inventory wins over status.
     public static func includingManagedOwner(_ owner: DiscoveredDevice, in devices: [DiscoveredDevice]) -> [DiscoveredDevice] {
@@ -360,20 +368,27 @@ public enum BoardDiscovery {
         }
         var remembered=hardware.rememberedBoards
         for board in hardware.boards {
-            remembered.removeAll { $0.id==board.id || (board.serial != nil && $0.serial==board.serial) }
+            remembered.removeAll { samePhysicalBoard($0, board) }
             remembered.append(board)
         }
         let candidates=hardware.boards+remembered
         var selected:[ConfiguredBoard]=[]
         for device in devices.prefix(3) {
             let port=(18110...65535).first { p in !reservedPorts.contains(p) && !selected.contains {$0.clientPort==p} }!
-            var board=BoardTopology.matching(device,in:candidates) ?? ConfiguredBoard(id:serviceBoardID(location:device.location),name:"ASIC \(selected.count+1)",port:port,location:device.location)
+            let serviceID=serviceBoardID(location:device.location)
+            var board=BoardTopology.matching(device,in:candidates) ?? ConfiguredBoard(id:serviceID,name:"ASIC \(selected.count+1)",port:port,location:device.location)
             board.deviceLocation=device.location;board.serial=device.serial ?? board.serial
+            // Location-based service IDs must follow the current port. A board
+            // that kept usb-{old port} after a move would collide with a new
+            // board minted at that port.
+            if board.id != serviceID, board.id.hasPrefix("usb-"), !selected.contains(where: { $0.id == serviceID }) {
+                board.id = serviceID
+            }
             if reservedPorts.contains(board.clientPort) || selected.contains(where:{$0.clientPort==board.clientPort}) {board.clientPort=port}
             selected.append(board)
         }
         result.boards=selected
-        result.rememberedBoards=remembered.filter { old in !selected.contains {$0.id==old.id} }
+        result.rememberedBoards=remembered.filter { old in !selected.contains { samePhysicalBoard($0, old) } }
         return result
     }
 
@@ -383,7 +398,9 @@ public enum BoardDiscovery {
         var result = hardware
         func adopt(_ board: inout ConfiguredBoard) {
             guard let match = identities.first(where: { identity in
-                if let serial = identity.serial, board.serial == serial { return true }
+                if let serial = identity.serial, let existing = board.serial {
+                    return serial == existing
+                }
                 if let location = identity.location, board.deviceLocation == location { return true }
                 return false
             }) else { return }
