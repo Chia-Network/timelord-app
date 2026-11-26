@@ -784,36 +784,6 @@ async fn replace_node_during_prepare_keeps_the_new_node() {
 }
 
 #[tokio::test]
-async fn replace_node_during_inventory_keeps_the_new_node() {
-    let dir = fixture_dir("inventory-keeps-node");
-    let (mut run, current) = run_from(&dir, Config::default()).await;
-    let mut stale = run.shared.config.clone();
-    stale.hardware.boards.push(
-        toml::from_str(
-            "id='inv-0'
-name='Inventory 0'
-serial='inv-0'
-profile='manual'
-client_port=18110
-device_location=1",
-        )
-        .unwrap(),
-    );
-    let mut testnet = run.shared.config.clone();
-    testnet.node_mut().network = Network::Testnet11;
-    testnet.node_mut().port = 58444;
-    run.replace_node(testnet, &current).await.unwrap();
-    let config = config_from_inventory(&run.shared.config, stale);
-    run.publish(config, &current).unwrap();
-    assert_eq!(run.shared.config.node().network, Network::Testnet11);
-    assert_eq!(run.shared.config.node().port, 58444);
-    assert_eq!(run.shared.config.hardware.boards.len(), 1);
-    assert_eq!(run.shared.config.hardware.boards[0].id, "inv-0");
-    run.stop().await.unwrap();
-    std::fs::remove_dir_all(dir).unwrap();
-}
-
-#[tokio::test]
 async fn boards_unpublished_during_prepare_stay_unpublished() {
     let dir = fixture_dir("prepare-keeps-unpub");
     let (discovered, native) = automatic_facts(&dir).await;

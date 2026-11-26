@@ -343,6 +343,34 @@ fn explicit_mapping_keeps_absent_board_while_refreshing_connected_locations() {
     );
 }
 #[test]
+fn replugged_board_restores_its_id_and_profile_from_the_registry() {
+    let mut config = configured();
+    config.hardware.boards[0].profile = timelord_core::ProfileMode::Manual;
+    config.hardware.boards[0].name = "Manual 0".into();
+    // Board 0 is unplugged and a new fourth board takes its place.
+    let first = connected_plan(config, devices(&[1, 2, 3])).unwrap();
+    assert_eq!(first.hardware.boards.len(), 3);
+    assert!(!first.hardware.boards.iter().any(|b| b.id == "b0"));
+    let remembered = first
+        .hardware
+        .remembered_boards
+        .iter()
+        .find(|b| b.id == "b0")
+        .expect("unplugged board stays in the registry");
+    assert_eq!(remembered.profile, timelord_core::ProfileMode::Manual);
+    // The replacement leaves and the original board 0 returns.
+    let second = connected_plan(first, devices(&[0, 1, 2])).unwrap();
+    let restored = second
+        .hardware
+        .boards
+        .iter()
+        .find(|b| b.id == "b0")
+        .expect("the original board keeps its identity when replugged");
+    assert_eq!(restored.profile, timelord_core::ProfileMode::Manual);
+    assert_eq!(restored.serial.as_deref(), Some("serial-0"));
+}
+
+#[test]
 fn hotplug_follows_the_serial_and_never_a_replacement_at_the_old_port() {
     let board =
         toml::from_str("id='a'\nname='A'\nclient_port=18110\ndevice_location=1\nserial='known'")
