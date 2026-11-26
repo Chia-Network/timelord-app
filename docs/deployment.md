@@ -203,9 +203,9 @@ can read the same journal. Pre-supervisor GUI-only builds are not unattended
 rollback targets. Never delete the safety journal to make an incompatible reader
 start; validate the target bundle/state pair on the canary first.
 
-Upgrading from 1.0.1–1.0.3 to 1.0.4 resets legacy safety-journal failure streaks whose
-last recorded failure is the Automatic prepare-state message. The journal does not
-store a reason for each recent failure, so a streak that ends in that software
-message is cleared completely, including any earlier real faults and the probation
-they earned. The migration runs once when the worker opens the journal; a read-only
-inspection leaves the file untouched.
+Upgrading from 1.0.1–1.0.3 to 1.0.4 resets legacy safety-journal failure
+streaks whose last recorded failure is the Automatic prepare-state message. The
+journal does not store a reason for each recent failure, so a streak that ends
+in that software message is cleared completely, including any earlier real
+faults and the probation they earned. The migration runs once when the worker
+opens the journal; a read-only inspection leaves the file untouched.

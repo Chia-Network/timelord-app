@@ -158,13 +158,9 @@ async fn continuous_discovery_restores_a_configured_board_missing_from_inventory
         "the configured board must remain at its new location"
     );
     let _ = signal.send(());
-    yield_paused(64).await;
-    tokio::time::advance(Duration::from_secs(3)).await;
-    yield_paused(64).await;
     await_shutdown(&mut task, Duration::from_secs(10))
         .await
         .expect("shutdown after discovery");
-    await_history_writers(Duration::from_secs(10)).await;
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -234,13 +230,9 @@ async fn startup_promotes_remembered_board_before_the_first_inventory_poll() {
         "the remembered board must be present at startup"
     );
     let _ = signal.send(());
-    yield_paused(64).await;
-    tokio::time::advance(Duration::from_secs(3)).await;
-    yield_paused(64).await;
     await_shutdown(&mut task, Duration::from_secs(10))
         .await
         .expect("shutdown after startup");
-    await_history_writers(Duration::from_secs(10)).await;
     drop(initialization);
     std::fs::remove_dir_all(dir).unwrap();
 }
