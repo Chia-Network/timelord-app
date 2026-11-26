@@ -161,10 +161,10 @@ async fn continuous_discovery_restores_a_configured_board_missing_from_inventory
     yield_paused(64).await;
     tokio::time::advance(Duration::from_secs(3)).await;
     yield_paused(64).await;
-    let result = tokio::time::timeout(Duration::from_secs(1), &mut task)
+    await_shutdown(&mut task, Duration::from_secs(10))
         .await
         .expect("shutdown after discovery");
-    result.unwrap().unwrap();
+    await_history_writers(Duration::from_secs(10)).await;
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -237,10 +237,10 @@ async fn startup_promotes_remembered_board_before_the_first_inventory_poll() {
     yield_paused(64).await;
     tokio::time::advance(Duration::from_secs(3)).await;
     yield_paused(64).await;
-    let result = tokio::time::timeout(Duration::from_secs(1), &mut task)
+    await_shutdown(&mut task, Duration::from_secs(10))
         .await
         .expect("shutdown after startup");
-    result.unwrap().unwrap();
+    await_history_writers(Duration::from_secs(10)).await;
     drop(initialization);
     std::fs::remove_dir_all(dir).unwrap();
 }

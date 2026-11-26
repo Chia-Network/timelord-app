@@ -565,6 +565,37 @@ async fn yield_paused(steps: usize) {
     }
 }
 
+/// Wait in wall-clock time while keeping the runtime busy, so a shutdown that
+/// joins a disk write is not cut short by paused virtual time.
+async fn await_shutdown(
+    task: &mut tokio::task::JoinHandle<Result<()>>,
+    budget: Duration,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if task.is_finished() {
+            return task.await.expect("serve task");
+        }
+        anyhow::ensure!(std::time::Instant::now() < deadline, "shutdown timed out");
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Wait in wall-clock time for the detached history_store final flush to finish
+/// its history.json atomic write. Paused virtual time can expire the production
+/// 2 s flush bound while the OS writer thread is still running, so teardown must
+/// wait for that writer before deleting the fixture directory.
+async fn await_history_writers(budget: Duration) {
+    let deadline = std::time::Instant::now() + budget;
+    while crate::optional_io::history_writers_in_flight() > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "detached history writer did not finish before teardown"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
 #[tokio::test]
 async fn shutdown_during_discovered_prepare_returns_promptly() {
     let dir = fixture_dir("discover-shutdown");
@@ -666,10 +697,10 @@ exit 1
     yield_paused(32).await;
     tokio::time::advance(Duration::from_secs(3)).await;
     yield_paused(32).await;
-    let result = tokio::time::timeout(Duration::from_secs(1), &mut task)
+    await_shutdown(&mut task, Duration::from_secs(10))
         .await
         .expect("shutdown after backoff");
-    result.unwrap().unwrap();
+    await_history_writers(Duration::from_secs(10)).await;
     std::fs::remove_dir_all(dir).unwrap();
 }
 
