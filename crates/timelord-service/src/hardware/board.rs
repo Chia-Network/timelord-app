@@ -393,12 +393,12 @@ impl BoardSupervisor {
     /// apart from a failure: an unplugged board did nothing wrong. Unknown
     /// (discovery failed or ambiguous) still counts, conservatively.
     async fn unplugged(&mut self) -> bool {
-        if self.board.serial.is_none() {
+        if self.board.serial.is_none() || *self.shutdown.borrow() {
             return false;
         }
-        let Some(_initialization) = acquire_initialization(&mut self.shutdown).await else {
-            return false;
-        };
+        // Do not wait on INITIALIZATION here: a delayed observation can see a
+        // later replug and count an unplug as a reliability failure. Enumerate
+        // concurrently with the holder instead of trusting a stale observation.
         let devices = match tokio::time::timeout(
             Duration::from_secs(15),
             crate::inventory::discover(&self.shared.config),
