@@ -337,7 +337,16 @@ impl Topology {
     }
 }
 
-pub async fn live_configuration(shared: &crate::Shared) -> Result<Option<Topology>> {
+pub(crate) fn plan_topology(config: Config, devices: Vec<Device>) -> Result<Topology> {
+    let config = connected_plan(config, devices)?;
+    let config = crate::hardware::continuous::known_configuration(config);
+    Ok(Topology {
+        boards: config.hardware.boards,
+        remembered_boards: config.hardware.remembered_boards,
+    })
+}
+
+pub async fn discover_topology(shared: &crate::Shared) -> Result<Option<Topology>> {
     // Explicit administrator mappings retain their fixed chain ownership.
     if shared.config.hardware.client_binary.is_none()
         || shared.config.hardware.chain_assignments.is_some()
@@ -360,12 +369,7 @@ pub async fn live_configuration(shared: &crate::Shared) -> Result<Option<Topolog
         &shared.runtime.lock().expect("runtime"),
         crate::unix_now(),
     );
-    let config = connected_plan(shared.config.clone(), devices)?;
-    let config = crate::hardware::continuous::known_configuration(config);
-    Ok(Some(Topology {
-        boards: config.hardware.boards,
-        remembered_boards: config.hardware.remembered_boards,
-    }))
+    plan_topology(shared.config.clone(), devices).map(Some)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

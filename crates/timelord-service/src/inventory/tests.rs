@@ -22,7 +22,7 @@ async fn initialization_wait_does_not_arm_discovery_watchdog() {
             .slot(timelord_supervisor::progress::Resource::Topology)
     };
     let initialization = crate::hardware::INITIALIZATION.lock().await;
-    let pending = live_configuration(&shared);
+    let pending = discover_topology(&shared);
     tokio::pin!(pending);
     assert!(
         tokio::time::timeout(Duration::from_millis(20), &mut pending)
@@ -344,14 +344,16 @@ fn explicit_mapping_keeps_absent_board_while_refreshing_connected_locations() {
 }
 #[test]
 fn replugged_board_restores_its_id_and_profile_from_the_registry() {
-    let mut config = configured();
-    config.hardware.boards[0].profile = timelord_core::ProfileMode::Manual;
-    config.hardware.boards[0].name = "Manual 0".into();
+    let mut live = configured();
+    live.hardware.boards[0].profile = timelord_core::ProfileMode::Manual;
+    live.hardware.boards[0].name = "Manual 0".into();
+    live.hardware.remembered_boards.clear();
     // Board 0 is unplugged and a new fourth board takes its place.
-    let first = connected_plan(config, devices(&[1, 2, 3])).unwrap();
-    assert_eq!(first.hardware.boards.len(), 3);
-    assert!(!first.hardware.boards.iter().any(|b| b.id == "b0"));
-    let remembered = first
+    let topology = plan_topology(live.clone(), devices(&[1, 2, 3])).unwrap();
+    live = topology.apply(live);
+    assert_eq!(live.hardware.boards.len(), 3);
+    assert!(!live.hardware.boards.iter().any(|b| b.id == "b0"));
+    let remembered = live
         .hardware
         .remembered_boards
         .iter()
@@ -359,8 +361,9 @@ fn replugged_board_restores_its_id_and_profile_from_the_registry() {
         .expect("unplugged board stays in the registry");
     assert_eq!(remembered.profile, timelord_core::ProfileMode::Manual);
     // The replacement leaves and the original board 0 returns.
-    let second = connected_plan(first, devices(&[0, 1, 2])).unwrap();
-    let restored = second
+    let topology = plan_topology(live.clone(), devices(&[0, 1, 2])).unwrap();
+    live = topology.apply(live);
+    let restored = live
         .hardware
         .boards
         .iter()

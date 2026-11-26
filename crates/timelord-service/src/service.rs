@@ -167,17 +167,14 @@ impl Run {
         if hardware::needs_prepare(&config, self.shared.native.as_ref()) {
             return Ok(Some(config));
         }
-        if let Err(error) = self.publish(config, current) {
-            tracing::warn!(
-                error = %format!("{error:#}"),
-                "Automatic capabilities could not be prepared for discovered boards; clients not started"
-            );
-        }
+        self.publish(config, current)?;
         Ok(None)
     }
 
-    /// Replace only the node session. Native owners, routes, learned tuning and
-    /// board health stay in place: no board depends on the selected network.
+    /// Replace only the node session. Only the node/connection sections of
+    /// `node_profile` are used; hardware and other sections are ignored.
+    /// Native owners, routes, learned tuning and board health stay in place:
+    /// no board depends on the selected network.
     async fn replace_node(
         &mut self,
         node_profile: Config,
@@ -526,7 +523,7 @@ pub(crate) async fn serve(
                             prepare_retry_at = None;
                             if inventory_task.is_none() {
                                 let shared=run.shared.clone();
-                                inventory_task=Some(tokio::spawn(async move{inventory::live_configuration(&shared).await}));
+                                inventory_task=Some(tokio::spawn(async move{inventory::discover_topology(&shared).await}));
                             }
                         }
                     }
@@ -545,7 +542,7 @@ pub(crate) async fn serve(
             _ = poll.tick() => {
                 if inventory_task.is_none() {
                     let shared=run.shared.clone();
-                    inventory_task=Some(tokio::spawn(async move{inventory::live_configuration(&shared).await}));
+                    inventory_task=Some(tokio::spawn(async move{inventory::discover_topology(&shared).await}));
                 }
                 continue;
             }
@@ -711,5 +708,7 @@ pub(crate) async fn shutdown_signal_from(mut term: tokio::signal::unix::Signal) 
 mod inventory_tests;
 #[cfg(test)]
 mod operations_tests;
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;
