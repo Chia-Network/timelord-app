@@ -187,7 +187,7 @@ impl Tuning {
         let facts = shared
             .native
             .as_ref()
-            .context("Automatic capabilities were not prepared")?
+            .ok_or_else(|| anyhow::Error::new(NotPrepared))?
             .clone();
         let learned = facts.learned(&shared.config, board, engines).await?;
         let current = self.policy.point;

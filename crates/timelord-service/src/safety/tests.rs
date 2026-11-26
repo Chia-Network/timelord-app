@@ -532,90 +532,48 @@ fn queued_writer_cannot_replace_the_critical_holders_watchdog() {
 }
 
 #[test]
-fn successful_prepare_forgives_stale_prepare_journal_entries() {
+fn open_forgives_stale_prepare_journal_entries_once() {
     let f = Fixture::new();
-    let store = Store::open(&f.config()).unwrap();
-    store
-        .update_health("A", false, |health| {
-            health.consecutive_failures = 6;
-            health.recent_failures = vec![100, 130, 160];
-            health.last_failure_unix = 160;
-            health.last_failure =
-                Some(crate::hardware::health::Health::PREPARE_STATE_FAILURE.into());
-            health.probation_until_unix = 160 + 7200;
-        })
-        .unwrap();
-    store
-        .update_health("B", false, |health| {
-            health.record_failure(200, "lane timed out");
-        })
-        .unwrap();
-    assert_eq!(store.forgive_prepare_state().unwrap(), 1);
-    let cleared = store.health("A");
+    let journal = {
+        let store = Store::open(&f.config()).unwrap();
+        store
+            .update_health("A", false, |health| {
+                health.consecutive_failures = 6;
+                health.recent_failures = vec![100, 130, 160];
+                health.last_failure_unix = 160;
+                health.last_failure =
+                    Some(crate::hardware::health::Health::PREPARE_STATE_FAILURE.into());
+                health.probation_until_unix = 160 + 7200;
+            })
+            .unwrap();
+        store
+            .update_health("B", false, |health| {
+                health.record_failure(200, "lane timed out");
+            })
+            .unwrap();
+        store.path.clone()
+    };
+    let before = fs::read(&journal).unwrap();
+    let inspected = Store::inspect(&f.config()).unwrap();
+    assert_eq!(inspected.health("A").consecutive_failures, 6);
+    assert_eq!(
+        fs::read(&journal).unwrap(),
+        before,
+        "inspect must not write"
+    );
+    let reopened = Store::open(&f.config()).unwrap();
+    let cleared = reopened.health("A");
     assert_eq!(cleared.consecutive_failures, 0);
     assert!(cleared.last_failure.is_none());
     assert_eq!(cleared.probation_until_unix, 0);
-    let kept = store.health("B");
+    let kept = reopened.health("B");
     assert_eq!(kept.consecutive_failures, 1);
     assert_eq!(kept.last_failure.as_deref(), Some("lane timed out"));
-    assert_eq!(store.forgive_prepare_state().unwrap(), 0);
-    // New prepare-state errors are not written as reliability failures.
-    let before = store.health("B");
-    let recorded = store
-        .record_failure("B", crate::hardware::health::Health::PREPARE_STATE_FAILURE)
-        .unwrap();
-    assert_eq!(recorded.0, before);
-    assert_eq!(recorded.1, before);
-    assert_eq!(store.health("B").consecutive_failures, 1);
-}
-
-#[test]
-fn forgive_prepare_state_uses_the_persistence_watchdog() {
-    let f = Fixture::new();
-    let progress = std::sync::Arc::new(timelord_supervisor::progress::Progress::default());
-    let store = std::sync::Arc::new(
-        Store::open(&f.config())
-            .unwrap()
-            .monitored(progress.clone()),
-    );
-    store
-        .update_health("A", false, |health| {
-            health.consecutive_failures = 6;
-            health.last_failure =
-                Some(crate::hardware::health::Health::PREPARE_STATE_FAILURE.into());
-        })
-        .unwrap();
-    let held = store.state.lock().unwrap();
-    let worker = store.clone();
-    let first = std::thread::spawn(move || worker.forgive_prepare_state());
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    let id = loop {
-        if let Some(work) = progress.snapshot(0, 1).and_then(|snapshot| {
-            snapshot.slot(timelord_supervisor::progress::Resource::Persistence)
-        }) {
-            break work.id;
-        }
-        assert!(std::time::Instant::now() < deadline);
-        std::thread::yield_now();
-    };
-    let second = store.clone();
-    let (started, waiting) = std::sync::mpsc::channel();
-    let second = std::thread::spawn(move || {
-        started.send(()).unwrap();
-        second.record_failure("B", "lane timed out")
-    });
-    waiting.recv().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    assert_eq!(
-        progress
-            .snapshot(0, 2)
-            .unwrap()
-            .slot(timelord_supervisor::progress::Resource::Persistence)
-            .unwrap()
-            .id,
-        id
-    );
-    drop(held);
-    assert_eq!(first.join().unwrap().unwrap(), 1);
-    assert_eq!(second.join().unwrap().unwrap().1.consecutive_failures, 1);
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+    assert_eq!(saved["boards"]["A"]["health"]["consecutive_failures"], 0);
+    assert_eq!(saved["boards"]["B"]["health"]["consecutive_failures"], 1);
+    // A second open finds nothing left to migrate and leaves the file alone.
+    let after = fs::read(&journal).unwrap();
+    Store::open(&f.config()).unwrap();
+    assert_eq!(fs::read(&journal).unwrap(), after);
 }

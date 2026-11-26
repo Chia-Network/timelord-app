@@ -228,6 +228,7 @@ impl Rig {
         super::board::Timing {
             restart: [Duration::from_millis(50); 3],
             absent: Duration::from_millis(100),
+            prepare: Duration::from_millis(50),
             liveness: Duration::from_millis(1500),
             canary: Duration::from_millis(500),
         }

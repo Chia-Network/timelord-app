@@ -4,7 +4,7 @@ use crate::{
     Shared, asic, config_checkpoint, hardware, history_store, inventory, observability,
     operational, private_control, runtime, safety, status_api, unix_now,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -94,7 +94,7 @@ impl Run {
         current: &watch::Sender<Arc<Shared>>,
     ) -> Result<()> {
         if hardware::needs_prepare(&config, native.as_ref()) {
-            bail!("Automatic capabilities were not prepared");
+            return Err(hardware::NotPrepared.into());
         }
         let previous = &self.shared;
         let updated = Arc::new(Shared {
@@ -122,10 +122,9 @@ impl Run {
         current: &watch::Sender<Arc<Shared>>,
     ) -> Result<()> {
         let Some(native) = native else {
-            bail!("Automatic capabilities were not prepared");
+            return Err(hardware::NotPrepared.into());
         };
         if self.shared.native.is_some() {
-            forgive_prepare_journal(&self.shared);
             return Ok(());
         }
         let previous = &self.shared;
@@ -142,7 +141,6 @@ impl Run {
         self.owner_updates.send_replace(updated.clone());
         self.shared = updated.clone();
         current.send_replace(updated);
-        forgive_prepare_journal(&self.shared);
         Ok(())
     }
 
@@ -214,14 +212,6 @@ async fn start_run(
     hardware::restore_lifecycles(&config, &mut runtime.boards, &safety);
     if let Some(reset) = safety.journal_reset() {
         process.metrics.safety_journal_reset(reset);
-    }
-    if native.is_some()
-        && let Err(error) = safety.forgive_prepare_state()
-    {
-        tracing::warn!(
-            error = %format!("{error:#}"),
-            "Could not clear stale Automatic prepare journal entries"
-        );
     }
     runtime.safety = Some(safety);
     process.metrics.register_boards(&config);
@@ -325,25 +315,6 @@ type DiscoveryPrepare = tokio::task::JoinHandle<(
     Option<std::path::PathBuf>,
     Result<Option<Arc<hardware::Facts>>>,
 )>;
-
-fn forgive_prepare_journal(shared: &Shared) {
-    let Some(store) = shared
-        .runtime
-        .lock()
-        .expect("runtime")
-        .safety
-        .as_ref()
-        .cloned()
-    else {
-        return;
-    };
-    if let Err(error) = store.forgive_prepare_state() {
-        tracing::warn!(
-            error = %format!("{error:#}"),
-            "Could not clear stale Automatic prepare journal entries"
-        );
-    }
-}
 
 fn spawn_discovery_prepare(
     config: Config,

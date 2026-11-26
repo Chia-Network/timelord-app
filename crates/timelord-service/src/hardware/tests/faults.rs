@@ -176,6 +176,46 @@ async fn an_absent_board_is_not_a_reliability_failure() {
     rig.shutdown().await;
 }
 
+/// An Automatic board whose capabilities are not prepared stops with a typed
+/// software state. It must not count toward reliability or write a failure
+/// history event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_prepare_state_is_not_a_reliability_failure() {
+    let mut rig = Rig::new("notprep", 1, "automatic", true).await;
+    let config = rig.shared.config.clone();
+    let process = rig.shared.process.clone();
+    let runtime = rig.shared.runtime.clone();
+    let started_unix = rig.shared.started_unix;
+    let service_started_unix = rig.shared.service_started_unix;
+    rig.shared = std::sync::Arc::new(crate::Shared::new(
+        None,
+        config,
+        runtime,
+        process,
+        started_unix,
+        service_started_unix,
+    ));
+    rig.start(Rig::fast());
+    rig.until(10, "the prepare-state stop", |s| {
+        s.boards["b1"]
+            .recovery_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("Automatic capabilities were not prepared"))
+    })
+    .await;
+    let serial = rig.serial(1);
+    assert_eq!(rig.store.health(&serial).consecutive_failures, 0);
+    assert!(
+        rig.shared
+            .process
+            .board_history
+            .events(&serial)
+            .iter()
+            .all(|event| event.kind != "failure")
+    );
+    rig.shutdown().await;
+}
+
 /// Overheating latches a thermal restriction on that board only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn overheating_restricts_only_its_own_board() {

@@ -20,6 +20,7 @@ use crate::{
     runtime::{HardwareState, RawState},
 };
 use anyhow::{Context, Result, bail};
+pub(crate) use board::NotPrepared;
 use board::*;
 pub(crate) use native::INITIALIZATION;
 use native::supervision::NativeSupervision;

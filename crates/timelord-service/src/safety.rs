@@ -308,7 +308,9 @@ fn parse(bytes: &[u8], now: u64) -> Result<Saved> {
 
 impl Store {
     pub fn open(config: &Path) -> Result<Self> {
-        Self::load(config, true)
+        let store = Self::load(config, true)?;
+        store.migrate_prepare_state()?;
+        Ok(store)
     }
     /// Read-only inspection for the explicit hardware check: report a journal
     /// reset without creating, replacing, or archiving the journal.
@@ -458,14 +460,11 @@ impl Store {
         self.transition(serial, relaxing, |_| true, change)
             .map(|_| ())
     }
-    fn transition(
+    fn commit(
         &self,
-        serial: &str,
         relaxing: bool,
-        accepts: impl FnOnce(&Board) -> bool,
-        change: impl FnOnce(&mut Board),
+        change: impl FnOnce(&mut Saved) -> Result<bool>,
     ) -> Result<bool> {
-        ensure!(serial_valid(serial), "Invalid persistent board serial");
         // Only the critical holder owns this watchdog slot. A queued writer
         // cannot replace its ID and reset a stalled transaction's deadline.
         let _order = self.update_order.lock().expect("safety writer");
@@ -478,16 +477,9 @@ impl Store {
             )
         });
         let mut next = self.state.lock().expect("safety").clone();
-        ensure!(
-            next.boards.contains_key(serial) || next.boards.len() < MAX_BOARDS,
-            "Board safety registry is full"
-        );
-        let board = next.boards.entry(serial.into()).or_default();
-        if !accepts(board) {
+        if !change(&mut next)? {
             return Ok(false);
         }
-        change(board);
-        board.updated_unix = crate::unix_now();
         if !relaxing {
             // Publish restrictions before I/O; a relaxation is published only
             // once the complete transaction is durable.
@@ -496,6 +488,28 @@ impl Store {
         self.save(&next)?;
         *self.state.lock().expect("safety") = next;
         Ok(true)
+    }
+    fn transition(
+        &self,
+        serial: &str,
+        relaxing: bool,
+        accepts: impl FnOnce(&Board) -> bool,
+        change: impl FnOnce(&mut Board),
+    ) -> Result<bool> {
+        ensure!(serial_valid(serial), "Invalid persistent board serial");
+        self.commit(relaxing, |next| {
+            ensure!(
+                next.boards.contains_key(serial) || next.boards.len() < MAX_BOARDS,
+                "Board safety registry is full"
+            );
+            let board = next.boards.entry(serial.into()).or_default();
+            if !accepts(board) {
+                return Ok(false);
+            }
+            change(board);
+            board.updated_unix = crate::unix_now();
+            Ok(true)
+        })
     }
     pub(crate) fn policy(&self, board: &timelord_core::BoardConfig) -> Policy {
         board
@@ -647,10 +661,6 @@ impl Store {
     /// Reliability updates. A failure is restrictive and published before I/O.
     /// Returns the health from before and after this one transaction.
     pub fn record_failure(&self, serial: &str, reason: &str) -> Result<(Health, Health)> {
-        if crate::hardware::health::Health::is_prepare_state(reason) {
-            let health = self.health(serial);
-            return Ok((health.clone(), health));
-        }
         if self.keep_health {
             let health = self.health(serial);
             return Ok((health.clone(), health));
@@ -677,35 +687,24 @@ impl Store {
             |b| b.health = previous,
         )
     }
-    /// After Automatic capabilities are prepared, drop journal streaks whose
-    /// last failure was only that software prepare state.
-    pub fn forgive_prepare_state(&self) -> Result<usize> {
-        if self.keep_health {
-            return Ok(0);
-        }
-        let _order = self.update_order.lock().expect("safety writer");
-        let _stage = self.progress.as_ref().map(|p| {
-            p.begin(
-                timelord_supervisor::progress::Resource::Persistence,
-                0,
-                0,
-                timelord_supervisor::progress::Stage::Persistence,
-            )
-        });
-        let mut next = self.state.lock().expect("safety").clone();
-        let mut changed = 0usize;
-        for board in next.boards.values_mut() {
-            if board.health.forgive_prepare_state() {
-                board.updated_unix = crate::unix_now();
-                changed += 1;
+    /// One-time migration for legacy journals: a streak whose last failure is
+    /// only the Automatic prepare-state message is reset. The journal stores no
+    /// reason per recent-failure entry, so a 1.0.2 streak that ends in that
+    /// message loses its earlier real faults and the probation they earned;
+    /// trailing-only decrement is impossible. This runs once per production
+    /// open, never for a read-only inspection.
+    fn migrate_prepare_state(&self) -> Result<()> {
+        self.commit(true, |next| {
+            let mut changed = false;
+            for board in next.boards.values_mut() {
+                if board.health.forgive_prepare_state() {
+                    board.updated_unix = crate::unix_now();
+                    changed = true;
+                }
             }
-        }
-        if changed == 0 {
-            return Ok(0);
-        }
-        self.save(&next)?;
-        *self.state.lock().expect("safety") = next;
-        Ok(changed)
+            Ok(changed)
+        })?;
+        Ok(())
     }
     pub fn update_health(
         &self,

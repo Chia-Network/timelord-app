@@ -64,9 +64,6 @@ impl Health {
         }
     }
     pub fn record_failure(&mut self, now: u64, reason: &str) {
-        if Self::is_prepare_state(reason) {
-            return;
-        }
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.recent_failures
             .retain(|&t| now.saturating_sub(t) < RECENT_WINDOW && t <= now);
@@ -222,19 +219,24 @@ mod tests {
     }
 
     #[test]
-    fn automatic_prepare_state_is_not_a_hardware_failure() {
+    fn prepare_state_text_is_counted_and_legacy_journals_can_still_be_forgiven() {
+        // The supervisor classifies a typed NotPrepared stop before recording
+        // health; record_failure itself no longer interprets the message.
         let mut health = Health::default();
         health.record_failure(100, Health::PREPARE_STATE_FAILURE);
         health.record_failure(110, "context: Automatic capabilities were not prepared");
+        assert_eq!(health.consecutive_failures, 2);
+        assert_eq!(
+            health.last_failure.as_deref(),
+            Some("context: Automatic capabilities were not prepared")
+        );
+        assert_eq!(health.tier(110), Tier::Probation);
+        // Legacy 1.0.2 journals are cleared once when the store opens.
+        assert!(health.forgive_prepare_state());
         assert_eq!(health.consecutive_failures, 0);
         assert!(health.recent_failures.is_empty());
         assert!(health.last_failure.is_none());
-        assert_eq!(health.tier(110), Tier::Trusted);
-        health.record_failure(200, "lane timed out");
-        assert_eq!(health.consecutive_failures, 1);
-        assert_eq!(health.last_failure.as_deref(), Some("lane timed out"));
         assert!(!health.forgive_prepare_state());
-        assert_eq!(health.consecutive_failures, 1);
     }
 
     #[test]
