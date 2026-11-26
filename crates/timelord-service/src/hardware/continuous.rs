@@ -59,9 +59,16 @@ pub(super) async fn retire_stale_groups(
 }
 
 pub(crate) fn known_configuration(mut config: Config) -> Config {
+    let reserved = config.service.reserved_ports();
     for board in config.hardware.remembered_boards.clone() {
         if config.hardware.boards.len() < 3
             && !config.hardware.boards.iter().any(|b| b.id == board.id)
+            && !reserved.contains(&board.client_port)
+            && !config
+                .hardware
+                .boards
+                .iter()
+                .any(|b| b.client_port == board.client_port)
         {
             config.hardware.boards.push(board);
         }

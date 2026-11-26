@@ -850,13 +850,12 @@ extension PresentationTests {
         var minted = ConfiguredBoard(id: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE", name: "ASIC 1", port: 18110, location: 4113)
         minted.serial = "serial-0"
         hardware.boards = [minted]
-        hardware.rememberedBoards = [minted]
         let adopted = BoardDiscovery.adoptingServiceIdentities(hardware, identities: [
             ServiceBoardIdentity(id: "usb-4113", name: "ASIC 1", serial: "serial-0", location: 4113)
         ])
         XCTAssertEqual(adopted.boards.map(\.id), ["usb-4113"])
         XCTAssertEqual(adopted.boards.map(\.name), ["ASIC 1"])
-        XCTAssertEqual(adopted.rememberedBoards.map(\.id), ["usb-4113"])
+        XCTAssertTrue(adopted.rememberedBoards.isEmpty)
     }
 
     func testSnapshotDoesNotShowDuplicateCardsForTheSamePhysicalBoard() throws {
@@ -891,30 +890,6 @@ extension PresentationTests {
         XCTAssertEqual(snapshot.boards.map(\.name), ["ASIC 1", "ASIC 2", "ASIC 3"])
     }
 
-    func testPrepareStateFailureDoesNotAdviseCheckingTheCable() throws {
-        let board: [String: Any] = ["id": "usb-4113", "name": "ASIC 1", "assigned_chains": ["challenge"],
-            "connected_clients": 1, "hardware_state": "connected", "profile": "Automatic",
-            "routing_state": "probation", "consecutive_failures": 6, "failures_last_hour": 0,
-            "serial": "serial-0", "last_failure": "Automatic capabilities were not prepared",
-            "latest_proof_unix": 1_000_000]
-        let object: [String: Any] = ["api_version": 2, "service_pid": 42, "timestamp_unix": 1_000_000,
-            "started_unix": 999000, "timelord_state": "running", "message": "Producing proofs",
-            "production_enabled": true, "proofs_delivered": 7, "tuning_paused": false,
-            "latest_proof_unix": 1_000_000,
-            "full_node": ["host": "localhost", "port": 8444, "network": "mainnet", "state": "ready"],
-            "boards": [board]]
-        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
-        let view = LivePresentation.snapshot(
-            status: try decoder.decode(ServiceStatus.self, from: JSONSerialization.data(withJSONObject: object)),
-            now: now)
-        XCTAssertEqual(view.boards.first?.state, .needsAttention)
-        let text = view.boards.first?.rotationText(at: now)
-        XCTAssertEqual(text, "Still working, but 6 failures in a row (0 in the last hour). Last: Automatic capabilities were not prepared.")
-        XCTAssertFalse(text?.contains("cable") == true)
-        XCTAssertTrue(BoardSnapshot.isPrepareStateFailure("context: Automatic capabilities were not prepared"))
-        XCTAssertFalse(BoardSnapshot.isPrepareStateFailure("Waiting for ASIC client timed out"))
-    }
-
     func testReconcileDoesNotReuseAMovedBoardsServiceIDForANewBoardAtTheOldPort() {
         var hardware = HardwareConfiguration()
         hardware = BoardDiscovery.reconcile(
@@ -927,7 +902,7 @@ extension PresentationTests {
             [DiscoveredDevice(name: "ASIC", location: 9001, serial: "serial-0"),
              DiscoveredDevice(name: "ASIC", location: 4113, serial: "serial-1")],
             hardware: hardware, service: ServiceConfiguration())
-        XCTAssertEqual(hardware.boards.map(\.id), ["usb-9001", "usb-4113"])
+        XCTAssertEqual(hardware.boards.map(\.id), ["usb-4113", "usb-4113-1"])
         XCTAssertEqual(hardware.boards.map(\.serial), ["serial-0", "serial-1"])
         XCTAssertEqual(hardware.boards[0].profileName, "Manual")
         XCTAssertEqual(hardware.boards[0].frequencyMhz, 1540)
@@ -946,10 +921,12 @@ extension PresentationTests {
         let adopted = BoardDiscovery.adoptingServiceIdentities(hardware, identities: [
             ServiceBoardIdentity(id: "usb-4113", name: "ASIC 2", serial: "serial-1", location: 4113)
         ])
-        XCTAssertEqual(adopted.boards.map(\.id), ["usb-4113"])
+        XCTAssertEqual(adopted.boards.map(\.id), ["AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"])
         XCTAssertEqual(adopted.boards.map(\.serial), ["serial-1"])
         XCTAssertEqual(adopted.rememberedBoards.map(\.id), ["usb-4113"])
         XCTAssertEqual(adopted.rememberedBoards.map(\.serial), ["serial-0"])
+        let ids = adopted.boards.map(\.id) + adopted.rememberedBoards.map(\.id)
+        XCTAssertEqual(Set(ids).count, ids.count)
     }
 
 }

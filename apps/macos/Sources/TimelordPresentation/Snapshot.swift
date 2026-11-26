@@ -154,7 +154,7 @@ public struct BoardSnapshot: Identifiable, Sendable {
         case .needsAttention where consecutiveFailures >= 6:
             return "Still working, but \(consecutiveFailures) failures in a row (\(failuresLastHour) in the last hour)"
                 + (lastFailure.map { ". Last: \($0)" } ?? "")
-                + (BoardSnapshot.isPrepareStateFailure(lastFailure) ? "." : ". Check its cable, hub and power.")
+                + ". Check its cable, hub and power."
         case .disabled:
             return disabledUntilUnix.map {
                 _ in "Kept out of rotation for about \(remaining(disabledUntilUnix) ?? 0) more min"
@@ -199,10 +199,6 @@ public struct BoardSnapshot: Identifiable, Sendable {
         }
     }
     public var temperatureText: String { temperatureC.map { String(format: "%.1f°C", $0) } ?? "—" }
-    /// Software Automatic prepare state, not a cable or power fault.
-    public static func isPrepareStateFailure(_ reason: String?) -> Bool {
-        reason?.contains("Automatic capabilities were not prepared") == true
-    }
 }
 
 public struct AppSnapshot: Sendable {
@@ -756,8 +752,8 @@ public enum LivePresentation {
             return live == serial
         }
         if existing.id == configured.id { return true }
-        let location = configured.deviceLocation ?? device.location
-        return existing.id == BoardDiscovery.serviceBoardID(location: location)
+        guard existing.serial == nil else { return false }
+        return existing.id == BoardDiscovery.serviceBoardID(location: device.location)
     }
 
     /// A fault outranks every phase message except an in-progress Pause.

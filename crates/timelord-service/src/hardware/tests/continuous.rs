@@ -95,6 +95,63 @@ fn port_available(port: u16) -> bool {
     std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
 
+#[test]
+fn a_remembered_board_does_not_reclaim_a_port_taken_by_a_new_board() {
+    let b0: BoardConfig = toml::from_str(
+        "id='b0'\nname='B0'\nserial='serial-0'\nprofile='automatic'\ndevice_location=1\nclient_port=18110",
+    )
+    .unwrap();
+    let b1: BoardConfig = toml::from_str(
+        "id='b1'\nname='B1'\nserial='serial-1'\nprofile='manual'\ndevice_location=2\nclient_port=18111\nfrequency_mhz=1500\nvoltage_v=0.95",
+    )
+    .unwrap();
+    let mut config = Config::default();
+    config.hardware.boards = vec![b0, b1.clone()];
+    let devices = vec![
+        crate::inventory::Device {
+            name: "ASIC 1".into(),
+            location: 1,
+            serial: Some("serial-0".into()),
+        },
+        crate::inventory::Device {
+            name: "ASIC 2".into(),
+            location: 4,
+            serial: Some("serial-2".into()),
+        },
+    ];
+    let planned = crate::inventory::connected_plan(config, devices).unwrap();
+    let config = continuous::known_configuration(planned);
+    config.validate().unwrap();
+    let ports: std::collections::BTreeSet<_> = config
+        .hardware
+        .boards
+        .iter()
+        .map(|board| board.client_port)
+        .collect();
+    assert_eq!(ports.len(), config.hardware.boards.len());
+    let new_board = config
+        .hardware
+        .boards
+        .iter()
+        .find(|board| board.serial.as_deref() == Some("serial-2"))
+        .expect("the newly plugged board stays configured");
+    assert_eq!(new_board.id, "usb-4");
+    assert!(
+        config.hardware.boards.iter().all(|board| board.id != "b1"),
+        "the unplugged board must not collide with the new board's port"
+    );
+    let remembered = config
+        .hardware
+        .remembered_boards
+        .iter()
+        .find(|board| board.id == "b1")
+        .expect("the unplugged board stays remembered");
+    assert_eq!(remembered.client_port, b1.client_port);
+    assert_eq!(remembered.profile, b1.profile);
+    assert_eq!(remembered.frequency_mhz, b1.frequency_mhz);
+    assert_eq!(remembered.voltage_v, b1.voltage_v);
+}
+
 async fn wait_until(message: &str, condition: impl Fn() -> bool) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while !condition() {

@@ -362,3 +362,192 @@ fn hotplug_follows_the_serial_and_never_a_replacement_at_the_old_port() {
     assert_eq!(board_location(&board, &[other, moved.clone()]).unwrap(), 9);
     assert!(board_location(&board, &[moved.clone(), moved]).is_err());
 }
+
+#[test]
+fn a_replacement_at_the_old_location_never_overwrites_the_remembered_board() {
+    let x: timelord_core::BoardConfig = toml::from_str(
+        "id='usb-4'\nname='Old board'\nserial='serial-0'\nprofile='manual'\ndevice_location=4\nclient_port=18110\nfrequency_mhz=1500\nvoltage_v=0.95",
+    )
+    .unwrap();
+    let collided: timelord_core::BoardConfig = toml::from_str(
+        "id='usb-4'\nname='Replacement board'\nserial='serial-1'\nprofile='automatic'\ndevice_location=4\nclient_port=18111",
+    )
+    .unwrap();
+    let mut collision = Config::default();
+    collision.hardware.remembered_boards = vec![x.clone()];
+    collision.hardware.boards = vec![collided];
+    let collision = connected_plan(
+        collision,
+        vec![Device {
+            name: "ASIC 2".into(),
+            location: 4,
+            serial: Some("serial-1".into()),
+        }],
+    )
+    .expect("a pre-existing id collision must not break discovery");
+    let preserved = collision
+        .hardware
+        .remembered_boards
+        .iter()
+        .find(|board| board.serial.as_deref() == Some("serial-0"))
+        .expect("the remembered board survives a same-id collision");
+    assert_eq!(preserved.id, "usb-4");
+    assert_eq!(preserved.serial.as_deref(), Some("serial-0"));
+    assert_eq!(preserved.profile, timelord_core::ProfileMode::Manual);
+    assert_eq!(preserved.frequency_mhz, x.frequency_mhz);
+    assert_eq!(preserved.voltage_v, x.voltage_v);
+
+    let mut config = Config::default();
+    config.hardware.boards = vec![x.clone()];
+    let y = Device {
+        name: "ASIC 2".into(),
+        location: 4,
+        serial: Some("serial-1".into()),
+    };
+    let mut plan = connected_plan(config, vec![y.clone()]).unwrap();
+    plan = connected_plan(plan, vec![y.clone()]).unwrap();
+    let remembered = plan
+        .hardware
+        .remembered_boards
+        .iter()
+        .find(|board| board.serial.as_deref() == Some("serial-0"))
+        .expect("the unplugged board keeps its remembered identity");
+    assert_eq!(remembered.id, "usb-4");
+    assert_eq!(remembered.profile, timelord_core::ProfileMode::Manual);
+    assert_eq!(remembered.frequency_mhz, x.frequency_mhz);
+    assert_eq!(remembered.voltage_v, x.voltage_v);
+    let live = plan
+        .hardware
+        .boards
+        .iter()
+        .find(|board| board.serial.as_deref() == Some("serial-1"))
+        .expect("the replacement board is live");
+    assert_eq!(live.id, "usb-4-1");
+    assert_eq!(live.profile, timelord_core::ProfileMode::Automatic);
+
+    let next = connected_plan(
+        plan,
+        vec![
+            y,
+            Device {
+                name: "ASIC 1".into(),
+                location: 5,
+                serial: Some("serial-0".into()),
+            },
+        ],
+    )
+    .unwrap();
+    let restored = next
+        .hardware
+        .boards
+        .iter()
+        .find(|board| board.serial.as_deref() == Some("serial-0"))
+        .expect("the original board returns");
+    assert_eq!(restored.id, "usb-4");
+    assert_eq!(restored.profile, timelord_core::ProfileMode::Manual);
+    assert_eq!(restored.frequency_mhz, x.frequency_mhz);
+    assert_eq!(restored.device_location, Some(5));
+    assert!(next.hardware.boards.iter().all(|board| board.id != "usb-5"));
+}
+
+#[derive(serde::Deserialize)]
+struct IdentityVectors {
+    vectors: Vec<IdentityVector>,
+}
+#[derive(serde::Deserialize)]
+struct IdentityVector {
+    name: String,
+    #[serde(default)]
+    boards: Vec<VectorBoard>,
+    #[serde(default)]
+    remembered_boards: Vec<VectorBoard>,
+    devices: Vec<VectorDevice>,
+    expected_boards: Vec<VectorBoard>,
+    #[serde(default)]
+    expected_remembered_boards: Option<Vec<VectorBoard>>,
+}
+#[derive(serde::Deserialize)]
+struct VectorBoard {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    client_port: Option<u16>,
+    #[serde(default)]
+    device_location: Option<u32>,
+    #[serde(default)]
+    serial: Option<String>,
+}
+#[derive(serde::Deserialize)]
+struct VectorDevice {
+    #[serde(default)]
+    name: Option<String>,
+    location: u32,
+    #[serde(default)]
+    serial: Option<String>,
+}
+
+fn vector_board(board: &VectorBoard, index: usize) -> timelord_core::BoardConfig {
+    let mut toml = format!(
+        "id='{}'\nname='{}'\nclient_port={}\ndevice_location={}\nprofile='automatic'",
+        board.id,
+        board
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("ASIC {}", index + 1)),
+        board.client_port.unwrap_or(18110 + index as u16),
+        board.device_location.unwrap_or_else(|| index as u32 + 1)
+    );
+    if let Some(serial) = &board.serial {
+        toml.push_str(&format!("\nserial='{serial}'"));
+    }
+    toml::from_str(&toml).unwrap()
+}
+fn assert_boards(actual: &[timelord_core::BoardConfig], expected: &[VectorBoard], name: &str) {
+    assert_eq!(actual.len(), expected.len(), "{name}");
+    for (board, expected) in actual.iter().zip(expected) {
+        assert_eq!(board.id, expected.id, "{name}");
+        assert_eq!(board.serial, expected.serial, "{name}");
+        assert_eq!(board.device_location, expected.device_location, "{name}");
+    }
+}
+#[test]
+fn shared_board_identity_vectors_match_the_service_plan() {
+    let vectors: IdentityVectors = serde_json::from_str(include_str!(
+        "../../../../tests/board-identity-vectors.json"
+    ))
+    .unwrap();
+    for vector in vectors.vectors {
+        let mut config = Config::default();
+        config.hardware.boards = vector
+            .boards
+            .iter()
+            .enumerate()
+            .map(|(index, board)| vector_board(board, index))
+            .collect();
+        config.hardware.remembered_boards = vector
+            .remembered_boards
+            .iter()
+            .enumerate()
+            .map(|(index, board)| vector_board(board, index))
+            .collect();
+        let devices = vector
+            .devices
+            .iter()
+            .map(|device| Device {
+                name: device.name.clone().unwrap_or_else(|| "ASIC".into()),
+                location: device.location,
+                serial: device.serial.clone(),
+            })
+            .collect();
+        let plan = connected_plan(config, devices)
+            .unwrap_or_else(|error| panic!("{}: {error:#}", vector.name));
+        assert_boards(&plan.hardware.boards, &vector.expected_boards, &vector.name);
+        let ids: Vec<_> = plan.hardware.boards.iter().map(|b| &b.id).collect();
+        let unique: std::collections::BTreeSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "{}", vector.name);
+        if let Some(expected) = vector.expected_remembered_boards {
+            assert_boards(&plan.hardware.remembered_boards, &expected, &vector.name);
+        }
+    }
+}

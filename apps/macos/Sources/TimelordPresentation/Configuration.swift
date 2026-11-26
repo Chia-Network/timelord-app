@@ -326,6 +326,16 @@ public enum BoardDiscovery {
     /// location and config has no existing owner for it.
     public static func serviceBoardID(location: Int) -> String { "usb-\(location)" }
 
+    /// Same algorithm as the service's `free_usb_id`: the base location form,
+    /// then `-1`, `-2`, ... until the identifier is unused.
+    public static func freeServiceBoardID(location: Int, usedIDs: Set<String>) -> String {
+        let base = serviceBoardID(location: location)
+        if !usedIDs.contains(base) { return base }
+        var n = 1
+        while usedIDs.contains("\(base)-\(n)") { n += 1 }
+        return "\(base)-\(n)"
+    }
+
     /// Same ASIC, even when a stale location-based identifier was later reused
     /// by a different board at that port. Serial wins; identical IDs only
     /// count when serials do not disagree.
@@ -372,20 +382,22 @@ public enum BoardDiscovery {
             remembered.append(board)
         }
         let candidates=hardware.boards+remembered
+        var usedIDs=Set(candidates.map(\.id))
         var selected:[ConfiguredBoard]=[]
         for device in devices.prefix(3) {
             let port=(18110...65535).first { p in !reservedPorts.contains(p) && !selected.contains {$0.clientPort==p} }!
-            let serviceID=serviceBoardID(location:device.location)
-            var board=BoardTopology.matching(device,in:candidates) ?? ConfiguredBoard(id:serviceID,name:"ASIC \(selected.count+1)",port:port,location:device.location)
-            board.deviceLocation=device.location;board.serial=device.serial ?? board.serial
-            // Location-based service IDs must follow the current port. A board
-            // that kept usb-{old port} after a move would collide with a new
-            // board minted at that port.
-            if board.id != serviceID, board.id.hasPrefix("usb-"), !selected.contains(where: { $0.id == serviceID }) {
-                board.id = serviceID
+            if var board=BoardTopology.matching(device,in:candidates) {
+                board.deviceLocation=device.location;board.serial=device.serial ?? board.serial
+                if reservedPorts.contains(board.clientPort) || selected.contains(where:{$0.clientPort==board.clientPort}) {board.clientPort=port}
+                usedIDs.insert(board.id)
+                selected.append(board)
+            } else {
+                let id=freeServiceBoardID(location:device.location,usedIDs:usedIDs)
+                var board=ConfiguredBoard(id:id,name:"ASIC \(selected.count+1)",port:port,location:device.location)
+                board.serial=device.serial
+                usedIDs.insert(id)
+                selected.append(board)
             }
-            if reservedPorts.contains(board.clientPort) || selected.contains(where:{$0.clientPort==board.clientPort}) {board.clientPort=port}
-            selected.append(board)
         }
         result.boards=selected
         result.rememberedBoards=remembered.filter { old in !selected.contains { samePhysicalBoard($0, old) } }
@@ -396,19 +408,21 @@ public enum BoardDiscovery {
     /// board is already present in configuration under a different identifier.
     public static func adoptingServiceIdentities(_ hardware: HardwareConfiguration, identities: [ServiceBoardIdentity]) -> HardwareConfiguration {
         var result = hardware
-        func adopt(_ board: inout ConfiguredBoard) {
+        for index in result.boards.indices {
             guard let match = identities.first(where: { identity in
-                if let serial = identity.serial, let existing = board.serial {
+                if let serial = identity.serial, let existing = result.boards[index].serial {
                     return serial == existing
                 }
-                if let location = identity.location, board.deviceLocation == location { return true }
+                if let location = identity.location, result.boards[index].deviceLocation == location { return true }
                 return false
-            }) else { return }
-            board.id = match.id
-            if board.name.hasPrefix("ASIC ") { board.name = match.name }
+            }) else { continue }
+            let inUse = result.boards.indices.contains { other in
+                other != index && result.boards[other].id == match.id
+            } || result.rememberedBoards.contains { $0.id == match.id }
+            guard !inUse else { continue }
+            result.boards[index].id = match.id
+            if result.boards[index].name.hasPrefix("ASIC ") { result.boards[index].name = match.name }
         }
-        for index in result.boards.indices { adopt(&result.boards[index]) }
-        for index in result.rememberedBoards.indices { adopt(&result.rememberedBoards[index]) }
         return result
     }
 }
