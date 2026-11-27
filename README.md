@@ -194,9 +194,9 @@ need a supervised restart. Start-at-login service registration is not implemente
 24 hours and restored after service restarts, with downtime shown as gaps. Current
 uptime and proof counts start fresh for each service run, and proof counts also
 for each node-profile switch. Board reliability (failure streaks, probation and
-safety restrictions) is saved per serial and survives restarts. The 1.0.3 to 1.0.4
-upgrade clears legacy streaks whose last failure is the Automatic prepare-state
-message; see [deployment](docs/deployment.md#upgrade-and-rollback-procedure).
+safety restrictions) is saved per serial and survives restarts. The 1.0.1–1.0.3 to
+1.0.4 upgrade clears legacy streaks whose last failure is the Automatic
+prepare-state message; see [deployment](docs/deployment.md#upgrade-and-rollback-procedure).
 
 See [architecture](docs/architecture.md) for process ownership, proof verification
 and tuning behavior. Licensed under [Apache-2.0](LICENSE); dependencies retain their

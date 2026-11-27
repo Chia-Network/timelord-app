@@ -565,6 +565,23 @@ async fn yield_paused(steps: usize) {
     }
 }
 
+/// Wait on a wall-clock budget while yielding, so virtual time stays frozen and
+/// the production 2 s flush bound is not tripped by a paused-clock jump. This
+/// lets serve() finish its bounded flush before teardown.
+async fn await_shutdown(
+    task: &mut tokio::task::JoinHandle<Result<()>>,
+    budget: Duration,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if task.is_finished() {
+            return task.await.expect("serve task");
+        }
+        anyhow::ensure!(std::time::Instant::now() < deadline, "shutdown timed out");
+        tokio::task::yield_now().await;
+    }
+}
+
 #[tokio::test]
 async fn shutdown_during_discovered_prepare_returns_promptly() {
     let dir = fixture_dir("discover-shutdown");
@@ -663,13 +680,9 @@ exit 1
         "prepare should run again after the backoff"
     );
     let _ = signal.send(());
-    yield_paused(32).await;
-    tokio::time::advance(Duration::from_secs(3)).await;
-    yield_paused(32).await;
-    let result = tokio::time::timeout(Duration::from_secs(1), &mut task)
+    await_shutdown(&mut task, Duration::from_secs(10))
         .await
         .expect("shutdown after backoff");
-    result.unwrap().unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -862,3 +875,5 @@ async fn reload_node_accepts_only_saved_node_changes_from_the_real_config_file()
     run.stop().await.unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+mod discovery;

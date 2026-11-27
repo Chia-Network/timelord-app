@@ -383,6 +383,9 @@ public enum BoardDiscovery {
         }
         let candidates=hardware.boards+remembered
         var usedIDs=Set(candidates.map(\.id))
+        // This considers only the first three devices; the service keeps every
+        // matched configured board and caps only newly discovered boards at three.
+        let liveIDs=Set(devices.prefix(3).compactMap { BoardTopology.matching($0,in:hardware.boards)?.id })
         var selected:[ConfiguredBoard]=[]
         for device in devices.prefix(3) {
             let port=(18110...65535).first { p in !reservedPorts.contains(p) && !selected.contains {$0.clientPort==p} }!
@@ -392,7 +395,7 @@ public enum BoardDiscovery {
                 return serial==device.serial
             })
             if var board=match {
-                if liveMatch==nil && (hardware.boards.contains {$0.id==board.id} || selected.contains {$0.id==board.id}) {
+                if liveMatch==nil && (liveIDs.contains(board.id) || selected.contains {$0.id==board.id}) {
                     board.id=freeServiceBoardID(location:device.location,usedIDs:usedIDs)
                 }
                 board.deviceLocation=device.location;board.serial=device.serial ?? board.serial

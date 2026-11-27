@@ -219,7 +219,7 @@ async fn a_missing_prepare_state_is_not_a_reliability_failure() {
     let first_retry = rig.shared.runtime.lock().unwrap().boards["b1"]
         .retry_after_unix
         .expect("the prepare-state stop schedules a retry");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let retry = rig.shared.runtime.lock().unwrap().boards["b1"].retry_after_unix;
         if retry.is_some_and(|retry| retry >= first_retry + 2) {

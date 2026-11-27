@@ -626,7 +626,7 @@ fn shared_board_identity_vectors_match_the_service_plan() {
     ))
     .unwrap();
     assert!(
-        vectors.vectors.len() >= 9,
+        vectors.vectors.len() >= 12,
         "shared board identity vectors are missing"
     );
     for vector in vectors.vectors {

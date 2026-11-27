@@ -12,7 +12,7 @@ use std::{
 };
 use timelord_core::Config;
 use timelord_supervisor::AcceptBackoff;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::{net::TcpListener, sync::watch, task::JoinSet};
 
 struct Run {
@@ -356,6 +356,32 @@ fn spawn_discovery_prepare(
         let result = hardware::prepared_native(&config, current).await;
         (binary, result)
     })
+}
+
+/// Read the versioned status snapshot from a running service.
+pub(crate) async fn fetch_status(address: std::net::SocketAddr) -> Result<serde_json::Value> {
+    let response = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut socket = tokio::net::TcpStream::connect(address).await?;
+        socket
+            .write_all(b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await?;
+        let mut response = String::new();
+        socket
+            .take(16 * 1024 * 1024)
+            .read_to_string(&mut response)
+            .await?;
+        Ok::<_, std::io::Error>(response)
+    })
+    .await
+    .context("Status request timed out")??;
+    let (header, body) = response
+        .split_once("\r\n\r\n")
+        .context("Invalid status response")?;
+    anyhow::ensure!(
+        header.starts_with("HTTP/1.1 200"),
+        "Service rejected status request"
+    );
+    Ok(serde_json::from_str(body)?)
 }
 
 pub(crate) async fn serve(

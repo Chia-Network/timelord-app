@@ -144,6 +144,59 @@
         {"id": "usb-4114", "serial": "serial-1", "device_location": 4113}
       ],
       "expected_remembered_boards": []
+    },
+    {
+      "name": "a remembered board listed before its live owner still gets a free identifier",
+      "boards": [
+        {"id": "usb-4", "name": "ASIC 1", "client_port": 18110, "device_location": 4, "serial": "serial-1"}
+      ],
+      "remembered_boards": [
+        {"id": "usb-4", "name": "ASIC 2", "client_port": 18111, "device_location": 4, "serial": "serial-0"}
+      ],
+      "devices": [
+        {"name": "ASIC", "location": 5, "serial": "serial-0"},
+        {"name": "ASIC", "location": 4, "serial": "serial-1"}
+      ],
+      "expected_boards": [
+        {"id": "usb-4", "serial": "serial-1", "device_location": 4},
+        {"id": "usb-5", "serial": "serial-0", "device_location": 5}
+      ],
+      "expected_remembered_boards": []
+    },
+    {
+      "name": "two remembered boards with the same identifier get distinct identifiers",
+      "boards": [],
+      "remembered_boards": [
+        {"id": "usb-4", "name": "ASIC 1", "client_port": 18110, "device_location": 4, "serial": "serial-0"},
+        {"id": "usb-4", "name": "ASIC 2", "client_port": 18111, "device_location": 6, "serial": "serial-2"}
+      ],
+      "devices": [
+        {"name": "ASIC", "location": 5, "serial": "serial-0"},
+        {"name": "ASIC", "location": 6, "serial": "serial-2"}
+      ],
+      "expected_boards": [
+        {"id": "usb-4", "serial": "serial-0", "device_location": 5},
+        {"id": "usb-6", "serial": "serial-2", "device_location": 6}
+      ],
+      "expected_remembered_boards": []
+    },
+    {
+      "name": "an absent configured owner does not occupy a restored remembered identifier",
+      "boards": [
+        {"id": "usb-4", "name": "ASIC 1", "client_port": 18110, "device_location": 4, "serial": "serial-1"}
+      ],
+      "remembered_boards": [
+        {"id": "usb-4", "name": "ASIC 2", "client_port": 18111, "device_location": 4, "serial": "serial-0"}
+      ],
+      "devices": [
+        {"name": "ASIC", "location": 5, "serial": "serial-0"}
+      ],
+      "expected_boards": [
+        {"id": "usb-4", "serial": "serial-0", "device_location": 5}
+      ],
+      "expected_remembered_boards": [
+        {"id": "usb-4", "serial": "serial-1", "device_location": 4}
+      ]
     }
   ]
 }

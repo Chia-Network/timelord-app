@@ -86,7 +86,7 @@ final class BoardIdentityTests: XCTestCase {
 
     func testSharedBoardIdentityVectorsMatchReconcile() throws {
         let vectors = try vectors()
-        XCTAssertGreaterThanOrEqual(vectors.count, 9, "shared board identity vectors are missing")
+        XCTAssertGreaterThanOrEqual(vectors.count, 12, "shared board identity vectors are missing")
         for vector in vectors {
             var hardware = HardwareConfiguration()
             hardware.boards = vector.boards.enumerated().map { configured($0.element, index: $0.offset) }
